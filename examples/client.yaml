@@ -5,5 +5,16 @@ control_server_name: localhost
 node_id: ""
 enroll_token: ""
 state_dir: .local/client
+# pool: 4
 tls:
   ca_file: .local/certs/ca.pem
+  # Hysteria2 keeps ca_file and replaces the TCP hop with QUIC. Do not set reality.
+  # hysteria2:
+  #   password: replace-me
+  # encryption: none
+  # encryption: <client encryption line from: veilink vlessenc>
+  # REALITY replaces ca_file. Remove ca_file, and do not set dest or private_key here.
+  # reality:
+  #   public_key: <public key printed by: veilink x25519>
+  #   short_id: 0123456789abcdef
+  #   fingerprint: chrome

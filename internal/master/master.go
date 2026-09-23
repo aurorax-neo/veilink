@@ -4,19 +4,23 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/keepalive"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"strings"
 	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
+
 	pb "veilink/api/control/v1"
 	"veilink/internal/config"
+	"veilink/internal/console"
 	"veilink/internal/control"
 	"veilink/internal/httpapi"
 	"veilink/internal/store"
-	"veilink/web"
 )
 
 func Run(ctx context.Context, c config.Config) error {
@@ -32,33 +36,72 @@ func Run(ctx context.Context, c config.Config) error {
 		return e
 	}
 	defer s.Close()
-	listener, e := net.Listen("tcp", c.ControlAddr)
+	initPass := os.Getenv("VEILINK_INIT_ADMIN_PASSWORD")
+	if initPass == "" {
+		initPass = os.Getenv("VEILINK_ADMIN_PASSWORD")
+	}
+	if initPass != "" {
+		hasAdmin, err := s.HasAdmin()
+		if err != nil {
+			return err
+		}
+		if !hasAdmin {
+			initUser := os.Getenv("VEILINK_INIT_ADMIN_USERNAME")
+			if initUser == "" {
+				initUser = "admin"
+			}
+			if err := s.InitAdmin(initUser, initPass); err != nil {
+				return fmt.Errorf("auto-init admin failed: %w", err)
+			}
+			slog.Info("initial administrator initialized from environment", "username", initUser)
+		}
+	}
+	listener, e := net.Listen("tcp", c.BindAddr)
 	if e != nil {
 		return e
 	}
-	defer listener.Close()
-	g := grpc.NewServer(grpc.Creds(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}})), grpc.MaxRecvMsgSize(64<<10), grpc.MaxSendMsgSize(4<<20), grpc.MaxConcurrentStreams(16), grpc.KeepaliveParams(keepalive.ServerParameters{MaxConnectionIdle: 5 * time.Minute, Time: time.Minute, Timeout: 10 * time.Second}))
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}, NextProtos: []string{"h2", "http/1.1"}}
+	g := grpc.NewServer(grpc.MaxRecvMsgSize(64<<10), grpc.MaxSendMsgSize(4<<20), grpc.MaxConcurrentStreams(16), grpc.KeepaliveParams(keepalive.ServerParameters{MaxConnectionIdle: 5 * time.Minute, Time: time.Minute, Timeout: 10 * time.Second}))
 	pb.RegisterControlServer(g, &control.Service{Store: s})
-	h := &http.Server{Addr: c.HTTPAddr, Handler: httpapi.New(s, c.InsecureLoopbackHTTP && c.HTTPCert == "" && !c.TrustedProxy, web.Handler()), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: time.Minute, MaxHeaderBytes: 16 << 10, TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12}}
-	errs := make(chan error, 2)
-	go func() { errs <- g.Serve(listener) }()
-	go func() {
-		if c.HTTPCert != "" {
-			errs <- h.ListenAndServeTLS(c.HTTPCert, c.HTTPKey)
-		} else {
-			errs <- h.ListenAndServe()
-		}
-	}()
-	slog.Info("master started", "http", c.HTTPAddr, "control", c.ControlAddr)
+	panel := httpapi.New(s, false, console.Handler(console.Locate(c.HTMLDir)))
+	h := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {
+				g.ServeHTTP(w, r)
+				return
+			}
+			panel.ServeHTTP(w, r)
+		}),
+		TLSConfig:         tlsConfig,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       5 * time.Minute,
+		MaxHeaderBytes:    16 << 10,
+	}
+	errc := make(chan error, 2)
+	go func() { errc <- h.Serve(tls.NewListener(listener, tlsConfig)) }()
+	slog.Info("master started", "addr", c.BindAddr)
+	embeddedDone := make(chan struct{})
+	if c.EmbeddedServer.Enabled {
+		go func() {
+			defer close(embeddedDone)
+			if err := runEmbeddedServer(ctx, c, s); err != nil && ctx.Err() == nil {
+				slog.Error("embedded server failed", "error", err)
+				errc <- err
+			}
+		}()
+	} else {
+		close(embeddedDone)
+	}
 	select {
 	case <-ctx.Done():
 		e = nil
-	case e = <-errs:
+	case e = <-errc:
 	}
 	stop, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	h.Shutdown(stop)
+	_ = h.Shutdown(stop)
 	g.Stop()
+	<-embeddedDone
 	if errors.Is(e, http.ErrServerClosed) {
 		return nil
 	}

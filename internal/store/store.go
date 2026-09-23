@@ -149,6 +149,29 @@ func (s *Store) InitAdmin(user, password string) error {
 	_, e = s.db.Exec("INSERT INTO admin VALUES(?,?)", user, h)
 	return e
 }
+func (s *Store) HasAdmin() (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var count int
+	if err := s.db.QueryRow("SELECT count(*) FROM admin").Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+func (s *Store) FindNodeByName(name string) (model.Node, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, err := s.load()
+	if err != nil {
+		return model.Node{}, false, err
+	}
+	for _, n := range st.Nodes {
+		if n.Name == name {
+			return n, true, nil
+		}
+	}
+	return model.Node{}, false, nil
+}
 func (s *Store) Login(user, password string) bool {
 	var h string
 	e := s.db.QueryRow("SELECT password FROM admin WHERE username=?", user).Scan(&h)
@@ -403,18 +426,25 @@ func host(h string) bool {
 	return true
 }
 func wildcard(h string) bool { return h == "" || h == "0.0.0.0" || h == "::" }
+func mappingNet(s string) string {
+	if strings.EqualFold(strings.TrimSpace(s), "udp") {
+		return "udp"
+	}
+	return "tcp"
+}
+
 func validate(st *state) error {
 	for id, m := range st.Mappings {
 		b, ok := st.Bindings[m.BindingID]
-		if !ok || m.Name == "" || len(m.Name) > 128 || m.ListenPort < 1 || m.ListenPort > 65535 || m.TargetPort < 1 || m.TargetPort > 65535 || !host(m.TargetHost) || net.ParseIP(m.ListenHost) == nil {
+		if !ok || m.Name == "" || len(m.Name) > 128 || (m.Network != "" && m.Network != "tcp" && m.Network != "udp") || m.ListenPort < 1 || m.ListenPort > 65535 || m.TargetPort < 1 || m.TargetPort > 65535 || !host(m.TargetHost) || net.ParseIP(m.ListenHost) == nil {
 			return ErrInvalid
 		}
 		n := st.Nodes[b.ServerID]
-		if m.ListenPort == n.Port {
+		if mappingNet(m.Network) != "udp" && m.ListenPort == n.Port {
 			return ErrInvalid
 		}
 		for oid, o := range st.Mappings {
-			if oid != id && m.Enabled && o.Enabled && st.Bindings[o.BindingID].ServerID == b.ServerID && o.ListenPort == m.ListenPort && (o.ListenHost == m.ListenHost || wildcard(o.ListenHost) || wildcard(m.ListenHost)) {
+			if oid != id && m.Enabled && o.Enabled && st.Bindings[o.BindingID].ServerID == b.ServerID && o.ListenPort == m.ListenPort && mappingNet(o.Network) == mappingNet(m.Network) && (o.ListenHost == m.ListenHost || wildcard(o.ListenHost) || wildcard(m.ListenHost)) {
 				return ErrInvalid
 			}
 		}
@@ -422,6 +452,7 @@ func validate(st *state) error {
 	return nil
 }
 func (s *Store) SaveMapping(m model.Mapping) (model.Mapping, error) {
+	m.Network = mappingNet(m.Network)
 	if m.ID == "" {
 		m.ID = auth.Token()
 	}

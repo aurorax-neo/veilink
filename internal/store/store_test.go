@@ -121,3 +121,200 @@ func TestPersistenceIsolationRevocation(t *testing.T) {
 		t.Fatal("audit")
 	}
 }
+
+func TestUDPMappingValidationAndPersistence(t *testing.T) {
+	dir := t.TempDir()
+	db, key := filepath.Join(dir, "db"), filepath.Join(dir, "key")
+	s, err := Open(db, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err = s.InitAdmin("admin", "test password long"); err != nil {
+		t.Fatal(err)
+	}
+
+	server, err := s.SaveNode(model.Node{Name: "gw", Role: "server", Address: "localhost", ServerName: "localhost", Port: 8443})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := s.SaveNode(model.Node{Name: "cli", Role: "client"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := s.SaveBinding(model.Binding{ServerID: server.ID, ClientID: client.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. TCP mapping on server.Port (8443) must be rejected
+	tcpConflict := model.Mapping{
+		Name:       "tcp-conflict",
+		BindingID:  binding.ID,
+		Network:    "tcp",
+		ListenHost: "0.0.0.0",
+		ListenPort: 8443,
+		TargetHost: "127.0.0.1",
+		TargetPort: 8080,
+		Enabled:    true,
+	}
+	if _, err := s.SaveMapping(tcpConflict); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("expected ErrInvalid when TCP mapping uses server.Port, got %v", err)
+	}
+
+	// 2. UDP mapping on server.Port (8443) is allowed (UDP port != TCP transport port)
+	// Also verify case-insensitive protocol normalization: "  UDP  " -> "udp"
+	udpOnServerPort := model.Mapping{
+		Name:       "udp-on-server-port",
+		BindingID:  binding.ID,
+		Network:    "  UDP  ",
+		ListenHost: "0.0.0.0",
+		ListenPort: 8443,
+		TargetHost: "127.0.0.1",
+		TargetPort: 5353,
+		Enabled:    true,
+	}
+	savedUDP, err := s.SaveMapping(udpOnServerPort)
+	if err != nil {
+		t.Fatalf("saving UDP mapping on server port failed: %v", err)
+	}
+	if savedUDP.Network != "udp" {
+		t.Fatalf("expected normalized network 'udp', got %q", savedUDP.Network)
+	}
+
+	// 3. UDP port collision: another UDP mapping on overlapping host and same port must fail
+	udpCollision := model.Mapping{
+		Name:       "udp-dup",
+		BindingID:  binding.ID,
+		Network:    "udp",
+		ListenHost: "127.0.0.1",
+		ListenPort: 8443,
+		TargetHost: "127.0.0.1",
+		TargetPort: 5354,
+		Enabled:    true,
+	}
+	if _, err := s.SaveMapping(udpCollision); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("expected ErrInvalid on UDP port collision, got %v", err)
+	}
+
+	// 4. TCP and UDP coexistence: a TCP mapping on a non-server port (e.g. 9000)
+	// and a UDP mapping on the same port (9000) must coexist without collision
+	tcp9000 := model.Mapping{
+		Name:       "tcp-9000",
+		BindingID:  binding.ID,
+		Network:    "tcp",
+		ListenHost: "0.0.0.0",
+		ListenPort: 9000,
+		TargetHost: "127.0.0.1",
+		TargetPort: 9001,
+		Enabled:    true,
+	}
+	if _, err := s.SaveMapping(tcp9000); err != nil {
+		t.Fatalf("saving TCP mapping on 9000 failed: %v", err)
+	}
+
+	udp9000 := model.Mapping{
+		Name:       "udp-9000",
+		BindingID:  binding.ID,
+		Network:    "udp",
+		ListenHost: "0.0.0.0",
+		ListenPort: 9000,
+		TargetHost: "127.0.0.1",
+		TargetPort: 9002,
+		Enabled:    true,
+	}
+	if _, err := s.SaveMapping(udp9000); err != nil {
+		t.Fatalf("saving UDP mapping on same port 9000 as TCP mapping should succeed, got: %v", err)
+	}
+
+	// 5. Snapshot validation: verify client credential gets the UDP mapping with network="udp"
+	tok, err := s.EnrollToken(client.ID, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred, err := s.Enroll(client.ID, tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := s.Snapshot(client.ID, cred)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Mappings) != 3 {
+		t.Fatalf("expected 3 mappings in snapshot, got %d", len(snap.Mappings))
+	}
+	var foundUDP8443, foundUDP9000, foundTCP9000 bool
+	for _, m := range snap.Mappings {
+		if m.ListenPort == 8443 && m.Network == "udp" {
+			foundUDP8443 = true
+		}
+		if m.ListenPort == 9000 && m.Network == "udp" {
+			foundUDP9000 = true
+		}
+		if m.ListenPort == 9000 && m.Network == "tcp" {
+			foundTCP9000 = true
+		}
+	}
+	if !foundUDP8443 || !foundUDP9000 || !foundTCP9000 {
+		t.Fatalf("snapshot missing expected mappings: udp8443=%v, udp9000=%v, tcp9000=%v", foundUDP8443, foundUDP9000, foundTCP9000)
+	}
+}
+func TestStoreHasAdminAndFindNodeByName(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "test.db"), filepath.Join(dir, "test.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	hasAdmin, err := s.HasAdmin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasAdmin {
+		t.Fatalf("expected no admin, got true")
+	}
+
+	if err := s.InitAdmin("admin", "AdminSecret123!"); err != nil {
+		t.Fatal(err)
+	}
+
+	hasAdmin, err = s.HasAdmin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasAdmin {
+		t.Fatalf("expected admin to exist, got false")
+	}
+
+	_, found, err := s.FindNodeByName("nonexistent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Fatalf("expected node to not be found")
+	}
+
+	node, err := s.SaveNode(model.Node{
+		Name:       "server-local",
+		Role:       "server",
+		Address:    "127.0.0.1",
+		Port:       8444,
+		ServerName: "localhost",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	foundNode, found, err := s.FindNodeByName("server-local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatalf("expected node to be found")
+	}
+	if foundNode.ID != node.ID || foundNode.Port != 8444 {
+		t.Fatalf("unexpected node data: %+v", foundNode)
+	}
+}

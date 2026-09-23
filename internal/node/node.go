@@ -103,7 +103,9 @@ func Run(ctx context.Context, c config.Config, role string) error {
 	} else if !os.IsNotExist(er) {
 		return er
 	}
-	runtime := tunnel.New(c.TLS)
+	local := c.TLS
+	local.Pool = c.Pool
+	runtime := tunnel.New(local)
 	defer runtime.Close()
 	failed := false
 	if st.Snapshot != nil {
@@ -231,7 +233,7 @@ func cycle(ctx context.Context, client pb.ControlClient, c config.Config, role s
 			}
 			if er = runtime.Apply(snap); er != nil {
 				*failed = true
-				slog.Warn("runtime configuration apply failed", "revision", snap.Revision)
+				slog.Warn("runtime configuration apply failed", "revision", snap.Revision, "err", er)
 			} else {
 				*failed = false
 				st.Snapshot = &snap

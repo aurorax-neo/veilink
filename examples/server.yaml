@@ -9,3 +9,15 @@ tls:
   cert_file: .local/certs/cert.pem
   key_file: .local/certs/key.pem
   listen_host: 0.0.0.0
+  # Hysteria2 listens on UDP and uses the certificate above. Do not set reality.
+  # hysteria2:
+  #   password: replace-me
+  # decryption: none
+  # decryption: <server decryption line from: veilink vlessenc>
+  # REALITY replaces the certificate files above. Remove cert_file and key_file first.
+  # reality:
+  #   dest: www.example.com:443
+  #   private_key: <output of: veilink x25519>
+  #   short_ids: 0123456789abcdef
+  #   server_names: www.example.com
+  #   max_time_diff: 1m
