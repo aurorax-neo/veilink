@@ -21,6 +21,7 @@ services:
     command: [init-admin, -config, /config/master.yaml, -username, admin]
     environment:
       VEILINK_ADMIN_PASSWORD: ${VEILINK_ADMIN_PASSWORD:-}
+      VEILINK_INIT_ADMIN_PASSWORD: ${VEILINK_INIT_ADMIN_PASSWORD:-}
     volumes:
       - master-data:/data
       - certificates:/certs:ro
@@ -29,7 +30,16 @@ services:
   master:
     <<: *veilink
     command: [master, -config, /config/master.yaml]
+    environment:
+      VEILINK_INIT_ADMIN_USERNAME: ${VEILINK_INIT_ADMIN_USERNAME:-admin}
+      VEILINK_INIT_ADMIN_PASSWORD: ${VEILINK_INIT_ADMIN_PASSWORD:-${VEILINK_ADMIN_PASSWORD:-}}
+      VEILINK_EMBEDDED_SERVER_ENABLED: ${VEILINK_EMBEDDED_SERVER_ENABLED:-false}
+      VEILINK_EMBEDDED_SERVER_PORT: ${VEILINK_EMBEDDED_SERVER_PORT:-8444}
+      VEILINK_EMBEDDED_SERVER_NAME: ${VEILINK_EMBEDDED_SERVER_NAME:-integrated-gateway}
+      VEILINK_EMBEDDED_SERVER_ADDRESS: ${VEILINK_EMBEDDED_SERVER_ADDRESS:-127.0.0.1}
+      VEILINK_EMBEDDED_SERVER_SERVER_NAME: ${VEILINK_EMBEDDED_SERVER_SERVER_NAME:-localhost}
     ports:
+      - "127.0.0.1:8443:8443"
       - "127.0.0.1:8444:8444"
     volumes:
       - master-data:/data

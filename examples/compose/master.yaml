@@ -1,8 +1,15 @@
 database: /data/veilink.db
 deployment_key: /data/veilink.key
-http_addr: 0.0.0.0:8444
-http_cert: /certs/demo/cert.pem
-http_key: /certs/demo/key.pem
-control_addr: 0.0.0.0:8443
+# Web panel and node gRPC share this TLS port.
+bind_addr: 0.0.0.0:8443
+html_dir: /usr/local/html
 control_cert: /certs/demo/cert.pem
 control_key: /certs/demo/key.pem
+
+# Optional embedded server (All-in-One integrated gateway):
+# embedded_server:
+#   enabled: true
+#   name: "local-gateway"
+#   port: 8444
+#   address: "127.0.0.1"
+#   server_name: "localhost"

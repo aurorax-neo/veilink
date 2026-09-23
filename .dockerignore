@@ -11,3 +11,5 @@ dist
 *.key
 *.pem
 .env
+frontend/node_modules
+frontend/dist

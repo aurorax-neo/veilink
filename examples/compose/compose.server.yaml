@@ -1,0 +1,24 @@
+# Veilink Standalone Server Gateway Deployment
+services:
+  server:
+    image: veilink:local
+    restart: unless-stopped
+    command: [server, -config, /config/server.yaml]
+    environment:
+      # Master address for TLS gRPC control plane connection
+      VEILINK_MASTER_ADDR: ${VEILINK_MASTER_ADDR:-master.example.com:8443}
+      VEILINK_CONTROL_SERVER_NAME: ${VEILINK_CONTROL_SERVER_NAME:-master.example.com}
+
+      # Gateway node credentials
+      VEILINK_NODE_ID: ${VEILINK_NODE_ID:-}
+      VEILINK_ENROLL_TOKEN: ${VEILINK_ENROLL_TOKEN:-}
+    ports:
+      # Data plane reverse tunnel listening port
+      - "4433:4433"
+      # Public service entry ports exposed by this gateway
+      - "8080:8080"
+      - "8080:8080/udp"
+    volumes:
+      - ./server.yaml:/config/server.yaml:ro
+      - ./data:/data
+      - ./certs:/certs:ro
