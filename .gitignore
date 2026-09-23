@@ -1,0 +1,42 @@
+# Local reference checkouts. Not a build dependency.
+/ref/
+/refs/
+
+# Editor and agent state
+.pi/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local workspace (examples use .local/; defaults are veilink.db, veilink.key, state/)
+.local/
+/state/
+/bin/
+/dist/
+/veilink
+/veilink.exe
+go.work
+go.work.sum
+
+# Secrets, certificates, and databases
+.env
+.env.*
+!.env.example
+*.db
+*.db-*
+*.key
+*.pem
+*.crt
+.state-*
+
+# Go build, test, and coverage output
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.*
+*.coverprofile

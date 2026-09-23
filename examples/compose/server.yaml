@@ -1,0 +1,8 @@
+master_addr: master:8443
+control_ca: /certs/demo/ca.pem
+control_server_name: master
+state_dir: /data/state
+tls:
+  cert_file: /certs/demo/cert.pem
+  key_file: /certs/demo/key.pem
+  listen_host: 0.0.0.0

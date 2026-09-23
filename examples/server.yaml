@@ -1,0 +1,11 @@
+master_addr: 127.0.0.1:8443
+control_ca: .local/certs/ca.pem
+control_server_name: localhost
+# Set these via VEILINK_NODE_ID and VEILINK_ENROLL_TOKEN on first start.
+node_id: ""
+enroll_token: ""
+state_dir: .local/server
+tls:
+  cert_file: .local/certs/cert.pem
+  key_file: .local/certs/key.pem
+  listen_host: 0.0.0.0

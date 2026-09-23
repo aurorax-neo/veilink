@@ -1,0 +1,13 @@
+.git
+.pi
+ref
+refs
+.local
+state
+bin
+dist
+*.db
+*.db-*
+*.key
+*.pem
+.env

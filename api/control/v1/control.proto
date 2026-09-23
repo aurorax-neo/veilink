@@ -1,0 +1,18 @@
+syntax = "proto3";
+package veilink.control.v1;
+option go_package = "veilink/api/control/v1;controlv1";
+import "google/protobuf/struct.proto";
+// All envelopes are genuine protobuf Struct, never a custom JSON codec.
+// Enroll request: node_id:string, token:string. Response: credential:string.
+// Pull request: node_id:string, credential:string. Response: model.Snapshot
+// field names (revision, node, nodes, bindings, mappings). UUID exists only here.
+// Events client: node_id:string, credential:string, applied_revision:number,
+// error:string (presence indicates failure; content never persisted).
+// Events server: revision:number. Client sends heartbeat at least every 15s,
+// pulls on every new revision and retries failed applications of same revision.
+// Numeric revisions are limited to protobuf Struct exact integers (<2^53).
+service Control {
+ rpc Enroll(google.protobuf.Struct) returns (google.protobuf.Struct);
+ rpc Pull(google.protobuf.Struct) returns (google.protobuf.Struct);
+ rpc Events(stream google.protobuf.Struct) returns (stream google.protobuf.Struct);
+}
