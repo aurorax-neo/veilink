@@ -15,6 +15,7 @@ Thumbs.db
 /state/
 /bin/
 /dist/
+/html/
 /veilink
 /veilink.exe
 go.work

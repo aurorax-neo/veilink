@@ -1,6 +1,6 @@
 # Veilink
 
-Go 编写的集中管理 TCP 内网穿透工具：自带的 VLESS 反向通道负责数据面，管理中心负责节点、绑定、映射与配置同步。数据面不经过 master，也不嵌入其他代理内核。
+Veilink 是一个专注于安全、高性能与易运维的集中管理型 TCP/UDP 内网穿透工具：基于原生 Go 实现的 VLESS 反向通道负责数据面传输，控制中心负责节点纳管、多路复用隧道绑定、映射生命周期以及动态配置下发。数据面不经过 Master 转发，也不依赖任何外部代理内核。
 
 ```text
 公网访问者 → server 映射端口 → 反向入口 ← VLESS + TLS ← client 出口 → 内网服务
@@ -8,144 +8,143 @@ Go 编写的集中管理 TCP 内网穿透工具：自带的 VLESS 反向通道�
                                 └──── TLS gRPC / master ────┘
 ```
 
-## 功能与范围
+---
 
-- 单二进制 `master` / `server` / `client` 三角色，多网关、多内网节点。
-- SQLite 集中配置、节点注册/吊销、独立绑定密钥、TCP 映射 CRUD 与启停。
-- TLS gRPC 事件流、完整配置拉取、心跳与期望/实际版本回报。
-- 内嵌中文管理界面，无 Node.js 构建依赖；会话、CSRF 与登录限速。
-- 客户端主动出站；管理中心离线时维持已运行的数据面，节点可恢复本地成功快照。
-- TLS 证书验证默认启用；管理 API 不返回 VLESS UUID，数据库中的绑定密钥加密保存。
+## 核心特性
 
-首版仅支持 TCP。HTTP、HTTPS、SSH 等均按 TCP 透明转发。**不承诺无损热更新**：配置变更会停掉该节点当前隧道并按新快照重新监听，已有连接会被中断。节点在线不等于目标服务健康。暂不含 UDP、REALITY、自动证书、多租户、P2P 打洞或远程终端。
+- **双部署架构**：
+  - **单机一体化模式 (All-in-One)**：Master 内置数据面网关（`embedded_server`），单个二进制进程同时承担控制台与公网穿透入口，免令牌自启动。
+  - **分布式多节点模式 (Distributed)**：Master 作为独立控制面，支持跨多台公网服务器连接多个独立 Server 网关与内网 Client。
+- **单二进制多角色**：一个二进制支持 `master`、`server`、`client`、`init-admin` 以及辅助诊断工具。
+- **原生高性能隧道**：基于 Go 原生 VLESS 协议、Private Mux（单连接多路复用）、XUDP 数据报封装，无外部重量级依赖。
+- **全方位传输安全**：数据面支持标准证书 TLS、REALITY（去特征与合规站点伪装）、Hysteria2（基于 QUIC 的弱网加速）及 VLESS Encryption 后量子加密。
+- **现代化管理控制台**：基于 Vue 3 + TypeScript 打造的单页面管理后台，Master 端口同源服务静态资源与 REST API。
+- **生产级容器化**：官方多阶段构建 Dockerfile，默认使用非 root 用户（`65532:65532`）运行，内置容器级探活健康检查（`HEALTHCHECK`）。
+- **完善的环境变量支持**：所有核心配置均可通过 `VEILINK_<SECTION>_<KEY>` 环境变量直接覆盖，支持容器集群的零文件挂载自动化引导。
 
-## 构建与验证
+---
 
-需要 **Go 1.27+**（与 `go.mod` 一致）。数据面在 `internal/tunnel` 内实现，构建不依赖 `ref/`。
+## 快速上手
+
+### 方式一：Docker Compose 生产级部署（推荐）
+
+#### 1. 单机一体化网关 (All-in-One)
+
+适合拥有单台公网 VPS，希望快速部署穿透服务并使用 Web 控制台管理的用户：
 
 ```sh
+# 进入示例目录
+cd examples/compose
+
+# 启动 Master（包含 Web 控制台与内置 Server 网关）
+# 首次启动会自动创建初始管理员：admin / ChangeMeToAStrongPassword123!
+docker compose -f compose.master.yaml up -d
+```
+
+启动后：
+- 浏览器访问控制台：**https://<你的公网IP>:8443**
+- 登录账号密码：`admin` / `ChangeMeToAStrongPassword123!`（可在 `compose.master.yaml` 中通过 `VEILINK_INIT_ADMIN_PASSWORD` 自定义）。
+- 内置网关 `integrated-gateway` 已经就绪，监听 `8444` 端口。
+
+#### 2. 内网客户端 (Client)
+
+在需要穿透内网服务的设备上部署客户端：
+
+```sh
+# 获取在控制台中生成的客户端节点 ID 与注册令牌
+export VEILINK_NODE_ID='<client-node-id>'
+export VEILINK_ENROLL_TOKEN='<client-enroll-token>'
+export VEILINK_MASTER_ADDR='<master-ip>:8443'
+
+docker compose -f compose.client.yaml up -d
+```
+
+在控制台创建**绑定（Binding）**并添加**映射（Mapping）**（支持 TCP / UDP），即可完成穿透！
+
+---
+
+### 方式二：本地二进制构建与运行
+
+需要 **Go 1.27+** 与 **Node.js** 环境。
+
+#### 1. 编译构建
+```sh
+# 构建前端
+cd frontend && npm install && npm run build && cd ..
+
+# 编译 Veilink 二进制
 go build -o bin/veilink ./cmd/veilink
 ./bin/veilink version
-go test ./...
-go vet ./...
-go test -race ./...
-# 较慢：真实 CLI 三进程 + TLS + 管理 API + 大响应/并发 + 故障恢复
-go test -tags integration -v -timeout 10m ./tests/integration
 ```
 
-测试生成的二进制、证书、数据库和日志保存在临时目录。
-
-## 本机快速启动
-
-以下命令从仓库根目录执行，相对配置路径以**进程工作目录**为准。使用 `.local/` 保存本机证书、数据库和节点状态。这些运行数据以及本地参考目录 `ref/` 已由 `.gitignore` 排除，不要强制加入版本库。
-
-### 1. 生成演示证书、初始化管理员
-
+#### 2. 生成本地测试证书并初始化管理员
 ```sh
+# 生成演示 TLS 证书
 go run ./tools/devcert -out .local/certs
-# 手工输入强口令，避免将明文写入历史；无默认管理员密码。
-read -rs VEILINK_ADMIN_PASSWORD; echo
-export VEILINK_ADMIN_PASSWORD
+
+# 初始化管理员账号
+export VEILINK_ADMIN_PASSWORD="YourStrongPasswordHere"
 ./bin/veilink init-admin -config examples/master.yaml -username admin
 unset VEILINK_ADMIN_PASSWORD
+```
+
+#### 3. 启动一体化 Master
+编辑 `examples/master.yaml`，开启内置网关：
+```yaml
+embedded_server:
+  enabled: true
+  name: "integrated-gateway"
+  port: 8444
+  address: "127.0.0.1"
+  server_name: "localhost"
+```
+
+启动 Master：
+```sh
 ./bin/veilink master -config examples/master.yaml
 ```
+访问 **https://127.0.0.1:8443** 登录控制台。
 
-打开 **http://127.0.0.1:8080** 登录。该示例显式允许仅回环 HTTP；控制面仍为 TLS。演示证书只有七天有效期，生成器不会覆盖已有文件。生产环境应使用自己的证书，并为管理入口启用 HTTPS。
+---
 
-### 2. 创建节点并注册
+## 环境变量配置规范
 
-管理页面创建：
+Veilink 支持完整的环境变量覆盖机制，优先级高于配置文件：
 
-| 名称 | 角色 | 网关地址 | VLESS 端口 | TLS ServerName |
-| --- | --- | --- | --- | --- |
-| gateway | server | `127.0.0.1` | `4433` | `localhost` |
-| inside | client | 无 | 无 | 无 |
+| 环境变量 | 作用与示例 | 默认值 |
+| :--- | :--- | :--- |
+| `VEILINK_CONFIG` | 指定加载的配置文件路径 | `veilink.yaml` |
+| `VEILINK_INIT_ADMIN_USERNAME` | Master 首次启动自动初始化的管理员用户名 | 无（需配合密码） |
+| `VEILINK_INIT_ADMIN_PASSWORD` | Master 首次启动自动初始化的管理员密码 | 无（留空则不自动初始化） |
+| `VEILINK_EMBEDDED_SERVER_ENABLED` | 是否在 Master 内置数据面 Server 网关（`true`/`false`） | `false` |
+| `VEILINK_EMBEDDED_SERVER_NAME` | 内置网关在控制台登记的节点名称 | `integrated-gateway` |
+| `VEILINK_EMBEDDED_SERVER_PORT` | 内置网关数据面反向隧道监听端口 | `8444` |
+| `VEILINK_EMBEDDED_SERVER_ADDRESS` | 客户端连接内置网关的公网域名或 IP | `127.0.0.1` |
+| `VEILINK_EMBEDDED_SERVER_SERVER_NAME`| 内置网关 TLS ServerName（SNI） | `localhost` |
+| `VEILINK_MASTER_ADDR` | 节点连接控制面的 `host:port` | `127.0.0.1:8443` |
+| `VEILINK_NODE_ID` | 节点自身唯一标识符（UUID） | 无 |
+| `VEILINK_ENROLL_TOKEN` | 节点首次加入时的一次性注册令牌 | 无 |
+| `VEILINK_STATE_DIR` | 节点持久化保存凭据与快照的目录 | `state/` |
 
-在各节点操作中生成一次性注册令牌，记录节点 ID。在**两个独立终端**启动：
+---
 
-```sh
-# 网关终端：替换为页面显示的实际值。
-export VEILINK_NODE_ID='<server-id>'
-export VEILINK_ENROLL_TOKEN='<server-onetime-token>'
-./bin/veilink server -config examples/server.yaml
+## 生产级 Nginx 反向代理
 
-# 内网客户端终端：替换为其自己的实际值。
-export VEILINK_NODE_ID='<client-id>'
-export VEILINK_ENROLL_TOKEN='<client-onetime-token>'
-./bin/veilink client -config examples/client.yaml
-```
+在生产环境中，推荐使用 Nginx 统一管理公网 80/443 端口与 SSL 证书，并反向代理 Master Web 控制台与 gRPC 控制通道。
 
-首次注册后，节点凭据存于其 `state_dir`。后续启动保留节点 ID 和同一状态目录，移除 `VEILINK_ENROLL_TOKEN` 即可。不要共用两个节点的状态目录，也不要把 client/server 凭据混用。
+Veilink 提供了完整的实战配置指南，涵盖：
+- Master Web 控制台与 REST API 的 HTTPS 反向代理与安全标头配置。
+- TLS gRPC 长连接与 HTTP/2 的 `grpc_pass` 代理转发。
+- 基于 Nginx `stream` 模块的 SNI Preread 四层透传与端口复用。
+- 经过语法与实操检验的完整 `nginx.conf` 范例。
 
-### 3. 创建绑定和 TCP 映射
+详细请阅读：👉 **[docs/nginx-reverse-proxy.md](docs/nginx-reverse-proxy.md)**
 
-页面将 gateway 与 inside 建立绑定，然后创建映射：
+---
 
-```text
-名称：web
-绑定：gateway → inside
-监听地址：127.0.0.1
-公网端口：8081
-目标地址：127.0.0.1
-目标端口：9000
-启用：是
-```
+## 架构与深入指南
 
-在客户端所在机器启动任意 HTTP 服务，例如在一个只含公开测试内容的目录运行：
-
-```sh
-python3 -m http.server 9000 --bind 127.0.0.1
-```
-
-等待两个节点期望/实际版本一致，然后：
-
-```sh
-curl --fail http://127.0.0.1:8081/
-```
-
-公网部署时，把 server 地址改为**客户端可访问的公网域名/IP**，ServerName 与证书 SAN 匹配；映射监听地址改为需要的地址（如 `0.0.0.0`），仅开放确实需要的端口。目标地址相对于 **client 的网络环境**，不是 master 或 server。
-
-SSH 也可直接映射：目标 `127.0.0.1:22`、网关映射 `2222`，用 `ssh -p 2222 user@gateway.example.com` 访问。SSH 服务自身应使用密钥认证与访问限制。
-
-## Docker Compose 演示
-
-需 Docker Engine 和 Compose v2。本演示的 client 不发布端口，目标 nginx 仅连接 `internal` 网络，网关无法绕过 client 直接访问它。
-
-```sh
-docker compose build
-docker compose --profile setup run --rm certs
-read -rs VEILINK_ADMIN_PASSWORD; echo
-export VEILINK_ADMIN_PASSWORD
-docker compose --profile setup run --rm init-admin
-unset VEILINK_ADMIN_PASSWORD
-docker compose up -d master
-```
-
-管理地址为 **https://localhost:8444**。将演示 CA 导入仅用于开发的信任库；不要在生产环境禁用证书校验。可导出 CA：
-
-```sh
-docker compose run --rm --no-deps --entrypoint cat master /certs/demo/ca.pem > /tmp/veilink-demo-ca.pem
-```
-
-页面创建 server 节点时填 **地址 `server`、端口 `4433`、ServerName `server`**（Compose 网络内解析），另建 client 节点并生成各自令牌。然后：
-
-```sh
-export SERVER_NODE_ID='<server-id>' SERVER_ENROLL_TOKEN='<server-token>'
-export CLIENT_NODE_ID='<client-id>' CLIENT_ENROLL_TOKEN='<client-token>'
-docker compose --profile nodes up -d server client target
-```
-
-创建绑定；映射监听 `0.0.0.0:8081`，目标 **`target:80`**。等待配置下发完成后，宿主机访问 `http://127.0.0.1:8081/` 可看到 nginx 页面。
-
-命名卷保存数据库、部署密钥及节点状态。`docker compose down` 不删除这些卷；不要随意使用 `down -v`。演示为了简化挂载共享了一套证书，**生产应分别签发 master/server 证书，client 仅挂载 CA，不挂载服务端私钥**。演示端口默认仅发布到宿主机回环。
-
-## 运维要点
-
-- 数据面连接失败：依次检查节点应用错误、client→server 端口、TLS ServerName/CA、映射端口防火墙和 client→目标连通性。
-- 管理中心不可达时，已运行映射继续；配置修改和即时吊销不可用。
-- 吊销要求网关收到新配置才能移除旧身份；紧急撤销可同时关闭映射入口/网关进程或使用防火墙阻断。
-- 备份 SQLite 和对应部署密钥；仅备份数据库无法恢复加密 UUID。维护窗口停止 master 后一起备份是最简单的安全方式。
-- 生产使用非 root 专用账户与受限文件权限；不要把节点凭据、一次性令牌或私钥交给不可信人员。
-
-详见 [架构](docs/architecture.md) 和 [第三方组件](THIRD_PARTY_NOTICES.md)。
+- **系统架构与安全边界**：[docs/architecture.md](docs/architecture.md)
+- **Nginx 生产反向代理指南**：[docs/nginx-reverse-proxy.md](docs/nginx-reverse-proxy.md)
+- **第三方组件与开源合规**：[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+- **开源许可证**：[LICENSE](LICENSE) (Apache License 2.0)
