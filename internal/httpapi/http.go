@@ -84,6 +84,10 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+	if r.URL.Path == "/healthz" || r.URL.Path == "/api/health" {
+		output(w, 200, map[string]string{"status": "ok"})
+		return
+	}
 	if !strings.HasPrefix(r.URL.Path, "/api/") {
 		a.web.ServeHTTP(w, r)
 		return
