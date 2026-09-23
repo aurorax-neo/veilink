@@ -5,6 +5,8 @@ package integration
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -208,13 +210,18 @@ func TestCLIEndToEnd(t *testing.T) {
 	command(t, root, nil, "go", "build", "-o", bin, "./cmd/veilink")
 	certs := filepath.Join(dir, "certs")
 	command(t, root, nil, "go", "run", "./tools/devcert", "-out", certs)
-	httpPort, controlPort, tunnelPort, publicPort := freePort(t), freePort(t), freePort(t), freePort(t)
+	controlPort, tunnelPort, publicPort := freePort(t), freePort(t), freePort(t)
 	masterCfg := filepath.Join(dir, "master.yaml")
-	write(t, masterCfg, fmt.Sprintf("database: %q\ndeployment_key: %q\nhttp_addr: 127.0.0.1:%d\ninsecure_loopback_http: true\ncontrol_addr: 127.0.0.1:%d\ncontrol_cert: %q\ncontrol_key: %q\n", filepath.Join(dir, "master.db"), filepath.Join(dir, "master.key"), httpPort, controlPort, filepath.Join(certs, "cert.pem"), filepath.Join(certs, "key.pem")))
+	write(t, masterCfg, fmt.Sprintf("database: %q\ndeployment_key: %q\nbind_addr: 127.0.0.1:%d\ncontrol_cert: %q\ncontrol_key: %q\n", filepath.Join(dir, "master.db"), filepath.Join(dir, "master.key"), controlPort, filepath.Join(certs, "cert.pem"), filepath.Join(certs, "key.pem")))
 	command(t, root, []string{"VEILINK_ADMIN_PASSWORD=integration-secret-not-production-8429"}, bin, "init-admin", "-config", masterCfg, "-username", "admin")
 	master := launch(t, bin, "master", masterCfg)
 	jar, _ := cookiejar.New(nil)
-	a := &api{c: &http.Client{Jar: jar, Timeout: 4 * time.Second}, base: fmt.Sprintf("http://127.0.0.1:%d", httpPort)}
+	pool := x509.NewCertPool()
+	ca, err := os.ReadFile(filepath.Join(certs, "ca.pem"))
+	if err != nil || !pool.AppendCertsFromPEM(ca) {
+		t.Fatal(err)
+	}
+	a := &api{c: &http.Client{Jar: jar, Timeout: 4 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool, ServerName: "localhost"}}}, base: fmt.Sprintf("https://127.0.0.1:%d", controlPort)}
 	a.login(t)
 	// Authenticated mutations must still require CSRF.
 	csrf := a.csrf

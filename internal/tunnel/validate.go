@@ -10,7 +10,7 @@ import (
 	"veilink/internal/model"
 )
 
-var identifier = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
+var identifier = regexp.MustCompile(`^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}$`)
 var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 func hostOK(h string) bool {
@@ -44,6 +44,15 @@ func portOK(p int) bool { return p > 0 && p <= 65535 }
 
 func validate(s model.Snapshot, local model.LocalTLS) error {
 	bad := func(msg string) error { return fmt.Errorf("invalid snapshot: %s", msg) }
+	if err := checkExclusive(s.Node.Role, local); err != nil {
+		return bad(err.Error())
+	}
+	if err := checkVLESS(s.Node.Role, local); err != nil {
+		return bad(err.Error())
+	}
+	if local.Reality.Enabled() && (local.CertFile != "" || local.KeyFile != "" || local.CAFile != "") {
+		return bad("REALITY cannot be combined with data-plane certificate files")
+	}
 	if s.Revision < 0 || !identifier.MatchString(s.Node.ID) || s.Node.Revoked || (s.Node.Role != "server" && s.Node.Role != "client") {
 		return bad("node or revision")
 	}
@@ -87,8 +96,9 @@ func validate(s model.Snapshot, local model.LocalTLS) error {
 		pairs[b.ServerID+"/"+b.ClientID] = true
 	}
 	type endpoint struct {
-		host string
-		port int
+		host    string
+		port    int
+		network string
 	}
 	var listeners []endpoint
 	if s.Node.Role == "server" {
@@ -98,11 +108,21 @@ func validate(s model.Snapshot, local model.LocalTLS) error {
 		if net.ParseIP(listenHost(local.ListenHost)) == nil {
 			return bad("transport listen IP")
 		}
-		if len(s.Bindings) > 0 && (local.CertFile == "" || local.KeyFile == "") {
-			return bad("server TLS certificate and key required")
+		if len(s.Bindings) > 0 {
+			if local.Reality.Enabled() {
+				if err := checkRealityServer(local.Reality, s.Node.ServerName); err != nil {
+					return bad(err.Error())
+				}
+			} else if decryptionEnabled(local.Decryption) {
+				if (local.CertFile == "") != (local.KeyFile == "") {
+					return bad("server TLS certificate and key must be paired")
+				}
+			} else if local.CertFile == "" || local.KeyFile == "" {
+				return bad("server TLS certificate and key required")
+			}
 		}
 		if len(s.Bindings) > 0 {
-			listeners = append(listeners, endpoint{listenHost(local.ListenHost), s.Node.Port})
+			listeners = append(listeners, endpoint{listenHost(local.ListenHost), s.Node.Port, "tcp"})
 		}
 	}
 	ids := map[string]bool{}
@@ -116,6 +136,9 @@ func validate(s model.Snapshot, local model.LocalTLS) error {
 		if _, ok := bindings[m.BindingID]; !ok {
 			return bad("mapping references missing binding")
 		}
+		if m.Network != "" && m.Network != "tcp" && m.Network != "udp" {
+			return bad("mapping network")
+		}
 		if !portOK(m.ListenPort) || !portOK(m.TargetPort) || !hostOK(m.TargetHost) || net.ParseIP(listenHost(m.ListenHost)) == nil {
 			return bad("mapping host or port")
 		}
@@ -125,12 +148,18 @@ func validate(s model.Snapshot, local model.LocalTLS) error {
 		if m.Enabled && s.Node.Role == "server" {
 			h := listenHost(m.ListenHost)
 			ip := net.ParseIP(h)
+			network := mappingNet(m.Network)
 			for _, e := range listeners {
-				if e.port == m.ListenPort && (ip.Equal(net.ParseIP(e.host)) || ip.IsUnspecified() || net.ParseIP(e.host).IsUnspecified()) {
+				if e.network == network && e.port == m.ListenPort && (ip.Equal(net.ParseIP(e.host)) || ip.IsUnspecified() || net.ParseIP(e.host).IsUnspecified()) {
 					return bad("overlapping listeners")
 				}
 			}
-			listeners = append(listeners, endpoint{h, m.ListenPort})
+			listeners = append(listeners, endpoint{h, m.ListenPort, network})
+		}
+	}
+	if s.Node.Role == "client" && local.Reality.Enabled() {
+		if err := checkRealityClient(local.Reality); err != nil {
+			return bad(err.Error())
 		}
 	}
 	return nil

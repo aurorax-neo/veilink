@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
@@ -373,5 +374,186 @@ func TestUntrustedTLS(t *testing.T) {
 			assertBlocked(t, s.Mappings[0].ListenPort)
 			_ = r.Close()
 		})
+	}
+}
+func camouflage(t *testing.T, certFile, keyFile string) string {
+	t.Helper()
+	pair, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{pair}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() { defer c.Close(); _, _ = io.Copy(io.Discard, c) }()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+func TestRealityReverse(t *testing.T) {
+	files := tlsFiles(t)
+	priv, pub, err := GenerateX25519()
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverLocal := model.LocalTLS{Reality: model.Reality{Dest: camouflage(t, files.CertFile, files.KeyFile), PrivateKey: priv, ShortIDs: "0123456789abcdef", ServerNames: "gateway.test"}}
+	clientLocal := model.LocalTLS{Reality: model.Reality{PublicKey: pub, ShortID: "0123456789abcdef"}}
+	serverSnap, clientSnap := fixtures(t, echoServer(t))
+	run(t, serverSnap, serverLocal)
+	run(t, clientSnap, clientLocal)
+	awaitEcho(t, serverSnap.Mappings[0].ListenPort)
+}
+
+func TestRealityRejectsShortID(t *testing.T) {
+	files := tlsFiles(t)
+	priv, pub, err := GenerateX25519()
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverLocal := model.LocalTLS{Reality: model.Reality{Dest: camouflage(t, files.CertFile, files.KeyFile), PrivateKey: priv, ShortIDs: "0123456789abcdef", ServerNames: "gateway.test"}}
+	clientLocal := model.LocalTLS{Reality: model.Reality{PublicKey: pub, ShortID: "0000000000000000"}}
+	serverSnap, clientSnap := fixtures(t, echoServer(t))
+	run(t, serverSnap, serverLocal)
+	run(t, clientSnap, clientLocal)
+	until := time.Now().Add(3 * time.Second)
+	for time.Now().Before(until) {
+		if exchange(serverSnap.Mappings[0].ListenPort, []byte("must-not-pass"), false) == nil {
+			t.Fatal("REALITY accepted a short id that was not configured")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func freeUDPPort(t *testing.T) int {
+	t.Helper()
+	l, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := l.LocalAddr().(*net.UDPAddr).Port
+	_ = l.Close()
+	return p
+}
+
+func udpEchoServer(t *testing.T) int {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pc.Close() })
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			_, _ = pc.WriteTo(buf[:n], addr)
+		}
+	}()
+	return pc.LocalAddr().(*net.UDPAddr).Port
+}
+
+func exchangeUDP(port int, payload []byte) error {
+	c, err := net.DialTimeout("udp", fmt.Sprintf("127.0.0.1:%d", port), time.Second)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c.Write(payload); err != nil {
+		return err
+	}
+	got := make([]byte, len(payload)+64)
+	n, err := c.Read(got)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(payload, got[:n]) {
+		return fmt.Errorf("payload mismatch: got %q, want %q", string(got[:n]), string(payload))
+	}
+	return nil
+}
+
+func awaitUDPEcho(t *testing.T, port int) {
+	t.Helper()
+	until := time.Now().Add(15 * time.Second)
+	var err error
+	for time.Now().Before(until) {
+		err = exchangeUDP(port, []byte("ready-udp"))
+		if err == nil {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("reverse UDP did not become ready: %v", err)
+}
+
+func TestUDPReverse(t *testing.T) {
+	local := tlsFiles(t)
+	targetPort := udpEchoServer(t)
+	serverSnap, clientSnap := fixtures(t, targetPort)
+	udpPort := freeUDPPort(t)
+	serverSnap.Mappings[0].Network = "udp"
+	serverSnap.Mappings[0].ListenPort = udpPort
+	clientSnap.Mappings[0].Network = "udp"
+	clientSnap.Mappings[0].ListenPort = udpPort
+
+	run(t, serverSnap, local)
+	run(t, clientSnap, local)
+	awaitUDPEcho(t, udpPort)
+
+	for i := 0; i < 5; i++ {
+		msg := []byte(fmt.Sprintf("datagram-payload-%d", i))
+		if err := exchangeUDP(udpPort, msg); err != nil {
+			t.Fatalf("failed UDP exchange %d: %v", i, err)
+		}
+	}
+}
+
+func TestTCPAndUDPCoexist(t *testing.T) {
+	local := tlsFiles(t)
+	tcpTarget := echoServer(t)
+	udpTarget := udpEchoServer(t)
+
+	serverSnap, clientSnap := fixtures(t, tcpTarget)
+
+	udpPort := freeUDPPort(t)
+	udpMap := model.Mapping{
+		ID:         "udp-echo",
+		Name:       "udp-echo",
+		BindingID:  serverSnap.Bindings[0].ID,
+		ListenPort: udpPort,
+		TargetHost: "127.0.0.1",
+		TargetPort: udpTarget,
+		Network:    "udp",
+		Enabled:    true,
+	}
+	serverSnap.Mappings = append(serverSnap.Mappings, udpMap)
+	clientSnap.Mappings = append(clientSnap.Mappings, udpMap)
+
+	run(t, serverSnap, local)
+	run(t, clientSnap, local)
+
+	awaitEcho(t, serverSnap.Mappings[0].ListenPort)
+	awaitUDPEcho(t, udpPort)
+
+	for i := 0; i < 3; i++ {
+		if err := exchange(serverSnap.Mappings[0].ListenPort, []byte("hello-tcp"), false); err != nil {
+			t.Fatalf("TCP exchange %d failed: %v", i, err)
+		}
+		if err := exchangeUDP(udpPort, []byte("hello-udp")); err != nil {
+			t.Fatalf("UDP exchange %d failed: %v", i, err)
+		}
 	}
 }

@@ -21,6 +21,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/quic-go/quic-go"
+	"github.com/xtls/reality"
+
 	"veilink/internal/model"
 )
 
@@ -226,10 +229,16 @@ type service struct {
 	byUser    map[string]model.Binding
 	allowed   map[string]map[string]bool
 	listeners []net.Listener
+	packets   []net.PacketConn
 	mu        sync.Mutex
 	sessions  map[string][]*session
 	conns     map[net.Conn]struct{}
 	next      uint32
+	reality   *reality.Config
+	quic      *quic.Listener
+	flow      string
+	inbound   *encServer
+	outbound  *encClient
 }
 
 func start(s model.Snapshot, local model.LocalTLS) (*service, error) {
@@ -258,14 +267,26 @@ func start(s model.Snapshot, local model.LocalTLS) (*service, error) {
 	}
 	for _, m := range s.Mappings {
 		if m.Enabled {
-			svc.allowed[m.BindingID][m.TargetHost+"\n"+strconv.Itoa(m.TargetPort)] = true
+			svc.allowed[m.BindingID][mappingNet(m.Network)+"\n"+m.TargetHost+"\n"+strconv.Itoa(m.TargetPort)] = true
 		}
+	}
+	if err = svc.prepareReality(); err != nil {
+		return nil, err
+	}
+	if err = svc.prepareCrypto(); err != nil {
+		return nil, err
 	}
 	if s.Node.Role == "server" {
 		err = svc.listenServer()
 	} else {
+		n := local.Pool
+		if n == 0 {
+			n = 1
+		}
 		for _, b := range s.Bindings {
-			go svc.maintain(b, gateways[b.ServerID])
+			for range n {
+				go svc.maintain(b, gateways[b.ServerID])
+			}
 		}
 	}
 	return svc, err
@@ -273,9 +294,18 @@ func start(s model.Snapshot, local model.LocalTLS) (*service, error) {
 
 func (s *service) stop() {
 	s.once.Do(func() {
+		if s.inbound != nil {
+			s.inbound.Close()
+		}
+		if s.quic != nil {
+			_ = s.quic.Close()
+		}
 		s.cancel()
 		for _, ln := range s.listeners {
 			_ = ln.Close()
+		}
+		for _, pc := range s.packets {
+			_ = pc.Close()
 		}
 		s.mu.Lock()
 		conns := s.conns
@@ -289,21 +319,46 @@ func (s *service) stop() {
 
 func (s *service) listenServer() error {
 	if len(s.snapshot.Bindings) > 0 {
-		cert, err := tls.LoadX509KeyPair(s.local.CertFile, s.local.KeyFile)
-		if err != nil {
-			return err
+		if s.local.Hysteria2.Enabled() {
+			if err := s.listenHysteria(); err != nil {
+				return err
+			}
+		} else {
+			addr := net.JoinHostPort(listenHost(s.local.ListenHost), strconv.Itoa(s.snapshot.Node.Port))
+			var ln net.Listener
+			var err error
+			min := uint16(tls.VersionTLS12)
+			if s.flow != "" {
+				min = tls.VersionTLS13
+			}
+			if s.reality != nil || (s.local.CertFile == "" && s.inbound != nil) {
+				ln, err = net.Listen("tcp", addr)
+			} else {
+				cert, loadErr := tls.LoadX509KeyPair(s.local.CertFile, s.local.KeyFile)
+				if loadErr != nil {
+					return loadErr
+				}
+				ln, err = tls.Listen("tcp", addr, &tls.Config{MinVersion: min, Certificates: []tls.Certificate{cert}})
+			}
+			if err != nil {
+				return err
+			}
+			s.listeners = append(s.listeners, ln)
+			go s.acceptTransport(ln)
 		}
-		ln, err := tls.Listen("tcp", net.JoinHostPort(listenHost(s.local.ListenHost), strconv.Itoa(s.snapshot.Node.Port)), &tls.Config{
-			MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert},
-		})
-		if err != nil {
-			return err
-		}
-		s.listeners = append(s.listeners, ln)
-		go s.acceptTransport(ln)
 	}
+
 	for _, m := range s.snapshot.Mappings {
 		if !m.Enabled {
+			continue
+		}
+		if mappingNet(m.Network) == "udp" {
+			pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP(listenHost(m.ListenHost)), Port: m.ListenPort})
+			if err != nil {
+				return err
+			}
+			s.packets = append(s.packets, pc)
+			go s.serveUDP(pc, m)
 			continue
 		}
 		ln, err := net.Listen("tcp", net.JoinHostPort(listenHost(m.ListenHost), strconv.Itoa(m.ListenPort)))
@@ -326,7 +381,7 @@ func (s *service) acceptTransport(ln net.Listener) {
 			_ = conn.Close()
 			continue
 		}
-		go s.authenticate(conn)
+		go s.acceptOne(conn)
 	}
 }
 
@@ -350,17 +405,33 @@ func (s *service) authenticate(conn net.Conn) {
 			_ = conn.Close()
 		}
 	}()
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-	id, host, port, err := readVLESS(conn)
+	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+	if s.inbound != nil {
+		wrapped, err := s.inbound.Handshake(conn)
+		if err != nil {
+			return
+		}
+		if !s.track(wrapped) {
+			_ = wrapped.Close()
+			return
+		}
+		s.untrack(conn)
+		conn = wrapped
+	}
+	id, host, port, flow, err := readVLESS(conn)
 	if err != nil {
 		return
 	}
+	got, flowErr := normalizeFlow(flow)
 	binding, ok := s.byUser[hex.EncodeToString(id[:])]
-	if !ok || port != 0 || !strings.EqualFold(host, binding.Domain) {
+	if flowErr != nil || got != s.flow || !ok || port != 0 || !strings.EqualFold(host, binding.Domain) {
 		return
 	}
 	if err = writeVLESSResponse(conn); err != nil {
 		return
+	}
+	if s.flow != "" {
+		conn = newVision(conn, id)
 	}
 	_ = conn.SetDeadline(time.Time{})
 	sess := newSession(conn)
@@ -396,26 +467,46 @@ func (s *service) openPublic(conn net.Conn, m model.Mapping) {
 }
 
 func (s *service) maintain(b model.Binding, gateway model.Node) {
-	pool, err := roots(s.local.CAFile)
-	if err != nil {
-		return
-	}
 	user, err := parseUUID(b.UUID)
 	if err != nil {
 		return
 	}
-	cfg := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: gateway.ServerName, RootCAs: pool}
 	for {
 		if s.ctx.Err() != nil {
 			return
 		}
-		dialer := tls.Dialer{NetDialer: &net.Dialer{Timeout: 5 * time.Second}, Config: cfg}
-		conn, err := dialer.DialContext(s.ctx, "tcp", net.JoinHostPort(gateway.Address, strconv.Itoa(gateway.Port)))
+		conn, err := s.dialGateway(gateway)
 		if err == nil {
-			if err = writeVLESS(conn, user, b.Domain, 0); err == nil {
+			_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+			if s.outbound != nil {
+				var wrapped net.Conn
+				wrapped, err = s.outbound.Handshake(conn)
+				if err != nil {
+					_ = conn.Close()
+					conn = nil
+				} else {
+					conn = wrapped
+				}
+			}
+		}
+		if err == nil {
+			if err = writeVLESS(conn, user, b.Domain, 0, s.flow); err == nil {
 				err = readVLESSResponse(conn)
 			}
 		}
+		if err == nil && s.flow != "" {
+			vc := newVision(conn, user)
+			if err = vc.camouflage(); err != nil {
+				_ = conn.Close()
+				conn = nil
+			} else {
+				conn = vc
+			}
+		}
+		if err == nil {
+			_ = conn.SetDeadline(time.Time{})
+		}
+
 		if err != nil {
 			if conn != nil {
 				_ = conn.Close()
@@ -431,12 +522,25 @@ func (s *service) maintain(b model.Binding, gateway model.Node) {
 		}
 		sess := newSession(conn)
 		s.addSession(b.ID, sess)
-		sess.readLoop(func(host string, port int) (net.Conn, error) {
-			if !s.allowed[b.ID][host+"\n"+strconv.Itoa(port)] {
+		sess.readLoop(func(host string, port int, udp bool) (net.Conn, error) {
+			if !s.allowed[b.ID][mappingNetBool(udp)+"\n"+host+"\n"+strconv.Itoa(port)] {
 				return nil, errors.New("target is not authorized")
 			}
 			dialer := net.Dialer{Timeout: 5 * time.Second}
-			return dialer.DialContext(s.ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+			network := "tcp"
+			if udp {
+				network = "udp"
+			}
+			conn, err := dialer.DialContext(s.ctx, network, net.JoinHostPort(host, strconv.Itoa(port)))
+			if err != nil || !udp {
+				return conn, err
+			}
+			uc, ok := conn.(*net.UDPConn)
+			if !ok {
+				_ = conn.Close()
+				return nil, errors.New("udp dial failed")
+			}
+			return newClientUDP(uc, host, port), nil
 		})
 		s.removeSession(b.ID, sess)
 		s.untrack(conn)
@@ -699,7 +803,7 @@ func (s *session) forget(id uint32) *stream {
 	return st
 }
 
-func (s *session) readLoop(open func(string, int) (net.Conn, error)) {
+func (s *session) readLoop(open func(string, int, bool) (net.Conn, error)) {
 	defer s.close()
 	for {
 		_ = s.conn.SetReadDeadline(time.Now().Add(45 * time.Second))
@@ -709,10 +813,10 @@ func (s *session) readLoop(open func(string, int) (net.Conn, error)) {
 		}
 		switch kind {
 		case frameOpen:
-			host, port, err := parseOpen(payload)
+			host, port, udp, err := parseOpen(payload)
 			conn, dialErr := net.Conn(nil), err
 			if err == nil && open != nil {
-				conn, dialErr = open(host, port)
+				conn, dialErr = open(host, port, udp)
 			} else if err == nil {
 				dialErr = errors.New("peer cannot open streams")
 			}
@@ -783,50 +887,81 @@ func (s *session) writeFrame(kind byte, id uint32, payload []byte) error {
 	return err
 }
 
-func parseOpen(payload []byte) (string, int, error) {
+func parseOpen(payload []byte) (string, int, bool, error) {
+	if len(payload) >= 6 && payload[0] == 0 && payload[1] == 0 && payload[2] == 'u' {
+		port := int(binary.BigEndian.Uint16(payload[3:5]))
+		host := string(payload[5:])
+		if port == 0 || len(host) > 253 || !hostOK(host) {
+			return "", 0, true, errors.New("invalid stream target")
+		}
+		return host, port, true, nil
+	}
 	if len(payload) < 3 || len(payload) > 2+253 {
-		return "", 0, errors.New("invalid stream open")
+		return "", 0, false, errors.New("invalid stream open")
 	}
 	port := int(binary.BigEndian.Uint16(payload[:2]))
 	host := string(payload[2:])
 	if port == 0 || !hostOK(host) {
-		return "", 0, errors.New("invalid stream target")
+		return "", 0, false, errors.New("invalid stream target")
 	}
-	return host, port, nil
+	return host, port, false, nil
 }
 
-func readVLESS(r io.Reader) ([16]byte, string, uint16, error) {
+func mappingNet(network string) string {
+	if network == "udp" {
+		return "udp"
+	}
+	return "tcp"
+}
+
+func mappingNetBool(udp bool) string {
+	if udp {
+		return "udp"
+	}
+	return "tcp"
+}
+
+func readVLESS(r io.Reader) ([16]byte, string, uint16, string, error) {
 	var id [16]byte
 	head := make([]byte, 18)
 	if _, err := io.ReadFull(r, head); err != nil {
-		return id, "", 0, err
+		return id, "", 0, "", err
 	}
 	if head[0] != 0 {
-		return id, "", 0, errors.New("unsupported vless version")
+		return id, "", 0, "", errors.New("unsupported vless version")
 	}
 	copy(id[:], head[1:17])
+	var flow string
 	if addons := int(head[17]); addons > 0 {
-		if _, err := io.CopyN(io.Discard, r, int64(addons)); err != nil {
-			return id, "", 0, err
+		raw := make([]byte, addons)
+		if _, err := io.ReadFull(r, raw); err != nil {
+			return id, "", 0, "", err
 		}
+		parsed, err := decodeFlow(raw)
+		if err != nil {
+			return id, "", 0, "", err
+		}
+		flow = parsed
 	}
 	var rest [4]byte
 	if _, err := io.ReadFull(r, rest[:]); err != nil {
-		return id, "", 0, err
+		return id, "", 0, flow, err
 	}
 	if rest[0] != 1 {
-		return id, "", 0, errors.New("only tcp is supported")
+		return id, "", 0, flow, errors.New("only tcp is supported")
 	}
 	port := binary.BigEndian.Uint16(rest[1:3])
 	host, err := readAddr(r, rest[3])
-	return id, host, port, err
+	return id, host, port, flow, err
 }
 
-func writeVLESS(w io.Writer, id [16]byte, host string, port uint16) error {
+func writeVLESS(w io.Writer, id [16]byte, host string, port uint16, flow string) error {
 	var buf bytes.Buffer
 	buf.WriteByte(0)
 	buf.Write(id[:])
-	buf.WriteByte(0)
+	addon := encodeFlow(flow)
+	buf.WriteByte(byte(len(addon)))
+	buf.Write(addon)
 	buf.WriteByte(1)
 	_ = binary.Write(&buf, binary.BigEndian, port)
 	if err := writeAddr(&buf, host); err != nil {
