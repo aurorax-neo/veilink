@@ -9,6 +9,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"log/slog"
 	"math/rand/v2"
@@ -122,7 +123,14 @@ func Run(ctx context.Context, c config.Config, role string) error {
 			slog.Warn("cached runtime configuration could not be restored")
 		}
 	}
-	conn, e := grpc.NewClient(c.MasterAddr, grpc.WithTransportCredentials(credentials.NewTLS(tc)), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(4<<20), grpc.MaxCallSendMsgSize(64<<10)))
+	var dialOpts []grpc.DialOption
+	if c.ControlCA == "" && c.ControlServerName == "" {
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	} else {
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(tc)))
+	}
+	dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(4<<20), grpc.MaxCallSendMsgSize(64<<10)))
+	conn, e := grpc.NewClient(c.MasterAddr, dialOpts...)
 	if e != nil {
 		return e
 	}
