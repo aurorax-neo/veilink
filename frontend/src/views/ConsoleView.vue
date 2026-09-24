@@ -4,20 +4,22 @@ import { deskKey } from '../desk'
 import { pages, type PageId } from '../types'
 import AuditView from './AuditView.vue'
 import BindingsView from './BindingsView.vue'
-import MappingsView from './MappingsView.vue'
-import NodesView from './NodesView.vue'
-import OverviewView from './OverviewView.vue'
+import ClientsView from './ClientsView.vue'
+import DashboardView from './DashboardView.vue'
+import LogsView from './LogsView.vue'
+import ProxiesView from './ProxiesView.vue'
+import ServersView from './ServersView.vue'
 
 defineProps<{ page: PageId; account: string }>()
 const emit = defineEmits<{ navigate: [page: PageId]; logout: [] }>()
 const desk = inject(deskKey)!
-const nav: PageId[] = ['overview', 'nodes', 'bindings', 'mappings', 'audit']
+const nav: PageId[] = ['dashboard', 'servers', 'clients', 'proxies', 'bindings', 'logs', 'audit']
 </script>
 
 <template>
   <div class="shell">
     <aside class="side">
-      <a class="brand" href="#/overview">
+      <a class="brand" href="#/dashboard">
         <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" /><path d="M7.5 8.5h4.4L16 20.2 20.1 8.5H24.5L17.4 24.5h-2.8L7.5 8.5z" /></svg>
         veilink
       </a>
@@ -32,6 +34,7 @@ const nav: PageId[] = ['overview', 'nodes', 'bindings', 'mappings', 'audit']
           :aria-current="page === id ? 'page' : undefined"
           @click="emit('navigate', id)"
         >
+          <span class="nav-icon" aria-hidden="true">{{ pages[id].icon }}</span>
           {{ pages[id].title }}
         </button>
       </nav>
@@ -59,10 +62,12 @@ const nav: PageId[] = ['overview', 'nodes', 'bindings', 'mappings', 'audit']
           <button type="button" class="btn" :disabled="desk.loading" @click="desk.reload()">{{ desk.loading ? '刷新中…' : '刷新' }}</button>
         </div>
         <p v-if="desk.notice" class="notice" :class="{ bad: desk.noticeBad }" role="status">{{ desk.notice }}</p>
-        <OverviewView v-if="page === 'overview'" />
-        <NodesView v-else-if="page === 'nodes'" />
+        <DashboardView v-if="page === 'dashboard'" />
+        <ServersView v-else-if="page === 'servers'" />
+        <ClientsView v-else-if="page === 'clients'" />
+        <ProxiesView v-else-if="page === 'proxies'" />
         <BindingsView v-else-if="page === 'bindings'" />
-        <MappingsView v-else-if="page === 'mappings'" />
+        <LogsView v-else-if="page === 'logs'" />
         <AuditView v-else />
         <footer class="fineprint"><span>VEILINK</span><span>心跳只说明控制面还在。配置下发会短暂断开该节点已有连接。</span></footer>
       </main>

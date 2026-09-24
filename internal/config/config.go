@@ -31,6 +31,7 @@ type Config struct {
 	HTMLDir           string               `yaml:"html_dir"`
 	ControlCert       string               `yaml:"control_cert"`
 	ControlKey        string               `yaml:"control_key"`
+	TLSMode           string               `yaml:"tls_mode"`
 	ControlCA         string               `yaml:"control_ca"`
 	ControlServerName string               `yaml:"control_server_name"`
 	MasterAddr        string               `yaml:"master_addr"`
@@ -40,6 +41,20 @@ type Config struct {
 	Pool              int                  `yaml:"pool"`
 	TLS               model.LocalTLS       `yaml:"tls"`
 	EmbeddedServer    EmbeddedServerConfig `yaml:"embedded_server"`
+}
+
+func (c Config) EffectiveTLSMode() string {
+	switch strings.ToLower(strings.TrimSpace(c.TLSMode)) {
+	case "https":
+		return "https"
+	case "http":
+		return "http"
+	default:
+		if c.ControlCert != "" && c.ControlKey != "" {
+			return "https"
+		}
+		return "http"
+	}
 }
 
 func Load(path string) (Config, error) {
@@ -115,8 +130,11 @@ func (c Config) Validate(role string) error {
 		return errors.New("pool must be from 1 to 32")
 	}
 	if role == "master" {
-		if c.ControlCert == "" || c.ControlKey == "" {
-			return errors.New("control TLS certificate and key required")
+		mode := c.EffectiveTLSMode()
+		if mode == "https" {
+			if c.ControlCert == "" || c.ControlKey == "" {
+				return errors.New("control TLS certificate and key required")
+			}
 		}
 		bindHost, bindPortStr, e := net.SplitHostPort(c.BindAddr)
 		if e != nil {

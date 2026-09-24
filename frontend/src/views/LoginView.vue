@@ -14,7 +14,7 @@ function onSubmit() {
 <template>
   <div class="login">
     <section class="story">
-      <a class="brand" href="#/overview" aria-label="Veilink">
+      <a class="brand" href="#/dashboard" aria-label="Veilink">
         <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" /><path d="M7.5 8.5h4.4L16 20.2 20.1 8.5H24.5L17.4 24.5h-2.8L7.5 8.5z" /></svg>
         veilink
         <span>CONTROL</span>

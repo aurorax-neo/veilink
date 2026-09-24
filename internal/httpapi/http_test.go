@@ -20,7 +20,7 @@ func TestSessionCSRFAndLimits(t *testing.T) {
 	if e = s.InitAdmin("admin", "long test password"); e != nil {
 		t.Fatal(e)
 	}
-	h := New(s, false, nil)
+	h := New(s, false, nil, nil)
 	call := func(method, path, body, csrf string, cookie *http.Cookie) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(method, path, strings.NewReader(body))
 		r.Header.Set("Content-Type", "application/json")

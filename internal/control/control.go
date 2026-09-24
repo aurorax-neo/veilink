@@ -11,12 +11,14 @@ import (
 	"io"
 	"time"
 	pb "veilink/api/control/v1"
+	"veilink/internal/logring"
 	"veilink/internal/store"
 )
 
 type Service struct {
 	pb.UnimplementedControlServer
-	Store *store.Store
+	Store    *store.Store
+	NodeRing *logring.NodeRing
 }
 
 func Envelope(v any) (*structpb.Struct, error) {
@@ -102,6 +104,28 @@ func (s *Service) Events(stream grpc.BidiStreamingServer[structpb.Struct, struct
 			rev, e := s.Store.Heartbeat(id, String(r.m, "credential"), int64(v), String(r.m, "error") != "")
 			if e != nil {
 				return rpcError(e)
+			}
+			// Ingest node logs if present
+			if s.NodeRing != nil {
+				if logsVal, ok := r.m.GetFields()["logs"]; ok {
+					if logsList := logsVal.GetListValue(); logsList != nil {
+						var entries []logring.Entry
+						for _, item := range logsList.GetValues() {
+							obj := item.GetStructValue()
+							if obj == nil {
+								continue
+							}
+							entries = append(entries, logring.Entry{
+								At:      int64(obj.GetFields()["at"].GetNumberValue()),
+								Level:   obj.GetFields()["level"].GetStringValue(),
+								Message: obj.GetFields()["message"].GetStringValue(),
+							})
+						}
+						if len(entries) > 0 {
+							s.NodeRing.Ingest(id, entries)
+						}
+					}
+				}
 			}
 			out, _ := Envelope(map[string]any{"revision": rev})
 			if e = stream.Send(out); e != nil {

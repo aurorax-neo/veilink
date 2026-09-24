@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"veilink/internal/auth"
+	"veilink/internal/logring"
 	"veilink/internal/model"
 	"veilink/internal/store"
 )
@@ -21,20 +23,21 @@ type API struct {
 	store       *store.Store
 	insecure    bool
 	web         http.Handler
+	ring        *logring.Ring
 	mu          sync.Mutex
 	sessions    map[string]session
 	loginWindow time.Time
 	attempts    int
 }
 
-func New(s *store.Store, insecureLoopback bool, web http.Handler) http.Handler {
+func New(s *store.Store, insecureLoopback bool, web http.Handler, ring *logring.Ring) http.Handler {
 	if web == nil {
 		web = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			w.Write([]byte("Veilink management API\n"))
 		})
 	}
-	return &API{store: s, insecure: insecureLoopback, web: web, sessions: map[string]session{}}
+	return &API{store: s, insecure: insecureLoopback, web: web, ring: ring, sessions: map[string]session{}}
 }
 func output(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -184,6 +187,35 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var err error
 	matched := true
 	switch p[0] {
+	case "logs":
+		if r.Method == "GET" && len(p) == 1 {
+			q := r.URL.Query()
+			source := q.Get("source")
+			nodeID := q.Get("node_id")
+			level := q.Get("level")
+			limit := 200
+			if ls := q.Get("limit"); ls != "" {
+				if n, pe := strconv.Atoi(ls); pe == nil && n > 0 {
+					limit = n
+				}
+			}
+			if limit > 2000 {
+				limit = 2000
+			}
+			if a.ring != nil {
+				result = a.ring.Query(source, nodeID, level, limit)
+			} else {
+				result = []logring.Entry{}
+			}
+		} else {
+			matched = false
+		}
+	case "stats":
+		if r.Method == "GET" && len(p) == 1 {
+			result, err = a.computeStats()
+		} else {
+			matched = false
+		}
 	case "nodes":
 		switch {
 		case r.Method == "GET" && len(p) == 1:
@@ -271,4 +303,34 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		result = map[string]bool{"ok": true}
 	}
 	output(w, 200, result)
+}
+
+func (a *API) computeStats() (any, error) {
+	nodes, err := a.store.Nodes()
+	if err != nil {
+		return nil, err
+	}
+	mappings, err := a.store.Mappings()
+	if err != nil {
+		return nil, err
+	}
+	online := 0
+	now := time.Now().Unix()
+	for _, n := range nodes {
+		if n.LastSeen > 0 && (now-n.LastSeen) < 60 && !n.Revoked {
+			online++
+		}
+	}
+	enabledMappings := 0
+	for _, m := range mappings {
+		if m.Enabled {
+			enabledMappings++
+		}
+	}
+	return map[string]any{
+		"total_nodes":      len(nodes),
+		"online_nodes":     online,
+		"total_mappings":   len(mappings),
+		"enabled_mappings": enabledMappings,
+	}, nil
 }

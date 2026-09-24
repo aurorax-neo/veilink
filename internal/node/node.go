@@ -18,6 +18,7 @@ import (
 	pb "veilink/api/control/v1"
 	"veilink/internal/config"
 	"veilink/internal/control"
+	"veilink/internal/logring"
 	"veilink/internal/model"
 	"veilink/internal/tunnel"
 )
@@ -81,6 +82,10 @@ func Run(ctx context.Context, c config.Config, role string) error {
 	if e := c.Validate(role); e != nil {
 		return e
 	}
+
+	ring := logring.New(200)
+	slog.SetDefault(slog.New(logring.NewHandler(ring, "node", slog.NewTextHandler(os.Stderr, nil))))
+
 	tc, e := tlsConfig(c)
 	if e != nil {
 		return e
@@ -147,7 +152,7 @@ func Run(ctx context.Context, c config.Config, role string) error {
 			e = nil
 		}
 		if e == nil {
-			e = cycle(ctx, client, c, role, &st, runtime, &failed, path)
+			e = cycle(ctx, client, c, role, &st, runtime, &failed, path, ring)
 		}
 		if ctx.Err() != nil {
 			return nil
@@ -178,7 +183,7 @@ func Run(ctx context.Context, c config.Config, role string) error {
 
 // A bounded stream avoids indefinitely hung Recv/Send; each reconnection pulls
 // regardless of revision. All runtime operations execute in this one goroutine.
-func cycle(ctx context.Context, client pb.ControlClient, c config.Config, role string, st *diskState, runtime *tunnel.Runtime, failed *bool, path string) error {
+func cycle(ctx context.Context, client pb.ControlClient, c config.Config, role string, st *diskState, runtime *tunnel.Runtime, failed *bool, path string, ring *logring.Ring) error {
 	streamCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	stream, e := client.Events(streamCtx)
@@ -195,7 +200,19 @@ func cycle(ctx context.Context, client pb.ControlClient, c config.Config, role s
 		if *failed {
 			errText = "apply failed"
 		}
-		in, _ := control.Envelope(map[string]any{"node_id": c.NodeID, "credential": st.Credential, "applied_revision": applied, "error": errText})
+
+		// Collect log entries from the ring to send with heartbeat
+		logEntries := ring.Query("", "", "", 0)
+		var logMaps []any
+		for _, entry := range logEntries {
+			logMaps = append(logMaps, map[string]any{
+				"at":      entry.At,
+				"level":   entry.Level,
+				"message": entry.Message,
+			})
+		}
+
+		in, _ := control.Envelope(map[string]any{"node_id": c.NodeID, "credential": st.Credential, "applied_revision": applied, "error": errText, "logs": logMaps})
 		if e = stream.Send(in); e != nil {
 			_, recvErr := stream.Recv()
 			if recvErr != nil {

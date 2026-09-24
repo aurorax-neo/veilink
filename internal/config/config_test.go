@@ -68,3 +68,19 @@ func TestEmbeddedServerEnvOverrides(t *testing.T) {
 		t.Errorf("expected ServerName to be gateway.example.com, got %q", c.EmbeddedServer.ServerName)
 	}
 }
+
+func TestEffectiveTLSMode(t *testing.T) {
+	tests := []struct{ mode, cert, key, want string }{
+		{"", "", "", "http"},
+		{"", "c.pem", "k.pem", "https"},
+		{"http", "c.pem", "k.pem", "http"},
+		{"https", "c.pem", "k.pem", "https"},
+		{"HTTPS", "", "", "https"},
+	}
+	for _, tt := range tests {
+		c := Config{TLSMode: tt.mode, ControlCert: tt.cert, ControlKey: tt.key}
+		if got := c.EffectiveTLSMode(); got != tt.want {
+			t.Errorf("TLSMode=%q cert=%q key=%q: got %q want %q", tt.mode, tt.cert, tt.key, got, tt.want)
+		}
+	}
+}

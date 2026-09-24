@@ -66,37 +66,70 @@ export interface Audit {
   object: string
 }
 
-export type PageId = 'overview' | 'nodes' | 'bindings' | 'mappings' | 'audit'
+export interface LogEntry {
+  at: number
+  level: string
+  message: string
+  source: string
+  node_id?: string
+}
 
-export const pages: Record<PageId, { title: string; kicker: string; lead: string }> = {
-  overview: {
-    title: '运行概览',
-    kicker: 'CONTROL PLANE',
-    lead: '心跳、配置版本和已登记通路。在线不是目标可达。',
+export interface Stats {
+  online_servers: number
+  online_clients: number
+  total_nodes: number
+  active_mappings: number
+  total_bindings: number
+}
+
+export type PageId = 'dashboard' | 'servers' | 'clients' | 'proxies' | 'bindings' | 'logs' | 'audit'
+
+export const pages: Record<PageId, { title: string; kicker: string; lead: string; icon: string }> = {
+  dashboard: {
+    title: '仪表盘',
+    kicker: 'DASHBOARD',
+    lead: '系统概览和拓扑状态。',
+    icon: '◉',
   },
-  nodes: {
-    title: '节点',
-    kicker: 'NODES',
-    lead: '公网网关与内网节点分开登记。令牌只生成一次。',
+  servers: {
+    title: '服务端',
+    kicker: 'SERVERS',
+    lead: '公网网关节点。承载反向隧道入口和端口映射。',
+    icon: '▲',
+  },
+  clients: {
+    title: '客户端',
+    kicker: 'CLIENTS',
+    lead: '内网节点。主动连出到网关，转发流量到本地目标。',
+    icon: '●',
+  },
+  proxies: {
+    title: '端口映射',
+    kicker: 'PROXIES',
+    lead: '从公网监听地址转到内网目标。TCP 和 UDP 映射。',
+    icon: '⇌',
   },
   bindings: {
-    title: '网关绑定',
+    title: '绑定',
     kicker: 'BINDINGS',
-    lead: '一条绑定是一对网关和内网节点，身份由管理中心生成，不能直接修改。',
+    lead: '网关与内网节点的配对关系。',
+    icon: '⊞',
   },
-  mappings: {
-    title: 'TCP 映射',
-    kicker: 'MAPPINGS',
-    lead: '从公网监听地址转到内网目标。启停都会下发配置，并可能断开现有连接。',
+  logs: {
+    title: '日志',
+    kicker: 'LOGS',
+    lead: '管理中心和节点的运行日志。',
+    icon: '☰',
   },
   audit: {
     title: '审计',
     kicker: 'AUDIT',
-    lead: '最近的管理写操作。删除节点与吊销共用同一条审计动作。',
+    lead: '管理写操作记录。',
+    icon: '✎',
   },
 }
 
 export function pageFromHash(hash = location.hash): PageId {
   const id = hash.replace(/^#\/?/, '') as PageId
-  return id in pages ? id : 'overview'
+  return id in pages ? id : 'dashboard'
 }

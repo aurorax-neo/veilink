@@ -140,3 +140,11 @@ export async function copyText(value: string): Promise<void> {
   if (!navigator.clipboard?.writeText) throw new Error('无法写入剪贴板，请手动选择文本。')
   await navigator.clipboard.writeText(value)
 }
+
+export function logLevelTone(level: string): Tone {
+  switch (level) {
+    case 'ERROR': return 'bad'
+    case 'WARN': return 'warn'
+    default: return 'good'
+  }
+}

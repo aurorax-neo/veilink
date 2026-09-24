@@ -1,0 +1,33 @@
+package logring
+
+import "testing"
+
+func TestRingBasic(t *testing.T) {
+	r := New(5)
+	for i := 0; i < 7; i++ {
+		r.Append(Entry{At: int64(i), Level: "INFO", Message: "m", Source: "master"})
+	}
+	got := r.Query("", "", "", 0)
+	if len(got) != 5 {
+		t.Fatalf("expected 5 entries, got %d", len(got))
+	}
+	if got[0].At != 6 {
+		t.Fatalf("newest should be 6, got %d", got[0].At)
+	}
+}
+
+func TestRingFilter(t *testing.T) {
+	r := New(10)
+	r.Append(Entry{At: 1, Level: "INFO", Source: "master", Message: "a"})
+	r.Append(Entry{At: 2, Level: "ERROR", Source: "node", NodeID: "n1", Message: "b"})
+	r.Append(Entry{At: 3, Level: "WARN", Source: "node", NodeID: "n2", Message: "c"})
+	if got := r.Query("node", "", "", 0); len(got) != 2 {
+		t.Fatalf("expected 2 node entries, got %d", len(got))
+	}
+	if got := r.Query("", "n1", "", 0); len(got) != 1 {
+		t.Fatalf("expected 1 n1 entry, got %d", len(got))
+	}
+	if got := r.Query("", "", "ERROR", 0); len(got) != 1 {
+		t.Fatalf("expected 1 ERROR entry, got %d", len(got))
+	}
+}
