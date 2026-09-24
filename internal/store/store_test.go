@@ -318,3 +318,158 @@ func TestStoreHasAdminAndFindNodeByName(t *testing.T) {
 		t.Fatalf("unexpected node data: %+v", foundNode)
 	}
 }
+
+func TestTunnelConfigPersistenceAndAutoDerivation(t *testing.T) {
+	dir := t.TempDir()
+	db, key := filepath.Join(dir, "db"), filepath.Join(dir, "key")
+	s, err := Open(db, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Test private key for X25519 (32 bytes base64url)
+	testPriv := "4A39kZk0Nvd5uD3fXJbF2WvJqCq23xQ3_gL7_J0mE1s"
+	expectedPub := model.DeriveX25519Public(testPriv)
+	if expectedPub == "" {
+		t.Fatal("failed to derive test public key")
+	}
+
+	server, err := s.SaveNode(model.Node{
+		Name:       "gateway-reality",
+		Role:       "server",
+		Address:    "1.2.3.4",
+		Port:       443,
+		ServerName: "gateway.example.com",
+		Tunnel: model.LocalTLS{
+			Flow:       "xtls-rprx-vision",
+			Decryption: "none",
+			Reality: model.Reality{
+				Dest:        "gateway.example.com:443",
+				PrivateKey:  testPriv,
+				ShortIDs:    "0123456789abcdef,fedcba9876543210",
+				ServerNames: "gateway.example.com",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if server.Tunnel.Reality.PublicKey != expectedPub {
+		t.Fatalf("expected auto-derived public key %q, got %q", expectedPub, server.Tunnel.Reality.PublicKey)
+	}
+
+	client, err := s.SaveNode(model.Node{
+		Name: "agent-1",
+		Role: "client",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Enroll client & server
+	tokenC, _ := s.EnrollToken(client.ID, time.Hour)
+	credC, _ := s.Enroll(client.ID, tokenC)
+	tokenS, _ := s.EnrollToken(server.ID, time.Hour)
+	credS, _ := s.Enroll(server.ID, tokenS)
+
+	// Create binding
+	b, err := s.SaveBinding(model.Binding{
+		ServerID: server.ID,
+		ClientID: client.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify client tunnel was auto-derived
+	nodes, err := s.Nodes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var foundClient model.Node
+	for _, n := range nodes {
+		if n.ID == client.ID {
+			foundClient = n
+			break
+		}
+	}
+	if foundClient.Tunnel.Flow != "xtls-rprx-vision" {
+		t.Fatalf("expected client flow to be auto-derived, got %q", foundClient.Tunnel.Flow)
+	}
+	if foundClient.Tunnel.Encryption != "none" {
+		t.Fatalf("expected client encryption 'none', got %q", foundClient.Tunnel.Encryption)
+	}
+	if foundClient.Tunnel.Reality.PublicKey != expectedPub {
+		t.Fatalf("expected client public key %q, got %q", expectedPub, foundClient.Tunnel.Reality.PublicKey)
+	}
+	if foundClient.Tunnel.Reality.ShortID != "0123456789abcdef" {
+		t.Fatalf("expected client short ID '0123456789abcdef', got %q", foundClient.Tunnel.Reality.ShortID)
+	}
+	if foundClient.Tunnel.Reality.Fingerprint != "chrome" {
+		t.Fatalf("expected default fingerprint 'chrome', got %q", foundClient.Tunnel.Reality.Fingerprint)
+	}
+
+	// Verify snapshot redacts server private key for client
+	clientSnap, err := s.Snapshot(client.ID, credC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(clientSnap.Nodes) != 1 {
+		t.Fatalf("expected 1 peer gateway, got %d", len(clientSnap.Nodes))
+	}
+	if clientSnap.Nodes[0].Tunnel.Reality.PrivateKey != "" {
+		t.Fatal("server private key leaked to client in snapshot!")
+	}
+	if clientSnap.Node.Tunnel.Reality.PublicKey != expectedPub {
+		t.Fatalf("expected client snapshot public key %q, got %q", expectedPub, clientSnap.Node.Tunnel.Reality.PublicKey)
+	}
+
+	// Server snapshot should retain private key
+	serverSnap, err := s.Snapshot(server.ID, credS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if serverSnap.Node.Tunnel.Reality.PrivateKey != testPriv {
+		t.Fatal("server snapshot lost private key")
+	}
+
+	// Close and re-open store to verify SQLite persistence
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := Open(db, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+
+	reloadedNodes, err := s2.Nodes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range reloadedNodes {
+		if n.ID == server.ID {
+			if n.Tunnel.Reality.PrivateKey != testPriv || n.Tunnel.Reality.PublicKey != expectedPub {
+				t.Fatalf("server tunnel not persisted properly: %+v", n.Tunnel)
+			}
+		}
+		if n.ID == client.ID {
+			if n.Tunnel.Reality.PublicKey != expectedPub || n.Tunnel.Flow != "xtls-rprx-vision" {
+				t.Fatalf("client tunnel not persisted properly: %+v", n.Tunnel)
+			}
+		}
+	}
+
+	// Test manual client override
+	foundClient.Tunnel.Reality.ShortID = "customoverride123"
+	foundClient.Tunnel.Pool = 8
+	updatedClient, err := s2.SaveNode(foundClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updatedClient.Tunnel.Reality.ShortID != "customoverride123" || updatedClient.Tunnel.Pool != 8 {
+		t.Fatalf("manual override failed: %+v", updatedClient.Tunnel)
+	}
+	_ = b
+}

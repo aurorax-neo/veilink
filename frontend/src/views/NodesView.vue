@@ -3,7 +3,7 @@ import { computed, inject, reactive, ref } from 'vue'
 import { api } from '../api'
 import { deskKey } from '../desk'
 import { copyText, endpoint, needsAttention, presence, revisionState, seenText, validateNode } from '../format'
-import type { Node } from '../types'
+import type { Node, TunnelConfig } from '../types'
 import Badge from '../components/Badge.vue'
 import EmptyState from '../components/EmptyState.vue'
 import Modal from '../components/Modal.vue'
@@ -22,7 +22,43 @@ const confirmTitle = ref('')
 const confirmLabel = ref('确认')
 let confirmRun: () => Promise<void> = async () => {}
 
-const draft = reactive({ id: '', name: '', role: 'server', address: '', port: '443', serverName: '' })
+const draft = reactive({
+  id: '',
+  name: '',
+  role: 'server',
+  address: '',
+  port: '443',
+  serverName: '',
+  transport: 'tls', // 'tls' | 'reality' | 'hysteria2'
+  flow: '',
+  enc: 'none',
+  pool: '',
+  realityDest: '',
+  realityPrivateKey: '',
+  realityPublicKey: '',
+  realityShortIDs: '',
+  realityServerNames: '',
+  realityFingerprint: 'chrome',
+  hysteria2Password: '',
+})
+
+function isReality(node?: Node | null): boolean {
+  if (!node?.tunnel?.reality) return false
+  const r = node.tunnel.reality
+  return !!(r.dest || r.public_key || r.private_key || r.short_ids || r.short_id || r.server_names)
+}
+
+function transportLabel(node: Node): string {
+  if (node.tunnel?.hysteria2?.password) return 'Hysteria2'
+  if (isReality(node)) return 'REALITY'
+  return '标准 TLS'
+}
+
+function transportTone(node: Node): '' | 'good' | 'warn' | 'bad' {
+  if (node.tunnel?.hysteria2?.password) return 'good'
+  if (isReality(node)) return 'good'
+  return ''
+}
 
 const rows = computed(() => {
   const q = query.value.trim().toLowerCase()
@@ -44,11 +80,36 @@ function bindingCount(id: string) {
 }
 
 function openCreate() {
-  Object.assign(draft, { id: '', name: '', role: 'server', address: '', port: '443', serverName: '' })
+  Object.assign(draft, {
+    id: '',
+    name: '',
+    role: 'server',
+    address: '',
+    port: '443',
+    serverName: '',
+    transport: 'tls',
+    flow: '',
+    enc: 'none',
+    pool: '',
+    realityDest: '',
+    realityPrivateKey: '',
+    realityPublicKey: '',
+    realityShortIDs: '',
+    realityServerNames: '',
+    realityFingerprint: 'chrome',
+    hysteria2Password: '',
+  })
   editor.value?.open()
 }
 
 function openEdit(node: Node) {
+  let transport = 'tls'
+  if (node.tunnel?.hysteria2?.password) {
+    transport = 'hysteria2'
+  } else if (isReality(node)) {
+    transport = 'reality'
+  }
+  const isServer = node.role === 'server'
   Object.assign(draft, {
     id: node.id,
     name: node.name,
@@ -56,6 +117,17 @@ function openEdit(node: Node) {
     address: node.address,
     port: String(node.port || 443),
     serverName: node.server_name,
+    transport,
+    flow: node.tunnel?.flow || '',
+    enc: (isServer ? node.tunnel?.decryption : node.tunnel?.encryption) || 'none',
+    pool: node.tunnel?.pool ? String(node.tunnel.pool) : '',
+    realityDest: node.tunnel?.reality?.dest || '',
+    realityPrivateKey: node.tunnel?.reality?.private_key || '',
+    realityPublicKey: node.tunnel?.reality?.public_key || '',
+    realityShortIDs: node.tunnel?.reality?.short_ids || node.tunnel?.reality?.short_id || '',
+    realityServerNames: node.tunnel?.reality?.server_names || '',
+    realityFingerprint: node.tunnel?.reality?.fingerprint || 'chrome',
+    hysteria2Password: node.tunnel?.hysteria2?.password || '',
   })
   editor.value?.open()
 }
@@ -64,12 +136,42 @@ async function saveNode() {
   const problem = validateNode(draft)
   if (problem) throw new Error(problem)
   const server = draft.role === 'server'
+  const tunnel: TunnelConfig = {}
+  if (draft.flow) {
+    tunnel.flow = draft.flow
+  }
+  if (draft.enc && draft.enc !== 'none') {
+    if (server) {
+      tunnel.decryption = draft.enc
+    } else {
+      tunnel.encryption = draft.enc
+    }
+  }
+  if (draft.pool && Number(draft.pool) > 0) {
+    tunnel.pool = Number(draft.pool)
+  }
+  if (draft.transport === 'reality') {
+    tunnel.reality = {
+      dest: draft.realityDest.trim(),
+      private_key: draft.realityPrivateKey.trim(),
+      public_key: draft.realityPublicKey.trim(),
+      short_ids: draft.realityShortIDs.trim(),
+      server_names: draft.realityServerNames.trim(),
+      fingerprint: draft.realityFingerprint.trim() || 'chrome',
+    }
+  } else if (draft.transport === 'hysteria2') {
+    tunnel.hysteria2 = {
+      password: draft.hysteria2Password.trim(),
+    }
+  }
+
   await api(draft.id ? `/nodes/${encodeURIComponent(draft.id)}` : '/nodes', draft.id ? 'PUT' : 'POST', {
     name: draft.name.trim(),
     role: draft.role,
     address: server ? draft.address.trim() : '',
     port: server ? Number(draft.port) : 0,
     server_name: server ? draft.serverName.trim() : '',
+    tunnel,
   })
   await desk.reload()
   desk.notify(draft.id ? '节点已保存，等待节点应用配置。' : '节点已创建。接下来生成一次性注册令牌。')
@@ -160,6 +262,7 @@ async function copy(value: string) {
             <thead>
               <tr>
                 <th scope="col">节点</th>
+                <th scope="col">传输</th>
                 <th scope="col">心跳</th>
                 <th scope="col">版本</th>
                 <th scope="col">绑定</th>
@@ -170,6 +273,10 @@ async function copy(value: string) {
                 <td>
                   <strong>{{ node.name }}</strong>
                   <small>{{ node.role === 'server' ? 'SERVER' : 'CLIENT' }} · {{ node.id }}</small>
+                </td>
+                <td>
+                  <Badge :text="transportLabel(node)" :tone="transportTone(node)" />
+                  <small v-if="node.tunnel?.flow" class="mono">{{ node.tunnel.flow }}</small>
                 </td>
                 <td>
                   <Badge :text="presence(node).text" :tone="presence(node).tone" />
@@ -194,6 +301,19 @@ async function copy(value: string) {
           <div><dt>版本</dt><dd>期望 r{{ selected.desired_revision }} / 已应用 r{{ selected.applied_revision }}</dd></div>
           <div v-if="selected.role === 'server'"><dt>数据面</dt><dd class="mono">{{ endpoint(selected.address, selected.port) }}</dd></div>
           <div v-if="selected.role === 'server'"><dt>TLS 名称</dt><dd class="mono">{{ selected.server_name }}</dd></div>
+          <div><dt>传输方式</dt><dd><Badge :text="transportLabel(selected)" :tone="transportTone(selected)" /></dd></div>
+          <div v-if="selected.tunnel?.flow"><dt>流控模式</dt><dd class="mono">{{ selected.tunnel.flow }}</dd></div>
+          <div v-if="selected.tunnel?.decryption || selected.tunnel?.encryption">
+            <dt>数据加密</dt>
+            <dd class="mono">{{ selected.role === 'server' ? '解密: ' + selected.tunnel.decryption : '加密: ' + selected.tunnel.encryption }}</dd>
+          </div>
+          <div v-if="selected.tunnel?.pool"><dt>连接池</dt><dd class="mono">{{ selected.tunnel.pool }} 路</dd></div>
+          <template v-if="isReality(selected)">
+            <div v-if="selected.tunnel?.reality?.dest"><dt>REALITY 目标</dt><dd class="mono">{{ selected.tunnel.reality.dest }}</dd></div>
+            <div v-if="selected.tunnel?.reality?.public_key"><dt>REALITY 公钥</dt><dd class="mono" style="word-break: break-all;">{{ selected.tunnel.reality.public_key }}</dd></div>
+            <div v-if="selected.tunnel?.reality?.short_ids || selected.tunnel?.reality?.short_id"><dt>Short ID</dt><dd class="mono">{{ selected.tunnel.reality.short_ids || selected.tunnel.reality.short_id }}</dd></div>
+            <div v-if="selected.tunnel?.reality?.server_names"><dt>伪装域名</dt><dd class="mono">{{ selected.tunnel.reality.server_names }}</dd></div>
+          </template>
           <div><dt>绑定</dt><dd>{{ bindingCount(selected.id) }} 条</dd></div>
         </dl>
         <p v-if="selected.error" class="detail-error">{{ selected.error }}</p>
@@ -222,6 +342,81 @@ async function copy(value: string) {
         <label for="node-sni">TLS 服务器名称</label>
         <input id="node-sni" v-model="draft.serverName" spellcheck="false" required />
         <small class="help">要和网关证书一致。REALITY 时，这也是客户端发送的伪装 SNI。证书和密钥只放在节点本机。</small>
+      </template>
+
+      <p class="field-label" style="margin-top: 16px; font-weight: 600;">隧道传输与安全</p>
+      
+      <label for="node-transport">传输方式</label>
+      <select id="node-transport" v-model="draft.transport">
+        <option value="tls">标准 TLS (TCP 证书)</option>
+        <option value="reality">REALITY 伪装 (无须域名证书)</option>
+        <option value="hysteria2">Hysteria2 (QUIC UDP 传输)</option>
+      </select>
+
+      <div class="grid-2">
+        <div>
+          <label for="node-flow">流控模式 (Flow)</label>
+          <select id="node-flow" v-model="draft.flow">
+            <option value="">无 (普通 VLESS)</option>
+            <option value="xtls-rprx-vision">xtls-rprx-vision</option>
+          </select>
+        </div>
+        <div>
+          <label for="node-enc">{{ draft.role === 'server' ? '解密算法' : '加密算法' }}</label>
+          <select id="node-enc" v-model="draft.enc">
+            <option value="none">none (标准)</option>
+            <option value="xor">xor (对称混淆)</option>
+          </select>
+        </div>
+      </div>
+
+      <label for="node-pool">反向连接池容量 (Pool)</label>
+      <input id="node-pool" v-model="draft.pool" type="number" min="0" max="64" placeholder="默认 0 (自动/单连接)" />
+      <small class="help">并发反向连接池数量，客户端与服务端复用连接。</small>
+
+      <template v-if="draft.transport === 'reality'">
+        <p class="field-label" style="margin-top: 12px; font-weight: 600;">REALITY 伪装参数</p>
+        <template v-if="draft.role === 'server'">
+          <label for="reality-dest">回落目标 (Dest)</label>
+          <input id="reality-dest" v-model="draft.realityDest" placeholder="例如 www.apple.com:443" />
+          <small class="help">REALITY 握手探测失败时的转发目标地址与端口。</small>
+
+          <label for="reality-priv">X25519 私钥 (Private Key)</label>
+          <input id="reality-priv" v-model="draft.realityPrivateKey" type="password" placeholder="留空则保持现有私钥不变" />
+          <small class="help">服务端的 REALITY 私钥。公钥会自动从该私钥推导并下发给客户端。</small>
+
+          <label for="reality-short-ids">Short IDs</label>
+          <input id="reality-short-ids" v-model="draft.realityShortIDs" placeholder="例如 0123456789abcdef (逗号分隔)" />
+
+          <label for="reality-names">伪装域名 (Server Names)</label>
+          <input id="reality-names" v-model="draft.realityServerNames" placeholder="例如 www.apple.com,gateway.icloud.com" />
+        </template>
+        <template v-else>
+          <label for="reality-pub">X25519 公钥 (Public Key)</label>
+          <input id="reality-pub" v-model="draft.realityPublicKey" placeholder="留空则自动从网关节点继承" />
+          <small class="help">客户端连接使用的网关 REALITY 公钥（可留空继承）。</small>
+
+          <label for="reality-short-id">Short ID</label>
+          <input id="reality-short-id" v-model="draft.realityShortIDs" placeholder="留空则自动从网关节点继承" />
+
+          <label for="reality-fp">客户端指纹 (Fingerprint)</label>
+          <select id="reality-fp" v-model="draft.realityFingerprint">
+            <option value="chrome">chrome</option>
+            <option value="firefox">firefox</option>
+            <option value="safari">safari</option>
+            <option value="ios">ios</option>
+            <option value="android">android</option>
+            <option value="edge">edge</option>
+            <option value="random">random</option>
+          </select>
+        </template>
+      </template>
+
+      <template v-if="draft.transport === 'hysteria2'">
+        <p class="field-label" style="margin-top: 12px; font-weight: 600;">Hysteria2 QUIC 配置</p>
+        <label for="hy2-pass">认证密码 (Password)</label>
+        <input id="hy2-pass" v-model="draft.hysteria2Password" type="password" :placeholder="draft.role === 'client' ? '留空则自动从绑定的网关继承' : '输入共享认证密码'" />
+        <small class="help">{{ draft.role === 'server' ? '网关与客户端之间 QUIC 握手的鉴权密码。' : '内网节点连接网关的鉴权密码。若留空则自动继承网关配置。' }}</small>
       </template>
     </Modal>
     <Modal ref="confirm" :title="confirmTitle" save-label="确认" :submit="runConfirm" danger :kicker="confirmLabel">

@@ -209,6 +209,12 @@ func (s *Store) SaveNode(n model.Node) (model.Node, error) {
 			n.AppliedRevision = old.AppliedRevision
 			n.LastSeen = old.LastSeen
 			n.Error = old.Error
+			if n.Role == "server" && n.Tunnel.Reality.PrivateKey == "" && old.Tunnel.Reality.PrivateKey != "" {
+				n.Tunnel.Reality.PrivateKey = old.Tunnel.Reality.PrivateKey
+			}
+		}
+		if n.Role == "server" && n.Tunnel.Reality.PrivateKey != "" && n.Tunnel.Reality.PublicKey == "" {
+			n.Tunnel.Reality.PublicKey = model.DeriveX25519Public(n.Tunnel.Reality.PrivateKey)
 		}
 		n.Revoked = false
 		st.Nodes[n.ID] = n
@@ -298,7 +304,8 @@ func (s *Store) Snapshot(id, credential string) (model.Snapshot, error) {
 	if !s.authorized(st, id, credential) {
 		return model.Snapshot{}, ErrAuth
 	}
-	out := model.Snapshot{Revision: st.Revision, Node: st.Nodes[id], Nodes: []model.Node{}, Bindings: []model.Binding{}, Mappings: []model.Mapping{}}
+	currentNode := st.Nodes[id]
+	out := model.Snapshot{Revision: st.Revision, Node: currentNode, Nodes: []model.Node{}, Bindings: []model.Binding{}, Mappings: []model.Mapping{}}
 	peers := map[string]bool{}
 	for bid, b := range st.Bindings {
 		a, aok := st.Nodes[b.ServerID]
@@ -318,8 +325,21 @@ func (s *Store) Snapshot(id, credential string) (model.Snapshot, error) {
 			}
 		}
 	}
+	if currentNode.Role == "client" {
+		for _, b := range out.Bindings {
+			if serverNode, ok := st.Nodes[b.ServerID]; ok {
+				currentNode.Tunnel = model.DeriveClientTunnel(currentNode.Tunnel, serverNode.Tunnel, serverNode)
+				break
+			}
+		}
+		out.Node = currentNode
+	}
 	for peer := range peers {
-		out.Nodes = append(out.Nodes, st.Nodes[peer])
+		peerNode := st.Nodes[peer]
+		if id != peer {
+			peerNode.Tunnel.Reality.PrivateKey = ""
+		}
+		out.Nodes = append(out.Nodes, peerNode)
 	}
 	return out, nil
 }
@@ -387,6 +407,9 @@ func (s *Store) SaveBinding(b model.Binding) (model.Binding, error) {
 		}
 		st.Bindings[b.ID] = b
 		st.Secrets[b.ID] = secret
+		clientNode := st.Nodes[b.ClientID]
+		clientNode.Tunnel = model.DeriveClientTunnel(clientNode.Tunnel, a.Tunnel, a)
+		st.Nodes[b.ClientID] = clientNode
 		return nil
 	})
 	return b, e

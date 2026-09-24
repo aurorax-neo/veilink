@@ -132,6 +132,22 @@ func (s *service) dialGateway(gateway model.Node) (net.Conn, error) {
 	if s.local.Reality.Enabled() {
 		return dialReality(s.ctx, addr, gateway.ServerName, s.local.Reality)
 	}
+	if gateway.Tunnel.Reality.Enabled() && gateway.Tunnel.Reality.PublicKey != "" {
+		r := gateway.Tunnel.Reality
+		if r.ShortID == "" && r.ShortIDs != "" {
+			ids := strings.Split(r.ShortIDs, ",")
+			if len(ids) > 0 {
+				r.ShortID = strings.TrimSpace(ids[0])
+			}
+		}
+		if r.ServerNames == "" && gateway.ServerName != "" {
+			r.ServerNames = gateway.ServerName
+		}
+		if r.Fingerprint == "" {
+			r.Fingerprint = "chrome"
+		}
+		return dialReality(s.ctx, addr, gateway.ServerName, r)
+	}
 	if s.local.CAFile == "" && s.outbound != nil {
 		return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(s.ctx, "tcp", addr)
 	}

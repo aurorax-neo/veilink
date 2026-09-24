@@ -1,3 +1,31 @@
+export interface RealityConfig {
+  dest?: string
+  private_key?: string
+  public_key?: string
+  short_id?: string
+  short_ids?: string
+  server_names?: string
+  fingerprint?: string
+  max_time_diff?: string
+}
+
+export interface Hysteria2Config {
+  password?: string
+}
+
+export interface TunnelConfig {
+  cert_file?: string
+  key_file?: string
+  ca_file?: string
+  listen_host?: string
+  flow?: string
+  decryption?: string
+  encryption?: string
+  pool?: number
+  reality?: RealityConfig
+  hysteria2?: Hysteria2Config
+}
+
 export interface Node {
   id: string
   name: string
@@ -5,6 +33,7 @@ export interface Node {
   address: string
   port: number
   server_name: string
+  tunnel?: TunnelConfig
   revoked: boolean
   desired_revision: number
   applied_revision: number

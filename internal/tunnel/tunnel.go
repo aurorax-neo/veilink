@@ -131,6 +131,7 @@ type Runtime struct {
 	local     model.LocalTLS
 	instance  *service
 	good      *model.Snapshot
+	goodLocal model.LocalTLS
 	document  []byte
 	revision  int64
 	highWater int64
@@ -152,7 +153,8 @@ func (r *Runtime) Apply(s model.Snapshot) error {
 	if s.Revision < r.highWater {
 		return fmt.Errorf("stale revision %d (last successful %d)", s.Revision, r.highWater)
 	}
-	document, err := Build(s, r.local)
+	effective := s.Node.Tunnel.Merge(r.local)
+	document, err := Build(s, effective)
 	if err != nil {
 		return err
 	}
@@ -170,10 +172,10 @@ func (r *Runtime) Apply(s model.Snapshot) error {
 		r.instance = nil
 		r.revision = -1
 	}
-	instance, err := start(s, r.local)
+	instance, err := start(s, effective)
 	if err != nil {
 		if r.good != nil {
-			restored, rollbackErr := start(*r.good, r.local)
+			restored, rollbackErr := start(*r.good, r.goodLocal)
 			if rollbackErr != nil {
 				return fmt.Errorf("start failed: %w; rollback failed: %v", err, rollbackErr)
 			}
@@ -189,6 +191,7 @@ func (r *Runtime) Apply(s model.Snapshot) error {
 	r.instance = instance
 	saved := cloneSnapshot(s)
 	r.good = &saved
+	r.goodLocal = effective
 	r.document = document
 	r.revision = s.Revision
 	r.highWater = s.Revision

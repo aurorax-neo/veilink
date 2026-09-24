@@ -1,12 +1,19 @@
-FROM node:24-alpine AS ui
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+ARG GOPROXY=https://goproxy.cn,direct
+
+FROM node:alpine AS ui
 WORKDIR /src/frontend
+ARG NPM_REGISTRY
+RUN npm config set registry ${NPM_REGISTRY}
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
-FROM golang:1.27-alpine AS build
+FROM golang:alpine AS build
 WORKDIR /src
+ARG GOPROXY
+ENV GOPROXY=${GOPROXY}
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
