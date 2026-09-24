@@ -172,7 +172,11 @@ func Run(ctx context.Context, c config.Config, role string) error {
 			}
 			return errors.New("node credential rejected; local state wiped; administrator must re-enroll")
 		}
-		slog.Warn("control connection unavailable; retaining last successful configuration")
+		if errors.Is(e, context.DeadlineExceeded) || errors.Is(e, context.Canceled) {
+			backoff = time.Second
+			continue
+		}
+		slog.Warn("control connection unavailable; retaining last successful configuration", "err", e)
 		delay := backoff + time.Duration(rand.Int64N(int64(backoff/2)+1))
 		select {
 		case <-ctx.Done():
@@ -209,15 +213,17 @@ func cycle(ctx context.Context, client pb.ControlClient, c config.Config, role s
 			errText = "apply failed"
 		}
 
-		// Collect log entries from the ring to send with heartbeat
-		logEntries := ring.Query("", "", "", 0)
+		// Collect and drain log entries from the ring to send with heartbeat
 		var logMaps []any
-		for _, entry := range logEntries {
-			logMaps = append(logMaps, map[string]any{
-				"at":      entry.At,
-				"level":   entry.Level,
-				"message": entry.Message,
-			})
+		if ring != nil {
+			logEntries := ring.Drain()
+			for _, entry := range logEntries {
+				logMaps = append(logMaps, map[string]any{
+					"at":      entry.At,
+					"level":   entry.Level,
+					"message": entry.Message,
+				})
+			}
 		}
 
 		in, _ := control.Envelope(map[string]any{"node_id": c.NodeID, "credential": st.Credential, "applied_revision": applied, "error": errText, "logs": logMaps})

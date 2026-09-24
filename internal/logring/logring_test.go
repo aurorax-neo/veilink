@@ -31,3 +31,18 @@ func TestRingFilter(t *testing.T) {
 		t.Fatalf("expected 1 ERROR entry, got %d", len(got))
 	}
 }
+func TestRingDrain(t *testing.T) {
+	r := New(5)
+	if got := r.Drain(); got != nil {
+		t.Fatalf("expected nil from empty ring drain, got %v", got)
+	}
+	r.Append(Entry{At: 1, Message: "m1"})
+	r.Append(Entry{At: 2, Message: "m2"})
+	got := r.Drain()
+	if len(got) != 2 || got[0].Message != "m1" || got[1].Message != "m2" {
+		t.Fatalf("unexpected drained entries: %+v", got)
+	}
+	if drainedAgain := r.Drain(); drainedAgain != nil {
+		t.Fatalf("expected nil after drain, got %v", drainedAgain)
+	}
+}

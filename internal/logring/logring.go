@@ -98,6 +98,28 @@ func (r *Ring) Query(source, nodeID, level string, limit int) []Entry {
 	}
 	return out
 }
+// Drain returns and removes all entries accumulated so far in oldest-first order.
+func (r *Ring) Drain() []Entry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := r.pos
+	if r.full {
+		n = r.cap
+	}
+	if n == 0 {
+		return nil
+	}
+	out := make([]Entry, 0, n)
+	if r.full {
+		out = append(out, r.buf[r.pos:]...)
+		out = append(out, r.buf[:r.pos]...)
+	} else {
+		out = append(out, r.buf[:r.pos]...)
+	}
+	r.pos = 0
+	r.full = false
+	return out
+}
 
 // Handler returns an slog.Handler that writes records both to the ring and
 // to an optional downstream handler. Records stored in the ring use the
