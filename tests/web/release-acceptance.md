@@ -1,6 +1,6 @@
 # 真实 mux 与地址模型发布验收
 
-本记录覆盖本轮最终源码；旧 `ux-report.md` 的 private-session、Podman 故障及生产 NO 是历史结果，不代表本轮结果。
+本记录是提交 `9c0f2b9eff20f6294dfba0e34285e2148fc96484` 的历史验收，不代表当前统一镜像的打包方式。下述三镜像方案已废弃，当前使用方式以 README 为准，统一镜像验收见 `unified-image-acceptance.md`。旧 `ux-report.md` 的 private-session、Podman 故障及生产 NO 同样是历史结果。
 
 ## 结果
 

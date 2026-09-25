@@ -17,7 +17,7 @@ func projectRoot(t *testing.T) string {
 	return filepath.Clean(filepath.Join(filepath.Dir(file), "../.."))
 }
 
-func TestRoleImagesAndDockerRunOnly(t *testing.T) {
+func TestUnifiedImageAndDockerRunOnly(t *testing.T) {
 	root := projectRoot(t)
 	body, err := os.ReadFile(filepath.Join(root, "README.md"))
 	if err != nil {
@@ -34,16 +34,18 @@ func TestRoleImagesAndDockerRunOnly(t *testing.T) {
 			t.Errorf("obsolete bootstrap instruction %q", obsolete)
 		}
 	}
+	if !strings.Contains(readme, "docker build -t veilink:latest .") {
+		t.Error("missing unified image build")
+	}
 	blocks := strings.Split(readme, "```sh\n")[1:]
 	for _, role := range []string{"master", "server", "client"} {
-		build := "docker build --target " + role + " -t veilink:" + role + " ."
-		if !strings.Contains(readme, build) {
-			t.Errorf("missing separate %s release image build", role)
+		if strings.Contains(readme, "veilink:"+role) || strings.Contains(readme, "--target "+role) {
+			t.Errorf("obsolete %s release product", role)
 		}
 		var runs []string
 		for _, part := range blocks {
 			block := strings.SplitN(part, "\n```", 2)[0]
-			if strings.HasPrefix(block, "docker run -itd") && strings.Contains(block, "veilink:"+role+" ") {
+			if strings.HasPrefix(block, "docker run -itd") && strings.Contains(block, "veilink:latest "+role+" ") {
 				runs = append(runs, block)
 			}
 		}
@@ -82,40 +84,23 @@ func TestRoleImagesAndDockerRunOnly(t *testing.T) {
 	}
 }
 
-func TestImageContentsAreRoleScoped(t *testing.T) {
-	root := projectRoot(t)
-	body, err := os.ReadFile(filepath.Join(root, "Dockerfile"))
+func TestUnifiedImageContents(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join(projectRoot(t), "Dockerfile"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	file := string(body)
+	for _, required := range []string{`ENTRYPOINT ["/usr/local/bin/veilink"]`, "USER 65532:65532", "COPY --from=ui /src/html /usr/local/html", "COPY --from=build /out/veilink /usr/local/bin/veilink", `CMD ["/usr/local/bin/docker-healthcheck.sh"]`, "ca-certificates tzdata curl sqlite"} {
+		if !strings.Contains(file, required) {
+			t.Errorf("unified image missing %q", required)
+		}
+	}
+	if strings.Count("\n"+file, "\nFROM ") != 3 || strings.Count(file, "ENTRYPOINT ") != 1 || strings.Count(file, "HEALTHCHECK ") != 1 {
+		t.Error("expected two build stages and one runtime product")
+	}
 	for _, role := range []string{"master", "server", "client"} {
-		marker := "FROM runtime AS " + role + "\n"
-		if strings.Count(file, marker) != 1 {
-			t.Fatalf("missing unique %s release target", role)
-		}
-		stage := strings.SplitN(strings.SplitN(file, marker, 2)[1], "\nFROM ", 2)[0]
-		if !strings.Contains(stage, `ENTRYPOINT ["/usr/local/bin/veilink", "`+role+`"]`) || !strings.Contains(stage, "USER 65532:65532") {
-			t.Errorf("%s lacks fixed role or nonroot runtime", role)
-		}
-		health := `CMD ["kill", "-0", "1"]`
-		if role == "master" {
-			health = `CMD ["/usr/local/bin/docker-healthcheck.sh"]`
-		}
-		if strings.Count(stage, "HEALTHCHECK ") != 1 || !strings.Contains(stage, health) || strings.Contains(stage, `"CMD-SHELL"`) {
-			t.Errorf("%s has invalid healthcheck command", role)
-		}
-		ui := strings.Contains(stage, "COPY --from=ui /src/html /usr/local/html")
-		if ui != (role == "master") {
-			t.Errorf("%s has incorrect Web UI packaging", role)
-		}
-		curl := strings.Contains(stage, "apk add --no-cache curl")
-		if curl != (role == "master") {
-			t.Errorf("%s has incorrect HTTP health dependency", role)
-		}
-		sqlite := strings.Contains(stage, "apk add --no-cache curl sqlite")
-		if sqlite != (role == "master") {
-			t.Errorf("%s has incorrect persisted-config health dependency", role)
+		if strings.Contains(strings.ToLower(file), " as "+role+"\n") {
+			t.Errorf("obsolete role target %s", role)
 		}
 	}
 }

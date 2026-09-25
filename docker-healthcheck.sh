@@ -1,9 +1,14 @@
 #!/bin/sh
 set -eu
 
-# Master resolves defaults, persisted settings, then explicitly visited CLI flags.
-# Read PID 1's flags rather than our own; the last occurrence wins as with Go flags.
+# Read the role and flags of PID 1, not the health probe itself.
 args=$(tr '\000' '\n' < /proc/1/cmdline)
+role=$(printf '%s\n' "$args" | sed -n '2p')
+case "$role" in
+  server|client) kill -0 1; exit $? ;;
+  master) ;;
+  *) exit 1 ;;
+esac
 flag() {
   printf '%s\n' "$args" | awk -v name="-$1" '
     $0 == name { if (getline > 0) value = $0; next }
@@ -18,8 +23,7 @@ database=${database:-/data/veilink.db}
 
 if [ -z "$listen" ] || [ -z "$scheme" ]; then
   if [ -e "$database" ]; then
-    # -readonly must never create a DB during a health probe. Query errors fail
-    # closed rather than checking an unrelated listener on the default port.
+    # Read-only: never create a DB, and fail closed on corrupt stored settings.
     stored=$(sqlite3 -readonly -separator '|' "$database" \
       "SELECT json_extract(data, '$.ListenAddr'), json_extract(data, '$.Scheme') FROM master_config WHERE id=1") || exit 1
     if [ -n "$stored" ]; then
@@ -42,6 +46,6 @@ esac
 
 case "$scheme" in
   https) curl --noproxy '*' --insecure --fail --silent --max-time 4 "https://${host}:${port}/healthz" >/dev/null ;;
-  http)  curl --noproxy '*' --fail --silent --max-time 4 "http://${host}:${port}/healthz" >/dev/null ;;
+  http) curl --noproxy '*' --fail --silent --max-time 4 "http://${host}:${port}/healthz" >/dev/null ;;
   *) exit 1 ;;
 esac

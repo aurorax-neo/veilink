@@ -58,7 +58,7 @@ defineExpose({ open })
 
 <template>
   <Modal ref="modal" :title="`快捷接入 · ${node?.name || ''}`" save-label="生成命令" :hide-save="!!result" :submit="generate" @close="clear">
-    <p class="help">在已安装 Docker 且已准备对应 veilink:server 或 veilink:client 镜像的节点上执行。请先执行目录准备命令，再执行 Docker 接入命令。</p>
+    <p class="help">在已安装 Docker 且已准备统一 veilink:latest 镜像的节点上执行，以 server 或 client 子命令选择角色。请先执行目录准备命令，再执行 Docker 接入命令。</p>
     <label for="join-master">管理地址</label>
     <input id="join-master" v-model="masterURL" type="url" required :disabled="!!result" placeholder="https://master.example.com:8443" />
     <small class="help">须含 https://；填写节点可达的管理端 gRPC 地址及端口，证书须匹配主机名。</small>

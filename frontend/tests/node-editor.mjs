@@ -400,7 +400,7 @@ test('onboarding displays role-specific flag commands and blocks embedded or ins
   const context = vm.createContext({
     exports: {}, computed, ref, URL, location: { origin: 'https://master.example.com' },
     window: { setInterval: () => 1, clearInterval: () => {} }, onUnmounted: () => {}, defineExpose: () => {},
-    api: async (...args) => { requests.push(args); return { prepare: "mkdir -p '/opt/docker/veilink-client-demo/config' '/opt/docker/veilink-client-demo/data' && chown -R 65532:65532 '/opt/docker/veilink-client-demo/config' '/opt/docker/veilink-client-demo/data' && chmod 700 '/opt/docker/veilink-client-demo/config' '/opt/docker/veilink-client-demo/data'", command: "docker run -itd --restart unless-stopped --name 'veilink-client-demo' -v '/opt/docker/veilink-client-demo/config:/config:ro' -v '/opt/docker/veilink-client-demo/data:/data' -e TZ=Asia/Shanghai veilink:client -master-addr 'master.example.com:443' -node-id 'remote/id' -enroll-token 'token' -state-dir '/data/state' -control-server-name 'master.example.com'", token: 'token', expires_at: 2000000000, warning: '私有 Master CA 时，在镜像名后添加 -control-ca /config/ca.pem。' } },
+    api: async (...args) => { requests.push(args); return { prepare: "mkdir -p '/opt/docker/veilink-client-demo/config' '/opt/docker/veilink-client-demo/data' && chown -R 65532:65532 '/opt/docker/veilink-client-demo/config' '/opt/docker/veilink-client-demo/data' && chmod 700 '/opt/docker/veilink-client-demo/config' '/opt/docker/veilink-client-demo/data'", command: "docker run -itd --restart unless-stopped --name 'veilink-client-demo' -v '/opt/docker/veilink-client-demo/config:/config:ro' -v '/opt/docker/veilink-client-demo/data:/data' -e TZ=Asia/Shanghai veilink:latest client -master-addr 'master.example.com:443' -node-id 'remote/id' -enroll-token 'token' -state-dir '/data/state' -control-server-name 'master.example.com'", token: 'token', expires_at: 2000000000, warning: '私有 Master CA 时，在角色子命令后添加 -control-ca /config/ca.pem。' } },
   })
   vm.runInContext(transpile(onboardingScript + '\nglobalThis.onboarding = { open, generate, revoke, node, modal, result, masterURL };'), context)
   const e = context.onboarding
@@ -418,10 +418,10 @@ test('onboarding displays role-specific flag commands and blocks embedded or ins
   assert.equal(opens, 1)
   assert.equal(requests[0][0], '/nodes/remote%2Fid/join')
   assert.equal(e.result.value.token, 'token')
-  assert.equal(e.result.value.command, "docker run -itd --restart unless-stopped --name 'veilink-client-demo' -v '/opt/docker/veilink-client-demo/config:/config:ro' -v '/opt/docker/veilink-client-demo/data:/data' -e TZ=Asia/Shanghai veilink:client -master-addr 'master.example.com:443' -node-id 'remote/id' -enroll-token 'token' -state-dir '/data/state' -control-server-name 'master.example.com'")
+  assert.equal(e.result.value.command, "docker run -itd --restart unless-stopped --name 'veilink-client-demo' -v '/opt/docker/veilink-client-demo/config:/config:ro' -v '/opt/docker/veilink-client-demo/data:/data' -e TZ=Asia/Shanghai veilink:latest client -master-addr 'master.example.com:443' -node-id 'remote/id' -enroll-token 'token' -state-dir '/data/state' -control-server-name 'master.example.com'")
   assert.match(e.result.value.prepare, /chown -R 65532:65532/)
   assert.match(e.result.value.warning, /-control-ca \/config\/ca.pem/)
-  assert.match(source('../src/components/NodeOnboarding.vue'), /veilink:server 或 veilink:client/)
+  assert.match(source('../src/components/NodeOnboarding.vue'), /统一 veilink:latest 镜像.*server 或 client 子命令/)
   assert.match(source('../src/components/NodeOnboarding.vue'), /id="join-prepare"[^>]+:value="result.prepare"/)
   e.masterURL.value = 'http://insecure.example'
   await assert.rejects(e.generate(), /https:\/\//)

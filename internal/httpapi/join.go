@@ -91,11 +91,7 @@ func (a *API) joinCommand(w http.ResponseWriter, r *http.Request, id string) {
 		command.WriteString(" --net host")
 	}
 	command.WriteString(" -v " + shellQuote(config+":/config:ro") + " -v " + shellQuote(data+":/data") + " -e TZ=Asia/Shanghai")
-	image := "veilink:client"
-	if role == "server" {
-		image = "veilink:server"
-	}
-	command.WriteString(" " + image)
+	command.WriteString(" veilink:latest " + role)
 	for _, v := range []struct{ flag, value string }{
 		{"-master-addr", address}, {"-node-id", id},
 		{"-enroll-token", token}, {"-state-dir", "/data/state"},
@@ -103,6 +99,6 @@ func (a *API) joinCommand(w http.ResponseWriter, r *http.Request, id string) {
 	} {
 		command.WriteString(" " + v.flag + " " + shellQuote(v.value))
 	}
-	warning := "命令包含一次性接入令牌，可能出现在 shell 历史和 Docker inspect 的容器参数中；请勿分享或记录日志。接入成功后保留 /data 状态并重建不带令牌的容器，删除原容器前妥善保护主机访问。私有 Master CA 时，请将证书放入 " + config + "/ca.pem，并在镜像名后添加 -control-ca /config/ca.pem；不要关闭 TLS 验证。"
+	warning := "命令包含一次性接入令牌，可能出现在 shell 历史和 Docker inspect 的容器参数中；请勿分享或记录日志。接入成功后保留 /data 状态并重建不带令牌的容器，删除原容器前妥善保护主机访问。私有 Master CA 时，请将证书放入 " + config + "/ca.pem，并在角色子命令后添加 -control-ca /config/ca.pem；不要关闭 TLS 验证。"
 	output(w, 200, map[string]any{"prepare": prepare, "command": command.String(), "token": token, "expires_at": time.Now().Unix() + in.TTL, "warning": warning})
 }

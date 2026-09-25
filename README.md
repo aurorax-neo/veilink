@@ -2,7 +2,7 @@
 
 Veilink 是原生 Go 实现的私有 VLESS 反向隧道。Master 管理 Server、Client 与 TCP/UDP 映射；业务数据由 Server 和 Client 直接传输，除非 Master 自身启用了内置 Server。Web 控制台由 Vue 3 + TypeScript 构建。不运行 Xray 外部内核二进制，也不承诺与其客户端互通；第三方源码组件及 HY2 BBR 来源见下方法律声明。
 
-> **唯一支持的生产运行方式是 Docker Run。** 发布物按 Master、Server、Client 三种角色分别打包为 `veilink:master`、`veilink:server`、`veilink:client`。项目开发约束见 [AGENTS.md](AGENTS.md)；许可证和法律声明分别见 [LICENSE](LICENSE)、[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+> **唯一支持的生产运行方式是 Docker Run。** 只发布一个统一镜像 `veilink:latest`（版本发布使用同一版本 tag），以 `master`、`server`、`client` 子命令选择角色，不维护角色镜像或发布包矩阵。项目开发约束见 [AGENTS.md](AGENTS.md)；许可证和法律声明分别见 [LICENSE](LICENSE)、[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 许可证与第三方来源
 
@@ -14,15 +14,15 @@ HY2 默认使用 Xray `standard` BBR：Client/Server 均在认证成功后、业
 
 ## 发布与目录
 
-各角色镜像只包含自己需要的文件。三者共用原生 Go 可执行文件与系统信任证书；**仅 Master** 包含 `/usr/local/html/` 管理页面、curl 和 Web 健康检查脚本。Server/Client 不包含前端资源。Docker 构建三个独立镜像：
+统一镜像包含一个原生 Go 可执行文件、系统信任证书、`/usr/local/html/` 管理页面及健康检查依赖。只有 Master 启用 Web，Server/Client 不启动 Web 服务。Go/UI 多阶段构建只是构建实现，不是多个发布产品；一次构建生成一个镜像：
 
 ```sh
-docker build --target master -t veilink:master .
-docker build --target server -t veilink:server .
-docker build --target client -t veilink:client .
+docker build -t veilink:latest .
 ```
 
-若使用发布的对应镜像，无需在宿主机编译。镜像的入口已固定角色，因此下面的 `docker run` 在镜像名后**直接跟该角色的 flags**，不加 `master|server|client` 子命令，也不接受 `-config`。所有持久化内容位于容器内 `/data/`，宿主机挂载根目录统一为 `/opt/docker/<app_name>/`；不在项目目录创建 `.local`。镜像用户是 UID/GID `65532:65532`。日志从 `docker logs <app_name>` 读取，不创建未被程序使用的 `logs` 目录。
+国内网络默认使用 USTC Alpine 镜像源、npmmirror 和 goproxy.cn，采用 linuxmirrors.cn 的替换软件源思路，不执行远程安装脚本。可用 `--build-arg APK_MIRROR=https://dl-cdn.alpinelinux.org/alpine` 覆盖 APK 源（地址不带末尾斜线），也可覆盖 `NPM_REGISTRY` 和 `GOPROXY`。
+
+若使用已发布的统一镜像，无需在宿主机编译。镜像入口是 `/usr/local/bin/veilink`，必须在镜像名后指定 **`master|server|client` 子命令，再跟角色 flags**；不指定角色会退出，不接受 `-config`。所有持久化内容位于容器内 `/data/`，宿主机挂载根目录统一为 `/opt/docker/<app_name>/`；不在项目目录创建 `.local`。镜像用户是 UID/GID `65532:65532`。日志从 `docker logs <app_name>` 读取，不创建未被程序使用的 `logs` 目录。
 
 所有命令包含 `-itd`、`--restart unless-stopped`、`--name` 和 `TZ=Asia/Shanghai`。Master（允许内置网关与动态映射）和独立 Server 使用 `--net host`，**不加 `-p`**；仅出站的 Client 使用 Docker 默认 Bridge 网络，**不写 `--net` 或 `-p`**。Host 网络直接使用宿主机端口，应检查端口冲突、防火墙和访问控制；Client 容器中的 `127.0.0.1` 不代表宿主机。
 
@@ -42,7 +42,7 @@ docker run -itd \
   -e TZ=Asia/Shanghai \
   -v /opt/docker/veilink-master/config:/config:ro \
   -v /opt/docker/veilink-master/data:/data \
-  veilink:master \
+  veilink:latest master \
   -database /data/veilink.db -deployment-key /data/veilink.key \
   -state-dir /data/state -listen-addr 0.0.0.0:8443 \
   -scheme https -cert-file /config/cert.pem -key-file /config/key.pem \
@@ -91,7 +91,7 @@ docker run -itd \
   -e TZ=Asia/Shanghai \
   -v /opt/docker/veilink-server/config:/config:ro \
   -v /opt/docker/veilink-server/data:/data \
-  veilink:server \
+  veilink:latest server \
   -master-addr panel.example.com:8443 \
   -control-server-name panel.example.com \
   -node-id '<Server 节点 ID>' -enroll-token '<一次性令牌>' \
@@ -104,7 +104,7 @@ docker run -itd \
 mkdir -p /opt/docker/veilink-server/config /opt/docker/veilink-server/data && chown -R 65532:65532 /opt/docker/veilink-server/config /opt/docker/veilink-server/data && chmod 700 /opt/docker/veilink-server/config /opt/docker/veilink-server/data
 ```
 
-**关键参数：** `-control-server-name` 开启并验证到 Master 的 HTTPS，`-master-addr` 是 `host:port`；只有 Master 使用私有 CA 时，才将 CA 放在 `config/master-ca.pem`，并在镜像名后的 flags 中添加 `-control-ca /config/master-ca.pem`。`/data/state` 保留已获取的节点凭据与最后成功快照；后续重建容器无需再次提供 `-enroll-token`。令牌在启动命令、Shell 历史和 `docker inspect` 中可见；首次接入成功后，**保留 `/data`，删除原容器并以不含令牌的命令重建**。绝不把服务端隧道私钥或证书路径放在节点启动参数中。
+**关键参数：** `-control-server-name` 开启并验证到 Master 的 HTTPS，`-master-addr` 是 `host:port`；只有 Master 使用私有 CA 时，才将 CA 放在 `config/master-ca.pem`，并在角色子命令后的 flags 中添加 `-control-ca /config/master-ca.pem`。`/data/state` 保留已获取的节点凭据与最后成功快照；后续重建容器无需再次提供 `-enroll-token`。令牌在启动命令、Shell 历史和 `docker inspect` 中可见；首次接入成功后，**保留 `/data`，删除原容器并以不含令牌的命令重建**。绝不把服务端隧道私钥或证书路径放在节点启动参数中。
 
 ### Client
 
@@ -118,7 +118,7 @@ docker run -itd \
   -e TZ=Asia/Shanghai \
   -v /opt/docker/veilink-client/config:/config:ro \
   -v /opt/docker/veilink-client/data:/data \
-  veilink:client \
+  veilink:latest client \
   -master-addr panel.example.com:8443 \
   -control-server-name panel.example.com \
   -node-id '<Client 节点 ID>' -enroll-token '<一次性令牌>' \
@@ -139,7 +139,7 @@ mkdir -p /opt/docker/veilink-client/config /opt/docker/veilink-client/data && ch
 - **所有隧道参数均从 Web 管理**：Master 数据库保存 Server 私有 `tunnel` 及配对 `client_tunnel`，授权快照只把所需公共参数/共享认证发给 Client；Client 不允许用启动参数或本地文件覆写。Master 身份证书来自只读 `/config`，与隧道 TLS/Hysteria2 的 Web PEM 不同。映射直接选择 Server、Client 与 Pool（1–32）。
 - **客户端连接地址与监听分离**：Server 私有 `tunnel.listen_host/listen_port` 是实际本地监听地址；`connect_endpoints` 的 Host/Port 是 Client 拨号使用的公网可达地址，可与监听 IP/端口不同（例如端口转发）。SNI（`server_name`）独立于拨号地址，须匹配 TLS 证书或 REALITY 域名。保留多个具名候选、优先级和启用状态，Client 按优先级失败切换；不再提供 direct/nat/cdn 分类，旧 `kind` 字段不受支持。Client 永不接收或覆盖本地监听字段。中间代理须保持原始 TCP 或 UDP/QUIC 的 L4 透传；HTTP-only 或终止、改写协议的 CDN 不支持。
 - **Hysteria2 安全边界**：Hysteria2 基于 QUIC/UDP 且使用 TLS；当前上游和本实现不支持 REALITY，配置会被拒绝。
-- **认证**：管理员使用密码会话、CSRF；节点一次性接入令牌最长 24 小时，凭据有效期 30 天。内置 Server 身份持久且不可通过外部令牌接管。Web 的“快捷接入”只生成对应角色镜像的 Docker Run 命令和挂载准备步骤；令牌可能暴露于 Shell 历史及 Docker inspect，关闭弹窗会从页面内存移除。
+- **认证**：管理员使用密码会话、CSRF；节点一次性接入令牌最长 24 小时，凭据有效期 30 天。内置 Server 身份持久且不可通过外部令牌接管。Web 的“快捷接入”生成统一镜像加角色子命令的 Docker Run 命令和挂载准备步骤；令牌可能暴露于 Shell 历史及 Docker inspect，关闭弹窗会从页面内存移除。
 - **TCP mux 可选**：Web「映射 → 新建/编辑 → TCP mux」对应映射 JSON 字段 `mux`，默认 `false`（省略也是关闭），不是节点或全局设置。关闭时每条 TCP 流使用独立认证反向连接；开启时多条 TCP 流共享 mux 会话。同一 Server/Client 的不同映射可独立选择。Pool（1–32）控制该节点对的共享会话或独立连接预备数量，取启用映射的最大值，不限制业务并发。保存开关或类型后授权快照触发相关节点重建，现有连接会断开；以已应用修订确认生效。控制连接仍保留，UDP 始终使用 XUDP/共享帧通道，不受 TCP mux 开关影响。
 - **mux 类型**：Mapping 保留布尔 `mux` 和字符串 `mux_type`。仅 TCP 映射开启 mux 时显示类型下拉，支持 sing-mux 的 `smux`、`yamux`、`h2mux`，开启默认 `smux`；省略/留空类型采用此默认值，保存和授权快照携带明确类型。关闭时保存清空类型且不参与连接模式协商，未知非空类型拒绝，不静默回退。切换 UDP 立即关闭 mux、清空类型并隐藏下拉；API 拒绝 UDP + mux=true。不提供额外 padding 或流数配置。反向隧道仍是 Veilink 协议，使用这些 mux 类型不代表兼容 mihomo 节点直连，也不宣称 Xray 通用互通。
 - **mux 实现边界**：smux/yamux 使用 sing-mux 客户端与服务端；h2mux 使用标准 HTTP/2 CONNECT 发起端及 sing-mux 编解码/服务端，以避开当前依赖的空 Header 兼容问题。每条真实 mux 流内另有 Veilink 有界 payload/FIN 记录，保留 TCP 半关闭语义；该记录不承担多路复用。连接池按节点绑定及 mux 类型隔离，每池最多 64 条活动/等待流，超过上限拒绝新流；Pool 不等于该并发上限。h2mux 单流 deadline API 不受支持，关闭和取消由上下文、受跟踪连接及目标 socket 驱动。旧 `private-session` 类型即使在关闭状态也明确拒绝。
