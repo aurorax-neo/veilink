@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"crypto/rand"
 	"database/sql"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	_ "modernc.org/sqlite"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -76,16 +78,98 @@ func Open(path, keyPath string) (*Store, error) {
 		return nil, e
 	}
 	db.SetMaxOpenConns(1)
-	_, e = db.Exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS schema_version(version INTEGER PRIMARY KEY); INSERT OR IGNORE INTO schema_version VALUES(1); CREATE TABLE IF NOT EXISTS config(id INTEGER PRIMARY KEY CHECK(id=1),data BLOB NOT NULL); CREATE TABLE IF NOT EXISTS admin(username TEXT PRIMARY KEY,password TEXT NOT NULL); CREATE TABLE IF NOT EXISTS credentials(node TEXT PRIMARY KEY,hash TEXT NOT NULL); CREATE TABLE IF NOT EXISTS enroll(node TEXT PRIMARY KEY,hash TEXT NOT NULL,expires INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS audit(at INTEGER NOT NULL,action TEXT NOT NULL,object TEXT NOT NULL);`)
-	if e != nil {
+	if e = initializeSchema(db); e != nil {
 		db.Close()
 		return nil, e
 	}
-	s := &Store{db: db, key: key}
+	return &Store{db: db, key: key}, nil
+}
+
+// OpenExisting never creates a database or deployment key (administrator reset commands only).
+func OpenExisting(path, keyPath string) (*Store, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Size() == 0 {
+		return nil, ErrInvalid
+	}
+	key, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, err
+	}
+	if len(key) != 32 {
+		return nil, ErrInvalid
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	u := url.URL{Scheme: "file", Path: abs, RawQuery: "mode=rw"}
+	db, err := sql.Open("sqlite", u.String())
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	var version int
+	if err = db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != schemaVersion {
+		db.Close()
+		return nil, errors.New("unsupported or missing database schema")
+	}
+	if _, err = db.Exec("PRAGMA busy_timeout=5000"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &Store{db: db, key: key}, nil
+}
+
+const schemaVersion = 4
+
+// Only fresh databases and this exact schema are supported. Never migrate or
+// discard an existing deployment implicitly.
+func initializeSchema(db *sql.DB) error {
+	var tables, versions int
+	if err := db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").Scan(&tables); err != nil {
+		return err
+	}
+	if tables != 0 {
+		var version int
+		err := db.QueryRow("SELECT count(*), COALESCE(max(version),0) FROM schema_version").Scan(&versions, &version)
+		if err != nil || versions != 1 || version != schemaVersion {
+			return fmt.Errorf("unsupported database schema: expected version %d; back up and explicitly reset the database to continue (automatic migration is not supported)", schemaVersion)
+		}
+	}
+	if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;"); err != nil {
+		return err
+	}
+	if tables != 0 {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`CREATE TABLE schema_version(version INTEGER PRIMARY KEY);
+CREATE TABLE config(id INTEGER PRIMARY KEY CHECK(id=1),data BLOB NOT NULL CHECK(json_valid(data)));
+CREATE TABLE admin(username TEXT PRIMARY KEY,password TEXT NOT NULL);
+CREATE TABLE credentials(node TEXT PRIMARY KEY,hash TEXT NOT NULL,expires INTEGER NOT NULL);
+CREATE TABLE enroll(node TEXT PRIMARY KEY,hash TEXT NOT NULL,expires INTEGER NOT NULL);
+CREATE TABLE audit(at INTEGER NOT NULL,action TEXT NOT NULL,object TEXT NOT NULL);`); err != nil {
+		return err
+	}
+	if _, err = tx.Exec("INSERT INTO schema_version VALUES(?)", schemaVersion); err != nil {
+		return err
+	}
 	st := state{Nodes: map[string]model.Node{}, Bindings: map[string]model.Binding{}, Mappings: map[string]model.Mapping{}, Secrets: map[string][]byte{}}
-	b, _ := json.Marshal(st)
-	_, e = db.Exec("INSERT OR IGNORE INTO config VALUES(1,?)", b)
-	return s, e
+	b, err := json.Marshal(st)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec("INSERT INTO config VALUES(1,?)", b); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 func (s *Store) Close() error { return s.db.Close() }
 func (s *Store) load() (state, error) {
@@ -93,7 +177,12 @@ func (s *Store) load() (state, error) {
 	var st state
 	e := s.db.QueryRow("SELECT data FROM config WHERE id=1").Scan(&b)
 	if e == nil {
-		e = json.Unmarshal(b, &st)
+		decoder := json.NewDecoder(bytes.NewReader(b))
+		decoder.DisallowUnknownFields()
+		e = decoder.Decode(&st)
+		if e != nil {
+			e = fmt.Errorf("unsupported persisted configuration: %w; back up before explicitly resetting obsolete data", e)
+		}
 	}
 	return st, e
 }
@@ -129,25 +218,102 @@ func (s *Store) mutate(action, id string, fn func(*state) error) error {
 	}
 	return tx.Commit()
 }
+
+var ErrRegistrationClosed = errors.New("registration is closed")
+
 func (s *Store) InitAdmin(user, password string) error {
-	if strings.TrimSpace(user) == "" {
+	if strings.TrimSpace(user) == "" || len(user) > 128 || len(password) > 72 {
 		return ErrInvalid
 	}
-	h, e := auth.Password(password)
-	if e != nil {
-		return e
+	h, err := auth.Password(password)
+	if err != nil {
+		return ErrInvalid
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var count int
-	if e = s.db.QueryRow("SELECT count(*) FROM admin").Scan(&count); e != nil {
-		return e
+	result, err := s.db.Exec("INSERT INTO admin(username,password) SELECT ?,? WHERE NOT EXISTS (SELECT 1 FROM admin)", user, h)
+	if err != nil {
+		return err
 	}
-	if count != 0 {
-		return errors.New("administrator already initialized")
+	n, err := result.RowsAffected()
+	if err == nil && n != 1 {
+		return ErrRegistrationClosed
 	}
-	_, e = s.db.Exec("INSERT INTO admin VALUES(?,?)", user, h)
-	return e
+	return err
+}
+
+// ResetAdminUsername changes only the existing sole administrator's name.
+// A persistent random audit marker prevents a rename back from reviving sessions.
+func (s *Store) ResetAdminUsername(user string) error {
+	if strings.TrimSpace(user) == "" || len(user) > 128 {
+		return ErrInvalid
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec("UPDATE admin SET username=? WHERE username<>? AND (SELECT count(*) FROM admin)=1", user, user)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return errors.New("rename requires exactly one existing administrator and a different username")
+	}
+	if _, err = tx.Exec("INSERT INTO audit(at,action,object) VALUES(?,?,?)", time.Now().Unix(), "admin.rename", auth.Token()); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ResetAdminPassword preserves the username; a fresh bcrypt salt revokes sessions.
+func (s *Store) ResetAdminPassword(password string) error {
+	if len(password) < 12 || len(password) > 72 {
+		return ErrInvalid
+	}
+	h, err := auth.Password(password)
+	if err != nil {
+		return ErrInvalid
+	}
+	result, err := s.db.Exec("UPDATE admin SET password=? WHERE (SELECT count(*) FROM admin)=1", h)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err == nil && n != 1 {
+		return errors.New("reset requires exactly one existing administrator")
+	}
+	return err
+}
+
+// adminVersion length-prefixes every component to prevent ambiguous encodings.
+func adminVersion(user, hash, marker string) string {
+	return auth.Hash(fmt.Sprintf("%d:%s%d:%s%d:%s", len(user), user, len(hash), hash, len(marker), marker))
+}
+
+const adminCredentials = "SELECT username,password,COALESCE((SELECT object FROM audit WHERE action='admin.rename' ORDER BY rowid DESC LIMIT 1),'') FROM admin"
+
+func (s *Store) AdminVersion() (string, error) {
+	var user, h, marker string
+	err := s.db.QueryRow(adminCredentials+" WHERE (SELECT count(*) FROM admin)=1").Scan(&user, &h, &marker)
+	return adminVersion(user, h, marker), err
+}
+
+// LoginVersion returns the version of the exact credential verified, avoiding
+// a reset racing between password verification and session creation.
+func (s *Store) LoginVersion(user, password string) (string, bool) {
+	if len(user) > 128 || len(password) > 72 {
+		return "", false
+	}
+	var storedUser, h, marker string
+	err := s.db.QueryRow(adminCredentials+" WHERE username=? AND (SELECT count(*) FROM admin)=1", user).Scan(&storedUser, &h, &marker)
+	if err != nil {
+		auth.Check("$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy", password)
+		return "", false
+	}
+	return adminVersion(storedUser, h, marker), auth.Check(h, password)
 }
 func (s *Store) HasAdmin() (bool, error) {
 	s.mu.Lock()
@@ -173,13 +339,8 @@ func (s *Store) FindNodeByName(name string) (model.Node, bool, error) {
 	return model.Node{}, false, nil
 }
 func (s *Store) Login(user, password string) bool {
-	var h string
-	e := s.db.QueryRow("SELECT password FROM admin WHERE username=?", user).Scan(&h)
-	if e != nil {
-		auth.Check("$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy", password)
-		return false
-	}
-	return auth.Check(h, password)
+	_, ok := s.LoginVersion(user, password)
+	return ok
 }
 func (s *Store) Nodes() ([]model.Node, error) {
 	s.mu.Lock()
@@ -192,15 +353,90 @@ func (s *Store) Nodes() ([]model.Node, error) {
 	return out, e
 }
 func (s *Store) SaveNode(n model.Node) (model.Node, error) {
+	return s.saveNode(n, false)
+}
+
+// EnsureEmbeddedNode is reserved for master registration. Existing embedded
+// identity and database settings win even if its display name was edited.
+func (s *Store) EnsureEmbeddedNode(seed model.Node) (model.Node, error) {
+	if seed.Role != "server" {
+		return seed, ErrInvalid
+	}
+	// Registration must never accept an external identity supplied by the caller.
+	seed.ID = ""
+	return s.saveNode(seed, true)
+}
+
+func connectEndpoints(n model.Node) []model.ConnectEndpoint {
+	if len(n.ConnectEndpoints) != 0 {
+		return n.ConnectEndpoints
+	}
+	if n.Address == "" || n.Port == 0 {
+		return nil
+	}
+	return []model.ConnectEndpoint{{ID: "primary", Name: "首选", Host: n.Address, Port: n.Port, ServerName: n.ServerName, Enabled: true}}
+}
+
+func validateConnectEndpoints(n model.Node) error {
+	seen := map[string]bool{}
+	enabled := 0
+	for _, ep := range connectEndpoints(n) {
+		if ep.ID == "" || len(ep.ID) > 128 || seen[ep.ID] || ep.Name == "" || len(ep.Name) > 128 || !host(ep.Host) || ep.Port < 1 || ep.Port > 65535 || !host(ep.ServerName) {
+			return ErrInvalid
+		}
+		seen[ep.ID] = true
+		if ep.Enabled {
+			enabled++
+		}
+	}
+	if enabled == 0 {
+		return ErrInvalid
+	}
+	return nil
+}
+
+func (s *Store) saveNode(n model.Node, embedded bool) (model.Node, error) {
 	if n.ID == "" {
 		n.ID = auth.Token()
 	}
 	e := s.mutate("node.save", n.ID, func(st *state) error {
+		if embedded {
+			// Prefer the registered identity over mutable display metadata.
+			var existing *model.Node
+			for _, candidate := range st.Nodes {
+				if candidate.Embedded {
+					if existing != nil {
+						return ErrInvalid
+					}
+					copy := candidate
+					existing = &copy
+				}
+			}
+			if existing != nil {
+				if existing.Role != "server" || existing.Revoked {
+					return ErrInvalid
+				}
+				n = *existing
+			}
+		}
+		if !embedded && n.Embedded && !st.Nodes[n.ID].Embedded {
+			return ErrInvalid
+		}
+		n.Embedded = embedded
+		if n.Role == "client" && (n.Tunnel != (model.LocalTLS{}) || n.ClientTunnel != nil) {
+			return ErrInvalid
+		}
+		if err := validateTunnel(n.Role, n.Tunnel); err != nil {
+			return err
+		}
 		if n.Name == "" || len(n.Name) > 128 || (n.Role != "server" && n.Role != "client") {
 			return ErrInvalid
 		}
-		if n.Role == "server" && (!host(n.Address) || n.Port < 1 || n.Port > 65535 || !host(n.ServerName)) {
-			return ErrInvalid
+		if n.Role == "server" {
+			if !host(n.Address) || n.Port < 1 || n.Port > 65535 || !host(n.ServerName) || validateConnectEndpoints(n) != nil {
+				return ErrInvalid
+			}
+			n.ConnectEndpoints = connectEndpoints(n)
 		}
 		if old, ok := st.Nodes[n.ID]; ok {
 			if old.Role != n.Role || old.Revoked {
@@ -209,12 +445,21 @@ func (s *Store) SaveNode(n model.Node) (model.Node, error) {
 			n.AppliedRevision = old.AppliedRevision
 			n.LastSeen = old.LastSeen
 			n.Error = old.Error
-			if n.Role == "server" && n.Tunnel.Reality.PrivateKey == "" && old.Tunnel.Reality.PrivateKey != "" {
-				n.Tunnel.Reality.PrivateKey = old.Tunnel.Reality.PrivateKey
-			}
+			n.Embedded = old.Embedded || embedded
 		}
-		if n.Role == "server" && n.Tunnel.Reality.PrivateKey != "" && n.Tunnel.Reality.PublicKey == "" {
-			n.Tunnel.Reality.PublicKey = model.DeriveX25519Public(n.Tunnel.Reality.PrivateKey)
+		if n.Role == "server" {
+			if n.Tunnel.Reality.PrivateKey != "" {
+				public := model.DeriveX25519Public(n.Tunnel.Reality.PrivateKey)
+				if n.Tunnel.Reality.PublicKey != "" && n.Tunnel.Reality.PublicKey != public {
+					return ErrInvalid
+				}
+				n.Tunnel.Reality.PublicKey = public
+			}
+			paired, err := clientTemplate(n)
+			if err != nil {
+				return err
+			}
+			n.ClientTunnel = paired
 		}
 		n.Revoked = false
 		st.Nodes[n.ID] = n
@@ -225,7 +470,7 @@ func (s *Store) SaveNode(n model.Node) (model.Node, error) {
 func (s *Store) RemoveNode(id string, remove bool) error {
 	return s.mutate("node.revoke", id, func(st *state) error {
 		n, ok := st.Nodes[id]
-		if !ok {
+		if !ok || n.Embedded {
 			return ErrInvalid
 		}
 		n.Revoked = true
@@ -281,7 +526,7 @@ func (s *Store) Enroll(id, token string) (string, error) {
 		return "", ErrAuth
 	}
 	credential := auth.Token()
-	if _, e = tx.Exec("INSERT OR REPLACE INTO credentials VALUES(?,?)", id, auth.Hash(credential)); e != nil {
+	if _, e = tx.Exec("INSERT OR REPLACE INTO credentials(node,hash,expires) VALUES(?,?,?)", id, auth.Hash(credential), time.Now().Add(30*24*time.Hour).Unix()); e != nil {
 		return "", e
 	}
 	return credential, tx.Commit()
@@ -292,7 +537,8 @@ func (s *Store) authorized(st state, id, credential string) bool {
 		return false
 	}
 	var h string
-	return s.db.QueryRow("SELECT hash FROM credentials WHERE node=?", id).Scan(&h) == nil && h == auth.Hash(credential)
+	var expires int64
+	return s.db.QueryRow("SELECT hash,expires FROM credentials WHERE node=?", id).Scan(&h, &expires) == nil && h == auth.Hash(credential) && expires > time.Now().Unix()
 }
 func (s *Store) Snapshot(id, credential string) (model.Snapshot, error) {
 	s.mu.Lock()
@@ -305,6 +551,10 @@ func (s *Store) Snapshot(id, credential string) (model.Snapshot, error) {
 		return model.Snapshot{}, ErrAuth
 	}
 	currentNode := st.Nodes[id]
+	currentNode.ClientTunnel = nil
+	if currentNode.Role == "client" {
+		currentNode.Tunnel = model.LocalTLS{}
+	}
 	out := model.Snapshot{Revision: st.Revision, Node: currentNode, Nodes: []model.Node{}, Bindings: []model.Binding{}, Mappings: []model.Mapping{}}
 	peers := map[string]bool{}
 	for bid, b := range st.Bindings {
@@ -325,20 +575,18 @@ func (s *Store) Snapshot(id, credential string) (model.Snapshot, error) {
 			}
 		}
 	}
-	if currentNode.Role == "client" {
-		for _, b := range out.Bindings {
-			if serverNode, ok := st.Nodes[b.ServerID]; ok {
-				currentNode.Tunnel = model.DeriveClientTunnel(currentNode.Tunnel, serverNode.Tunnel, serverNode)
-				break
-			}
-		}
-		out.Node = currentNode
-	}
 	for peer := range peers {
 		peerNode := st.Nodes[peer]
 		if id != peer {
-			peerNode.Tunnel.Reality.PrivateKey = ""
+			// Send public endpoints and the persisted template, never local bind data.
+			peerNode.Tunnel, e = publicTunnel(peerNode)
+			if e != nil {
+				return model.Snapshot{}, e
+			}
+			peerNode.Tunnel.ListenHost = ""
+			peerNode.Tunnel.ListenPort = 0
 		}
+		peerNode.ClientTunnel = nil
 		out.Nodes = append(out.Nodes, peerNode)
 	}
 	return out, nil
@@ -368,52 +616,6 @@ func (s *Store) Heartbeat(id, credential string, applied int64, failed bool) (in
 	_, e = s.db.Exec("UPDATE config SET data=? WHERE id=1", b)
 	return st.Revision, e
 }
-func (s *Store) Bindings() ([]model.Binding, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	st, e := s.load()
-	out := []model.Binding{}
-	for _, b := range st.Bindings {
-		b.UUID = ""
-		out = append(out, b)
-	}
-	return out, e
-}
-func (s *Store) SaveBinding(b model.Binding) (model.Binding, error) {
-	b.ID = auth.Token()
-	b.UUID = ""
-	b.Domain = "b-" + strings.ToLower(auth.Hash(b.ID)[:24]) + ".veilink.internal"
-	e := s.mutate("binding.create", b.ID, func(st *state) error {
-		a, ok := st.Nodes[b.ServerID]
-		c, ok2 := st.Nodes[b.ClientID]
-		if !ok || !ok2 || a.Role != "server" || c.Role != "client" || a.Revoked || c.Revoked {
-			return ErrInvalid
-		}
-		for _, old := range st.Bindings {
-			if old.ServerID == b.ServerID && old.ClientID == b.ClientID {
-				return ErrInvalid
-			}
-		}
-		u := make([]byte, 16)
-		if _, e := rand.Read(u); e != nil {
-			return e
-		}
-		u[6] = (u[6] & 15) | 64
-		u[8] = (u[8] & 63) | 128
-		uuid := fmt.Sprintf("%x-%x-%x-%x-%x", u[:4], u[4:6], u[6:8], u[8:10], u[10:])
-		secret, e := auth.Seal(s.key, uuid)
-		if e != nil {
-			return e
-		}
-		st.Bindings[b.ID] = b
-		st.Secrets[b.ID] = secret
-		clientNode := st.Nodes[b.ClientID]
-		clientNode.Tunnel = model.DeriveClientTunnel(clientNode.Tunnel, a.Tunnel, a)
-		st.Nodes[b.ClientID] = clientNode
-		return nil
-	})
-	return b, e
-}
 func removeBinding(st *state, id string) {
 	delete(st.Bindings, id)
 	delete(st.Secrets, id)
@@ -422,15 +624,6 @@ func removeBinding(st *state, id string) {
 			delete(st.Mappings, mid)
 		}
 	}
-}
-func (s *Store) DeleteBinding(id string) error {
-	return s.mutate("binding.delete", id, func(st *state) error {
-		if _, ok := st.Bindings[id]; !ok {
-			return ErrInvalid
-		}
-		removeBinding(st, id)
-		return nil
-	})
 }
 func (s *Store) Mappings() ([]model.Mapping, error) {
 	s.mu.Lock()
@@ -443,12 +636,37 @@ func (s *Store) Mappings() ([]model.Mapping, error) {
 	return out, e
 }
 func host(h string) bool {
-	if h == "" || len(h) > 253 || strings.ContainsAny(h, " /\\\t\r\n:@") {
-		return net.ParseIP(h) != nil
+	if net.ParseIP(h) != nil {
+		return true
+	}
+	if len(h) == 0 || len(h) > 253 || strings.ToLower(h) != h {
+		return false
+	}
+	for _, label := range strings.Split(h, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, c := range label {
+			if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+				return false
+			}
+		}
 	}
 	return true
 }
+func listenOverlap(a, b string) bool {
+	a, b = listenHostForStore(a), listenHostForStore(b)
+	aIP, bIP := net.ParseIP(a), net.ParseIP(b)
+	return aIP != nil && bIP != nil && (aIP.Equal(bIP) || aIP.IsUnspecified() || bIP.IsUnspecified())
+}
 func wildcard(h string) bool { return h == "" || h == "0.0.0.0" || h == "::" }
+func listenHostForStore(h string) string {
+	if h == "" {
+		return "127.0.0.1"
+	}
+	return h
+}
+
 func mappingNet(s string) string {
 	if strings.EqualFold(strings.TrimSpace(s), "udp") {
 		return "udp"
@@ -458,16 +676,35 @@ func mappingNet(s string) string {
 
 func validate(st *state) error {
 	for id, m := range st.Mappings {
+		if _, err := m.EffectiveMuxType(); err != nil {
+			return ErrInvalid
+		}
 		b, ok := st.Bindings[m.BindingID]
 		if !ok || m.Name == "" || len(m.Name) > 128 || (m.Network != "" && m.Network != "tcp" && m.Network != "udp") || m.ListenPort < 1 || m.ListenPort > 65535 || m.TargetPort < 1 || m.TargetPort > 65535 || !host(m.TargetHost) || net.ParseIP(m.ListenHost) == nil {
 			return ErrInvalid
 		}
+		if m.ServerID != b.ServerID || m.ClientID != b.ClientID || m.Pool < 1 || m.Pool > 32 || st.Nodes[b.ServerID].Role != "server" || st.Nodes[b.ClientID].Role != "client" {
+			return ErrInvalid
+		}
 		n := st.Nodes[b.ServerID]
-		if mappingNet(m.Network) != "udp" && m.ListenPort == n.Port {
+		// Even disabled mappings create a live binding. Do not attach one to
+		// an unconfigured server, or clear settings while it remains bound.
+		if n.Tunnel == (model.LocalTLS{}) || validateTunnel("server", n.Tunnel) != nil {
+			return ErrInvalid
+		}
+		if n.Tunnel.ListenPort == 0 {
+			return ErrInvalid
+		}
+		transportNet := "tcp"
+		if n.Tunnel.Hysteria2.Enabled() {
+			transportNet = "udp"
+		}
+		transportHost := listenHostForStore(n.Tunnel.ListenHost)
+		if m.Enabled && mappingNet(m.Network) == transportNet && m.ListenPort == n.Tunnel.ListenPort && listenOverlap(m.ListenHost, transportHost) {
 			return ErrInvalid
 		}
 		for oid, o := range st.Mappings {
-			if oid != id && m.Enabled && o.Enabled && st.Bindings[o.BindingID].ServerID == b.ServerID && o.ListenPort == m.ListenPort && mappingNet(o.Network) == mappingNet(m.Network) && (o.ListenHost == m.ListenHost || wildcard(o.ListenHost) || wildcard(m.ListenHost)) {
+			if oid != id && m.Enabled && o.Enabled && st.Bindings[o.BindingID].ServerID == b.ServerID && o.ListenPort == m.ListenPort && mappingNet(o.Network) == mappingNet(m.Network) && listenOverlap(o.ListenHost, m.ListenHost) {
 				return ErrInvalid
 			}
 		}
@@ -475,26 +712,59 @@ func validate(st *state) error {
 	return nil
 }
 func (s *Store) SaveMapping(m model.Mapping) (model.Mapping, error) {
-	m.Network = mappingNet(m.Network)
+	network := strings.ToLower(strings.TrimSpace(m.Network))
+	if network != "" && network != "tcp" && network != "udp" {
+		return m, ErrInvalid
+	}
+	m.Network = mappingNet(network)
+	muxType, err := m.EffectiveMuxType()
+	if err != nil {
+		return m, ErrInvalid
+	}
+	m.MuxType = muxType
+	if m.BindingID != "" || m.ServerID == "" || m.ClientID == "" || m.Pool < 1 || m.Pool > 32 {
+		return m, ErrInvalid
+	}
 	if m.ID == "" {
 		m.ID = auth.Token()
 	}
 	e := s.mutate("mapping.save", m.ID, func(st *state) error {
-		b, ok := st.Bindings[m.BindingID]
-		if !ok || st.Nodes[b.ServerID].Revoked || st.Nodes[b.ClientID].Revoked {
+		old := st.Mappings[m.ID]
+		if !validPair(st, m.ServerID, m.ClientID) {
 			return ErrInvalid
 		}
+		for _, b := range st.Bindings {
+			if b.ServerID == m.ServerID && b.ClientID == m.ClientID {
+				m.BindingID = b.ID
+				break
+			}
+		}
+		if m.BindingID == "" {
+			b, err := s.createBinding(st, m.ServerID, m.ClientID)
+			if err != nil {
+				return err
+			}
+			m.BindingID = b.ID
+		}
 		st.Mappings[m.ID] = m
-		return validate(st)
+		if err := validate(st); err != nil {
+			return err
+		}
+		if old.BindingID != "" && old.BindingID != m.BindingID {
+			cleanupBinding(st, old.BindingID)
+		}
+		return nil
 	})
 	return m, e
 }
 func (s *Store) DeleteMapping(id string) error {
 	return s.mutate("mapping.delete", id, func(st *state) error {
-		if _, ok := st.Mappings[id]; !ok {
+		m, ok := st.Mappings[id]
+		if !ok {
 			return ErrInvalid
 		}
 		delete(st.Mappings, id)
+		cleanupBinding(st, m.BindingID)
 		return nil
 	})
 }

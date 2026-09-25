@@ -1,7 +1,0 @@
-# Paths are relative to the process working directory, not this YAML file.
-database: .local/master/veilink.db
-deployment_key: .local/master/veilink.key
-# Web panel and node gRPC share this TLS port.
-bind_addr: 127.0.0.1:8443
-control_cert: .local/certs/cert.pem
-control_key: .local/certs/key.pem

@@ -3,12 +3,12 @@ package master
 import (
 	"context"
 	"crypto/tls"
-	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,7 +16,8 @@ import (
 	"veilink/internal/model"
 	"veilink/internal/store"
 )
-func TestEmbeddedServerLifecycleAndAutoAdmin(t *testing.T) {
+
+func TestEmbeddedServerLifecycleAndRegistration(t *testing.T) {
 	dir := t.TempDir()
 	cert, key := writeCert(t, dir)
 
@@ -37,31 +38,11 @@ func TestEmbeddedServerLifecycleAndAutoAdmin(t *testing.T) {
 
 	dbPath := filepath.Join(dir, "veilink.db")
 	keyPath := filepath.Join(dir, "veilink.key")
-	cfgPath := filepath.Join(dir, "master.yaml")
-
-	body := fmt.Sprintf(`
-database: %s
-deployment_key: %s
-bind_addr: %s
-state_dir: %s
-control_cert: %s
-control_key: %s
-embedded_server:
-  enabled: true
-  name: "integrated-gateway"
-  port: %d
-  address: "127.0.0.1"
-  server_name: "localhost"
-`, quote(dbPath), quote(keyPath), quote(masterAddr), quote(filepath.Join(dir, "state")), quote(cert), quote(key), serverPort)
-
-	if err := os.WriteFile(cfgPath, []byte(body), 0600); err != nil {
-		t.Fatal(err)
-	}
 
 	t.Setenv("VEILINK_INIT_ADMIN_PASSWORD", "SuperSecureAdminPassword123!")
 	t.Setenv("VEILINK_INIT_ADMIN_USERNAME", "admin-root")
 
-	c, err := config.Load(cfgPath)
+	c, err := config.ParseFlags("master", []string{"-database", dbPath, "-deployment-key", keyPath, "-listen-addr", masterAddr, "-state-dir", filepath.Join(dir, "state"), "-scheme=https", "-cert-file", cert, "-key-file", key, "-embedded-server-enabled", "-embedded-server-name=integrated-gateway", "-embedded-server-port", strconv.Itoa(serverPort), "-embedded-server-address=127.0.0.1", "-embedded-server-server-name=localhost"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +75,7 @@ embedded_server:
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	// 2. Verify auto-admin initialization in database
+	// Environment bootstrap is ignored; only public registration creates admin.
 	s, err := store.Open(dbPath, keyPath)
 	if err != nil {
 		t.Fatal(err)
@@ -105,11 +86,16 @@ embedded_server:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !hasAdmin {
-		t.Fatalf("expected admin to be auto-initialized")
+	if hasAdmin || s.Login("admin-root", "SuperSecureAdminPassword123!") {
+		t.Fatal("environment created administrator")
 	}
-	if !s.Login("admin-root", "SuperSecureAdminPassword123!") {
-		t.Fatalf("admin login verification failed")
+	resp, err := httpClient.Post("https://"+masterAddr+"/api/register", "application/json", strings.NewReader(`{"username":"admin-root","password":"SuperSecureAdminPassword123!"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 201 || !s.Login("admin-root", "SuperSecureAdminPassword123!") {
+		t.Fatal("registration failed")
 	}
 
 	// 3. Verify embedded server node auto-registration and heartbeat in database
@@ -129,9 +115,30 @@ embedded_server:
 		t.Fatalf("embedded server node was not registered or last_seen not updated")
 	}
 
-	// 4. Create client and binding so the server has active bindings to listen for
+	// 4. Configure tunnel PEM in the database, as Web does, then add a mapping.
 	embeddedNode, _, err := s.FindNodeByName("integrated-gateway")
 	if err != nil {
+		t.Fatal(err)
+	}
+	if embeddedNode.Tunnel != (model.LocalTLS{ListenPort: serverPort}) {
+		t.Fatal("embedded initialization must contain only the explicit tunnel listen port")
+	}
+	serverAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(serverPort))
+	if conn, err := net.DialTimeout("tcp", serverAddr, 200*time.Millisecond); err == nil {
+		conn.Close()
+		t.Fatal("unconfigured embedded tunnel is listening")
+	}
+	tunnelCert, tunnelKey := writeCert(t, t.TempDir())
+	certPEM, err := os.ReadFile(tunnelCert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM, err := os.ReadFile(tunnelKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	embeddedNode.Tunnel = model.LocalTLS{ListenPort: serverPort, TransportSecurity: "tls", CertPEM: string(certPEM), KeyPEM: string(keyPEM)}
+	if _, err := s.SaveNode(embeddedNode); err != nil {
 		t.Fatal(err)
 	}
 	clientNode, err := s.SaveNode(model.Node{
@@ -141,9 +148,10 @@ embedded_server:
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = s.SaveBinding(model.Binding{
-		ServerID: embeddedNode.ID,
-		ClientID: clientNode.ID,
+	_, err = s.SaveMapping(model.Mapping{
+		Name: "test-route", ServerID: embeddedNode.ID, ClientID: clientNode.ID,
+		Pool: 1, ListenHost: "127.0.0.1", ListenPort: 10080,
+		TargetHost: "127.0.0.1", TargetPort: 80, Enabled: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -152,7 +160,6 @@ embedded_server:
 	// 5. Verify embedded server starts listening on its allocated port (heartbeat cycle is 10s)
 	portDeadline := time.Now().Add(15 * time.Second)
 	var serverPortOpen bool
-	serverAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(serverPort))
 	for time.Now().Before(portDeadline) {
 		conn, err := net.DialTimeout("tcp", serverAddr, 200*time.Millisecond)
 		if err == nil {
@@ -191,24 +198,8 @@ func TestEmbeddedServerDisabled(t *testing.T) {
 
 	dbPath := filepath.Join(dir, "veilink.db")
 	keyPath := filepath.Join(dir, "veilink.key")
-	cfgPath := filepath.Join(dir, "master.yaml")
 
-	body := fmt.Sprintf(`
-database: %s
-deployment_key: %s
-bind_addr: %s
-state_dir: %s
-control_cert: %s
-control_key: %s
-embedded_server:
-  enabled: false
-`, quote(dbPath), quote(keyPath), quote(masterAddr), quote(filepath.Join(dir, "state")), quote(cert), quote(key))
-
-	if err := os.WriteFile(cfgPath, []byte(body), 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	c, err := config.Load(cfgPath)
+	c, err := config.ParseFlags("master", []string{"-database", dbPath, "-deployment-key", keyPath, "-listen-addr", masterAddr, "-state-dir", filepath.Join(dir, "state"), "-scheme=https", "-cert-file", cert, "-key-file", key, "-embedded-server-enabled=false"})
 	if err != nil {
 		t.Fatal(err)
 	}

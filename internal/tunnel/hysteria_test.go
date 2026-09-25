@@ -11,7 +11,7 @@ func TestHysteriaReverse(t *testing.T) {
 	serverLocal, clientLocal := files, files
 	serverLocal.Hysteria2.Password = "pool-secret"
 	clientLocal.Hysteria2.Password = "pool-secret"
-	clientLocal.Pool = 2
+	clientSnap.Mappings[0].Pool = 2
 	run(t, serverSnap, serverLocal)
 	run(t, clientSnap, clientLocal)
 	awaitEcho(t, serverSnap.Mappings[0].ListenPort)

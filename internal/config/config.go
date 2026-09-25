@@ -2,145 +2,119 @@ package config
 
 import (
 	"errors"
-	"gopkg.in/yaml.v3"
-	"io"
+	"flag"
 	"net"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strconv"
-	"strings"
-	"veilink/internal/model"
-	"veilink/internal/tunnel"
 )
 
 type EmbeddedServerConfig struct {
-	Enabled    bool           `yaml:"enabled"`
-	Name       string         `yaml:"name"`
-	Address    string         `yaml:"address"`
-	Port       int            `yaml:"port"`
-	ServerName string         `yaml:"server_name"`
-	StateDir   string         `yaml:"state_dir"`
-	TLS        model.LocalTLS `yaml:"tls"`
+	Enabled    bool
+	Name       string
+	Address    string
+	Port       int
+	ServerName string
+	StateDir   string
 }
 
 type Config struct {
-	Database          string               `yaml:"database"`
-	DeploymentKey     string               `yaml:"deployment_key"`
-	BindAddr          string               `yaml:"bind_addr"`
-	HTMLDir           string               `yaml:"html_dir"`
-	ControlCert       string               `yaml:"control_cert"`
-	ControlKey        string               `yaml:"control_key"`
-	TLSMode           string               `yaml:"tls_mode"`
-	ControlCA         string               `yaml:"control_ca"`
-	ControlServerName string               `yaml:"control_server_name"`
-	MasterAddr        string               `yaml:"master_addr"`
-	NodeID            string               `yaml:"node_id"`
-	EnrollToken       string               `yaml:"enroll_token"`
-	StateDir          string               `yaml:"state_dir"`
-	Pool              int                  `yaml:"pool"`
-	TLS               model.LocalTLS       `yaml:"tls"`
-	EmbeddedServer    EmbeddedServerConfig `yaml:"embedded_server"`
+	Database          string
+	DeploymentKey     string
+	ListenAddr        string
+	HTMLDir           string
+	CertFile          string
+	KeyFile           string
+	Scheme            string
+	ControlCA         string
+	ControlServerName string
+	MasterAddr        string
+	NodeID            string
+	EnrollToken       string
+	StateDir          string
+	EmbeddedServer    EmbeddedServerConfig
+
+	// explicit tracks visited CLI flags; defaults never overwrite stored settings.
+	explicit map[string]bool
 }
 
-func (c Config) EffectiveTLSMode() string {
-	switch strings.ToLower(strings.TrimSpace(c.TLSMode)) {
-	case "https":
-		return "https"
-	case "http":
-		return "http"
+func Defaults() Config {
+	return Config{Database: "/data/veilink.db", DeploymentKey: "/data/veilink.key", ListenAddr: "127.0.0.1:8443", Scheme: "http", StateDir: "/data/state", explicit: make(map[string]bool)}
+}
+
+// ParseFlags accepts only flags belonging to the requested role. Visited flags,
+// including false and empty values, take precedence over persisted master settings.
+func ParseFlags(role string, args []string) (Config, error) {
+	c := Defaults()
+	f := flag.NewFlagSet(role, flag.ContinueOnError)
+	f.Usage = func() {
+		_, _ = f.Output().Write([]byte("Usage: veilink " + role + " [flags]\nTunnel settings are managed in the Master Web UI, not local flags: TLS needs matching certificate/CA/SNI; plain requires VLESS Encryption; REALITY needs matching public key/Short ID/name; Hysteria2 needs UDP, TLS and a shared password. Vision requires TCP + TLS/REALITY and may use encrypted fallback. -control-ca trusts Master HTTPS only, not tunnel TLS.\n"))
+		f.PrintDefaults()
+	}
+	fields := make(map[string]string)
+	stringFlag := func(name, field string, dst *string) {
+		f.StringVar(dst, name, *dst, "")
+		fields[name] = field
+	}
+	switch role {
+	case "master":
+		stringFlag("database", "database", &c.Database)
+		stringFlag("deployment-key", "deployment_key", &c.DeploymentKey)
+		stringFlag("listen-addr", "listen_addr", &c.ListenAddr)
+		stringFlag("scheme", "scheme", &c.Scheme)
+		stringFlag("cert-file", "cert_file", &c.CertFile)
+		stringFlag("key-file", "key_file", &c.KeyFile)
+		stringFlag("html-dir", "html_dir", &c.HTMLDir)
+		stringFlag("state-dir", "state_dir", &c.StateDir)
+		stringFlag("control-ca", "control_ca", &c.ControlCA)
+		stringFlag("control-server-name", "control_server_name", &c.ControlServerName)
+		f.BoolVar(&c.EmbeddedServer.Enabled, "embedded-server-enabled", c.EmbeddedServer.Enabled, "")
+		fields["embedded-server-enabled"] = "embedded_server.enabled"
+		stringFlag("embedded-server-name", "embedded_server.name", &c.EmbeddedServer.Name)
+		stringFlag("embedded-server-address", "embedded_server.address", &c.EmbeddedServer.Address)
+		f.IntVar(&c.EmbeddedServer.Port, "embedded-server-port", c.EmbeddedServer.Port, "")
+		fields["embedded-server-port"] = "embedded_server.port"
+		stringFlag("embedded-server-server-name", "embedded_server.server_name", &c.EmbeddedServer.ServerName)
+		stringFlag("embedded-server-state-dir", "embedded_server.state_dir", &c.EmbeddedServer.StateDir)
+	case "server", "client":
+		stringFlag("master-addr", "master_addr", &c.MasterAddr)
+		stringFlag("node-id", "node_id", &c.NodeID)
+		stringFlag("enroll-token", "enroll_token", &c.EnrollToken)
+		stringFlag("state-dir", "state_dir", &c.StateDir)
+		stringFlag("control-ca", "control_ca", &c.ControlCA)
+		stringFlag("control-server-name", "control_server_name", &c.ControlServerName)
 	default:
-		if c.ControlCert != "" && c.ControlKey != "" {
-			return "https"
-		}
-		return "http"
+		return c, errors.New("unknown command")
 	}
-}
-
-func Load(path string) (Config, error) {
-	c := Config{Database: "veilink.db", DeploymentKey: "veilink.key", BindAddr: "127.0.0.1:8443", StateDir: "state"}
-	if path == "" {
-		if e := env(reflect.ValueOf(&c).Elem(), "VEILINK_"); e != nil {
-			return c, e
-		}
-		return c, nil
+	if err := f.Parse(args); err != nil {
+		return c, err
 	}
-	f, e := os.Open(path)
-	if e != nil {
-		if os.IsNotExist(e) && path == "veilink.yaml" {
-			if e := env(reflect.ValueOf(&c).Elem(), "VEILINK_"); e != nil {
-				return c, e
-			}
-			return c, nil
-		}
-		return c, e
+	if f.NArg() != 0 {
+		return c, errors.New("unexpected positional arguments")
 	}
-	defer f.Close()
-	d := yaml.NewDecoder(io.LimitReader(f, 1<<20))
-	d.KnownFields(true)
-	if e = d.Decode(&c); e != nil {
-		return c, e
-	}
-	var extra any
-	if e = d.Decode(&extra); e != io.EOF {
-		return c, errors.New("configuration must contain one YAML document")
-	}
-	if e = env(reflect.ValueOf(&c).Elem(), "VEILINK_"); e != nil {
-		return c, e
-	}
+	f.Visit(func(v *flag.Flag) { c.explicit[fields[v.Name]] = true })
 	return c, nil
 }
-func env(v reflect.Value, prefix string) error {
-	t := v.Type()
-	for i := 0; i < v.NumField(); i++ {
-		f := v.Field(i)
-		key := prefix + strings.ToUpper(t.Field(i).Tag.Get("yaml"))
-		if f.Kind() == reflect.Struct {
-			if e := env(f, key+"_"); e != nil {
-				return e
-			}
-			continue
-		}
-		if value, ok := os.LookupEnv(key); ok {
-			switch f.Kind() {
-			case reflect.Bool:
-				b, e := strconv.ParseBool(value)
-				if e != nil {
-					return errors.New("invalid boolean environment override")
-				}
-				f.SetBool(b)
-			case reflect.Int, reflect.Int64:
-				n, e := strconv.ParseInt(value, 10, 64)
-				if e != nil {
-					return errors.New("invalid integer environment override")
-				}
-				f.SetInt(n)
-			default:
-				f.SetString(value)
-			}
-		}
-	}
-	return nil
-}
+
 func (c Config) Validate(role string) error {
-	if role != "client" && c.Pool != 0 {
-		return errors.New("pool is client-only")
-	}
-	if c.Pool < 0 || c.Pool > 32 {
-		return errors.New("pool must be from 1 to 32")
+	if (c.Scheme == "" && c.explicit["scheme"]) || (c.Scheme != "" && c.Scheme != "http" && c.Scheme != "https") {
+		return errors.New("scheme must be http or https")
 	}
 	if role == "master" {
-		mode := c.EffectiveTLSMode()
-		if mode == "https" {
-			if c.ControlCert == "" || c.ControlKey == "" {
-				return errors.New("control TLS certificate and key required")
-			}
+		if c.Database == "" || c.DeploymentKey == "" {
+			return errors.New("database and deployment_key bootstrap paths required")
 		}
-		bindHost, bindPortStr, e := net.SplitHostPort(c.BindAddr)
+		if c.Scheme == "https" && (c.CertFile == "" || c.KeyFile == "") {
+			return errors.New("HTTPS cert_file and key_file required")
+		}
+		_, listenPortStr, e := net.SplitHostPort(c.ListenAddr)
 		if e != nil {
 			return e
 		}
-		bindPort, _ := strconv.Atoi(bindPortStr)
+		listenPort, e := strconv.Atoi(listenPortStr)
+		if e != nil || listenPort < 0 || listenPort > 65535 {
+			return errors.New("master listen_addr must have a numeric port from 0 to 65535")
+		}
 		if c.HTMLDir != "" {
 			info, e := os.Stat(filepath.Join(c.HTMLDir, "index.html"))
 			if e != nil || info.IsDir() {
@@ -155,18 +129,8 @@ func (c Config) Validate(role string) error {
 			if srvPort == 0 {
 				srvPort = 8444
 			}
-			srvHost := c.EmbeddedServer.TLS.ListenHost
-			if srvHost == "" {
-				srvHost = "0.0.0.0"
-			}
-			if srvPort == bindPort && (bindHost == "" || bindHost == "0.0.0.0" || srvHost == "0.0.0.0" || bindHost == srvHost) {
-				return errors.New("embedded_server port collides with master bind_addr")
-			}
-			srvTLS := c.EmbeddedServer.TLS
-			if srvTLS.CertFile != "" || srvTLS.Reality.Enabled() || srvTLS.Hysteria2.Enabled() {
-				if err := tunnel.CheckBootstrap("server", srvTLS); err != nil {
-					return err
-				}
+			if srvPort == listenPort {
+				return errors.New("embedded_server port collides with master listen_addr")
 			}
 		}
 		return nil
@@ -177,11 +141,8 @@ func (c Config) Validate(role string) error {
 	if c.MasterAddr == "" || c.NodeID == "" || c.StateDir == "" {
 		return errors.New("master_addr, node_id and state_dir required")
 	}
-	if role == "server" || role == "client" {
-		if e := tunnel.CheckBootstrap(role, c.TLS); e != nil {
-			return e
-		}
+	if c.CertFile != "" || c.KeyFile != "" || c.explicit["cert_file"] || c.explicit["key_file"] {
+		return errors.New("cert_file and key_file are master-only; configure tunnel certificates in Web")
 	}
 	return nil
-
 }

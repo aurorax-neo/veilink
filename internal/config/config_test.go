@@ -1,86 +1,64 @@
 package config
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
 )
 
-func TestStrictAndEnv(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "config.yaml")
-	os.WriteFile(p, []byte("unknown: true\n"), 0600)
-	if _, e := Load(p); e == nil {
-		t.Fatal("unknown field accepted")
+func TestDefaultsAndFlags(t *testing.T) {
+	c := Defaults()
+	if c.Database != "/data/veilink.db" || c.DeploymentKey != "/data/veilink.key" || c.StateDir != "/data/state" || c.ListenAddr != "127.0.0.1:8443" || c.Scheme != "http" {
+		t.Fatalf("defaults: %+v", c)
 	}
-	os.WriteFile(p, []byte("node_id: test\nmaster_addr: localhost:8443\n"), 0600)
-	t.Setenv("VEILINK_NODE_ID", "override")
-	c, e := Load(p)
-	if e != nil || c.NodeID != "override" {
-		t.Fatal(c, e)
+	t.Setenv("VEILINK_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
+	t.Setenv("VEILINK_SCHEME", "https")
+	t.Setenv("VEILINK_LISTEN_ADDR", "0.0.0.0:65536")
+	t.Setenv("VEILINK_ENROLL_TOKEN", "ignored")
+	c, err := ParseFlags("master", nil)
+	if err != nil || c.Scheme != "http" || c.ListenAddr != "127.0.0.1:8443" {
+		t.Fatal(c, err)
 	}
-	if e = c.Validate("client"); e != nil {
-		t.Fatal(e)
+	c, err = ParseFlags("master", []string{"-listen-addr", "127.0.0.1:9443", "-control-server-name", "panel.example.com", "-control-ca", "/config/master-ca.pem", "-embedded-server-enabled", "-embedded-server-port", "9999", "-embedded-server-name", "gateway", "-embedded-server-address", "127.0.0.1", "-embedded-server-server-name", "localhost", "-embedded-server-state-dir", "/tmp/gateway"})
+	if err != nil || c.Validate("master") != nil || c.ControlServerName != "panel.example.com" || c.ControlCA != "/config/master-ca.pem" || !c.EmbeddedServer.Enabled || c.EmbeddedServer.Port != 9999 || c.EmbeddedServer.Name != "gateway" || c.EmbeddedServer.StateDir != "/tmp/gateway" {
+		t.Fatal(c, err)
 	}
-	c.ControlCert = "cert"
-	c.ControlKey = "key"
-	if e = c.Validate("master"); e != nil {
-		t.Fatal(e)
+	node, err := ParseFlags("client", []string{"-master-addr", "localhost:8443", "-node-id", "node", "-enroll-token", "secret", "-state-dir", "/tmp/node", "-control-ca", "/tmp/ca", "-control-server-name", "localhost"})
+	if err != nil || node.Validate("client") != nil || node.EnrollToken != "secret" || node.ControlCA != "/tmp/ca" || node.ControlServerName != "localhost" {
+		t.Fatal(node, err)
 	}
-	c.Pool = 4
-	if c.Validate("master") == nil {
-		t.Fatal("server pool accepted")
-	}
-	c.Pool = 0
-	if e = c.Validate("client"); e != nil {
-		t.Fatal(e)
-	}
-	c.Pool = 64
-	if c.Validate("client") == nil {
-		t.Fatal("oversized pool accepted")
-	}
-}
-func TestEmbeddedServerEnvOverrides(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "config.yaml")
-	os.WriteFile(p, []byte("bind_addr: 127.0.0.1:8443\ncontrol_cert: cert.pem\ncontrol_key: key.pem\n"), 0600)
-	t.Setenv("VEILINK_EMBEDDED_SERVER_ENABLED", "true")
-	t.Setenv("VEILINK_EMBEDDED_SERVER_NAME", "my-gateway")
-	t.Setenv("VEILINK_EMBEDDED_SERVER_PORT", "9999")
-	t.Setenv("VEILINK_EMBEDDED_SERVER_ADDRESS", "192.168.1.100")
-	t.Setenv("VEILINK_EMBEDDED_SERVER_SERVER_NAME", "gateway.example.com")
-
-	c, err := Load(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !c.EmbeddedServer.Enabled {
-		t.Errorf("expected Enabled to be true, got %v", c.EmbeddedServer.Enabled)
-	}
-	if c.EmbeddedServer.Name != "my-gateway" {
-		t.Errorf("expected Name to be my-gateway, got %q", c.EmbeddedServer.Name)
-	}
-	if c.EmbeddedServer.Port != 9999 {
-		t.Errorf("expected Port to be 9999, got %d", c.EmbeddedServer.Port)
-	}
-	if c.EmbeddedServer.Address != "192.168.1.100" {
-		t.Errorf("expected Address to be 192.168.1.100, got %q", c.EmbeddedServer.Address)
-	}
-	if c.EmbeddedServer.ServerName != "gateway.example.com" {
-		t.Errorf("expected ServerName to be gateway.example.com, got %q", c.EmbeddedServer.ServerName)
+	node, err = ParseFlags("server", []string{"-master-addr", "localhost:8443", "-node-id", "node"})
+	if err != nil || node.EnrollToken != "" || node.StateDir != "/data/state" {
+		t.Fatal(node, err)
 	}
 }
 
-func TestEffectiveTLSMode(t *testing.T) {
-	tests := []struct{ mode, cert, key, want string }{
-		{"", "", "", "http"},
-		{"", "c.pem", "k.pem", "https"},
-		{"http", "c.pem", "k.pem", "http"},
-		{"https", "c.pem", "k.pem", "https"},
-		{"HTTPS", "", "", "https"},
-	}
-	for _, tt := range tests {
-		c := Config{TLSMode: tt.mode, ControlCert: tt.cert, ControlKey: tt.key}
-		if got := c.EffectiveTLSMode(); got != tt.want {
-			t.Errorf("TLSMode=%q cert=%q key=%q: got %q want %q", tt.mode, tt.cert, tt.key, got, tt.want)
+func TestRemovedAndWrongRoleFlags(t *testing.T) {
+	for _, tc := range []struct {
+		role string
+		args []string
+	}{
+		{"master", []string{"-config", "old.yaml"}}, {"client", []string{"-config=old.yaml"}}, {"init-admin", []string{"-config", "old.yaml"}},
+		{"server", []string{"-database", "db"}}, {"client", []string{"-cert-file", "cert"}}, {"master", []string{"-enroll-token", "secret"}},
+		{"master", []string{"-embedded-server-port", "bad"}}, {"master", []string{"-embedded-server-enabled=bad"}}, {"master", []string{"stray"}},
+	} {
+		if _, err := ParseFlags(tc.role, tc.args); err == nil {
+			t.Errorf("%s %v accepted", tc.role, tc.args)
 		}
+	}
+}
+
+func TestSchemeExplicitAndValidated(t *testing.T) {
+	for _, scheme := range []string{"http", "https", "HTTPS", "auto", "ftp", ""} {
+		c, err := ParseFlags("master", []string{"-scheme=" + scheme, "-cert-file=cert", "-key-file=key"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Validate("master"); (err == nil) != (scheme == "http" || scheme == "https") {
+			t.Fatalf("scheme %q: %v", scheme, err)
+		}
+	}
+	c, _ := ParseFlags("master", []string{"-scheme=https"})
+	if c.Validate("master") == nil {
+		t.Fatal("HTTPS without certificate accepted")
 	}
 }

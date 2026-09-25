@@ -3,24 +3,43 @@ package model
 
 import (
 	"crypto/ecdh"
+	"crypto/mlkem"
 	"encoding/base64"
+	"strconv"
 	"strings"
 )
 
-// Node contains administrative metadata, never reusable secrets.
+// ConnectEndpoint is a public Client dial candidate for a Server. Host and Port
+// are the Client dial address, independent of the Server's local listen address.
+// ServerName is the independent TLS SNI; candidates preserve transport end to end.
+type ConnectEndpoint struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Host       string `json:"host"`
+	Port       int    `json:"port"`
+	ServerName string `json:"server_name"`
+	Priority   int    `json:"priority"`
+	Enabled    bool   `json:"enabled"`
+}
+
+// Node contains master-managed metadata and role-scoped tunnel configuration.
 type Node struct {
-	ID              string `json:"id"`
-	Name            string `json:"name"`
-	Role            string `json:"role"`
-	Address         string `json:"address"` // server dial hostname or IP
-	Port            int    `json:"port"`
-	ServerName      string `json:"server_name"`
-	Revoked         bool   `json:"revoked"`
-	DesiredRevision int64  `json:"desired_revision"`
-	AppliedRevision int64  `json:"applied_revision"`
-	LastSeen        int64  `json:"last_seen"`
-	Error           string `json:"error"`
-	Tunnel          LocalTLS `json:"tunnel"`
+	ID               string            `json:"id"`
+	Name             string            `json:"name"`
+	Role             string            `json:"role"`
+	Address          string            `json:"address"` // compatibility/default connect endpoint
+	Port             int               `json:"port"`
+	ServerName       string            `json:"server_name"`
+	ConnectEndpoints []ConnectEndpoint `json:"connect_endpoints,omitempty"`
+	Revoked          bool              `json:"revoked"`
+	DesiredRevision  int64             `json:"desired_revision"`
+	AppliedRevision  int64             `json:"applied_revision"`
+	LastSeen         int64             `json:"last_seen"`
+	Error            string            `json:"error"`
+	Tunnel           LocalTLS          `json:"tunnel"`
+	// ClientTunnel is the persisted, public client template owned by a server.
+	ClientTunnel *LocalTLS `json:"client_tunnel,omitempty"`
+	Embedded     bool      `json:"embedded"` // master-owned registration metadata
 }
 
 type Binding struct {
@@ -34,12 +53,17 @@ type Binding struct {
 type Mapping struct {
 	ID         string `json:"id"`
 	Name       string `json:"name"`
-	BindingID  string `json:"binding_id"`
+	BindingID  string `json:"binding_id,omitempty"`
+	ServerID   string `json:"server_id"`
+	ClientID   string `json:"client_id"`
 	ListenHost string `json:"listen_host"`
 	ListenPort int    `json:"listen_port"`
 	TargetHost string `json:"target_host"`
 	TargetPort int    `json:"target_port"`
 	Network    string `json:"network,omitempty"`
+	Pool       int    `json:"pool"`               // 1..32: shared sessions per binding (maximum of enabled mappings)
+	Mux        bool   `json:"mux"`                // TCP stream multiplexing; disabled by default
+	MuxType    string `json:"mux_type,omitempty"` // extensible implementation selector; ignored when mux is off
 	Enabled    bool   `json:"enabled"`
 }
 
@@ -52,33 +76,34 @@ type Snapshot struct {
 	Mappings []Mapping `json:"mappings"`
 }
 
-// LocalTLS paths are local bootstrap settings, never supplied by the master.
-// Flow and VLESS encryption are optional. Empty flow is ordinary VLESS. Empty
-// decryption/encryption means "none". Private decryption keys stay on the server.
+// LocalTLS contains Web-managed data-plane settings distributed in authorized snapshots.
+// Server Tunnel holds private settings; its ClientTunnel holds the paired public
+// settings. Client nodes have an empty Tunnel and consume their related servers.
 type LocalTLS struct {
-	CertFile   string    `json:"cert_file" yaml:"cert_file"`
-	KeyFile    string    `json:"key_file" yaml:"key_file"`
-	CAFile     string    `json:"ca_file" yaml:"ca_file"`
-	ListenHost string    `json:"listen_host" yaml:"listen_host"`
-	Flow       string    `json:"flow" yaml:"flow"`
-	Decryption string    `json:"decryption" yaml:"decryption"`
-	Encryption string    `json:"encryption" yaml:"encryption"`
-	Pool       int       `json:"pool,omitempty" yaml:"pool,omitempty"`
-	Reality    Reality   `json:"reality" yaml:"reality"`
-	Hysteria2  Hysteria2 `json:"hysteria2" yaml:"hysteria2"`
+	TransportSecurity string    `json:"transport_security,omitempty"` // tls or plain; empty clients inherit
+	CertPEM           string    `json:"cert_pem"`
+	KeyPEM            string    `json:"key_pem"`
+	CAPEM             string    `json:"ca_pem"`
+	ListenHost        string    `json:"listen_host"`
+	ListenPort        int       `json:"listen_port"`
+	Flow              string    `json:"flow"`
+	Decryption        string    `json:"decryption"`
+	Encryption        string    `json:"encryption"`
+	Reality           Reality   `json:"reality"`
+	Hysteria2         Hysteria2 `json:"hysteria2"`
 }
 
 // Reality is optional camouflage for the data plane. Private keys stay on the
 // server; the master never distributes them. An empty value keeps certificate TLS.
 type Reality struct {
-	Dest        string `json:"dest" yaml:"dest"`
-	PrivateKey  string `json:"private_key" yaml:"private_key"`
-	PublicKey   string `json:"public_key" yaml:"public_key"`
-	ShortID     string `json:"short_id" yaml:"short_id"`
-	ShortIDs    string `json:"short_ids" yaml:"short_ids"`
-	ServerNames string `json:"server_names" yaml:"server_names"`
-	Fingerprint string `json:"fingerprint" yaml:"fingerprint"`
-	MaxTimeDiff string `json:"max_time_diff" yaml:"max_time_diff"`
+	Dest        string `json:"dest"`
+	PrivateKey  string `json:"private_key"`
+	PublicKey   string `json:"public_key"`
+	ShortID     string `json:"short_id"`
+	ShortIDs    string `json:"short_ids"`
+	ServerNames string `json:"server_names"`
+	Fingerprint string `json:"fingerprint"`
+	MaxTimeDiff string `json:"max_time_diff"`
 }
 
 // Enabled reports whether any REALITY setting is present.
@@ -87,9 +112,9 @@ func (r Reality) Enabled() bool {
 }
 
 // Hysteria2 is an optional QUIC transport for the client-to-server data plane.
-// It uses the certificate files for QUIC TLS and cannot be combined with REALITY.
+// It uses certificate PEM for QUIC TLS and cannot be combined with REALITY.
 type Hysteria2 struct {
-	Password string `json:"password" yaml:"password"`
+	Password string `json:"password"`
 }
 
 // Enabled reports whether a Hysteria2 password is configured.
@@ -98,17 +123,23 @@ func (h Hysteria2) Enabled() bool { return strings.TrimSpace(h.Password) != "" }
 // Merge returns a new LocalTLS taking non-empty values from override over base.
 func (base LocalTLS) Merge(override LocalTLS) LocalTLS {
 	res := base
-	if override.CertFile != "" {
-		res.CertFile = override.CertFile
+	if override.TransportSecurity != "" {
+		res.TransportSecurity = override.TransportSecurity
 	}
-	if override.KeyFile != "" {
-		res.KeyFile = override.KeyFile
+	if override.CertPEM != "" {
+		res.CertPEM = override.CertPEM
 	}
-	if override.CAFile != "" {
-		res.CAFile = override.CAFile
+	if override.KeyPEM != "" {
+		res.KeyPEM = override.KeyPEM
+	}
+	if override.CAPEM != "" {
+		res.CAPEM = override.CAPEM
 	}
 	if override.ListenHost != "" {
 		res.ListenHost = override.ListenHost
+	}
+	if override.ListenPort != 0 {
+		res.ListenPort = override.ListenPort
 	}
 	if override.Flow != "" {
 		res.Flow = override.Flow
@@ -118,9 +149,6 @@ func (base LocalTLS) Merge(override LocalTLS) LocalTLS {
 	}
 	if override.Encryption != "" {
 		res.Encryption = override.Encryption
-	}
-	if override.Pool > 0 {
-		res.Pool = override.Pool
 	}
 	if override.Reality.Dest != "" {
 		res.Reality.Dest = override.Reality.Dest
@@ -173,63 +201,120 @@ func DeriveX25519Public(privateKey string) string {
 	return base64.RawURLEncoding.EncodeToString(k.PublicKey().Bytes())
 }
 
-// DeriveClientTunnel generates client tunnel settings from a server's tunnel settings and node metadata,
-// preserving any manual overrides already configured on the client.
-func DeriveClientTunnel(clientTunnel LocalTLS, serverTunnel LocalTLS, serverNode Node) LocalTLS {
-	res := clientTunnel
-	// 1. Flow
-	if res.Flow == "" && serverTunnel.Flow != "" {
-		res.Flow = serverTunnel.Flow
+// DeriveClientTunnel generates public settings solely from the authoritative
+// server configuration. Template customization and validation are separate.
+func DeriveClientTunnel(serverTunnel LocalTLS, serverNode Node) LocalTLS {
+	res := LocalTLS{
+		TransportSecurity: serverTunnel.TransportSecurity,
+		Flow:              serverTunnel.Flow,
+		CAPEM:             serverTunnel.CAPEM,
+		Hysteria2:         serverTunnel.Hysteria2,
+		Encryption:        serverTunnel.Encryption,
 	}
-	// 2. Encryption / Decryption
-	if res.Encryption == "" && serverTunnel.Decryption != "" {
-		res.Encryption = serverTunnel.Decryption
+	if serverTunnel.Decryption != "" {
+		res.Encryption = DeriveVLESSEncryption(serverTunnel.Decryption)
 	}
-	// 3. REALITY
-	if serverTunnel.Reality.Enabled() {
-		pubKey := serverTunnel.Reality.PublicKey
-		if pubKey == "" && serverTunnel.Reality.PrivateKey != "" {
-			pubKey = DeriveX25519Public(serverTunnel.Reality.PrivateKey)
+	if r := serverTunnel.Reality; r.Enabled() {
+		res.Reality.PublicKey = r.PublicKey
+		if r.PublicKey == "" && r.PrivateKey != "" {
+			res.Reality.PublicKey = DeriveX25519Public(r.PrivateKey)
 		}
-		if res.Reality.PublicKey == "" {
-			res.Reality.PublicKey = pubKey
-		}
+		res.Reality.ShortID = strings.TrimSpace(strings.Split(r.ShortIDs, ",")[0])
 		if res.Reality.ShortID == "" {
-			ids := strings.Split(serverTunnel.Reality.ShortIDs, ",")
-			if len(ids) > 0 && strings.TrimSpace(ids[0]) != "" {
-				res.Reality.ShortID = strings.TrimSpace(ids[0])
-			} else if serverTunnel.Reality.ShortID != "" {
-				res.Reality.ShortID = serverTunnel.Reality.ShortID
-			}
+			res.Reality.ShortID = r.ShortID
 		}
+		res.Reality.ServerNames = strings.TrimSpace(strings.Split(r.ServerNames, ",")[0])
 		if res.Reality.ServerNames == "" {
-			names := strings.Split(serverTunnel.Reality.ServerNames, ",")
-			if len(names) > 0 && strings.TrimSpace(names[0]) != "" {
-				res.Reality.ServerNames = strings.TrimSpace(names[0])
-			} else if serverNode.ServerName != "" {
-				res.Reality.ServerNames = serverNode.ServerName
-			}
+			res.Reality.ServerNames = serverNode.ServerName
 		}
+		res.Reality.Fingerprint = r.Fingerprint
 		if res.Reality.Fingerprint == "" {
-			if serverTunnel.Reality.Fingerprint != "" {
-				res.Reality.Fingerprint = serverTunnel.Reality.Fingerprint
-			} else {
-				res.Reality.Fingerprint = "chrome"
-			}
+			res.Reality.Fingerprint = "chrome"
 		}
-		if res.Reality.MaxTimeDiff == "" && serverTunnel.Reality.MaxTimeDiff != "" {
-			res.Reality.MaxTimeDiff = serverTunnel.Reality.MaxTimeDiff
-		}
+		res.Reality.MaxTimeDiff = r.MaxTimeDiff
 	}
-	// 4. Hysteria2
-	if serverTunnel.Hysteria2.Enabled() {
-		if res.Hysteria2.Password == "" {
-			res.Hysteria2.Password = serverTunnel.Hysteria2.Password
-		}
-	}
-	// 5. CAFile
-	if res.CAFile == "" && serverTunnel.CAFile != "" {
-		res.CAFile = serverTunnel.CAFile
-	}
+	// Trust is explicit: never promote the server's leaf certificate to a CA.
 	return res
+}
+
+// DeriveVLESSEncryption converts server key material to client public keys without
+// importing the tunnel runtime. Invalid keys or lifetimes produce no configuration.
+// Callers requiring full protocol/padding validation should use the error-returning
+// tunnel.DeriveClientTunnel helper. Ticket lifetimes become 0rtt or 1rtt.
+func DeriveVLESSEncryption(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "none" {
+		return raw
+	}
+	parts := strings.Split(raw, ".")
+	if len(parts) < 4 || parts[0] != "mlkem768x25519plus" {
+		return ""
+	}
+	switch parts[1] {
+	case "native", "xorpub", "random":
+	default:
+		return ""
+	}
+	// Protocol validation is performed by the native tunnel parser. Only public
+	// keys are ever emitted here, including for chained X25519/ML-KEM keys.
+	span := strings.SplitN(strings.TrimSuffix(parts[2], "s"), "-", 2)
+	from, err := strconv.ParseInt(span[0], 10, 64)
+	if err != nil || from < 0 {
+		return ""
+	}
+	to := from
+	if len(span) == 2 {
+		to, err = strconv.ParseInt(span[1], 10, 64)
+		if err != nil || to < from {
+			return ""
+		}
+	}
+	parts[2] = "0rtt"
+	if from == 0 && to == 0 {
+		parts[2] = "1rtt"
+	}
+	keys := 0
+	for i := 3; i < len(parts); i++ {
+		if len(parts[i]) < 20 && keys == 0 {
+			continue // optional padding parameters, before the keys only
+		}
+		rawKey, err := base64.RawURLEncoding.DecodeString(parts[i])
+		if err != nil {
+			return ""
+		}
+		var public []byte
+		switch len(rawKey) {
+		case 32:
+			key, err := ecdh.X25519().NewPrivateKey(rawKey)
+			if err != nil {
+				return ""
+			}
+			public = key.PublicKey().Bytes()
+		case 64:
+			key, err := mlkem.NewDecapsulationKey768(rawKey)
+			if err != nil {
+				return ""
+			}
+			public = key.EncapsulationKey().Bytes()
+		default:
+			return ""
+		}
+		parts[i] = base64.RawURLEncoding.EncodeToString(public)
+		keys++
+	}
+	if keys == 0 {
+		return ""
+	}
+	return strings.Join(parts, ".")
+}
+
+// PublicPeerTunnel exposes only public client-facing settings. It excludes local
+// certificate PEM, private keys, server-only fields, and the shared Hysteria2 password.
+// Authorized Hysteria2 snapshots must supply that credential separately; this
+// public view alone cannot describe or authenticate a Hysteria2 connection.
+func PublicPeerTunnel(serverTunnel LocalTLS, serverNode Node) LocalTLS {
+	peer := DeriveClientTunnel(serverTunnel, serverNode)
+	peer.CertPEM, peer.KeyPEM = "", ""
+	peer.Hysteria2 = Hysteria2{}
+	return peer
 }

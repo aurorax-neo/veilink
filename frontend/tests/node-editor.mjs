@@ -1,0 +1,513 @@
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import vm from 'node:vm'
+import { test } from 'node:test'
+import ts from 'typescript'
+import { computed, reactive, ref, watch } from 'vue'
+
+const source = path => readFileSync(new URL(path, import.meta.url), 'utf8')
+const transpile = text => ts.transpileModule(text, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText
+const formatContext = vm.createContext({ exports: {}, TextEncoder })
+vm.runInContext(transpile(source('../src/format.ts')), formatContext)
+const { validateNode, validatePEM, PEM_MAX_BYTES } = formatContext.exports
+const editorSource = source('../src/components/NodeEditor.vue')
+const script = editorSource.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import .*$/gm, '')
+// Envelope-only fixtures, not real certificates or private keys. Crypto parsing belongs to the API.
+const cert = '-----BEGIN CERTIFICATE-----\nZGVtbw==\n-----END CERTIFICATE-----'
+const key = '-----BEGIN PRIVATE KEY-----\nZGVtbw==\n-----END PRIVATE KEY-----'
+function setup(role = 'server', respond = async () => undefined) {
+  const requests = []
+  const context = vm.createContext({
+    exports: {}, computed, reactive, ref, watch, structuredClone, TextEncoder,
+    validateNode, validatePEM, PEM_MAX_BYTES,
+    defineProps: () => ({ role, saved: async () => {} }), defineExpose: () => {},
+    api: async (...args) => { requests.push(args); return respond(...args) },
+  })
+  vm.runInContext(transpile(script + '\nglobalThis.editor = { open, save, draft, endpoints, addEndpoint, removeEndpoint, uploadPEM, uploads, clearSecrets, pemFields, reading, uploadError, generate, generation, options, shownPair, pair, pairDirty, editingPair, editPair, resetPair, preservePair };'), context)
+  const editor = context.editor
+  editor.open()
+  Object.assign(editor.draft, { name: 'Demo node', address: 'example.com', listenPort: '8444', cert, key })
+  if (role === 'server') Object.assign(editor.endpoints[0], { name: '首选地址', host: 'example.com', port: 443, server_name: 'example.com', priority: 0, enabled: true })
+  return { ...editor, requests }
+}
+const payload = e => e.requests.at(-1)[2].tunnel
+const upload = (e, field, text, size = new TextEncoder().encode(text).length) => e.uploadPEM({ target: { files: [{ size, text: async () => text }], value: 'selected' } }, field)
+
+test('server TLS requires complete PEM pair; save sends PEM only', async () => {
+  const e = setup()
+  e.draft.key = ''
+  await assert.rejects(e.save(), /完整/)
+  e.draft.key = 'not PEM'
+  await assert.rejects(e.save(), /完整/)
+  e.draft.key = key
+  e.draft.ca = cert
+  await e.save()
+  assert.equal(e.requests[0][0], '/nodes')
+  assert.equal(e.requests[0][1], 'POST')
+  assert.equal(payload(e).transport_security, 'tls')
+  assert.equal(payload(e).cert_pem, cert)
+  assert.equal(payload(e).key_pem, key)
+  assert.equal(payload(e).ca_pem, cert)
+  assert.equal(validatePEM(cert + '\n' + cert, 'cert'), null)
+  assert.ok(validatePEM(cert, 'key'))
+  assert.ok(validatePEM(key.replaceAll('PRIVATE KEY', 'ENCRYPTED PRIVATE KEY'), 'key'))
+  assert.ok(validatePEM('a'.repeat(PEM_MAX_BYTES + 1), 'ca'))
+  assert.equal(e.requests.length, 1)
+})
+
+test('HY2 requires PEM and password; switching modes fully replaces tunnel', async () => {
+  const e = setup()
+  e.draft.transport = 'hysteria2'
+  await assert.rejects(e.save(), /Hysteria2 密码/)
+  e.draft.password = 'demo-password'
+  e.draft.key = ''
+  await assert.rejects(e.save(), /完整/)
+  e.draft.key = key
+  e.draft.enc = 'demo-encryption'
+  e.draft.flow = 'xtls-rprx-vision'
+  await e.save()
+  assert.equal(payload(e).transport_security, '')
+  assert.equal(payload(e).cert_pem, cert)
+  assert.equal(payload(e).decryption, 'demo-encryption')
+  assert.equal(payload(e).flow, undefined)
+  e.draft.transport = 'tcp'
+  e.draft.security = 'reality'
+  await e.save()
+  assert.equal(payload(e).transport_security, '')
+  assert.ok(payload(e).reality)
+  assert.equal(payload(e).cert_pem, undefined)
+  assert.equal(payload(e).hysteria2, undefined)
+  e.draft.security = 'encryption'
+  await e.save()
+  assert.equal(payload(e).transport_security, 'plain')
+  assert.equal(payload(e).reality, undefined)
+  assert.equal(payload(e).flow, undefined)
+})
+
+test('clients edit metadata only, with no local tunnel or template overrides', async () => {
+  const e = setup('client')
+  e.open({ id: 'client/id', name: 'Demo client' })
+  assert.deepEqual(Array.from(e.pemFields.value), [])
+  Object.assign(e.draft, { ca: 'invalid ignored material', enc: 'ignored', name: 'Renamed client' })
+  await e.save()
+  assert.equal(e.requests[0][0], '/nodes/client%2Fid')
+  assert.equal(e.requests[0][1], 'PUT')
+  const body = e.requests[0][2]
+  assert.equal(body.name, 'Renamed client')
+  assert.equal('tunnel' in body, false)
+  assert.equal('client_tunnel' in body, false)
+  await e.generate('reality')
+  assert.equal(e.requests.length, 1)
+  e.draft.name = ''
+  await assert.rejects(e.save(), /名称/)
+})
+
+test('uploads enforce size, kind, empty/read errors; stale reads cannot restore secrets', async () => {
+  const e = setup()
+  await upload(e, 'cert', '', PEM_MAX_BYTES + 1)
+  assert.match(e.uploads.cert.error, /64 KiB/)
+  await assert.rejects(e.save(), /64 KiB/)
+  await upload(e, 'cert', '')
+  assert.match(e.uploads.cert.error, /为空/)
+  await upload(e, 'cert', key)
+  assert.match(e.uploads.cert.error, /完整/)
+  await upload(e, 'cert', cert)
+  assert.equal(e.uploads.cert.error, '')
+  assert.match(e.uploads.cert.status, /已载入/)
+  await e.uploadPEM({ target: { files: [{ size: 10, text: async () => { throw Error('never echo content') } }] } }, 'key')
+  assert.match(e.uploads.key.error, /读取失败/)
+  let resolve
+  const pending = e.uploadPEM({ target: { files: [{ size: 10, text: () => new Promise(done => { resolve = done }) }] } }, 'key')
+  assert.equal(e.reading.value, true)
+  await assert.rejects(e.save(), /读取完成/)
+  e.clearSecrets()
+  resolve(key)
+  await pending
+  assert.equal(e.draft.key, '')
+  assert.equal(e.reading.value, false)
+})
+
+const tableSource = source('../src/components/NodesTable.vue')
+function setupTable(role = 'server') {
+  const requests = []
+  const desk = reactive({ nodes: [], mappings: [], reload: async () => {}, notify: () => {} })
+  const tableScript = tableSource.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import .*$/gm, '')
+  const context = vm.createContext({ exports: {}, computed, ref, inject: () => desk, deskKey: {}, defineProps: () => ({ role }), api: async (...args) => { requests.push(args) } })
+  vm.runInContext(transpile(tableScript + '\nglobalThis.table = { tunnelLabel, effectiveSources, ask, run, pending };'), context)
+  return { ...context.table, desk, requests }
+}
+
+test('labels and read-only effective configuration use authoritative mapped server templates', () => {
+  const s = setupTable()
+  assert.equal(s.tunnelLabel({ tunnel: { cert_pem: cert, decryption: 'demo' } }), '未配置安全模式')
+  assert.equal(s.tunnelLabel({ tunnel: { transport_security: 'tls', decryption: 'demo' } }), 'TCP / TLS + Encryption')
+  const c = setupTable('client')
+  const client = { id: 'client' }
+  assert.equal(c.tunnelLabel(client), '未关联服务端')
+  c.desk.nodes.push({ id: 'server', role: 'server', client_tunnel: { ca_pem: cert } }, { id: 'revoked', role: 'server', revoked: true })
+  c.desk.mappings.push({ client_id: 'client', server_id: 'server' }, { client_id: 'client', server_id: 'server' }, { client_id: 'client', server_id: 'revoked' }, { client_id: 'other', server_id: 'server' })
+  assert.equal(c.tunnelLabel(client), '服务端统一下发')
+  assert.equal(c.effectiveSources(client).length, 1)
+  assert.equal(c.effectiveSources(client)[0].client_tunnel.ca_pem, cert)
+  assert.equal(c.effectiveSources({ ...client, revoked: true }).length, 0)
+  assert.match(tableSource, /JSON.stringify\(source.client_tunnel, null, 2\)[^\n]+readonly/)
+  assert.doesNotMatch(editorSource + tableSource + source('../src/types.ts'), /cert_file|key_file|ca_file|pool\?:/)
+  assert.doesNotMatch(editorSource + source('../src/format.ts'), /override|v-html|console\./)
+})
+
+const ca = cert.replace('ZGVtbw==', 'Y3VzdG9t')
+const tlsNode = () => ({ id: 'server', name: 'Server', address: 'example.com', port: 443, server_name: 'example.com', connect_endpoints: [{ id: 'primary', name: '首选地址', host: 'example.com', port: 443, server_name: 'example.com', priority: 0, enabled: true }], tunnel: { listen_port: 8444, transport_security: 'tls', cert_pem: cert, key_pem: key, ca_pem: cert }, client_tunnel: { transport_security: 'tls', ca_pem: ca } })
+const realityNode = () => ({ id: 'reality', name: 'Reality', address: 'example.com', port: 443, server_name: 'example.com', connect_endpoints: [{ id: 'primary', name: '首选地址', host: 'example.com', port: 443, server_name: 'example.com', priority: 0, enabled: true }], tunnel: { listen_port: 8444, reality: { private_key: 'private', short_ids: 'aa,bb', server_names: 'example.com', dest: 'example.com:443' } }, client_tunnel: { reality: { public_key: 'public', short_id: 'bb', fingerprint: 'firefox', server_names: 'example.com', max_time_diff: '1m' } } })
+const body = e => e.requests.at(-1)[2]
+
+test('persisted CA and selected short ID are shown and preserved on metadata saves', async () => {
+  for (const node of [tlsNode(), realityNode()]) {
+    const e = setup()
+    e.open(node)
+    assert.equal(e.preservePair.value, true)
+    assert.equal(e.shownPair.value.ca, node.client_tunnel.ca_pem || '')
+    assert.equal(e.shownPair.value.shortID, node.client_tunnel.reality?.short_id || '')
+    e.draft.name = 'Renamed'; e.draft.address = 'new.example.com'; e.draft.port = '8443'; e.draft.listen = '127.0.0.1'
+    await e.save()
+    assert.equal(JSON.stringify(body(e).client_tunnel), JSON.stringify(node.client_tunnel))
+    e.editPair()
+    assert.equal(e.pair.ca, e.shownPair.value.ca)
+    assert.equal(e.pair.shortID, e.shownPair.value.shortID)
+    assert.equal(e.pair.fingerprint, e.shownPair.value.fingerprint)
+    await e.save() // Merely opening the editor does not rewrite unexposed public fields.
+    assert.equal(JSON.stringify(body(e).client_tunnel), JSON.stringify(node.client_tunnel))
+    e.resetPair()
+    assert.equal(e.preservePair.value, false)
+    assert.equal(e.shownPair.value.ca, node.tunnel.ca_pem || '')
+    assert.equal(e.shownPair.value.shortID, node.tunnel.reality ? 'aa' : '')
+    await e.save()
+    assert.equal('client_tunnel' in body(e), false)
+  }
+})
+
+test('server material edits derive automatically, including while pair editor is untouched', async () => {
+  for (const [field, value] of Object.entries({ cert: ca, key: key.replace('ZGVtbw==', 'bmV3'), ca: '', enc: 'new-decryption', serverName: 'new.example.com', flow: 'xtls-rprx-vision', security: 'reality' })) {
+    const e = setup(); e.open(tlsNode()); e.editPair()
+    e.draft[field] = value
+    assert.equal(e.preservePair.value, false, field)
+    assert.equal(e.pair.ca, e.shownPair.value.ca, field)
+    await e.save()
+    assert.equal('client_tunnel' in body(e), false, field)
+  }
+  const e = setup(); e.open(realityNode()); e.editPair()
+  e.draft.privateKey = 'new-private'; e.draft.shortIDs = 'cc,dd'
+  assert.equal(e.shownPair.value.publicKey, '')
+  assert.equal(e.pair.publicKey, '')
+  assert.equal(e.shownPair.value.shortID, 'cc')
+  e.editPair()
+  assert.equal(e.pair.shortID, 'cc')
+  await e.save()
+  assert.equal(payload(e).reality.public_key, undefined)
+  assert.equal('client_tunnel' in body(e), false)
+})
+
+test('explicit mismatches stay explicit and backend save rejection propagates', async () => {
+  const e = setup('server', async () => { throw Error('backend rejected mismatched pair') })
+  e.open(realityNode()); e.editPair()
+  e.pair.publicKey = 'explicit-mismatch'; e.pairDirty.value = true
+  e.draft.privateKey = 'new-private'
+  assert.equal(e.shownPair.value.publicKey, 'explicit-mismatch')
+  await assert.rejects(e.save(), /backend rejected/)
+  assert.equal(body(e).client_tunnel.reality.public_key, 'explicit-mismatch')
+  assert.equal(e.pairDirty.value, true)
+})
+
+const generated = {
+  reality: { private_key: 'generated-private', public_key: 'generated-public', short_id: 'cc' },
+  short_id: { short_id: 'dd' },
+  vless: { decryption: 'generated-decryption', encryption: 'generated-encryption' },
+  hysteria2: { password: 'generated-password' },
+  certificate: { cert_pem: ca, key_pem: key, ca_pem: ca, expires_at: '2030-01-01T00:00:00Z' },
+}
+
+test('all generator kinds update pairs without saving; certificate defaults and bounds match API', async () => {
+  const e = setup('server', async (_path, _method, request) => generated[request.kind])
+  e.open(realityNode())
+  await e.generate('reality')
+  assert.equal(e.draft.privateKey, generated.reality.private_key)
+  assert.equal(e.shownPair.value.publicKey, generated.reality.public_key)
+  assert.equal(e.shownPair.value.shortID, 'cc')
+  await e.generate('short_id')
+  assert.equal(e.shownPair.value.shortID, 'dd')
+  await e.generate('vless')
+  assert.equal(e.draft.enc, generated.vless.decryption)
+  assert.equal(e.shownPair.value.encryption, generated.vless.encryption)
+  e.draft.enc = 'manually-changed'
+  assert.equal(e.shownPair.value.encryption, '')
+  e.draft.transport = 'hysteria2'
+  await e.generate('hysteria2')
+  assert.equal(e.shownPair.value.password, generated.hysteria2.password)
+  await e.generate('certificate')
+  assert.equal(e.options.ttl, 30)
+  assert.equal(body(e).ttl_days, 30)
+  assert.equal(e.draft.cert, ca)
+  assert.equal(e.shownPair.value.ca, ca)
+  assert.equal(e.requests.length, 5)
+  assert.ok(e.requests.every(([path, method]) => path === '/nodes/generate' && method === 'POST'))
+  assert.equal(e.generation.busy, '')
+  assert.match(e.generation.status, /尚未保存/)
+  for (const ttl of [0, 366, 1.5, 'invalid']) {
+    e.options.ttl = ttl; await e.generate('certificate')
+    assert.match(e.generation.error, /1 到 365/)
+  }
+  assert.equal(e.requests.length, 5)
+  e.options.ttl = 365; await e.generate('certificate')
+  assert.equal(body(e).ttl_days, 365)
+  assert.match(editorSource, /id="cert-ttl"[^>]+max="365"/)
+})
+
+test('generation preserves explicit paired edits', async () => {
+  const e = setup('server', async () => generated.reality)
+  e.open(realityNode()); e.editPair(); e.pair.shortID = 'bb'; e.pairDirty.value = true
+  await e.generate('reality')
+  assert.equal(e.draft.shortIDs, 'cc')
+  assert.equal(e.shownPair.value.shortID, 'bb')
+  assert.match(e.generation.status, /核对已编辑/)
+})
+
+test('generation blocks saves and duplicate requests, drops stale results and ignores closed sessions', async () => {
+  for (const change of [e => { e.draft.name = 'Changed' }, e => { e.options.mode = 'random' }, e => e.resetPair(), e => e.clearSecrets()]) {
+    let resolve
+    const e = setup('server', () => new Promise(done => { resolve = done }))
+    const pending = e.generate('reality')
+    assert.equal(e.generation.busy, 'reality')
+    await assert.rejects(e.save(), /生成完成/)
+    await e.generate('short_id')
+    assert.equal(e.requests.length, 1)
+    change(e); resolve(generated.reality); await pending
+    assert.equal(e.draft.privateKey, '')
+    assert.equal(e.generation.busy, '')
+    assert.equal(e.generation.error, '')
+    assert.ok(!e.generation.status || e.generation.status.includes('过期'))
+  }
+  let resolve
+  const e = setup('server', () => new Promise(done => { resolve = done }))
+  const pending = e.generate('certificate'); e.open(tlsNode()); resolve(generated.certificate); await pending
+  assert.equal(e.draft.cert, cert)
+  assert.equal(e.shownPair.value.ca, ca)
+  assert.equal(e.generation.status, '')
+})
+
+test('generator failures and malformed responses preserve material and hide backend error contents', async () => {
+  for (const respond of [async () => { throw Error('SECRET backend detail') }, async () => ({}), async () => ({ ...generated.certificate, key_pem: 'invalid SECRET' })]) {
+    const e = setup('server', respond)
+    e.open(tlsNode())
+    await e.generate('certificate')
+    assert.match(e.generation.error, /生成失败/)
+    assert.doesNotMatch(e.generation.error, /SECRET/)
+    assert.equal(e.generation.busy, '')
+    assert.equal(e.draft.cert, cert)
+    assert.equal(e.draft.key, key)
+    assert.equal(e.shownPair.value.ca, ca)
+  }
+  let reject
+  const e = setup('server', () => new Promise((_resolve, fail) => { reject = fail }))
+  const pending = e.generate('reality'); e.clearSecrets(); reject(Error('SECRET')); await pending
+  assert.equal(e.generation.error, '')
+})
+
+test('embedded nodes retain editing but cannot enroll, revoke or delete through table controls', async () => {
+  const t = setupTable()
+  const embedded = { id: 'embedded', embedded: true }
+  t.ask(embedded, 'delete')
+  assert.equal(t.pending.value, null)
+  t.pending.value = embedded
+  assert.equal(await t.run(), false)
+  assert.equal(t.requests.length, 0)
+  assert.match(tableSource, /v-if="!node.embedded"[^>]+@click="onboarding/)
+  assert.match(tableSource, /v-if="!node.embedded"[^>]+@click="ask/)
+  assert.match(tableSource, /v-if="!selected.embedded"/)
+  assert.match(tableSource, /@click="editor\?\.open\(node\)"/)
+  const e = setup(); e.open({ ...tlsNode(), embedded: true }); e.draft.name = 'Embedded renamed'; await e.save()
+  assert.equal(body(e).name, 'Embedded renamed')
+  assert.equal('embedded' in body(e), false)
+  t.ask({ id: 'remote' }, 'delete'); await t.run()
+  assert.equal(t.requests[0][1], 'DELETE')
+})
+
+test('blank server TLS name defaults to address for TLS and encryption-only saves', async () => {
+  const e = setup()
+  e.draft.serverName = '  '
+  await e.save()
+  assert.equal(body(e).server_name, e.draft.address)
+  e.draft.security = 'encryption'
+  e.draft.enc = 'demo-encryption'
+  await e.save()
+  assert.equal(body(e).server_name, e.draft.address)
+  e.endpoints[0].server_name = 'tunnel.example.com'
+  await e.save()
+  assert.equal(body(e).server_name, 'tunnel.example.com')
+})
+
+test('API empty nested objects do not enable HY2 or REALITY in persisted pair fields', async () => {
+  const plain = { ...tlsNode(), tunnel: { transport_security: 'plain', decryption: 'private-encryption' }, client_tunnel: { transport_security: 'plain', encryption: 'public-encryption' } }
+  const hy2 = tlsNode(); hy2.tunnel.hysteria2 = { password: 'hy-password' }; hy2.client_tunnel.hysteria2 = { password: 'hy-password' }
+  for (const [node, transport, security] of [[tlsNode(), 'tcp', 'tls'], [plain, 'tcp', 'encryption'], [realityNode(), 'tcp', 'reality'], [hy2, 'hysteria2', 'tls']]) {
+    node.tunnel = { reality: {}, hysteria2: {}, ...node.tunnel }
+    node.client_tunnel = { reality: {}, hysteria2: {}, ...node.client_tunnel }
+    const e = setup(); e.open(node)
+    for (const fields of [e.shownPair.value, (e.editPair(), e.pair)]) {
+      assert.equal(fields.transport, transport)
+      assert.equal(fields.security, security)
+      assert.equal(fields.ca, node.client_tunnel.ca_pem || '')
+      assert.equal(fields.publicKey, node.client_tunnel.reality.public_key || '')
+      assert.equal(fields.shortID, node.client_tunnel.reality.short_id || '')
+      assert.equal(fields.encryption, node.client_tunnel.encryption || '')
+      assert.equal(fields.password, node.client_tunnel.hysteria2.password || '')
+    }
+    await e.save()
+    assert.equal(JSON.stringify(body(e).client_tunnel), JSON.stringify(node.client_tunnel))
+  }
+})
+
+test('fingerprint edits preserve alternate approved REALITY names and other public settings after reopen', async () => {
+  const node = realityNode()
+  node.tunnel.reality.server_names = 'example.com,alternate.example.com'
+  node.client_tunnel.reality.server_names = 'alternate.example.com'
+  const e = setup(); e.open(node); e.editPair()
+  e.pair.fingerprint = 'chrome'; e.pairDirty.value = true
+  await e.save()
+  const saved = JSON.parse(JSON.stringify(body(e)))
+  assert.deepEqual(saved.client_tunnel.reality, { ...node.client_tunnel.reality, fingerprint: 'chrome' })
+  e.open({ ...node, ...saved }); e.editPair()
+  assert.equal(e.shownPair.value.fingerprint, 'chrome')
+  e.pair.fingerprint = 'safari'; e.pairDirty.value = true
+  await e.save()
+  assert.deepEqual(JSON.parse(JSON.stringify(body(e).client_tunnel.reality)), { ...node.client_tunnel.reality, fingerprint: 'safari' })
+  e.resetPair(); e.editPair(); e.pair.fingerprint = 'chrome'; e.pairDirty.value = true
+  await e.save()
+  assert.equal(body(e).client_tunnel.reality.server_names, undefined)
+  assert.equal(body(e).client_tunnel.reality.max_time_diff, undefined)
+})
+
+test('untouched pair editing follows derivation without restoring old hidden public settings', async () => {
+  const e = setup(); e.open(realityNode()); e.editPair()
+  e.draft.names = 'new.example.com'
+  e.pair.fingerprint = 'safari'; e.pairDirty.value = true
+  await e.save()
+  assert.equal(body(e).client_tunnel.reality.server_names, undefined)
+  assert.equal(body(e).client_tunnel.reality.max_time_diff, undefined)
+})
+
+test('onboarding displays role-specific flag commands and blocks embedded or insecure generation', async () => {
+  const requests = []; let opens = 0
+  const onboardingScript = source('../src/components/NodeOnboarding.vue').match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import .*$/gm, '')
+  const context = vm.createContext({
+    exports: {}, computed, ref, URL, location: { origin: 'https://master.example.com' },
+    window: { setInterval: () => 1, clearInterval: () => {} }, onUnmounted: () => {}, defineExpose: () => {},
+    api: async (...args) => { requests.push(args); return { prepare: "mkdir -p '/opt/docker/veilink-client-demo/config' '/opt/docker/veilink-client-demo/data' && chown -R 65532:65532 '/opt/docker/veilink-client-demo/config' '/opt/docker/veilink-client-demo/data' && chmod 700 '/opt/docker/veilink-client-demo/config' '/opt/docker/veilink-client-demo/data'", command: "docker run -itd --restart unless-stopped --name 'veilink-client-demo' -v '/opt/docker/veilink-client-demo/config:/config:ro' -v '/opt/docker/veilink-client-demo/data:/data' -e TZ=Asia/Shanghai veilink:client -master-addr 'master.example.com:443' -node-id 'remote/id' -enroll-token 'token' -state-dir '/data/state' -control-server-name 'master.example.com'", token: 'token', expires_at: 2000000000, warning: '私有 Master CA 时，在镜像名后添加 -control-ca /config/ca.pem。' } },
+  })
+  vm.runInContext(transpile(onboardingScript + '\nglobalThis.onboarding = { open, generate, revoke, node, modal, result, masterURL };'), context)
+  const e = context.onboarding
+  e.modal.value = { open: () => { opens++ } }
+  const embedded = { id: 'embedded', embedded: true }
+  e.open(embedded)
+  assert.equal(opens, 0)
+  assert.equal(e.node.value, null)
+  await assert.rejects(e.generate(), /未选择节点/)
+  e.node.value = embedded
+  await assert.rejects(e.generate(), /内置节点/)
+  await assert.rejects(e.revoke(), /内置节点/)
+  assert.equal(requests.length, 0)
+  e.open({ id: 'remote/id', embedded: false }); await e.generate()
+  assert.equal(opens, 1)
+  assert.equal(requests[0][0], '/nodes/remote%2Fid/join')
+  assert.equal(e.result.value.token, 'token')
+  assert.equal(e.result.value.command, "docker run -itd --restart unless-stopped --name 'veilink-client-demo' -v '/opt/docker/veilink-client-demo/config:/config:ro' -v '/opt/docker/veilink-client-demo/data:/data' -e TZ=Asia/Shanghai veilink:client -master-addr 'master.example.com:443' -node-id 'remote/id' -enroll-token 'token' -state-dir '/data/state' -control-server-name 'master.example.com'")
+  assert.match(e.result.value.prepare, /chown -R 65532:65532/)
+  assert.match(e.result.value.warning, /-control-ca \/config\/ca.pem/)
+  assert.match(source('../src/components/NodeOnboarding.vue'), /veilink:server 或 veilink:client/)
+  assert.match(source('../src/components/NodeOnboarding.vue'), /id="join-prepare"[^>]+:value="result.prepare"/)
+  e.masterURL.value = 'http://insecure.example'
+  await assert.rejects(e.generate(), /https:\/\//)
+  assert.equal(requests.length, 1)
+  e.masterURL.value = 'https://master.example.com'
+  e.open(embedded)
+  assert.equal(e.result.value, null)
+  assert.equal(e.node.value, null)
+  assert.equal(opens, 1)
+  await assert.rejects(e.generate(), /未选择节点/)
+  assert.equal(requests.length, 1)
+})
+
+test('listen validation, NAT port independence, and transport copy stay explicit', async () => {
+  const e = setup()
+  e.draft.listen = '11111'
+  await assert.rejects(e.save(), /监听地址必须是 IP/)
+  e.draft.listen = '0.0.0.0'
+  e.draft.listenPort = '8444'
+  Object.assign(e.endpoints[0], { host: 'public.example.com', port: 443, server_name: 'tunnel.example.com' })
+  await e.save()
+  assert.equal(body(e).tunnel.listen_port, 8444)
+  assert.equal(body(e).connect_endpoints[0].port, 443)
+  assert.equal('kind' in body(e).connect_endpoints[0], false)
+  assert.equal(body(e).connect_endpoints[0].host, 'public.example.com')
+  assert.equal(body(e).connect_endpoints[0].server_name, 'tunnel.example.com')
+  assert.match(editorSource, /<label for="node-security">安全<\/label>[\s\S]*<label for="node-transport">传输<\/label>/)
+  assert.match(editorSource, /Hysteria2 基于 QUIC\/UDP 且使用 TLS，当前上游和本实现不支持 REALITY/)
+  assert.match(editorSource, /HTTP-only 或终止、改写协议的 CDN 不支持/)
+})
+
+test('reactive server endpoints open as isolated editable copies', async () => {
+  const node = reactive(tlsNode())
+  const e = setup()
+  assert.doesNotThrow(() => e.open(node))
+  e.endpoints[0].host = 'edited.example.com'
+  assert.equal(node.connect_endpoints[0].host, 'example.com')
+  await e.save()
+  assert.equal(body(e).connect_endpoints[0].host, 'edited.example.com')
+})
+
+test('certificate generation uses current enabled endpoint SNI or Host', async () => {
+  const e = setup('server', async () => generated.certificate)
+  e.endpoints[0].enabled = false
+  e.addEndpoint()
+  Object.assign(e.endpoints[1], { host: 'new.example.com', server_name: ' sni.example.com ' })
+  await e.generate('certificate')
+  assert.equal(body(e).server_name, 'sni.example.com')
+  e.endpoints[1].server_name = ' '
+  await e.generate('certificate')
+  assert.equal(body(e).server_name, 'new.example.com')
+})
+
+test('endpoint edits invalidate pending certificate results', async () => {
+  let resolve
+  const e = setup('server', () => new Promise(done => { resolve = done }))
+  const pending = e.generate('certificate')
+  e.endpoints[0].server_name = 'changed.example.com'
+  resolve(generated.certificate)
+  await pending
+  assert.equal(e.draft.cert, cert)
+  assert.match(e.generation.status, /丢弃过期/)
+})
+
+test('candidate inputs have unique explicit labels and no protocol classification', () => {
+  const candidate = editorSource.match(/<div v-for="\(endpoint, index\) in endpoints"[\s\S]*?添加连接地址/)[0]
+  const ids = [...candidate.matchAll(/:id="([^"]+)"/g)].map(match => match[1])
+  const labels = [...candidate.matchAll(/:for="([^"]+)"/g)].map(match => match[1])
+  assert.equal(ids.length, 6)
+  assert.equal(new Set(ids).size, 6)
+  assert.deepEqual(labels, ids)
+  assert.ok(ids.every(id => id.includes('${index}')))
+  assert.doesNotMatch(candidate + tableSource, /endpoint.kind|item.kind|value="(?:direct|nat|cdn)"/)
+})
+
+test('multiple connection addresses survive edits and removal without kind', async () => {
+  const e = setup()
+  e.addEndpoint()
+  Object.assign(e.endpoints[1], { host: 'backup.example.com', port: 9443, server_name: 'tls.example.com', priority: 5 })
+  await e.save()
+  assert.equal(body(e).connect_endpoints.length, 2)
+  assert.ok(body(e).connect_endpoints.every(endpoint => !('kind' in endpoint)))
+  e.open({ ...tlsNode(), ...JSON.parse(JSON.stringify(body(e))) })
+  assert.equal(e.endpoints[1].server_name, 'tls.example.com')
+  e.removeEndpoint(0)
+  await e.save()
+  assert.equal(body(e).connect_endpoints[0].port, 9443)
+  assert.equal(body(e).tunnel.listen_port, 8444)
+})

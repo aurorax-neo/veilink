@@ -15,13 +15,15 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/quic-go/quic-go"
+	"github.com/apernet/quic-go"
 	"github.com/xtls/reality"
 
 	"veilink/internal/model"
@@ -76,13 +78,14 @@ type policy struct {
 // Build validates a snapshot and returns its deny-by-default routing policy.
 // Snapshots cannot select protocols, disable certificate checks, or set paths.
 func Build(s model.Snapshot, local model.LocalTLS) ([]byte, error) {
+	s = orderedSnapshot(s)
 	if err := validate(s, local); err != nil {
 		return nil, err
 	}
 	falseValue := false
 	doc := policy{Outbounds: []outbound{{Protocol: "blackhole", Tag: "reject"}}}
 	if s.Node.Role == "server" && len(s.Bindings) > 0 {
-		doc.Inbounds = append(doc.Inbounds, inbound{Tag: "transport", Listen: listenHost(local.ListenHost), Port: s.Node.Port})
+		doc.Inbounds = append(doc.Inbounds, inbound{Tag: "transport", Listen: listenHost(local.ListenHost), Port: local.ListenPort})
 	}
 	for _, b := range s.Bindings {
 		if s.Node.Role == "server" {
@@ -92,7 +95,7 @@ func Build(s model.Snapshot, local model.LocalTLS) ([]byte, error) {
 			})
 		} else {
 			doc.Outbounds = append(doc.Outbounds, outbound{
-				Protocol: "vless", Tag: "tunnel-" + b.ID, AllowInsecure: &falseValue, Mux: &muxSetting{},
+				Protocol: "vless", Tag: "tunnel-" + b.ID, AllowInsecure: &falseValue, Mux: &muxSetting{Enabled: bindingMux(s.Mappings, b.ID)},
 			})
 			doc.Routing.Rules = append(doc.Routing.Rules, rule{
 				InboundTag: []string{"bridge-" + b.ID}, Domain: []string{"full:" + b.Domain},
@@ -158,10 +161,13 @@ func (r *Runtime) Apply(s model.Snapshot) error {
 	if err != nil {
 		return err
 	}
-	if s.Revision == r.highWater && !bytes.Equal(document, r.document) {
+	// Routing policy omits keys, gateway settings and mapping pool sizes. Compare
+	// the full runtime inputs too, or those changes would silently be ignored.
+	same := r.good != nil && sameConfiguration(*r.good, s) && r.goodLocal == effective
+	if s.Revision == r.highWater && !same {
 		return errors.New("revision reused with different configuration")
 	}
-	if r.instance != nil && bytes.Equal(document, r.document) {
+	if r.instance != nil && same && bytes.Equal(document, r.document) {
 		r.revision = s.Revision
 		r.highWater = s.Revision
 		return nil
@@ -223,33 +229,147 @@ func cloneSnapshot(s model.Snapshot) model.Snapshot {
 	return out
 }
 
+// orderedSnapshot copies the slices before sorting, leaving the caller's view intact.
+// Build uses the same ordering so equivalent inputs also produce identical policy.
+func orderedSnapshot(s model.Snapshot) model.Snapshot {
+	s.Nodes = append([]model.Node(nil), s.Nodes...)
+	s.Bindings = append([]model.Binding(nil), s.Bindings...)
+	s.Mappings = append([]model.Mapping(nil), s.Mappings...)
+	sort.Slice(s.Nodes, func(i, j int) bool { return s.Nodes[i].ID < s.Nodes[j].ID })
+	sort.Slice(s.Bindings, func(i, j int) bool { return s.Bindings[i].ID < s.Bindings[j].ID })
+	sort.Slice(s.Mappings, func(i, j int) bool { return s.Mappings[i].ID < s.Mappings[j].ID })
+	return s
+}
+
+func sameConfiguration(a, b model.Snapshot) bool {
+	canonical := func(s model.Snapshot) model.Snapshot {
+		s = orderedSnapshot(s)
+		s.Revision = 0
+		// Administrative metadata on local and related nodes is not data-plane
+		// configuration. Keep mapping names: validation requires unique names.
+		clearStatus := func(n *model.Node) {
+			n.Name = ""
+			n.DesiredRevision, n.AppliedRevision, n.LastSeen = 0, 0, 0
+			n.Error = ""
+		}
+		clearStatus(&s.Node)
+		for i := range s.Nodes {
+			clearStatus(&s.Nodes[i])
+		}
+		return s
+	}
+	return reflect.DeepEqual(canonical(a), canonical(b))
+}
+
+type clientGateway struct {
+	local    model.LocalTLS
+	flow     string
+	outbound *encClient
+}
+
+func gatewayClientConfig(local model.LocalTLS, gateway model.Node) (model.LocalTLS, error) {
+	if local != (model.LocalTLS{}) {
+		return model.LocalTLS{}, errors.New("client-local tunnel overrides are not allowed")
+	}
+	// Related gateways carry the exact, server-owned public template. Never
+	// rederive it: selected REALITY names/IDs and operator CA trust must survive.
+	config := gateway.Tunnel
+	if err := requireTransportSecurity(config); err != nil {
+		return model.LocalTLS{}, err
+	}
+	if err := ValidateClientTemplate(config); err != nil {
+		return model.LocalTLS{}, err
+	}
+	if config.Reality.Enabled() {
+		if _, err := realityNames(config.Reality, gateway.ServerName); err != nil {
+			return model.LocalTLS{}, err
+		}
+	}
+	return config, nil
+}
+
+func newClientGateway(local model.LocalTLS, gateway model.Node) (*clientGateway, error) {
+	config, err := gatewayClientConfig(local, gateway)
+	if err != nil {
+		return nil, err
+	}
+	flow, _ := normalizeFlow(config.Flow)
+	peer := &clientGateway{local: config, flow: flow}
+	spec, err := parseEncryption(config.Encryption)
+	if err == nil && spec != nil {
+		peer.outbound, err = spec.newClient()
+	}
+	return peer, err
+}
+
+// bindingPool is a shared session pool, not a dedicated pool per mapping. All
+// enabled mappings on the binding use round-robin sessions; the largest requested
+// size wins. Bindings without enabled mappings retain one control session.
+func bindingPool(mappings []model.Mapping, binding string) int {
+	n := 0
+	for _, m := range mappings {
+		if m.Enabled && m.BindingID == binding {
+			n = max(n, m.Pool)
+		}
+	}
+	return max(1, min(n, 32))
+}
+
+func bindingMux(mappings []model.Mapping, binding string) bool {
+	for _, m := range mappings {
+		if m.Enabled && m.BindingID == binding && mappingNet(m.Network) == "tcp" && m.Mux {
+			return true
+		}
+	}
+	return false
+}
+
+func bindingDedicated(mappings []model.Mapping, binding string) bool {
+	for _, m := range mappings {
+		if m.Enabled && m.BindingID == binding && mappingNet(m.Network) == "tcp" && !m.Mux {
+			return true
+		}
+	}
+	return false
+}
+
 type service struct {
-	ctx       context.Context
-	cancel    context.CancelFunc
-	once      sync.Once
-	local     model.LocalTLS
-	snapshot  model.Snapshot
-	byUser    map[string]model.Binding
-	allowed   map[string]map[string]bool
-	listeners []net.Listener
-	packets   []net.PacketConn
-	mu        sync.Mutex
-	sessions  map[string][]*session
-	conns     map[net.Conn]struct{}
-	next      uint32
-	reality   *reality.Config
-	quic      *quic.Listener
-	flow      string
-	inbound   *encServer
-	outbound  *encClient
+	ctx                context.Context
+	cancel             context.CancelFunc
+	once               sync.Once
+	local              model.LocalTLS
+	snapshot           model.Snapshot
+	byUser             map[string]model.Binding
+	allowed            map[string]map[string]bool
+	listeners          []net.Listener
+	packets            []net.PacketConn
+	mu                 sync.Mutex
+	sessions           map[string][]*session
+	conns              map[net.Conn]struct{}
+	next               uint32
+	reality            *reality.Config
+	quic               *quic.Listener
+	flow               string
+	inbound            *encServer
+	tlsConfig          *tls.Config
+	applicationChanged chan struct{}
+	applicationWaiting map[string]int
+	applications       map[string][]*applicationSlot
+	singPools          map[string]*singPool
 }
 
 func start(s model.Snapshot, local model.LocalTLS) (*service, error) {
+	if err := validate(s, local); err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	svc := &service{
 		ctx: ctx, cancel: cancel, local: local, snapshot: cloneSnapshot(s),
 		byUser: map[string]model.Binding{}, allowed: map[string]map[string]bool{},
 		sessions: map[string][]*session{}, conns: map[net.Conn]struct{}{},
+		applications:       map[string][]*applicationSlot{},
+		applicationChanged: make(chan struct{}), applicationWaiting: map[string]int{},
+		singPools: map[string]*singPool{},
 	}
 	var err error
 	defer func() {
@@ -273,22 +393,38 @@ func start(s model.Snapshot, local model.LocalTLS) (*service, error) {
 			svc.allowed[m.BindingID][mappingNet(m.Network)+"\n"+m.TargetHost+"\n"+strconv.Itoa(m.TargetPort)] = true
 		}
 	}
+	svc.initSingPools()
 	if err = svc.prepareReality(); err != nil {
 		return nil, err
 	}
-	if err = svc.prepareCrypto(); err != nil {
-		return nil, err
+	if s.Node.Role == "server" {
+		if err = svc.prepareCrypto(); err != nil {
+			return nil, err
+		}
 	}
 	if s.Node.Role == "server" {
 		err = svc.listenServer()
 	} else {
-		n := local.Pool
-		if n == 0 {
-			n = 1
-		}
+		peers := map[string]*clientGateway{}
 		for _, b := range s.Bindings {
-			for range n {
-				go svc.maintain(b, gateways[b.ServerID])
+			peer := peers[b.ServerID]
+			if peer == nil {
+				peer, err = newClientGateway(local, gateways[b.ServerID])
+				if err != nil {
+					return nil, err
+				}
+				peers[b.ServerID] = peer
+			}
+			for _, kind := range singKinds {
+				for range singPoolSize(s.Mappings, b.ID, kind) {
+					go svc.maintainSingMux(b, gateways[b.ServerID], peer, kind)
+				}
+			}
+			for range bindingPool(s.Mappings, b.ID) {
+				go svc.maintain(b, gateways[b.ServerID], peer)
+				if bindingDedicated(s.Mappings, b.ID) {
+					go svc.maintainApplication(b, gateways[b.ServerID], peer)
+				}
 			}
 		}
 	}
@@ -317,6 +453,9 @@ func (s *service) stop() {
 		for conn := range conns {
 			_ = conn.Close()
 		}
+		for _, pool := range s.singPools {
+			pool.client.Close()
+		}
 	})
 }
 
@@ -327,21 +466,22 @@ func (s *service) listenServer() error {
 				return err
 			}
 		} else {
-			addr := net.JoinHostPort(listenHost(s.local.ListenHost), strconv.Itoa(s.snapshot.Node.Port))
+			addr := net.JoinHostPort(listenHost(s.local.ListenHost), strconv.Itoa(s.local.ListenPort))
 			var ln net.Listener
 			var err error
 			min := uint16(tls.VersionTLS12)
 			if s.flow != "" {
 				min = tls.VersionTLS13
 			}
-			if s.reality != nil || (s.local.CertFile == "" && s.inbound != nil) {
+			if s.reality != nil || s.local.TransportSecurity == "plain" {
 				ln, err = net.Listen("tcp", addr)
 			} else {
-				cert, loadErr := tls.LoadX509KeyPair(s.local.CertFile, s.local.KeyFile)
+				cert, loadErr := tls.X509KeyPair([]byte(s.local.CertPEM), []byte(s.local.KeyPEM))
 				if loadErr != nil {
 					return loadErr
 				}
-				ln, err = tls.Listen("tcp", addr, &tls.Config{MinVersion: min, Certificates: []tls.Certificate{cert}})
+				s.tlsConfig = &tls.Config{MinVersion: min, Certificates: []tls.Certificate{cert}, SessionTicketsDisabled: true}
+				ln, err = net.Listen("tcp", addr)
 			}
 			if err != nil {
 				return err
@@ -403,6 +543,8 @@ func (s *service) acceptMapping(ln net.Listener, m model.Mapping) {
 }
 
 func (s *service) authenticate(conn net.Conn) {
+	tracked := conn
+	defer s.untrack(tracked)
 	defer func() {
 		if conn != nil {
 			_ = conn.Close()
@@ -420,6 +562,7 @@ func (s *service) authenticate(conn net.Conn) {
 		}
 		s.untrack(conn)
 		conn = wrapped
+		defer s.untrack(wrapped)
 	}
 	id, host, port, flow, err := readVLESS(conn)
 	if err != nil {
@@ -427,10 +570,18 @@ func (s *service) authenticate(conn net.Conn) {
 	}
 	got, flowErr := normalizeFlow(flow)
 	binding, ok := s.byUser[hex.EncodeToString(id[:])]
-	if flowErr != nil || got != s.flow || !ok || port != 0 || !strings.EqualFold(host, binding.Domain) {
+	if flowErr != nil || got != s.flow || !ok || (port != 0 && port != applicationPort && port != singMuxPort) || !strings.EqualFold(host, binding.Domain) {
 		return
 	}
 	if err = writeVLESSResponse(conn); err != nil {
+		return
+	}
+	if port == singMuxPort {
+		s.acceptSingMux(conn, id, binding)
+		return
+	}
+	if port == applicationPort {
+		s.acceptApplication(conn, id, binding)
 		return
 	}
 	if s.flow != "" {
@@ -448,28 +599,14 @@ func (s *service) authenticate(conn net.Conn) {
 
 func (s *service) openPublic(conn net.Conn, m model.Mapping) {
 	defer s.untrack(conn)
-	sess := s.pick(m.BindingID)
-	if sess == nil {
-		_ = conn.Close()
+	if !m.Mux {
+		s.openApplication(conn, m)
 		return
 	}
-	id := atomic.AddUint32(&sess.next, 1)
-	st := &stream{id: id, conn: conn}
-	if !sess.track(st) {
-		_ = conn.Close()
-		return
-	}
-	payload := append([]byte{byte(m.TargetPort >> 8), byte(m.TargetPort)}, m.TargetHost...)
-	if err := sess.writeFrame(frameOpen, id, payload); err != nil {
-		if old := sess.forget(id); old != nil {
-			_ = old.conn.Close()
-		}
-		return
-	}
-	sess.pump(conn, id)
+	s.openSingMux(conn, m)
 }
 
-func (s *service) maintain(b model.Binding, gateway model.Node) {
+func (s *service) maintain(b model.Binding, gateway model.Node, peer *clientGateway) {
 	user, err := parseUUID(b.UUID)
 	if err != nil {
 		return
@@ -478,12 +615,12 @@ func (s *service) maintain(b model.Binding, gateway model.Node) {
 		if s.ctx.Err() != nil {
 			return
 		}
-		conn, err := s.dialGateway(gateway)
+		conn, err := s.dialGateway(gateway, peer)
 		if err == nil {
 			_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
-			if s.outbound != nil {
+			if peer.outbound != nil {
 				var wrapped net.Conn
-				wrapped, err = s.outbound.Handshake(conn)
+				wrapped, err = peer.outbound.Handshake(conn)
 				if err != nil {
 					_ = conn.Close()
 					conn = nil
@@ -493,11 +630,11 @@ func (s *service) maintain(b model.Binding, gateway model.Node) {
 			}
 		}
 		if err == nil {
-			if err = writeVLESS(conn, user, b.Domain, 0, s.flow); err == nil {
+			if err = writeVLESS(conn, user, b.Domain, 0, peer.flow); err == nil {
 				err = readVLESSResponse(conn)
 			}
 		}
-		if err == nil && s.flow != "" {
+		if err == nil && peer.flow != "" {
 			vc := newVision(conn, user)
 			if err = vc.camouflage(); err != nil {
 				_ = conn.Close()
@@ -526,7 +663,7 @@ func (s *service) maintain(b model.Binding, gateway model.Node) {
 		sess := newSession(conn)
 		s.addSession(b.ID, sess)
 		sess.readLoop(func(host string, port int, udp bool) (net.Conn, error) {
-			if !s.allowed[b.ID][mappingNetBool(udp)+"\n"+host+"\n"+strconv.Itoa(port)] {
+			if !udp || !s.allowed[b.ID]["udp\n"+host+"\n"+strconv.Itoa(port)] {
 				return nil, errors.New("target is not authorized")
 			}
 			dialer := net.Dialer{Timeout: 5 * time.Second}
@@ -553,17 +690,13 @@ func (s *service) maintain(b model.Binding, gateway model.Node) {
 	}
 }
 
-func roots(path string) (*x509.CertPool, error) {
-	if path == "" {
+func roots(caPEM string) (*x509.CertPool, error) {
+	if caPEM == "" {
 		return nil, nil
 	}
-	pem, err := readFile(path)
-	if err != nil {
-		return nil, err
-	}
 	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		return nil, errors.New("client CA contains no certificates")
+	if !pool.AppendCertsFromPEM([]byte(caPEM)) {
+		return nil, errors.New("ca_pem contains no valid certificates")
 	}
 	return pool, nil
 }
@@ -639,13 +772,14 @@ func (st *stream) halt() {
 }
 
 type session struct {
-	conn    net.Conn
-	wmu     sync.Mutex
-	mu      sync.Mutex
-	streams map[uint32]*stream
-	next    uint32
-	done    chan struct{}
-	once    sync.Once
+	conn     net.Conn
+	wmu      sync.Mutex
+	writeBuf [7 + maxPayload]byte // owned by wmu until the synchronous write returns
+	mu       sync.Mutex
+	streams  map[uint32]*stream
+	next     uint32
+	done     chan struct{}
+	once     sync.Once
 }
 
 func newSession(conn net.Conn) *session {
@@ -879,13 +1013,13 @@ func (s *session) writeFrame(kind byte, id uint32, payload []byte) error {
 	if len(payload) > maxPayload {
 		return errors.New("frame too large")
 	}
-	buf := make([]byte, 7+len(payload))
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	buf := s.writeBuf[:7+len(payload)]
 	buf[0] = kind
 	binary.BigEndian.PutUint32(buf[1:5], id)
 	binary.BigEndian.PutUint16(buf[5:7], uint16(len(payload)))
 	copy(buf[7:], payload)
-	s.wmu.Lock()
-	defer s.wmu.Unlock()
 	_, err := s.conn.Write(buf)
 	return err
 }

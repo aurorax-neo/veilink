@@ -3,7 +3,6 @@ import { inject } from 'vue'
 import { deskKey } from '../desk'
 import { pages, type PageId } from '../types'
 import AuditView from './AuditView.vue'
-import BindingsView from './BindingsView.vue'
 import ClientsView from './ClientsView.vue'
 import DashboardView from './DashboardView.vue'
 import LogsView from './LogsView.vue'
@@ -13,7 +12,10 @@ import ServersView from './ServersView.vue'
 defineProps<{ page: PageId; account: string }>()
 const emit = defineEmits<{ navigate: [page: PageId]; logout: [] }>()
 const desk = inject(deskKey)!
-const nav: PageId[] = ['dashboard', 'servers', 'clients', 'proxies', 'bindings', 'logs', 'audit']
+const nav: PageId[] = ['dashboard', 'servers', 'clients', 'proxies', 'logs', 'audit']
+async function refresh() {
+  try { await desk.reload() } catch { /* desk displays the error. */ }
+}
 </script>
 
 <template>
@@ -38,11 +40,6 @@ const nav: PageId[] = ['dashboard', 'servers', 'clients', 'proxies', 'bindings',
           {{ pages[id].title }}
         </button>
       </nav>
-      <div class="side-note">
-        <span>架构</span>
-        <p>控制面与数据面分开</p>
-        <small>业务流量不经过管理中心</small>
-      </div>
     </aside>
     <div class="workspace">
       <header class="topbar">
@@ -55,21 +52,17 @@ const nav: PageId[] = ['dashboard', 'servers', 'clients', 'proxies', 'bindings',
       <main id="main" class="stage" tabindex="-1">
         <div class="page-head">
           <div>
-            <p class="kicker">{{ pages[page].kicker }}</p>
             <h1>{{ pages[page].title }}</h1>
-            <p class="lead">{{ pages[page].lead }}</p>
           </div>
-          <button type="button" class="btn" :disabled="desk.loading" @click="desk.reload()">{{ desk.loading ? '刷新中…' : '刷新' }}</button>
+          <button type="button" class="btn" :disabled="desk.loading" @click="refresh">{{ desk.loading ? '刷新中…' : '刷新' }}</button>
         </div>
         <p v-if="desk.notice" class="notice" :class="{ bad: desk.noticeBad }" role="status">{{ desk.notice }}</p>
         <DashboardView v-if="page === 'dashboard'" />
         <ServersView v-else-if="page === 'servers'" />
         <ClientsView v-else-if="page === 'clients'" />
         <ProxiesView v-else-if="page === 'proxies'" />
-        <BindingsView v-else-if="page === 'bindings'" />
         <LogsView v-else-if="page === 'logs'" />
         <AuditView v-else />
-        <footer class="fineprint"><span>VEILINK</span><span>心跳只说明控制面还在。配置下发会短暂断开该节点已有连接。</span></footer>
       </main>
     </div>
   </div>

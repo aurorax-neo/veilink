@@ -146,7 +146,7 @@ func (h *handler) Handle(_ context.Context, rec slog.Record) error {
 		lvl = "ERROR"
 	case rec.Level >= slog.LevelWarn:
 		lvl = "WARN"
-	case rec.Level >= slog.LevelDebug:
+	case rec.Level < slog.LevelInfo:
 		lvl = "DEBUG"
 	}
 	h.ring.Append(Entry{

@@ -1,7 +1,0 @@
-database: veilink.db
-deployment_key: veilink.key
-bind_addr: 0.0.0.0:8443
-html_dir: html
-tls_mode: https
-control_cert: /path/to/cert.pem
-control_key: /path/to/key.pem

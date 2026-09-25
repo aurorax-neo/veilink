@@ -50,8 +50,33 @@ func decryptionEnabled(raw string) bool {
 }
 
 func checkVLESS(role string, local model.LocalTLS) error {
-	if _, err := normalizeFlow(local.Flow); err != nil {
+	if err := checkTransportSecurity(local); err != nil {
 		return err
+	}
+	if role == "server" {
+		if err := requireTransportSecurity(local); err != nil {
+			return err
+		}
+	}
+	if local.TransportSecurity == "plain" {
+		if role == "server" && (local.CertPEM != "" || local.KeyPEM != "") {
+			return errors.New("plain transport_security cannot use server TLS certificate PEM")
+		}
+		if (role == "server" && !decryptionEnabled(local.Decryption)) || (role == "client" && !decryptionEnabled(local.Encryption)) {
+			return errors.New("plain transport_security requires VLESS encryption")
+		}
+	}
+	flow, err := normalizeFlow(local.Flow)
+	if err != nil {
+		return err
+	}
+	if flow != "" {
+		if local.Hysteria2.Enabled() {
+			return errors.New("Vision requires TCP TLS or REALITY, not Hysteria2")
+		}
+		if !local.Reality.Enabled() && local.TransportSecurity == "plain" {
+			return errors.New("Vision requires TCP TLS or REALITY, not raw TCP encryption")
+		}
 	}
 	if decryptionEnabled(local.Decryption) && decryptionEnabled(local.Encryption) {
 		return errors.New("decryption and encryption cannot both be set")
@@ -75,6 +100,9 @@ func checkVLESS(role string, local model.LocalTLS) error {
 }
 
 func (s *service) prepareCrypto() error {
+	if idleServer(s.snapshot, s.local) {
+		return nil
+	}
 	if err := checkVLESS(s.snapshot.Node.Role, s.local); err != nil {
 		return err
 	}
@@ -91,12 +119,7 @@ func (s *service) prepareCrypto() error {
 		s.inbound, err = spec.newServer()
 		return err
 	}
-	spec, err := parseEncryption(s.local.Encryption)
-	if err != nil || spec == nil {
-		return err
-	}
-	s.outbound, err = spec.newClient()
-	return err
+	return nil // Client cryptographic state is isolated per gateway, not per node.
 }
 
 // GenerateVLESSEnc prints the same two authentication choices as Xray's vlessenc.
@@ -128,6 +151,81 @@ func GenerateVLESSEnc() (xDec, xEnc, pqDec, pqEnc string, err error) {
 
 func vlessDot(mode, ticket string, key []byte) string {
 	return vlessScheme + "." + mode + "." + ticket + "." + base64.RawURLEncoding.EncodeToString(key)
+}
+
+// DeriveClientTunnel derives public settings using native encryption validation.
+// The client argument must be empty: client-local overrides are rejected.
+// Server-owned public template edits use ValidateClientTemplate, not derivation.
+func DeriveClientTunnel(client, server model.LocalTLS, node model.Node) (model.LocalTLS, error) {
+	if err := requireTransportSecurity(server); err != nil {
+		return model.LocalTLS{}, err
+	}
+	if client != (model.LocalTLS{}) {
+		return model.LocalTLS{}, errors.New("client-local tunnel overrides are not allowed")
+	}
+	result := model.DeriveClientTunnel(server, node)
+	if server.Decryption != "" {
+		spec, err := parseDecryption(server.Decryption)
+		if err != nil {
+			return model.LocalTLS{}, err
+		}
+		if spec != nil {
+			ticket := "1rtt"
+			if spec.from > 0 || spec.to > 0 {
+				ticket = "0rtt"
+			}
+			// Derivation needs key constructors, not ticket-reaper goroutines.
+			spec.from, spec.to = 0, 0
+			keys, err := spec.newServer()
+			if err != nil {
+				return model.LocalTLS{}, err
+			}
+			defer keys.Close()
+			mode := []string{"native", "xorpub", "random"}[spec.xor]
+			parts := []string{vlessScheme, mode, ticket}
+			if spec.padding != "" {
+				parts = append(parts, spec.padding)
+			}
+			for _, key := range keys.keys {
+				parts = append(parts, base64.RawURLEncoding.EncodeToString(key.pub))
+			}
+			result.Encryption = strings.Join(parts, ".")
+		} else {
+			result.Encryption = strings.TrimSpace(server.Decryption)
+		}
+	}
+	if err := ValidateClientTemplate(result); err != nil {
+		return model.LocalTLS{}, err
+	}
+	return result, nil
+}
+
+// ValidateClientTemplate validates public template fields without deriving,
+// merging or replacing them. Store pairing and runtime completeness are separate.
+func ValidateClientTemplate(result model.LocalTLS) error {
+	if result.CertPEM != "" || result.KeyPEM != "" || result.ListenHost != "" || result.Decryption != "" || result.Reality.PrivateKey != "" || result.Reality.Dest != "" || result.Reality.ShortIDs != "" {
+		return errors.New("client template contains server-only settings")
+	}
+	if err := CheckBootstrap("client", result); err != nil {
+		return err
+	}
+	if spec, err := parseEncryption(result.Encryption); err != nil {
+		return err
+	} else if spec != nil {
+		if _, err = spec.newClient(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// PublicPeerTunnel returns a validated, public-only gateway view. Hysteria2's
+// shared password is deliberately omitted; authorized snapshots need it separately.
+func PublicPeerTunnel(server model.LocalTLS, node model.Node) (model.LocalTLS, error) {
+	peer, err := DeriveClientTunnel(model.LocalTLS{}, server, node)
+	peer.CertPEM, peer.KeyPEM = "", ""
+	peer.Hysteria2 = model.Hysteria2{}
+	return peer, err
 }
 
 type cryptSpec struct {
@@ -344,7 +442,7 @@ func (spec *cryptSpec) newServer() (*encServer, error) {
 	out.relays -= 32
 	if out.from > 0 || out.to > 0 {
 		out.stop = make(chan struct{})
-		go out.reap()
+		go out.reap(out.stop)
 	}
 	return out, nil
 }
@@ -358,16 +456,15 @@ func (s *encServer) Close() {
 	s.closed = true
 	if s.stop != nil {
 		close(s.stop)
-		s.stop = nil
 	}
 }
 
-func (s *encServer) reap() {
+func (s *encServer) reap(stop <-chan struct{}) {
 	timer := time.NewTimer(time.Minute)
 	defer timer.Stop()
 	for {
 		select {
-		case <-s.stop:
+		case <-stop:
 			return
 		case <-timer.C:
 			s.mu.Lock()
@@ -923,17 +1020,46 @@ func decodeHeader(h []byte) (int, error) {
 
 type recordConn struct {
 	net.Conn
-	aes     bool
-	client  *encClient
-	united  []byte
-	pre     []byte
-	out     *aeadBox
-	peer    *aeadBox
-	peerPad []byte
-	pending bytes.Reader
+	aes         bool
+	client      *encClient
+	united      []byte
+	pre         []byte
+	out         *aeadBox
+	peer        *aeadBox
+	peerPad     []byte
+	pending     bytes.Reader
+	writeMu     sync.Mutex
+	writeClosed bool
+}
+
+// CloseWrite preserves the independent read-side AEAD/XOR state. All records
+// (including deferred handshake bytes) are flushed before the transport FIN or
+// TLS close_notify; no raw bypass of the encryption wrapper is permitted.
+func (c *recordConn) CloseWrite() error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.writeClosed {
+		return nil
+	}
+	c.writeClosed = true
+	if len(c.pre) > 0 {
+		if err := writeAll(c.Conn, c.pre); err != nil {
+			return err
+		}
+		c.pre = nil
+	}
+	if w, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return w.CloseWrite()
+	}
+	return errors.New("encryption transport does not support half-close")
 }
 
 func (c *recordConn) Write(p []byte) (int, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.writeClosed {
+		return 0, net.ErrClosed
+	}
 	if len(p) == 0 {
 		return 0, nil
 	}
@@ -1071,6 +1197,13 @@ type xorConn struct {
 
 func newXor(conn net.Conn, out, peer cipher.Stream, outSkip, inSkip int) *xorConn {
 	return &xorConn{Conn: conn, out: out, peer: peer, outSkip: outSkip, inSkip: inSkip, outHead: make([]byte, 0, 5), inHead: make([]byte, 0, 5)}
+}
+
+func (c *xorConn) CloseWrite() error {
+	if w, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return w.CloseWrite()
+	}
+	return errors.New("XOR transport does not support half-close")
 }
 
 func (c *xorConn) Write(p []byte) (int, error) {

@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -29,7 +30,7 @@ import (
 	"veilink/internal/model"
 )
 
-// CheckBootstrap validates local data-plane TLS before a process starts.
+// CheckBootstrap validates data-plane settings before the runtime starts.
 // REALITY replaces the certificate on that hop; control-plane TLS is unchanged.
 func CheckBootstrap(role string, local model.LocalTLS) error {
 	if err := checkExclusive(role, local); err != nil {
@@ -43,13 +44,10 @@ func CheckBootstrap(role string, local model.LocalTLS) error {
 		if local.Reality.Enabled() {
 			return checkRealityServer(local.Reality, "")
 		}
-		if decryptionEnabled(local.Decryption) {
-			if (local.CertFile == "") != (local.KeyFile == "") {
-				return errors.New("server data TLS certificate and key must be paired")
-			}
+		if !local.Hysteria2.Enabled() && local.TransportSecurity == "plain" {
 			return nil
 		}
-		if local.CertFile == "" || local.KeyFile == "" {
+		if local.CertPEM == "" || local.KeyPEM == "" {
 			return errors.New("server data TLS certificate and key required")
 		}
 	case "client":
@@ -107,60 +105,112 @@ func (s *service) prepareReality() error {
 }
 
 func (s *service) acceptOne(conn net.Conn) {
+	raw := conn
+	defer s.untrack(raw)
+	_ = raw.SetDeadline(time.Now().Add(15 * time.Second))
+	gate := &recordBoundaryConn{Conn: raw, ordinary: s.local.Flow != flowVision && s.reality == nil}
 	if s.reality != nil {
-		wrapped, err := reality.Server(s.ctx, conn, s.reality)
+		wrapped, err := reality.Server(s.ctx, gate, s.reality)
 		if err != nil {
-			s.untrack(conn)
+			raw.Close()
 			return
 		}
-		if !s.track(wrapped) {
-			_ = wrapped.Close()
-			s.untrack(conn)
+		conn = ownTLS(wrapped, gate)
+	} else if s.tlsConfig != nil {
+		wrapped := tls.Server(gate, s.tlsConfig)
+		if err := wrapped.HandshakeContext(s.ctx); err != nil {
+			raw.Close()
 			return
 		}
-		s.untrack(conn)
-		conn = wrapped
+		conn = ownTLS(wrapped, gate)
+	}
+	if conn != raw {
+		if !s.track(conn) {
+			conn.Close()
+			return
+		}
+		s.untrack(raw)
 	}
 	s.authenticate(conn)
 }
 
-func (s *service) dialGateway(gateway model.Node) (net.Conn, error) {
-	addr := net.JoinHostPort(gateway.Address, strconv.Itoa(gateway.Port))
-	if s.local.Hysteria2.Enabled() {
-		return dialHysteria(s.ctx, addr, gateway.ServerName, s.local)
+func enabledEndpoints(gateway model.Node) []model.ConnectEndpoint {
+	endpoints := append([]model.ConnectEndpoint(nil), gateway.ConnectEndpoints...)
+	if len(endpoints) == 0 && gateway.Address != "" && gateway.Port > 0 {
+		endpoints = []model.ConnectEndpoint{{ID: "primary", Name: "primary", Host: gateway.Address, Port: gateway.Port, ServerName: gateway.ServerName, Enabled: true}}
 	}
-	if s.local.Reality.Enabled() {
-		return dialReality(s.ctx, addr, gateway.ServerName, s.local.Reality)
-	}
-	if gateway.Tunnel.Reality.Enabled() && gateway.Tunnel.Reality.PublicKey != "" {
-		r := gateway.Tunnel.Reality
-		if r.ShortID == "" && r.ShortIDs != "" {
-			ids := strings.Split(r.ShortIDs, ",")
-			if len(ids) > 0 {
-				r.ShortID = strings.TrimSpace(ids[0])
-			}
+	out := endpoints[:0]
+	for _, ep := range endpoints {
+		if ep.Enabled && hostOK(ep.Host) && portOK(ep.Port) && hostOK(ep.ServerName) {
+			out = append(out, ep)
 		}
-		if r.ServerNames == "" && gateway.ServerName != "" {
-			r.ServerNames = gateway.ServerName
-		}
-		if r.Fingerprint == "" {
-			r.Fingerprint = "chrome"
-		}
-		return dialReality(s.ctx, addr, gateway.ServerName, r)
 	}
-	if s.local.CAFile == "" && s.outbound != nil {
-		return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(s.ctx, "tcp", addr)
-	}
-	min := uint16(tls.VersionTLS12)
-	if s.flow != "" {
-		min = tls.VersionTLS13
-	}
-	pool, err := roots(s.local.CAFile)
-	if err != nil {
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
+	return out
+}
+
+func (s *service) dialGateway(gateway model.Node, peer *clientGateway) (net.Conn, error) {
+	local := peer.local
+	if err := checkVLESS("client", local); err != nil {
 		return nil, err
 	}
-	dialer := tls.Dialer{NetDialer: &net.Dialer{Timeout: 5 * time.Second}, Config: &tls.Config{MinVersion: min, ServerName: gateway.ServerName, RootCAs: pool}}
-	return dialer.DialContext(s.ctx, "tcp", addr)
+	var last error
+	for _, endpoint := range enabledEndpoints(gateway) {
+		addr := net.JoinHostPort(endpoint.Host, strconv.Itoa(endpoint.Port))
+		serverName := endpoint.ServerName
+		if local.Hysteria2.Enabled() {
+			if conn, err := dialHysteria(s.ctx, addr, serverName, local); err == nil {
+				return conn, nil
+			} else {
+				last = err
+			}
+			continue
+		}
+		if local.Reality.Enabled() {
+			if conn, err := dialReality(s.ctx, addr, serverName, local.Reality); err == nil {
+				return conn, nil
+			} else {
+				last = err
+			}
+			continue
+		}
+		if local.TransportSecurity == "plain" {
+			if conn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(s.ctx, "tcp", addr); err == nil {
+				return conn, nil
+			} else {
+				last = err
+			}
+			continue
+		}
+		min := uint16(tls.VersionTLS12)
+		if peer.flow != "" {
+			min = tls.VersionTLS13
+		}
+		pool, err := roots(local.CAPEM)
+		if err != nil {
+			return nil, err
+		}
+		raw, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(s.ctx, "tcp", addr)
+		if err != nil {
+			last = err
+			continue
+		}
+		gate := &recordBoundaryConn{Conn: raw, ordinary: peer.flow != flowVision}
+		conn := tls.Client(gate, &tls.Config{MinVersion: min, ServerName: serverName, RootCAs: pool, SessionTicketsDisabled: true})
+		ctx, cancel := context.WithTimeout(s.ctx, 15*time.Second)
+		err = conn.HandshakeContext(ctx)
+		cancel()
+		if err != nil {
+			raw.Close()
+			last = err
+			continue
+		}
+		return ownTLS(conn, gate), nil
+	}
+	if last == nil {
+		last = errors.New("gateway has no enabled connect endpoint")
+	}
+	return nil, last
 }
 
 func newRealityConfig(r model.Reality, fallback string) (*reality.Config, error) {
@@ -207,6 +257,13 @@ func dialReality(ctx context.Context, addr, serverName string, r model.Reality) 
 	if err := checkRealityClient(r); err != nil {
 		return nil, err
 	}
+	// The authoritative public template may select a cover name unrelated to
+	// gateway metadata. Use that same name when building the authenticated hello.
+	names, err := realityNames(r, serverName)
+	if err != nil {
+		return nil, err
+	}
+	serverName = names[0]
 	pub, err := decodeKey(r.PublicKey)
 	if err != nil {
 		return nil, err
@@ -223,9 +280,10 @@ func dialReality(ctx context.Context, addr, serverName string, r model.Reality) 
 	if err != nil {
 		return nil, err
 	}
+	gate := &recordBoundaryConn{Conn: raw}
 	verified := false
 	var authKey []byte
-	uconn := utls.UClient(raw, &utls.Config{
+	uconn := utls.UClient(gate, &utls.Config{
 		ServerName:             serverName,
 		InsecureSkipVerify:     true,
 		SessionTicketsDisabled: true,
@@ -271,7 +329,7 @@ func dialReality(ctx context.Context, addr, serverName string, r model.Reality) 
 		_ = uconn.Close()
 		return nil, errors.New("REALITY certificate was not authenticated")
 	}
-	return uconn, nil
+	return ownTLS(uconn, gate), nil
 }
 
 func realityAuthKey(local *ecdh.PrivateKey, peer, salt []byte) ([]byte, error) {

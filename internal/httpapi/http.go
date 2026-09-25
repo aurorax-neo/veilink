@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 )
 
 type session struct {
+	version string
 	csrf    string
 	expires time.Time
 }
@@ -65,7 +67,15 @@ func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 		failure(w, 400)
 		return false
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	limit := int64(64 << 10)
+	if r.URL.Path == "/api/nodes/generate" {
+		limit = 4 << 10
+	}
+	// Three PEM fields may each contain up to 64 KiB; JSON escaping adds overhead.
+	if r.URL.Path == "/api/nodes" || (strings.HasPrefix(r.URL.Path, "/api/nodes/") && r.Method == http.MethodPut) {
+		limit = 512 << 10
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	d := json.NewDecoder(r.Body)
 	d.DisallowUnknownFields()
 	if d.Decode(v) != nil {
@@ -98,11 +108,26 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	// Reject browser cross-site mutations, including login CSRF. Same-origin JSON
 	// and the CSRF header cannot be sent by an untrusted origin without preflight.
-	if r.Method != "GET" && r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+	origin := r.Header.Get("Origin")
+	parsed, originErr := url.Parse(origin)
+	scheme := "https"
+	if a.insecure {
+		scheme = "http"
+	}
+	if r.Method != "GET" && (r.Header.Get("Sec-Fetch-Site") == "cross-site" || (origin != "" && (originErr != nil || parsed.Host != r.Host || parsed.Scheme != scheme))) {
 		failure(w, 403)
 		return
 	}
-	if r.URL.Path == "/api/login" && r.Method == "POST" {
+	if r.URL.Path == "/api/setup" && r.Method == "GET" {
+		has, err := a.store.HasAdmin()
+		if err != nil {
+			failure(w, 503)
+			return
+		}
+		output(w, 200, map[string]bool{"registration_required": !has})
+		return
+	}
+	if (r.URL.Path == "/api/login" || r.URL.Path == "/api/register") && r.Method == "POST" {
 		a.mu.Lock()
 		now := time.Now()
 		if now.Sub(a.loginWindow) > time.Minute {
@@ -123,15 +148,33 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !decode(w, r, &in) {
 			return
 		}
-		if !a.store.Login(in.Username, in.Password) {
+		if r.URL.Path == "/api/register" {
+			err := a.store.InitAdmin(in.Username, in.Password)
+			if err == store.ErrRegistrationClosed {
+				failure(w, 409)
+				return
+			}
+			if err == store.ErrInvalid {
+				failure(w, 400)
+				return
+			}
+			if err != nil {
+				failure(w, 503)
+				return
+			}
+			output(w, 201, map[string]bool{"ok": true})
+			return
+		}
+		version, valid := a.store.LoginVersion(in.Username, in.Password)
+		if !valid {
 			failure(w, 401)
 			return
 		}
 		token := auth.Token()
-		s := session{csrf: auth.Token(), expires: now.Add(12 * time.Hour)}
+		s := session{csrf: auth.Token(), version: version, expires: now.Add(12 * time.Hour)}
 		a.mu.Lock()
 		for k, v := range a.sessions {
-			if now.After(v.expires) {
+			if now.After(v.expires) || v.version != version {
 				delete(a.sessions, k)
 			}
 		}
@@ -158,7 +201,8 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ok = false
 	}
 	a.mu.Unlock()
-	if !ok {
+	version, versionErr := a.store.AdminVersion()
+	if !ok || versionErr != nil || s.version != version {
 		failure(w, 401)
 		return
 	}
@@ -217,7 +261,29 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			matched = false
 		}
 	case "nodes":
+		// Embedded enrollment belongs exclusively to the local master. Guard all
+		// external token operations before they can issue, rotate, or revoke it.
+		if len(p) == 3 && (p[2] == "join" || p[2] == "enroll") {
+			nodes, loadErr := a.store.Nodes()
+			if loadErr != nil {
+				failure(w, 400)
+				return
+			}
+			for _, n := range nodes {
+				if n.ID == id && n.Embedded {
+					failure(w, 400)
+					return
+				}
+			}
+		}
 		switch {
+		case len(p) == 2 && id == "generate":
+			if r.Method != http.MethodPost {
+				failure(w, http.StatusNotFound)
+				return
+			}
+			generate(w, r)
+			return
 		case r.Method == "GET" && len(p) == 1:
 			result, err = a.store.Nodes()
 		case (r.Method == "POST" && len(p) == 1) || (r.Method == "PUT" && len(p) == 2):
@@ -231,6 +297,11 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			err = a.store.RemoveNode(id, true)
 		case r.Method == "POST" && len(p) == 3 && p[2] == "revoke":
 			err = a.store.RemoveNode(id, false)
+		case r.Method == "POST" && len(p) == 3 && p[2] == "join":
+			a.joinCommand(w, r, id)
+			return
+		case r.Method == "DELETE" && len(p) == 3 && p[2] == "enroll":
+			err = a.store.RevokeEnrollToken(id)
 		case r.Method == "POST" && len(p) == 3 && p[2] == "enroll":
 			var in struct {
 				TTL int64 `json:"ttl_seconds"`
@@ -248,21 +319,6 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			var token string
 			token, err = a.store.EnrollToken(id, time.Duration(in.TTL)*time.Second)
 			result = map[string]string{"token": token}
-		default:
-			matched = false
-		}
-	case "bindings":
-		switch {
-		case r.Method == "GET" && len(p) == 1:
-			result, err = a.store.Bindings()
-		case r.Method == "POST" && len(p) == 1:
-			var b model.Binding
-			if !decode(w, r, &b) {
-				return
-			}
-			result, err = a.store.SaveBinding(b)
-		case r.Method == "DELETE" && len(p) == 2:
-			err = a.store.DeleteBinding(id)
 		default:
 			matched = false
 		}
@@ -302,6 +358,17 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if result == nil {
 		result = map[string]bool{"ok": true}
 	}
+	// Session associations belong to node snapshots, never management payloads.
+	switch value := result.(type) {
+	case model.Mapping:
+		value.BindingID = ""
+		result = value
+	case []model.Mapping:
+		for i := range value {
+			value[i].BindingID = ""
+		}
+		result = value
+	}
 	output(w, 200, result)
 }
 
@@ -317,7 +384,7 @@ func (a *API) computeStats() (any, error) {
 	online := 0
 	now := time.Now().Unix()
 	for _, n := range nodes {
-		if n.LastSeen > 0 && (now-n.LastSeen) < 60 && !n.Revoked {
+		if n.LastSeen > 0 && now >= n.LastSeen && (now-n.LastSeen) < 90 && !n.Revoked {
 			online++
 		}
 	}

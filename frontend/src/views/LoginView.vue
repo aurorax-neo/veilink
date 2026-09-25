@@ -1,53 +1,41 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 
-defineProps<{ error: string; busy: boolean }>()
+const props = defineProps<{ error: string; busy: boolean; register?: boolean }>()
 const emit = defineEmits<{ submit: [username: string, password: string] }>()
 const username = ref('')
 const password = ref('')
+const confirm = ref('')
+const localError = ref('')
 
 function onSubmit() {
+  localError.value = ''
+  if (props.register && password.value !== confirm.value) { localError.value = '两次密码不一致'; return }
+  const size = new TextEncoder().encode(password.value).length
+  if (props.register && (size < 12 || size > 72)) { localError.value = '密码须为 12–72 字节'; return }
   emit('submit', username.value, password.value)
 }
 </script>
 
 <template>
   <div class="login">
-    <section class="story">
-      <a class="brand" href="#/dashboard" aria-label="Veilink">
-        <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" /><path d="M7.5 8.5h4.4L16 20.2 20.1 8.5H24.5L17.4 24.5h-2.8L7.5 8.5z" /></svg>
-        veilink
-        <span>CONTROL</span>
-      </a>
-      <div>
-        <p class="kicker">PRIVATE TCP FABRIC</p>
-        <h1>把公网入口接到内网服务。</h1>
-        <p class="story-copy">只转发已经登记的 TCP。控制面下发配置，数据面不经过管理中心。</p>
-        <ol class="rail" aria-label="数据路径">
-          <li><span>01</span><div><strong>访问者</strong><small>公网客户端</small></div></li>
-          <li><span>02</span><div><strong>映射端口</strong><small>只接受已登记的 TCP</small></div></li>
-          <li><span>03</span><div><strong>公网网关</strong><small>server 上的 VLESS 入口</small></div></li>
-          <li><span>04</span><div><strong>内网节点</strong><small>client 主动连出</small></div></li>
-          <li><span>05</span><div><strong>目标服务</strong><small>节点自己的网络</small></div></li>
-        </ol>
-      </div>
-      <p class="story-foot">VEILINK / 前端与 master API 分离</p>
-    </section>
     <main class="login-main" id="login-main">
       <form class="login-card" @submit.prevent="onSubmit">
-        <p class="kicker">管理中心</p>
-        <h2>登录</h2>
-        <p class="lead">管理节点、绑定和 TCP 映射。账号由初始化命令创建，没有默认密码。</p>
+        <h2>veilink · {{ register ? '首次注册' : '登录' }}</h2>
+        <p v-if="register">创建唯一管理员。请在可信网络中完成首次注册。</p>
         <label for="username">管理员账号</label>
-        <input id="username" v-model="username" name="username" autocomplete="username" required :disabled="busy" />
+        <input id="username" v-model="username" name="username" autocomplete="username" maxlength="128" required :disabled="busy" />
         <label for="password">密码</label>
-        <input id="password" v-model="password" name="password" type="password" autocomplete="current-password" required :disabled="busy" />
-        <p v-if="error" class="error" role="alert">{{ error }}</p>
+        <input id="password" v-model="password" name="password" type="password" :autocomplete="register ? 'new-password' : 'current-password'" maxlength="72" required :disabled="busy" />
+        <template v-if="register">
+          <label for="confirm">确认密码</label>
+          <input id="confirm" v-model="confirm" type="password" autocomplete="new-password" maxlength="72" required :disabled="busy" />
+        </template>
+        <p v-if="localError || error" class="error" role="alert">{{ localError || error }}</p>
         <button class="btn primary login-submit" type="submit" :disabled="busy">
-          {{ busy ? '正在登录…' : '进入控制台' }}
+          {{ busy ? '正在提交…' : register ? '创建管理员' : '进入控制台' }}
           <span aria-hidden="true">→</span>
         </button>
-        <p class="fine">页面运行在独立前端。开发服务器把 /api 转到 master，浏览器仍按同源处理 Cookie 和 CSRF。</p>
       </form>
     </main>
   </div>

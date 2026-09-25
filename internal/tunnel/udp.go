@@ -17,19 +17,21 @@ const maxDatagram = maxPayload - 64
 // existing mux can carry it. On the gateway, queue is filled by the shared
 // listener and replies go back to peer. On the client, udp is a connected socket.
 type xudpConn struct {
-	host   string
-	port   int
-	global [8]byte
-	udp    *net.UDPConn
-	back   *net.UDPConn
-	peer   *net.UDPAddr
-	queue  chan []byte
-	done   chan struct{}
-	once   sync.Once
-	mu     sync.Mutex
-	buf    []byte
-	fresh  bool
-	seen   time.Time
+	host      string
+	port      int
+	global    [8]byte
+	udp       *net.UDPConn
+	back      *net.UDPConn
+	peer      *net.UDPAddr
+	queue     chan []byte
+	done      chan struct{}
+	once      sync.Once
+	mu        sync.Mutex
+	rmu       sync.Mutex // serializes Read and owns packetBuf
+	packetBuf []byte
+	buf       []byte
+	fresh     bool
+	seen      time.Time
 }
 
 func newClientUDP(conn *net.UDPConn, host string, port int) *xudpConn {
@@ -65,6 +67,11 @@ func (c *xudpConn) idle(limit time.Duration) bool {
 }
 
 func (c *xudpConn) Read(p []byte) (int, error) {
+	c.rmu.Lock()
+	defer c.rmu.Unlock()
+	if len(p) == 0 {
+		return 0, nil
+	}
 	c.mu.Lock()
 	if len(c.buf) > 0 {
 		n := copy(p, c.buf)
@@ -81,15 +88,20 @@ func (c *xudpConn) Read(p []byte) (int, error) {
 		case raw = <-c.queue:
 		}
 	} else {
-		buf := make([]byte, 64<<10)
-		n, err := c.udp.Read(buf)
-		if n == 0 {
-			return 0, err
+		if c.packetBuf == nil {
+			c.packetBuf = make([]byte, 64<<10)
 		}
-		if n > maxDatagram {
-			return c.Read(p)
+		for {
+			n, err := c.udp.Read(c.packetBuf)
+			if n == 0 {
+				return 0, err
+			}
+			if n > maxDatagram {
+				continue
+			}
+			raw = c.packetBuf[:n]
+			break
 		}
-		raw = buf[:n]
 	}
 	c.mu.Lock()
 	first := c.fresh

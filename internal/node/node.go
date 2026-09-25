@@ -11,10 +11,13 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/structpb"
 	"log/slog"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 	pb "veilink/api/control/v1"
 	"veilink/internal/config"
@@ -23,6 +26,11 @@ import (
 	"veilink/internal/model"
 	"veilink/internal/tunnel"
 )
+
+// ErrCredentialRejected is returned only after an authentication rejection and
+// successful removal of the local credential/snapshot. Ordinary nodes still
+// require administrator enrollment; the owning master may recover its node.
+var ErrCredentialRejected = errors.New("node credential rejected; local state wiped; administrator must re-enroll")
 
 type diskState struct {
 	NodeID     string          `json:"node_id"`
@@ -109,19 +117,16 @@ func Run(ctx context.Context, c config.Config, role string) error {
 	} else if !os.IsNotExist(er) {
 		return er
 	}
-	local := c.TLS
-	local.Pool = c.Pool
-	runtime := tunnel.New(local)
-	defer runtime.Close()
-	failed := false
+	// Only authenticated database snapshots configure the tunnel runtime.
+	runtime := tunnel.New(model.LocalTLS{})
+	runCtx, stopRuntime := context.WithCancel(ctx)
+	defer func() { stopRuntime(); closeRuntime(runtime) }()
+	state := newSyncState(runCtx, runtime)
 	if st.Snapshot != nil {
 		if st.Snapshot.Node.ID != c.NodeID || st.Snapshot.Node.Role != role {
 			return errors.New("cached node identity mismatch")
 		}
-		if e = runtime.Apply(*st.Snapshot); e != nil {
-			failed = true
-			slog.Warn("cached runtime configuration could not be restored")
-		}
+		state.restore(*st.Snapshot)
 	}
 	var dialOpts []grpc.DialOption
 	if c.ControlCA == "" && c.ControlServerName == "" {
@@ -160,19 +165,19 @@ func Run(ctx context.Context, c config.Config, role string) error {
 			e = nil
 		}
 		if e == nil {
-			e = cycle(ctx, client, c, role, &st, runtime, &failed, path, ring)
+			e = cycle(ctx, client, c, role, &st, state, path, ring, defaultCycleTiming)
+		}
+		if rejected(e) {
+			stopRuntime()
+			if er := wipeState(path, &st); er != nil {
+				return er
+			}
+			return ErrCredentialRejected
 		}
 		if ctx.Err() != nil {
 			return nil
 		}
-		if status.Code(e) == codes.Unauthenticated || status.Code(e) == codes.PermissionDenied {
-			runtime.Close()
-			if er := os.Remove(path); er != nil && !os.IsNotExist(er) {
-				return errors.New("credential rejected; local state removal failed")
-			}
-			return errors.New("node credential rejected; local state wiped; administrator must re-enroll")
-		}
-		if errors.Is(e, context.DeadlineExceeded) || errors.Is(e, context.Canceled) {
+		if e == nil || errors.Is(e, context.DeadlineExceeded) || errors.Is(e, context.Canceled) {
 			backoff = time.Second
 			continue
 		}
@@ -193,91 +198,249 @@ func Run(ctx context.Context, c config.Config, role string) error {
 	return nil
 }
 
-// A bounded stream avoids indefinitely hung Recv/Send; each reconnection pulls
-// regardless of revision. All runtime operations execute in this one goroutine.
-func cycle(ctx context.Context, client pb.ControlClient, c config.Config, role string, st *diskState, runtime *tunnel.Runtime, failed *bool, path string, ring *logring.Ring) error {
-	streamCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-	stream, e := client.Events(streamCtx)
-	if e != nil {
-		return e
-	}
-	first := true
-	for {
-		applied := runtime.Revision()
-		if applied < 0 {
-			applied = 0
-		}
-		errText := ""
-		if *failed {
-			errText = "apply failed"
-		}
+// runtimeDriver permits deterministic slow-apply tests without real listeners.
+type runtimeDriver interface {
+	Apply(model.Snapshot) error
+	Revision() int64
+	Close() error
+}
 
-		// Collect and drain log entries from the ring to send with heartbeat
-		var logMaps []any
-		if ring != nil {
-			logEntries := ring.Drain()
-			for _, entry := range logEntries {
-				logMaps = append(logMaps, map[string]any{
-					"at":      entry.At,
-					"level":   entry.Level,
-					"message": entry.Message,
-				})
+type applyResult struct {
+	snapshot model.Snapshot
+	revision int64
+	err      error
+}
+
+// One worker survives stream rotations. It never touches credentials or disk,
+// and no second Apply is started while the first is outstanding.
+type syncState struct {
+	ctx      context.Context
+	jobs     chan model.Snapshot
+	results  chan applyResult
+	busy     bool // control-loop owned
+	revision atomic.Int64
+	failed   atomic.Bool
+}
+
+func newSyncState(ctx context.Context, runtime runtimeDriver) *syncState {
+	s := &syncState{ctx: ctx, jobs: make(chan model.Snapshot, 1), results: make(chan applyResult, 1)}
+	s.revision.Store(-1)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case snap := <-s.jobs:
+				if ctx.Err() != nil {
+					return
+				}
+				var err error
+				if cancellable, ok := runtime.(interface {
+					ApplyContext(context.Context, model.Snapshot) error
+				}); ok {
+					err = cancellable.ApplyContext(ctx, snap)
+				} else {
+					err = runtime.Apply(snap)
+				}
+				if ctx.Err() != nil {
+					return
+				}
+				r := applyResult{snapshot: snap, revision: runtime.Revision(), err: err}
+				select {
+				case s.results <- r:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
+	}()
+	return s
+}
 
-		in, _ := control.Envelope(map[string]any{"node_id": c.NodeID, "credential": st.Credential, "applied_revision": applied, "error": errText, "logs": logMaps})
-		if e = stream.Send(in); e != nil {
-			_, recvErr := stream.Recv()
-			if recvErr != nil {
+func (s *syncState) restore(snap model.Snapshot) {
+	s.busy = true
+	s.jobs <- snap
+}
+
+func closeRuntime(runtime runtimeDriver) {
+	done := make(chan struct{})
+	go func() { _ = runtime.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		// Legacy Apply is not cancellable. Do not hold credential cleanup hostage.
+	}
+}
+
+func rejected(err error) bool {
+	return status.Code(err) == codes.Unauthenticated || status.Code(err) == codes.PermissionDenied
+}
+
+func wipeState(path string, st *diskState) error {
+	st.Credential, st.Snapshot = "", nil
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return errors.New("credential rejected; local state removal failed")
+	}
+	return nil
+}
+
+type cycleTiming struct{ lifetime, heartbeat, pull time.Duration }
+
+var defaultCycleTiming = cycleTiming{2 * time.Minute, 10 * time.Second, 10 * time.Second}
+
+// heartbeatEnvelope drains exactly once. Oversized entries/batches are dropped,
+// not retried or re-drained; the complete protobuf stays within the RPC limit.
+func heartbeatEnvelope(id, credential string, revision int64, failed bool, ring *logring.Ring) (*structpb.Struct, error) {
+	errText := ""
+	if failed {
+		errText = "apply failed"
+	}
+	if revision < 0 {
+		revision = 0
+	}
+	m, err := control.Envelope(map[string]any{"node_id": id, "credential": credential, "applied_revision": revision, "error": errText, "logs": []any{}})
+	if err != nil {
+		return nil, err
+	}
+	logs := m.Fields["logs"].GetListValue()
+	if ring != nil {
+		for _, entry := range ring.Drain() {
+			item, err := structpb.NewStruct(map[string]any{"at": float64(entry.At), "level": entry.Level, "message": entry.Message})
+			if err != nil {
+				continue
+			}
+			logs.Values = append(logs.Values, structpb.NewStructValue(item))
+			if proto.Size(m) > 64<<10 {
+				logs.Values = logs.Values[:len(logs.Values)-1]
+			}
+		}
+	}
+	if proto.Size(m) > 64<<10 {
+		return nil, errors.New("heartbeat identity exceeds RPC size limit")
+	}
+	return m, nil
+}
+
+func heartbeat(ctx context.Context, client pb.ControlClient, id, credential string, state *syncState, ring *logring.Ring, interval time.Duration, revisions chan<- int64) error {
+	stream, err := client.Events(ctx)
+	if err != nil {
+		return err
+	}
+	for {
+		in, err := heartbeatEnvelope(id, credential, state.revision.Load(), state.failed.Load(), ring)
+		if err != nil {
+			return err
+		}
+		if err = stream.Send(in); err != nil {
+			if _, recvErr := stream.Recv(); recvErr != nil {
 				return recvErr
 			}
-			return e
+			return err
 		}
-		out, e := stream.Recv()
-		if e != nil {
-			return e
+		out, err := stream.Recv()
+		if err != nil {
+			return err
 		}
 		desired := int64(out.GetFields()["revision"].GetNumberValue())
-		if first || desired > runtime.Revision() || *failed {
-			first = false
-			call, stop := context.WithTimeout(ctx, 10*time.Second)
-			req, _ := control.Envelope(map[string]any{"node_id": c.NodeID, "credential": st.Credential})
-			response, er := client.Pull(call, req)
-			stop()
-			if er != nil {
-				return er
+		select {
+		case revisions <- desired:
+		default:
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(interval):
+		}
+	}
+}
+
+// Heartbeats never call Runtime.Revision (which locks behind Apply). Disk state
+// and scheduling belong exclusively to this loop; the apply worker is serialized.
+func cycle(ctx context.Context, client pb.ControlClient, c config.Config, role string, st *diskState, state *syncState, path string, ring *logring.Ring, timing cycleTiming) (err error) {
+	streamCtx, cancel := context.WithTimeout(ctx, timing.lifetime)
+	deadline, _ := streamCtx.Deadline()
+	defer cancel()
+	revisions := make(chan int64, 1)
+	terminal := make(chan error, 1)
+	go func() {
+		err := heartbeat(streamCtx, client, c.NodeID, st.Credential, state, ring, timing.heartbeat, revisions)
+		terminal <- err
+		cancel() // interrupts an outstanding Pull immediately on rejection
+	}()
+	defer func() {
+		cancel()
+		// gRPC Send/Recv honor cancellation; join before diskState may be wiped.
+		heartbeatErr := <-terminal
+		if rejected(heartbeatErr) {
+			err = heartbeatErr
+			return
+		}
+		if err == nil && ctx.Err() != nil {
+			err = ctx.Err()
+		}
+		// A routine two-minute rotation is not a transport failure/backoff.
+		// The server's propagated gRPC deadline can fire just before the local
+		// timer; our explicit cancel must not turn that rotation into a failure.
+		rotated := errors.Is(streamCtx.Err(), context.DeadlineExceeded) ||
+			(status.Code(heartbeatErr) == codes.DeadlineExceeded && time.Until(deadline) <= 10*time.Millisecond)
+		if ctx.Err() == nil && rotated && !rejected(err) {
+			err = nil
+		} else if err == nil && heartbeatErr != nil {
+			err = heartbeatErr
+		}
+	}()
+	first := true
+	for {
+		select {
+		case <-streamCtx.Done():
+			return nil
+		case result := <-state.results:
+			state.busy = false
+			state.revision.Store(result.revision)
+			state.failed.Store(result.err != nil)
+			if result.err != nil {
+				slog.Warn("runtime configuration apply failed", "revision", result.snapshot.Revision, "err", result.err)
+			} else if streamCtx.Err() == nil && state.ctx.Err() == nil {
+				st.Snapshot = &result.snapshot
+				if err := save(path, *st); err != nil {
+					state.failed.Store(true)
+					return errors.New("cannot persist runtime cache")
+				}
 			}
-			b, er := json.Marshal(response.AsMap())
-			if er != nil {
-				return er
+		case desired := <-revisions:
+			if state.busy || (!first && desired <= state.revision.Load() && !state.failed.Load()) {
+				continue
+			}
+			first = false
+			request := map[string]any{"node_id": c.NodeID, "credential": st.Credential}
+			req, err := control.Envelope(request)
+			if err != nil {
+				return err
+			}
+			call, stop := context.WithTimeout(streamCtx, timing.pull)
+			response, err := client.Pull(call, req)
+			stop()
+			if err != nil {
+				return err
+			}
+			b, err := json.Marshal(response.AsMap())
+			if err != nil {
+				return err
 			}
 			var snap model.Snapshot
-			if er = json.Unmarshal(b, &snap); er != nil {
-				return er
+			if err = json.Unmarshal(b, &snap); err != nil {
+				return err
 			}
 			if snap.Node.ID != c.NodeID || snap.Node.Role != role || snap.Node.Revoked {
 				return status.Error(codes.PermissionDenied, "node identity rejected")
 			}
-			if snap.Revision < runtime.Revision() {
+			if snap.Revision < state.revision.Load() {
 				return errors.New("stale snapshot")
 			}
-			if er = runtime.Apply(snap); er != nil {
-				*failed = true
-				slog.Warn("runtime configuration apply failed", "revision", snap.Revision, "err", er)
-			} else {
-				*failed = false
-				st.Snapshot = &snap
-				if er = save(path, *st); er != nil {
-					*failed = true
-					return errors.New("cannot persist runtime cache")
-				}
+			if streamCtx.Err() != nil {
+				return nil
 			}
-		}
-		select {
-		case <-streamCtx.Done():
-			return streamCtx.Err()
-		case <-time.After(10 * time.Second):
+			state.restore(snap)
 		}
 	}
 }

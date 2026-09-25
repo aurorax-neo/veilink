@@ -1,225 +1,112 @@
 <script setup lang="ts">
-import { computed, inject, reactive, ref } from 'vue'
+import { computed, inject, reactive, ref, watch } from 'vue'
 import { api } from '../api'
 import { deskKey } from '../desk'
-import { bindingLabel, endpoint, nodeName, validateMapping } from '../format'
+import { endpoint, nodeName, validateMapping } from '../format'
 import type { Mapping } from '../types'
 import Badge from '../components/Badge.vue'
 import EmptyState from '../components/EmptyState.vue'
 import Modal from '../components/Modal.vue'
 
 const desk = inject(deskKey)!
-const filter = ref<'all' | 'on' | 'off'>('all')
+const filter = ref('all')
 const query = ref('')
 const editor = ref<InstanceType<typeof Modal> | null>(null)
 const confirm = ref<InstanceType<typeof Modal> | null>(null)
-const confirmTitle = ref('')
-const confirmText = ref('')
-let confirmRun: () => Promise<void> = async () => {}
-const draft = reactive({
-  id: '',
-  name: '',
-  bindingId: '',
-  listenHost: '0.0.0.0',
-  listenPort: '',
-  targetHost: '',
-  targetPort: '',
-  network: 'tcp',
-  enabled: true,
-})
-
-const rows = computed(() => {
-  const q = query.value.trim().toLowerCase()
-  return desk.mappings.filter((mapping) => {
-    if (filter.value === 'on' && !mapping.enabled) return false
-    if (filter.value === 'off' && mapping.enabled) return false
-    if (!q) return true
-    const binding = desk.bindings.find((item) => item.id === mapping.binding_id)
-    return [mapping.name, mapping.network || 'tcp', mapping.listen_host, mapping.target_host, binding ? bindingLabel(desk.nodes, binding) : ''].join(' ').toLowerCase().includes(q)
-  })
-})
-
-const groups = computed(() => {
-  const map = new Map<string, Mapping[]>()
-  for (const m of rows.value) {
-    const key = m.binding_id
-    if (!map.has(key)) map.set(key, [])
-    map.get(key)!.push(m)
-  }
-  return [...map.entries()].map(([bindingId, mappings]) => {
-    const binding = desk.bindings.find((b) => b.id === bindingId)
-    const label = binding ? `${nodeName(desk.nodes, binding.server_id)} → ${nodeName(desk.nodes, binding.client_id)}` : bindingId
-    return { bindingId, label, mappings }
-  })
-})
-
-function openCreate() {
-  Object.assign(draft, {
-    id: '', name: '', bindingId: desk.bindings[0]?.id || '',
-    listenHost: '0.0.0.0', listenPort: '', targetHost: '', targetPort: '',
-    network: 'tcp', enabled: true,
-  })
+const pending = ref<Mapping | null>(null)
+const action = ref<'toggle' | 'delete'>('toggle')
+const draft = reactive({ id: '', name: '', serverId: '', clientId: '', pool: 1, mux: false, listenHost: '0.0.0.0', listenPort: '', targetHost: '', targetPort: '', network: 'tcp', enabled: true })
+const defaultMuxType = 'smux'
+const muxType = ref('')
+watch(() => draft.mux, enabled => { muxType.value = enabled ? muxType.value || defaultMuxType : '' }, { flush: 'sync' })
+watch(() => draft.network, network => { if (network !== 'tcp') { draft.mux = false; muxType.value = '' } }, { flush: 'sync' })
+const servers = computed(() => desk.nodes.filter(n => n.role === 'server' && !n.revoked))
+const clients = computed(() => desk.nodes.filter(n => n.role === 'client' && !n.revoked))
+const rows = computed(() => desk.mappings.filter(m => (filter.value === 'all' || m.enabled === (filter.value === 'on')) && [m.name, m.listen_host, m.target_host, nodeName(desk.nodes, m.server_id), nodeName(desk.nodes, m.client_id)].join(' ').toLowerCase().includes(query.value.trim().toLowerCase())))
+function fields(m: Mapping) {
+  return { id: m.id, name: m.name, serverId: m.server_id, clientId: m.client_id, pool: m.pool || 1, mux: m.mux, listenHost: m.listen_host, listenPort: String(m.listen_port), targetHost: m.target_host, targetPort: String(m.target_port), network: m.network || 'tcp', enabled: m.enabled }
+}
+function open(mapping?: Mapping) {
+  Object.assign(draft, mapping ? fields(mapping) : { id: '', name: '', serverId: servers.value[0]?.id || '', clientId: clients.value[0]?.id || '', pool: 1, mux: false, listenHost: '0.0.0.0', listenPort: '', targetHost: '127.0.0.1', targetPort: '', network: 'tcp', enabled: true })
+  muxType.value = draft.network === 'tcp' && draft.mux ? mapping?.mux_type || defaultMuxType : ''
   editor.value?.open()
 }
-
-function openEdit(mapping: Mapping) {
-  Object.assign(draft, {
-    id: mapping.id, name: mapping.name, bindingId: mapping.binding_id,
-    listenHost: mapping.listen_host, listenPort: String(mapping.listen_port),
-    targetHost: mapping.target_host, targetPort: String(mapping.target_port),
-    network: mapping.network || 'tcp', enabled: mapping.enabled,
-  })
-  editor.value?.open()
-}
-
-async function saveMapping() {
-  const problem = validateMapping(draft, desk.nodes, desk.bindings, desk.mappings, draft.id)
+async function save() {
+  const problem = validateMapping(draft, desk.nodes, desk.mappings, draft.id)
   if (problem) throw new Error(problem)
   await api(draft.id ? `/mappings/${encodeURIComponent(draft.id)}` : '/mappings', draft.id ? 'PUT' : 'POST', {
-    name: draft.name.trim(), binding_id: draft.bindingId,
-    listen_host: draft.listenHost.trim(), listen_port: Number(draft.listenPort),
-    target_host: draft.targetHost.trim(), target_port: Number(draft.targetPort),
-    network: draft.network || 'tcp', enabled: draft.enabled,
+    name: draft.name.trim(), server_id: draft.serverId, client_id: draft.clientId, pool: draft.pool, mux: draft.network === 'tcp' && draft.mux,
+    mux_type: draft.network === 'tcp' && draft.mux ? muxType.value : '',
+    listen_host: draft.listenHost.trim(), listen_port: Number(draft.listenPort), target_host: draft.targetHost.trim(), target_port: Number(draft.targetPort), network: draft.network, enabled: draft.enabled,
   })
-  await desk.reload()
-  desk.notify('映射已保存。请到节点页查看期望版本和已应用版本。')
+  await desk.reload(); desk.notify('映射已保存。')
   return true
 }
-
-function ask(title: string, text: string, run: () => Promise<void>) {
-  confirmTitle.value = title; confirmText.value = text; confirmRun = run
-  confirm.value?.open()
-}
-
-async function runConfirm() { await confirmRun(); return true }
-
-function toggle(mapping: Mapping) {
-  const next = !mapping.enabled
-  ask(next ? '启用映射' : '停用映射', `确定${next ? '启用' : '停用'}「${mapping.name}」？变更会下发到两端，可能断开现有连接。`, async () => {
-    const problem = next ? validateMapping({
-      name: mapping.name, bindingId: mapping.binding_id,
-      listenHost: mapping.listen_host, listenPort: String(mapping.listen_port),
-      targetHost: mapping.target_host, targetPort: String(mapping.target_port),
-      network: mapping.network || 'tcp',
-    }, desk.nodes, desk.bindings, desk.mappings, mapping.id) : null
-    if (problem) throw new Error(problem)
-    await api(`/mappings/${encodeURIComponent(mapping.id)}`, 'PUT', { ...mapping, enabled: next })
-    await desk.reload()
-    desk.notify(next ? '映射已启用。' : '映射已停用。')
-  })
-}
-
-function remove(mapping: Mapping) {
-  ask('删除映射', `确定删除「${mapping.name}」？此操作不可撤销。`, async () => {
-    await api(`/mappings/${encodeURIComponent(mapping.id)}`, 'DELETE')
-    await desk.reload()
-    desk.notify('映射已删除。')
-  })
+function ask(mapping: Mapping, operation: 'toggle' | 'delete') { pending.value = mapping; action.value = operation; confirm.value?.open() }
+async function run() {
+  const mapping = pending.value
+  if (!mapping) return false
+  if (action.value === 'toggle') {
+    if (!mapping.enabled) {
+      const problem = validateMapping({ ...fields(mapping), enabled: true }, desk.nodes, desk.mappings, mapping.id)
+      if (problem) throw new Error(problem)
+    }
+    await api(`/mappings/${encodeURIComponent(mapping.id)}`, 'PUT', { ...mapping, enabled: !mapping.enabled })
+  } else await api(`/mappings/${encodeURIComponent(mapping.id)}`, 'DELETE')
+  await desk.reload(); desk.notify(action.value === 'delete' ? '映射已删除。' : '状态已更新。')
+  return true
 }
 </script>
 
 <template>
-  <EmptyState v-if="!desk.loaded && desk.loading" title="正在读取映射" text="正在从管理中心获取最新列表。" />
-  <EmptyState v-else-if="!desk.loaded" title="暂时无法读取映射" :text="(desk.error || '请求失败') + ' 未显示缓存或演示数据。'" />
+  <EmptyState v-if="!desk.loaded && desk.loading" title="加载中…" text="" />
+  <EmptyState v-else-if="!desk.loaded" title="加载失败" :text="desk.error" />
   <div v-else class="stack">
     <div class="toolbar">
-      <div class="chips" role="tablist" aria-label="映射筛选">
-        <button type="button" :aria-selected="filter === 'all'" @click="filter = 'all'">全部 {{ desk.mappings.length }}</button>
-        <button type="button" :aria-selected="filter === 'on'" @click="filter = 'on'">已启用 {{ desk.mappings.filter((m) => m.enabled).length }}</button>
-        <button type="button" :aria-selected="filter === 'off'" @click="filter = 'off'">已停用 {{ desk.mappings.filter((m) => !m.enabled).length }}</button>
-      </div>
-      <input v-model="query" type="search" aria-label="搜索映射" placeholder="搜索名称、地址或绑定" />
-      <button type="button" class="btn primary" @click="openCreate">新建映射</button>
+      <div class="chips" role="group" aria-label="映射筛选"><button v-for="item in [{id: 'all', text: '全部'}, {id: 'on', text: '启用'}, {id: 'off', text: '停用'}]" :key="item.id" type="button" :aria-pressed="filter === item.id" @click="filter = item.id">{{ item.text }}</button></div>
+      <input v-model="query" type="search" aria-label="搜索映射" placeholder="搜索名称、节点或地址" />
+      <button type="button" class="btn primary" @click="open()">新建映射</button>
     </div>
-
-    <EmptyState v-if="!rows.length" title="没有匹配的映射" text="先创建网关绑定，再添加从公网 IP 到内网目标的端口转发。" />
-    <div v-else>
-      <div v-for="group in groups" :key="group.bindingId" class="proxy-group panel">
-        <div class="proxy-group-head">{{ group.label }}</div>
-        <div class="table-scroll" tabindex="0" role="region" aria-label="映射列表，可横向滚动">
-          <table>
-            <thead>
-              <tr>
-                <th scope="col">名称</th>
-                <th scope="col">路径</th>
-                <th scope="col">状态</th>
-                <th scope="col">操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="mapping in group.mappings" :key="mapping.id">
-                <td>
-                  <strong>{{ mapping.name }}</strong>
-                  <small>{{ group.label }}</small>
-                </td>
-                <td>
-                  <div class="route">
-                    <Badge :text="(mapping.network || 'tcp').toUpperCase()" />
-                    <code>{{ endpoint(mapping.listen_host, mapping.listen_port) }}</code>
-                    <i aria-hidden="true">→</i>
-                    <code>{{ endpoint(mapping.target_host, mapping.target_port) }}</code>
-                  </div>
-                </td>
-                <td><Badge :text="mapping.enabled ? '已启用' : '已停用'" :tone="mapping.enabled ? 'good' : ''" /></td>
-                <td>
-                  <div class="actions">
-                    <button type="button" class="btn small" @click="openEdit(mapping)">编辑</button>
-                    <button type="button" class="btn small" @click="toggle(mapping)">{{ mapping.enabled ? '停用' : '启用' }}</button>
-                    <button type="button" class="btn small danger" @click="remove(mapping)">删除</button>
-                  </div>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
+    <EmptyState v-if="!rows.length" title="暂无映射" text="新建映射或调整筛选。" />
+    <div v-else class="panel table-scroll" tabindex="0" role="region" aria-label="映射列表">
+      <table>
+        <thead><tr><th scope="col">名称</th><th scope="col">服务端 → 客户端</th><th scope="col">路径</th><th scope="col">Pool</th><th scope="col">状态</th><th scope="col">操作</th></tr></thead>
+        <tbody><tr v-for="mapping in rows" :key="mapping.id">
+          <td><strong>{{ mapping.name }}</strong><Badge :text="(mapping.network || 'tcp').toUpperCase()" /></td>
+          <td>{{ nodeName(desk.nodes, mapping.server_id) }}<small>→ {{ nodeName(desk.nodes, mapping.client_id) }}</small></td>
+          <td><code>{{ endpoint(mapping.listen_host, mapping.listen_port) }}</code><small>→ <code>{{ endpoint(mapping.target_host, mapping.target_port) }}</code></small></td>
+          <td>{{ mapping.pool || 1 }}<small>{{ mapping.network === 'udp' ? 'XUDP' : mapping.mux ? 'mux 开' : 'mux 关' }}</small></td><td><Badge :text="mapping.enabled ? '启用' : '停用'" :tone="mapping.enabled ? 'good' : ''" /></td>
+          <td><div class="actions"><button type="button" class="btn small" @click="open(mapping)">编辑</button><button type="button" class="btn small" @click="ask(mapping, 'toggle')">{{ mapping.enabled ? '停用' : '启用' }}</button><button type="button" class="btn small danger" @click="ask(mapping, 'delete')">删除</button></div></td>
+        </tr></tbody>
+      </table>
     </div>
-
-    <Modal ref="editor" :title="draft.id ? '编辑端口映射' : '新建端口映射'" :disabled="!desk.bindings.length" :submit="saveMapping">
-      <p v-if="!desk.bindings.length" class="callout">请先创建网关绑定。</p>
-      <div class="grid-2">
-        <div>
-          <label for="map-name">映射名称</label>
-          <input id="map-name" v-model="draft.name" maxlength="128" required />
-        </div>
-        <div>
-          <label for="map-network">协议类型</label>
-          <select id="map-network" v-model="draft.network">
-            <option value="tcp">TCP</option>
-            <option value="udp">UDP (XUDP 封装)</option>
-          </select>
-        </div>
-      </div>
-      <label for="map-binding">网关 → 内网节点</label>
-      <select id="map-binding" v-model="draft.bindingId">
-        <option v-for="binding in desk.bindings" :key="binding.id" :value="binding.id">{{ bindingLabel(desk.nodes, binding) }}</option>
-      </select>
-      <div class="grid-2">
-        <div>
-          <label for="map-listen-host">公网监听地址</label>
-          <input id="map-listen-host" v-model="draft.listenHost" spellcheck="false" required />
-          <small class="help">必须是 IP。0.0.0.0 会暴露到全部 IPv4 接口。</small>
-        </div>
-        <div>
-          <label for="map-listen-port">公网端口</label>
-          <input id="map-listen-port" v-model="draft.listenPort" inputmode="numeric" required />
-        </div>
-      </div>
-      <div class="grid-2">
-        <div>
-          <label for="map-target-host">内网目标地址</label>
-          <input id="map-target-host" v-model="draft.targetHost" spellcheck="false" required />
-          <small class="help">从内网节点看得到的主机或 IP。</small>
-        </div>
-        <div>
-          <label for="map-target-port">目标端口</label>
-          <input id="map-target-port" v-model="draft.targetPort" inputmode="numeric" required />
-        </div>
-      </div>
-      <label class="check" for="map-enabled"><input id="map-enabled" v-model="draft.enabled" type="checkbox" /> 启用这条映射</label>
-    </Modal>
-    <Modal ref="confirm" :title="confirmTitle" save-label="确认" danger :submit="runConfirm">
-      <p class="lead">{{ confirmText }}</p>
-    </Modal>
   </div>
+  <Modal ref="editor" :title="draft.id ? '编辑映射' : '新建映射'" :disabled="!servers.length || !clients.length" :submit="save">
+    <p v-if="!servers.length || !clients.length" class="help">请先创建可用的服务端和客户端。</p>
+    <label for="map-name">名称</label><input id="map-name" v-model="draft.name" maxlength="128" required />
+    <div class="grid-2">
+      <div><label for="map-server">服务端</label><select id="map-server" v-model="draft.serverId" required :disabled="!servers.length"><option value="" disabled>请选择</option><option v-for="node in servers" :key="node.id" :value="node.id">{{ node.name }}</option></select></div>
+      <div><label for="map-client">客户端</label><select id="map-client" v-model="draft.clientId" required :disabled="!clients.length"><option value="" disabled>请选择</option><option v-for="node in clients" :key="node.id" :value="node.id">{{ node.name }}</option></select></div>
+    </div>
+    <div class="grid-2">
+      <div><label for="map-network">协议</label><select id="map-network" v-model="draft.network"><option value="tcp">TCP</option><option value="udp">UDP</option></select></div>
+      <div><label for="map-pool">Pool</label><select id="map-pool" v-model.number="draft.pool"><option v-for="n in 32" :key="n" :value="n">{{ n }}</option></select></div>
+    </div>
+    <label class="check" for="map-mux"><input id="map-mux" v-model="draft.mux" type="checkbox" :disabled="draft.network !== 'tcp'" /> TCP mux（默认关闭）</label>
+    <div v-if="draft.network === 'tcp' && draft.mux">
+      <label for="map-mux-type">mux 类型</label>
+      <select id="map-mux-type" v-model="muxType" required><option value="smux">smux</option><option value="yamux">yamux</option><option value="h2mux">h2mux</option></select>
+    </div>
+    <p class="help">关闭：每条 TCP 流使用独立认证连接；开启：多条 TCP 流共享连接，Vision 不直拷。UDP 始终使用 XUDP，不受此开关影响。Pool 控制共享会话或独立连接的预备数量。保存后自动重建相关隧道，现有连接会断开。</p>
+    <div class="grid-2">
+      <div><label for="map-listen">监听 IP</label><input id="map-listen" v-model="draft.listenHost" required spellcheck="false" /></div>
+      <div><label for="map-port">监听端口</label><input id="map-port" v-model="draft.listenPort" type="number" min="1" max="65535" required /></div>
+    </div>
+    <div class="grid-2">
+      <div><label for="map-target">目标地址</label><input id="map-target" v-model="draft.targetHost" required spellcheck="false" /></div>
+      <div><label for="map-target-port">目标端口</label><input id="map-target-port" v-model="draft.targetPort" type="number" min="1" max="65535" required /></div>
+    </div>
+    <label class="check" for="map-enabled"><input id="map-enabled" v-model="draft.enabled" type="checkbox" /> 启用</label>
+  </Modal>
+  <Modal ref="confirm" :title="action === 'delete' ? '删除映射' : pending?.enabled ? '停用映射' : '启用映射'" save-label="确认" :danger="action === 'delete'" :submit="run"><p>确认修改「{{ pending?.name }}」？现有连接可能断开。</p></Modal>
 </template>

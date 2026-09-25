@@ -1,4 +1,0 @@
-master_addr: master:8443
-state_dir: /data/state
-tls:
-  ca_file: /certs/demo/ca.pem

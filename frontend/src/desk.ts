@@ -1,9 +1,8 @@
 import type { InjectionKey } from 'vue'
-import type { Audit, Binding, Mapping, Node, PageId } from './types'
+import type { Audit, Mapping, Node, PageId } from './types'
 
 export interface Desk {
   nodes: Node[]
-  bindings: Binding[]
   mappings: Mapping[]
   audit: Audit[]
   loading: boolean

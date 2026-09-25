@@ -6,10 +6,14 @@ refs
 state
 bin
 dist
+html
 *.db
 *.db-*
 *.key
 *.pem
+*.env
+*.sqlite*
+state.json
 .env
 frontend/node_modules
 frontend/dist

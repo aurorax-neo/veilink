@@ -37,16 +37,7 @@ func TestWebAndGRPCShareOnePort(t *testing.T) {
 	}
 	addr := ln.Addr().String()
 	_ = ln.Close()
-	cfg := filepath.Join(dir, "master.yaml")
-	body := "database: " + quote(filepath.Join(dir, "veilink.db")) + "\n" +
-		"deployment_key: " + quote(filepath.Join(dir, "veilink.key")) + "\n" +
-		"bind_addr: " + quote(addr) + "\n" +
-		"control_cert: " + quote(cert) + "\n" +
-		"control_key: " + quote(key) + "\n"
-	if err = os.WriteFile(cfg, []byte(body), 0600); err != nil {
-		t.Fatal(err)
-	}
-	c, err := config.Load(cfg)
+	c, err := config.ParseFlags("master", []string{"-database", filepath.Join(dir, "veilink.db"), "-deployment-key", filepath.Join(dir, "veilink.key"), "-listen-addr", addr, "-scheme=https", "-cert-file", cert, "-key-file", key})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +45,7 @@ func TestWebAndGRPCShareOnePort(t *testing.T) {
 	defer cancel()
 	errc := make(chan error, 1)
 	go func() { errc <- Run(ctx, c) }()
-	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{ForceAttemptHTTP2: true, TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
 	var page *http.Response
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -72,6 +63,9 @@ func TestWebAndGRPCShareOnePort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if page.ProtoMajor != 2 {
+		t.Fatalf("HTTPS listener did not negotiate HTTP/2: %s", page.Proto)
+	}
 	if page.StatusCode != http.StatusOK {
 		t.Fatalf("http status %d", page.StatusCode)
 	}
@@ -83,7 +77,9 @@ func TestWebAndGRPCShareOnePort(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	_, err = pb.NewControlClient(conn).Enroll(context.Background(), &structpb.Struct{})
+	call, cancelCall := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelCall()
+	_, err = pb.NewControlClient(conn).Enroll(call, &structpb.Struct{})
 	if status.Code(err) == codes.OK || status.Code(err) == codes.Unavailable {
 		t.Fatal(err)
 	}
@@ -97,8 +93,6 @@ func TestWebAndGRPCShareOnePort(t *testing.T) {
 		t.Fatal("master did not stop")
 	}
 }
-
-func quote(s string) string { return "\"" + s + "\"" }
 
 func writeCert(t *testing.T, dir string) (string, string) {
 	t.Helper()

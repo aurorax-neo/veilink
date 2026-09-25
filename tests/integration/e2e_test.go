@@ -32,14 +32,13 @@ type process struct {
 	once sync.Once
 }
 
-func launch(t *testing.T, bin, role, cfg string, env ...string) *process {
+func launch(t *testing.T, bin, role string, flags ...string) *process {
 	t.Helper()
 	log, err := os.CreateTemp(t.TempDir(), role+"-*.log")
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(bin, role, "-config", cfg)
-	cmd.Env = append(os.Environ(), env...)
+	cmd := exec.Command(bin, append([]string{role}, flags...)...)
 	cmd.Stdout = log
 	cmd.Stderr = log
 	if err := cmd.Start(); err != nil {
@@ -79,11 +78,8 @@ func freePort(t *testing.T) int {
 	defer l.Close()
 	return l.Addr().(*net.TCPAddr).Port
 }
-func write(t *testing.T, path, content string) {
-	t.Helper()
-	if e := os.WriteFile(path, []byte(content), 0600); e != nil {
-		t.Fatal(e)
-	}
+func nodeFlags(port int, ca, id, state string) []string {
+	return []string{"-master-addr", fmt.Sprintf("127.0.0.1:%d", port), "-control-ca", ca, "-control-server-name", "localhost", "-node-id", id, "-state-dir", state}
 }
 func command(t *testing.T, root string, env []string, args ...string) {
 	t.Helper()
@@ -211,10 +207,8 @@ func TestCLIEndToEnd(t *testing.T) {
 	certs := filepath.Join(dir, "certs")
 	command(t, root, nil, "go", "run", "./tools/devcert", "-out", certs)
 	controlPort, tunnelPort, publicPort := freePort(t), freePort(t), freePort(t)
-	masterCfg := filepath.Join(dir, "master.yaml")
-	write(t, masterCfg, fmt.Sprintf("database: %q\ndeployment_key: %q\nbind_addr: 127.0.0.1:%d\ncontrol_cert: %q\ncontrol_key: %q\n", filepath.Join(dir, "master.db"), filepath.Join(dir, "master.key"), controlPort, filepath.Join(certs, "cert.pem"), filepath.Join(certs, "key.pem")))
-	command(t, root, []string{"VEILINK_ADMIN_PASSWORD=integration-secret-not-production-8429"}, bin, "init-admin", "-config", masterCfg, "-username", "admin")
-	master := launch(t, bin, "master", masterCfg)
+	masterFlags := []string{"-database", filepath.Join(dir, "master.db"), "-deployment-key", filepath.Join(dir, "master.key"), "-listen-addr", fmt.Sprintf("127.0.0.1:%d", controlPort), "-scheme=https", "-cert-file", filepath.Join(certs, "cert.pem"), "-key-file", filepath.Join(certs, "key.pem")}
+	master := launch(t, bin, "master", masterFlags...)
 	jar, _ := cookiejar.New(nil)
 	pool := x509.NewCertPool()
 	ca, err := os.ReadFile(filepath.Join(certs, "ca.pem"))
@@ -222,6 +216,8 @@ func TestCLIEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	a := &api{c: &http.Client{Jar: jar, Timeout: 4 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool, ServerName: "localhost"}}}, base: fmt.Sprintf("https://127.0.0.1:%d", controlPort)}
+	eventually(t, "setup ready", func() error { return a.call("GET", "/setup", nil, nil) })
+	a.must(t, "POST", "/register", map[string]string{"username": "admin", "password": "integration-secret-not-production-8429"}, nil)
 	a.login(t)
 	// Authenticated mutations must still require CSRF.
 	csrf := a.csrf
@@ -231,8 +227,25 @@ func TestCLIEndToEnd(t *testing.T) {
 	}
 	a.csrf = csrf
 	var server, client model.Node
-	a.must(t, "POST", "/nodes", model.Node{Name: "gateway", Role: "server", Address: "127.0.0.1", Port: tunnelPort, ServerName: "localhost"}, &server)
+	var generated struct {
+		CertPEM string `json:"cert_pem"`
+		KeyPEM  string `json:"key_pem"`
+		CAPEM   string `json:"ca_pem"`
+	}
+	a.must(t, "POST", "/nodes/generate", map[string]any{"role": "server", "kind": "certificate", "server_name": "localhost", "ttl_days": 1}, &generated)
+	a.must(t, "POST", "/nodes", model.Node{Name: "gateway", Role: "server", Address: "127.0.0.1", Port: tunnelPort, ServerName: "localhost", Tunnel: model.LocalTLS{TransportSecurity: "tls", CertPEM: generated.CertPEM, KeyPEM: generated.KeyPEM, CAPEM: generated.CAPEM, ListenHost: "127.0.0.1", ListenPort: tunnelPort}}, &server)
+	if server.ClientTunnel == nil || server.ClientTunnel.CAPEM != generated.CAPEM || server.ClientTunnel.KeyPEM != "" {
+		t.Fatal("server paired client settings not persisted safely")
+	}
 	a.must(t, "POST", "/nodes", model.Node{Name: "inside", Role: "client"}, &client)
+	for _, override := range []model.Node{
+		{ID: client.ID, Name: client.Name, Role: "client", Tunnel: model.LocalTLS{CAPEM: generated.CAPEM}},
+		{ID: client.ID, Name: client.Name, Role: "client", ClientTunnel: &model.LocalTLS{TransportSecurity: "tls"}},
+	} {
+		if e := a.call("PUT", "/nodes/"+client.ID, override, nil); e == nil {
+			t.Fatal("client-side tunnel override accepted")
+		}
+	}
 	enroll := func(id string) string {
 		var v struct {
 			Token string `json:"token"`
@@ -244,30 +257,19 @@ func TestCLIEndToEnd(t *testing.T) {
 		return v.Token
 	}
 	serverToken, clientToken := enroll(server.ID), enroll(client.ID)
-	serverCfg, clientCfg := filepath.Join(dir, "server.yaml"), filepath.Join(dir, "client.yaml")
-	common := fmt.Sprintf("master_addr: 127.0.0.1:%d\ncontrol_ca: %q\ncontrol_server_name: localhost\n", controlPort, filepath.Join(certs, "ca.pem"))
-	write(t, serverCfg, common+fmt.Sprintf("node_id: %q\nstate_dir: %q\ntls:\n  cert_file: %q\n  key_file: %q\n  listen_host: 127.0.0.1\n", server.ID, filepath.Join(dir, "server"), filepath.Join(certs, "cert.pem"), filepath.Join(certs, "key.pem")))
-	write(t, clientCfg, common+fmt.Sprintf("node_id: %q\nstate_dir: %q\ntls:\n  ca_file: %q\n", client.ID, filepath.Join(dir, "client"), filepath.Join(certs, "ca.pem")))
-	launch(t, bin, "server", serverCfg, "VEILINK_ENROLL_TOKEN="+serverToken)
-	cli := launch(t, bin, "client", clientCfg, "VEILINK_ENROLL_TOKEN="+clientToken)
-	var binding model.Binding
-	a.must(t, "POST", "/bindings", model.Binding{ServerID: server.ID, ClientID: client.ID}, &binding)
-	if binding.UUID != "" {
-		t.Fatal("management binding API leaked VLESS credential")
-	}
-	var rawBindings []map[string]any
-	a.must(t, "GET", "/bindings", nil, &rawBindings)
-	for _, b := range rawBindings {
-		if v, ok := b["uuid"]; ok && v != "" {
-			t.Fatal("management list leaked UUID")
-		}
+	serverFlags := nodeFlags(controlPort, filepath.Join(certs, "ca.pem"), server.ID, filepath.Join(dir, "server"))
+	clientFlags := nodeFlags(controlPort, filepath.Join(certs, "ca.pem"), client.ID, filepath.Join(dir, "client"))
+	launch(t, bin, "server", append(serverFlags, "-enroll-token", serverToken)...)
+	cli := launch(t, bin, "client", append(clientFlags, "-enroll-token", clientToken)...)
+	if e := a.call("GET", "/bindings", nil, nil); e == nil {
+		t.Fatal("binding management endpoint still exists")
 	}
 	// HTTP is a TCP application; a large body also checks sustained bidirectional transfer.
 	body := strings.Repeat("veilink-real-vless-tls\n", 16384)
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, body) }))
 	defer target.Close()
 	targetPort := target.Listener.Addr().(*net.TCPAddr).Port
-	mapping := model.Mapping{Name: "web", BindingID: binding.ID, ListenHost: "127.0.0.1", ListenPort: publicPort, TargetHost: "127.0.0.1", TargetPort: targetPort, Enabled: true}
+	mapping := model.Mapping{Name: "web", ServerID: server.ID, ClientID: client.ID, Pool: 2, ListenHost: "127.0.0.1", ListenPort: publicPort, TargetHost: "127.0.0.1", TargetPort: targetPort, Enabled: true}
 	a.must(t, "POST", "/mappings", mapping, &mapping)
 	a.applied(t, server.ID, client.ID)
 	url := fmt.Sprintf("http://127.0.0.1:%d/", publicPort)
@@ -285,17 +287,86 @@ func TestCLIEndToEnd(t *testing.T) {
 			t.Fatal(e)
 		}
 	}
+	// Rotating only the server updates the persisted client template and both runtimes.
+	a.must(t, "POST", "/nodes/generate", map[string]any{"role": "server", "kind": "certificate", "server_name": "localhost", "ttl_days": 1}, &generated)
+	server.Tunnel.CertPEM, server.Tunnel.KeyPEM, server.Tunnel.CAPEM = generated.CertPEM, generated.KeyPEM, generated.CAPEM
+	server.ClientTunnel = nil // derive the matching client template atomically
+	a.must(t, "PUT", "/nodes/"+server.ID, server, &server)
+	if server.ClientTunnel == nil || server.ClientTunnel.CAPEM != generated.CAPEM {
+		t.Fatal("rotation retained stale client trust")
+	}
+	a.applied(t, server.ID, client.ID)
+	eventually(t, "server-only certificate rotation reaches clients", func() error { return checkBody(url, body) })
+
+	// Exercise real HTTPS over the dedicated Vision application path. Raw handoff
+	// counters are asserted in tunnel tests; this checks the complete CLI/API path.
+	secureTarget := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, body)
+	}))
+	secureTarget.TLS = &tls.Config{MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13}
+	secureTarget.StartTLS()
+	defer secureTarget.Close()
+	server.Tunnel.Flow = "xtls-rprx-vision"
+	server.ClientTunnel = nil
+	a.must(t, "PUT", "/nodes/"+server.ID, server, &server)
+	mapping.TargetPort = secureTarget.Listener.Addr().(*net.TCPAddr).Port
+	a.must(t, "PUT", "/mappings/"+mapping.ID, mapping, &mapping)
+	a.applied(t, server.ID, client.ID)
+	httpsClient := secureTarget.Client()
+	httpsClient.Timeout = 5 * time.Second
+	defer httpsClient.CloseIdleConnections()
+	eventually(t, "TLS 1.3 HTTPS over Vision", func() error {
+		r, err := httpsClient.Get(fmt.Sprintf("https://127.0.0.1:%d/", publicPort))
+		if err != nil {
+			return err
+		}
+		defer r.Body.Close()
+		got, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))
+		if err != nil {
+			return err
+		}
+		if r.TLS == nil || r.TLS.Version != tls.VersionTLS13 || string(got) != body {
+			return fmt.Errorf("unexpected Vision HTTPS response")
+		}
+		return nil
+	})
+	httpsClient.CloseIdleConnections()
+	mapping.TargetPort = targetPort
+	a.must(t, "PUT", "/mappings/"+mapping.ID, mapping, &mapping)
+	a.applied(t, server.ID, client.ID)
+	eventually(t, "plain HTTP uses encrypted Vision fallback", func() error { return checkBody(url, body) })
+
 	// Central outage must not stop existing traffic; cached state permits offline client restart.
 	master.stop()
 	if e := checkBody(url, body); e != nil {
 		t.Fatalf("master outage interrupted data plane: %v", e)
 	}
 	cli.stop()
-	cli = launch(t, bin, "client", clientCfg)
+	cli = launch(t, bin, "client", clientFlags...)
 	eventually(t, "client restores last-good config without master", func() error { return checkBody(url, body) })
-	master = launch(t, bin, "master", masterCfg)
+	master = launch(t, bin, "master", masterFlags...)
 	a.login(t)
 	a.applied(t, server.ID, client.ID)
+	var persistedNodes []model.Node
+	a.must(t, "GET", "/nodes", nil, &persistedNodes)
+	foundServer, foundClient := false, false
+	for _, n := range persistedNodes {
+		switch n.ID {
+		case server.ID:
+			foundServer = true
+			if n.ClientTunnel == nil || *n.ClientTunnel != *server.ClientTunnel || n.Tunnel != server.Tunnel {
+				t.Fatal("server pair changed across master restart")
+			}
+		case client.ID:
+			foundClient = true
+			if n.Tunnel != (model.LocalTLS{}) || n.ClientTunnel != nil {
+				t.Fatal("rejected client override persisted")
+			}
+		}
+	}
+	if !foundServer || !foundClient {
+		t.Fatal("server/client metadata missing after master restart")
+	}
 	// Persistent database survives master restart and disable/enable is applied, not just stored.
 	mapping.Enabled = false
 	a.must(t, "PUT", "/mappings/"+mapping.ID, mapping, &mapping)
@@ -331,7 +402,6 @@ func TestCLIEndToEnd(t *testing.T) {
 		return fmt.Errorf("revoked tunnel still forwards")
 	})
 	a.must(t, "DELETE", "/mappings/"+mapping.ID, nil, nil)
-	a.must(t, "DELETE", "/bindings/"+binding.ID, nil, nil)
 	a.must(t, "DELETE", "/nodes/"+client.ID, nil, nil)
 	a.must(t, "DELETE", "/nodes/"+server.ID, nil, nil)
 	var audit []map[string]any

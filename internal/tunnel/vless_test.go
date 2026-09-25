@@ -9,6 +9,10 @@ import (
 
 func TestVisionRoundTrip(t *testing.T) {
 	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	_ = left.SetDeadline(time.Now().Add(5 * time.Second))
+	_ = right.SetDeadline(time.Now().Add(5 * time.Second))
 	var id [16]byte
 	id[0] = 7
 	writer := newVision(left, id)
@@ -40,6 +44,7 @@ func TestEncryptionRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer server.Close()
 		client, err := mustSpec(t, pair[1], true).newClient()
 		if err != nil {
 			t.Fatal(err)
@@ -48,6 +53,7 @@ func TestEncryptionRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer ln.Close()
 		errc := make(chan error, 2)
 		go func() {
 			conn, err := ln.Accept()
@@ -56,6 +62,7 @@ func TestEncryptionRoundTrip(t *testing.T) {
 				return
 			}
 			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 			conn, err = server.Handshake(conn)
 			if err != nil {
 				errc <- err
@@ -72,12 +79,13 @@ func TestEncryptionRoundTrip(t *testing.T) {
 			errc <- err
 		}()
 		go func() {
-			conn, err := net.Dial("tcp", ln.Addr().String())
+			conn, err := net.DialTimeout("tcp", ln.Addr().String(), time.Second)
 			if err != nil {
 				errc <- err
 				return
 			}
 			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 			conn, err = client.Handshake(conn)
 			if err != nil {
 				errc <- err
@@ -96,8 +104,13 @@ func TestEncryptionRoundTrip(t *testing.T) {
 			errc <- err
 		}()
 		for range 2 {
-			if err := <-errc; err != nil {
-				t.Fatal(pair, err)
+			select {
+			case err := <-errc:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(6 * time.Second):
+				t.Fatal("encryption exchange timed out")
 			}
 		}
 		server.Close()

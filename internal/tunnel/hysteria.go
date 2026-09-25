@@ -10,10 +10,11 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/quicvarint"
+	"github.com/apernet/quic-go"
+	"github.com/apernet/quic-go/quicvarint"
 
 	"veilink/internal/model"
 )
@@ -23,36 +24,35 @@ const hysteriaTCP = 0x401
 func checkExclusive(role string, local model.LocalTLS) error {
 	reality := local.Reality.Enabled()
 	hy := local.Hysteria2.Enabled()
-	certs := local.CertFile != "" || local.KeyFile != "" || local.CAFile != ""
+	certs := local.CertPEM != "" || local.KeyPEM != "" || local.CAPEM != ""
 	if reality && hy {
 		return errors.New("REALITY and Hysteria2 cannot both be set")
 	}
 	if reality && certs {
-		return errors.New("REALITY cannot be combined with data-plane certificate files")
+		return errors.New("REALITY cannot be combined with data-plane certificate PEM")
 	}
-	if (local.CertFile == "") != (local.KeyFile == "") {
+	if (local.CertPEM == "") != (local.KeyPEM == "") {
 		return errors.New("data-plane certificate and key must be paired")
 	}
-	if role == "server" && hy && (local.CertFile == "" || local.KeyFile == "") {
-		return errors.New("Hysteria2 requires cert_file and key_file")
-	}
-	if role == "client" && hy && local.CAFile == "" {
-		return errors.New("Hysteria2 requires ca_file")
+	if role == "server" && hy && (local.CertPEM == "" || local.KeyPEM == "") {
+		return errors.New("Hysteria2 requires cert_pem and key_pem")
 	}
 	if hy && len(local.Hysteria2.Password) > 128 {
 		return errors.New("Hysteria2 password must be at most 128 bytes")
 	}
-	if role != "client" && local.Pool != 0 {
-		return errors.New("pool is client-only")
+	if local.CertPEM != "" {
+		if _, err := tls.X509KeyPair([]byte(local.CertPEM), []byte(local.KeyPEM)); err != nil {
+			return errors.New("invalid data-plane certificate or key PEM")
+		}
 	}
-	if local.Pool < 0 || local.Pool > 32 {
-		return errors.New("pool must be from 1 to 32")
+	if _, err := roots(local.CAPEM); err != nil {
+		return err
 	}
 	return nil
 }
 
 func (s *service) listenHysteria() error {
-	addr := net.JoinHostPort(listenHost(s.local.ListenHost), strconv.Itoa(s.snapshot.Node.Port))
+	addr := net.JoinHostPort(listenHost(s.local.ListenHost), strconv.Itoa(s.local.ListenPort))
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return err
@@ -61,7 +61,7 @@ func (s *service) listenHysteria() error {
 	if err != nil {
 		return err
 	}
-	cert, err := tls.LoadX509KeyPair(s.local.CertFile, s.local.KeyFile)
+	cert, err := tls.X509KeyPair([]byte(s.local.CertPEM), []byte(s.local.KeyPEM))
 	if err != nil {
 		_ = udp.Close()
 		return err
@@ -107,6 +107,9 @@ func (s *service) serveHysteria(conn *quic.Conn) {
 			_ = stream.Close()
 			if err != nil || !ok {
 				return
+			}
+			if !authed {
+				enableHysteriaBBR(conn)
 			}
 			authed = true
 		case hysteriaTCP:
@@ -157,7 +160,7 @@ func (s *service) hysteriaAuth(stream *quic.Stream) (bool, error) {
 }
 
 func dialHysteria(ctx context.Context, addr, serverName string, local model.LocalTLS) (net.Conn, error) {
-	pool, err := roots(local.CAFile)
+	pool, err := roots(local.CAPEM)
 	if err != nil {
 		return nil, err
 	}
@@ -200,6 +203,7 @@ func dialHysteria(ctx context.Context, addr, serverName string, local model.Loca
 		cleanup()
 		return nil, err
 	}
+	enableHysteriaBBR(conn)
 	stream, err := conn.OpenStreamSync(dialCtx)
 	if err != nil {
 		cleanup()
@@ -221,16 +225,18 @@ type quicConn struct {
 	*quic.Stream
 	local, remote net.Addr
 	done          func()
+	once          sync.Once
 }
 
 func (c *quicConn) LocalAddr() net.Addr  { return c.local }
 func (c *quicConn) RemoteAddr() net.Addr { return c.remote }
 func (c *quicConn) Close() error {
 	err := c.Stream.Close()
-	if c.done != nil {
-		c.done()
-		c.done = nil
-	}
+	c.once.Do(func() {
+		if c.done != nil {
+			c.done()
+		}
+	})
 	return err
 }
 

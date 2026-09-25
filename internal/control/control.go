@@ -50,6 +50,11 @@ func (s *Service) Enroll(ctx context.Context, m *structpb.Struct) (*structpb.Str
 	return Envelope(map[string]any{"credential": c})
 }
 func (s *Service) Pull(ctx context.Context, m *structpb.Struct) (*structpb.Struct, error) {
+	for name := range m.GetFields() {
+		if name != "node_id" && name != "credential" {
+			return nil, status.Error(codes.InvalidArgument, "unknown pull field: "+name)
+		}
+	}
 	snap, e := s.Store.Snapshot(String(m, "node_id"), String(m, "credential"))
 	if e != nil {
 		return nil, rpcError(e)

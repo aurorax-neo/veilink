@@ -2,8 +2,11 @@ package store
 
 import (
 	"bytes"
+	"database/sql"
 	"errors"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 	"veilink/internal/model"
@@ -23,7 +26,7 @@ func TestPersistenceIsolationRevocation(t *testing.T) {
 	if !s.Login("admin", "test password long") || s.Login("admin", "wrong") {
 		t.Fatal("login")
 	}
-	server, e := s.SaveNode(model.Node{Name: "gateway", Role: "server", Address: "localhost", ServerName: "localhost", Port: 443})
+	server, e := s.SaveNode(model.Node{Name: "gateway", Role: "server", Address: "localhost", ServerName: "localhost", Port: 443, Tunnel: testTLS(t)})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -57,15 +60,12 @@ func TestPersistenceIsolationRevocation(t *testing.T) {
 	if _, e = s.Enroll(other.ID, expired); !errors.Is(e, ErrAuth) {
 		t.Fatal("expired token accepted")
 	}
-	b, e := s.SaveBinding(model.Binding{ServerID: server.ID, ClientID: client.ID})
-	if e != nil {
-		t.Fatal(e)
-	}
-	m, e := s.SaveMapping(model.Mapping{Name: "test", BindingID: b.ID, ListenHost: "0.0.0.0", ListenPort: 10080, TargetHost: "127.0.0.1", TargetPort: 80, Enabled: true})
+	m, e := s.SaveMapping(model.Mapping{Name: "test", ServerID: server.ID, ClientID: client.ID, Pool: 1, ListenHost: "0.0.0.0", ListenPort: 10080, TargetHost: "127.0.0.1", TargetPort: 80, Enabled: true})
 	if e != nil {
 		t.Fatal(e)
 	}
 	m.ID = ""
+	m.BindingID = ""
 	m.ListenHost = "127.0.0.1"
 	if _, e = s.SaveMapping(m); e == nil {
 		t.Fatal("wildcard conflict accepted")
@@ -80,9 +80,14 @@ func TestPersistenceIsolationRevocation(t *testing.T) {
 	if bytes.Contains(data, []byte(uuid)) {
 		t.Fatal("UUID stored plaintext")
 	}
-	bindings, _ := s.Bindings()
-	if bindings[0].UUID != "" {
-		t.Fatal("UUID leaked")
+	st, err := s.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, binding := range st.Bindings {
+		if binding.UUID != "" {
+			t.Fatal("UUID persisted in binding")
+		}
 	}
 	isolated, e := s.Snapshot(other.ID, creds[other.ID])
 	if e != nil || len(isolated.Bindings) != 0 || len(isolated.Mappings) != 0 {
@@ -135,7 +140,7 @@ func TestUDPMappingValidationAndPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server, err := s.SaveNode(model.Node{Name: "gw", Role: "server", Address: "localhost", ServerName: "localhost", Port: 8443})
+	server, err := s.SaveNode(model.Node{Name: "gw", Role: "server", Address: "localhost", ServerName: "localhost", Port: 8443, Tunnel: testTLS(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,31 +148,26 @@ func TestUDPMappingValidationAndPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	binding, err := s.SaveBinding(model.Binding{ServerID: server.ID, ClientID: client.ID})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// 1. TCP mapping on server.Port (8443) must be rejected
+	// 1. TCP mapping on the real local listen port must be rejected.
 	tcpConflict := model.Mapping{
-		Name:       "tcp-conflict",
-		BindingID:  binding.ID,
+		Name:     "tcp-conflict",
+		ServerID: server.ID, ClientID: client.ID, Pool: 1,
 		Network:    "tcp",
 		ListenHost: "0.0.0.0",
-		ListenPort: 8443,
+		ListenPort: server.Tunnel.ListenPort,
 		TargetHost: "127.0.0.1",
 		TargetPort: 8080,
 		Enabled:    true,
 	}
 	if _, err := s.SaveMapping(tcpConflict); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("expected ErrInvalid when TCP mapping uses server.Port, got %v", err)
+		t.Fatalf("expected ErrInvalid when TCP mapping uses tunnel listen port, got %v", err)
 	}
 
-	// 2. UDP mapping on server.Port (8443) is allowed (UDP port != TCP transport port)
+	// 2. UDP mapping on the public connect port is allowed for a TCP tunnel.
 	// Also verify case-insensitive protocol normalization: "  UDP  " -> "udp"
 	udpOnServerPort := model.Mapping{
-		Name:       "udp-on-server-port",
-		BindingID:  binding.ID,
+		Name:     "udp-on-server-port",
+		ServerID: server.ID, ClientID: client.ID, Pool: 1,
 		Network:    "  UDP  ",
 		ListenHost: "0.0.0.0",
 		ListenPort: 8443,
@@ -185,8 +185,8 @@ func TestUDPMappingValidationAndPersistence(t *testing.T) {
 
 	// 3. UDP port collision: another UDP mapping on overlapping host and same port must fail
 	udpCollision := model.Mapping{
-		Name:       "udp-dup",
-		BindingID:  binding.ID,
+		Name:     "udp-dup",
+		ServerID: server.ID, ClientID: client.ID, Pool: 1,
 		Network:    "udp",
 		ListenHost: "127.0.0.1",
 		ListenPort: 8443,
@@ -201,8 +201,8 @@ func TestUDPMappingValidationAndPersistence(t *testing.T) {
 	// 4. TCP and UDP coexistence: a TCP mapping on a non-server port (e.g. 9000)
 	// and a UDP mapping on the same port (9000) must coexist without collision
 	tcp9000 := model.Mapping{
-		Name:       "tcp-9000",
-		BindingID:  binding.ID,
+		Name:     "tcp-9000",
+		ServerID: server.ID, ClientID: client.ID, Pool: 1,
 		Network:    "tcp",
 		ListenHost: "0.0.0.0",
 		ListenPort: 9000,
@@ -215,8 +215,8 @@ func TestUDPMappingValidationAndPersistence(t *testing.T) {
 	}
 
 	udp9000 := model.Mapping{
-		Name:       "udp-9000",
-		BindingID:  binding.ID,
+		Name:     "udp-9000",
+		ServerID: server.ID, ClientID: client.ID, Pool: 1,
 		Network:    "udp",
 		ListenHost: "0.0.0.0",
 		ListenPort: 9000,
@@ -342,6 +342,7 @@ func TestTunnelConfigPersistenceAndAutoDerivation(t *testing.T) {
 		Port:       443,
 		ServerName: "gateway.example.com",
 		Tunnel: model.LocalTLS{
+			ListenPort: 8444,
 			Flow:       "xtls-rprx-vision",
 			Decryption: "none",
 			Reality: model.Reality{
@@ -373,16 +374,13 @@ func TestTunnelConfigPersistenceAndAutoDerivation(t *testing.T) {
 	tokenS, _ := s.EnrollToken(server.ID, time.Hour)
 	credS, _ := s.Enroll(server.ID, tokenS)
 
-	// Create binding
-	b, err := s.SaveBinding(model.Binding{
-		ServerID: server.ID,
-		ClientID: client.ID,
-	})
+	// A direct mapping automatically creates the internal session.
+	_, err = s.SaveMapping(testMapping(server.ID, client.ID, 8080))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Verify client tunnel was auto-derived
+	// Binding creation must not persist derived defaults into client overrides.
 	nodes, err := s.Nodes()
 	if err != nil {
 		t.Fatal(err)
@@ -394,20 +392,8 @@ func TestTunnelConfigPersistenceAndAutoDerivation(t *testing.T) {
 			break
 		}
 	}
-	if foundClient.Tunnel.Flow != "xtls-rprx-vision" {
-		t.Fatalf("expected client flow to be auto-derived, got %q", foundClient.Tunnel.Flow)
-	}
-	if foundClient.Tunnel.Encryption != "none" {
-		t.Fatalf("expected client encryption 'none', got %q", foundClient.Tunnel.Encryption)
-	}
-	if foundClient.Tunnel.Reality.PublicKey != expectedPub {
-		t.Fatalf("expected client public key %q, got %q", expectedPub, foundClient.Tunnel.Reality.PublicKey)
-	}
-	if foundClient.Tunnel.Reality.ShortID != "0123456789abcdef" {
-		t.Fatalf("expected client short ID '0123456789abcdef', got %q", foundClient.Tunnel.Reality.ShortID)
-	}
-	if foundClient.Tunnel.Reality.Fingerprint != "chrome" {
-		t.Fatalf("expected default fingerprint 'chrome', got %q", foundClient.Tunnel.Reality.Fingerprint)
+	if foundClient.Tunnel != (model.LocalTLS{}) {
+		t.Fatalf("derived defaults frozen into overrides: %+v", foundClient.Tunnel)
 	}
 
 	// Verify snapshot redacts server private key for client
@@ -421,8 +407,8 @@ func TestTunnelConfigPersistenceAndAutoDerivation(t *testing.T) {
 	if clientSnap.Nodes[0].Tunnel.Reality.PrivateKey != "" {
 		t.Fatal("server private key leaked to client in snapshot!")
 	}
-	if clientSnap.Node.Tunnel.Reality.PublicKey != expectedPub {
-		t.Fatalf("expected client snapshot public key %q, got %q", expectedPub, clientSnap.Node.Tunnel.Reality.PublicKey)
+	if clientSnap.Nodes[0].Tunnel.Reality.PublicKey != expectedPub {
+		t.Fatalf("expected gateway public default %q, got %q", expectedPub, clientSnap.Nodes[0].Tunnel.Reality.PublicKey)
 	}
 
 	// Server snapshot should retain private key
@@ -455,21 +441,82 @@ func TestTunnelConfigPersistenceAndAutoDerivation(t *testing.T) {
 			}
 		}
 		if n.ID == client.ID {
-			if n.Tunnel.Reality.PublicKey != expectedPub || n.Tunnel.Flow != "xtls-rprx-vision" {
+			if n.Tunnel != (model.LocalTLS{}) {
 				t.Fatalf("client tunnel not persisted properly: %+v", n.Tunnel)
 			}
 		}
 	}
 
-	// Test manual client override
-	foundClient.Tunnel.Reality.ShortID = "customoverride123"
-	foundClient.Tunnel.Pool = 8
-	updatedClient, err := s2.SaveNode(foundClient)
-	if err != nil {
-		t.Fatal(err)
+	// Client settings are always issued by the selected server, never overridden.
+	foundClient.Tunnel.Reality.ShortID = "ab"
+	if _, err := s2.SaveNode(foundClient); err != ErrInvalid {
+		t.Fatalf("manual client override accepted: %v", err)
 	}
-	if updatedClient.Tunnel.Reality.ShortID != "customoverride123" || updatedClient.Tunnel.Pool != 8 {
-		t.Fatalf("manual override failed: %+v", updatedClient.Tunnel)
+	foundClient.Tunnel = model.LocalTLS{}
+	foundClient.ClientTunnel = &model.LocalTLS{}
+	if _, err := s2.SaveNode(foundClient); err != ErrInvalid {
+		t.Fatalf("client-owned template accepted: %v", err)
 	}
-	_ = b
+}
+
+func TestFreshSchemaAndUnsupportedDatabases(t *testing.T) {
+	t.Run("fresh", func(t *testing.T) {
+		s, db, key := testStore(t)
+		var version, count, required int
+		var defaultValue sql.NullString
+		if err := s.db.QueryRow("SELECT count(*), max(version) FROM schema_version").Scan(&count, &version); err != nil || count != 1 || version != schemaVersion {
+			t.Fatal("incorrect fresh schema version", count, version, err)
+		}
+		if err := s.db.QueryRow(`SELECT "notnull", dflt_value FROM pragma_table_info('credentials') WHERE name='expires'`).Scan(&required, &defaultValue); err != nil || required != 1 || defaultValue.Valid {
+			t.Fatal("expiry must be required with no default", err)
+		}
+		if _, err := s.db.Exec("INSERT INTO credentials(node,hash) VALUES('missing-expiry','hash')"); err == nil {
+			t.Fatal("missing expiry accepted")
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		reopened, err := Open(db, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reopened.Close()
+	})
+	for _, tc := range []struct{ name, versionSQL string }{
+		{"unversioned", ""},
+		{"version-one", "CREATE TABLE schema_version(version INTEGER PRIMARY KEY); INSERT INTO schema_version VALUES(1);"},
+		{"version-two", "CREATE TABLE schema_version(version INTEGER PRIMARY KEY); INSERT INTO schema_version VALUES(1),(2);"},
+		{"future", "CREATE TABLE schema_version(version INTEGER PRIMARY KEY); INSERT INTO schema_version VALUES(999);"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path, key := filepath.Join(dir, "db"), filepath.Join(dir, "key")
+			db, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(tc.versionSQL + "CREATE TABLE credentials(node TEXT PRIMARY KEY,hash TEXT NOT NULL); INSERT INTO credentials VALUES('existing-node','preserve-this-hash');"); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			opened, err := Open(path, key)
+			if opened != nil {
+				opened.Close()
+				t.Fatal("unsupported database opened")
+			}
+			if err == nil || !strings.Contains(err.Error(), "unsupported database schema") || !strings.Contains(err.Error(), "reset") {
+				t.Fatal("missing actionable reset error", err)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatal("unsupported database was modified or deleted", err)
+			}
+		})
+	}
 }

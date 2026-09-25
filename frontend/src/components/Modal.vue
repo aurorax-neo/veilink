@@ -13,7 +13,7 @@ const props = withDefaults(
     submit?: () => Promise<boolean>
   }>(),
   {
-    kicker: '配置',
+    kicker: '',
     saveLabel: '保存',
     cancelLabel: '取消',
     hideSave: false,
@@ -71,14 +71,14 @@ defineExpose({ open, close })
     <form @submit.prevent="onSubmit">
       <header class="modal-head">
         <div>
-          <p class="kicker">{{ kicker }}</p>
+          <p v-if="kicker" class="kicker">{{ kicker }}</p>
           <h2 :id="titleId">{{ title }}</h2>
         </div>
         <button type="button" class="icon-btn" aria-label="关闭" :disabled="busy" @click="close">×</button>
       </header>
-      <div class="modal-body">
+      <fieldset class="modal-body" :disabled="busy">
         <slot />
-      </div>
+      </fieldset>
       <p v-if="error" class="error" role="alert">{{ error }}</p>
       <footer class="modal-foot">
         <button type="button" class="btn" :disabled="busy" @click="close">{{ hideSave ? '关闭' : cancelLabel }}</button>

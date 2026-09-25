@@ -1,0 +1,39 @@
+Veilink
+Copyright (C) 2026 Veilink Authors
+
+SPDX-License-Identifier: GPL-3.0-or-later
+
+Veilink's original code and documentation, unless otherwise indicated,
+are free software: you can redistribute them and/or modify them under
+the terms of the GNU General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option)
+any later version.
+
+Veilink is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+FITNESS FOR A PARTICULAR PURPOSE. See LICENSE for the complete GNU
+General Public License version 3.
+
+Third-party components retain their own copyright and license notices.
+The project license does not replace or erase those licenses. See
+THIRD_PARTY_NOTICES.md for component provenance and distribution duties.
+
+This revision changes Veilink's project license from Apache-2.0 to
+GPL-3.0-or-later. Third-party licenses are unchanged.
+
+HY2 BBR uses the XTLS/Xray-core Go module at commit
+d562d8947d3175db86b4fa849742433a9876cb63 (local reference: ref/Xray-core).
+Only transport/internet/hysteria/congestion/bbr and congestion/common
+are linked from that module, under MPL-2.0. The local adapter
+internal/tunnel/hysteria_bbr.go is adapted from congestion/utils.go and
+retains MPL-2.0: it narrows the connection interface, fixes the standard
+profile, and omits Brutal/Reno selection. Both endpoints install BBR
+after authentication. The QUIC implementation is github.com/apernet/quic-go
+v0.61.1-0.20260806010916-184d081eef3e (MIT).
+The mux selection follows mihomo's sing-mux integration. Veilink links
+github.com/metacubex/sing-mux v0.3.10 and sing v0.5.8 (GPL-3.0-or-later),
+with smux (MIT) and yamux (MPL-2.0); no mihomo implementation was copied.
+The standard GPLv3 license text was reproduced from ref/mihomo/LICENSE.
+
+This notice records licensing and provenance; it adds no restrictions
+and provides no legal opinion or guarantee of distribution compliance.

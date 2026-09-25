@@ -3,7 +3,6 @@ package tunnel
 import (
 	"fmt"
 	"net"
-	"os"
 	"regexp"
 	"strings"
 
@@ -42,16 +41,30 @@ func listenHost(h string) string {
 
 func portOK(p int) bool { return p > 0 && p <= 65535 }
 
+// Only a wholly unconfigured, unbound server may idle. A reserved local bind
+// endpoint alone does not activate crypto or listeners.
+func idleServer(s model.Snapshot, local model.LocalTLS) bool {
+	unconfigured := local
+	unconfigured.ListenHost, unconfigured.ListenPort = "", 0
+	return s.Node.Role == "server" && len(s.Bindings) == 0 && len(s.Mappings) == 0 && unconfigured == (model.LocalTLS{})
+}
+
 func validate(s model.Snapshot, local model.LocalTLS) error {
 	bad := func(msg string) error { return fmt.Errorf("invalid snapshot: %s", msg) }
+	if s.Node.Role == "client" && (local != (model.LocalTLS{}) || s.Node.Tunnel != (model.LocalTLS{}) || s.Node.ClientTunnel != nil) {
+		return bad("client-local tunnel settings are not allowed; use gateway templates")
+	}
 	if err := checkExclusive(s.Node.Role, local); err != nil {
 		return bad(err.Error())
 	}
-	if err := checkVLESS(s.Node.Role, local); err != nil {
-		return bad(err.Error())
+	// Clients consume complete authoritative per-gateway public templates.
+	if !idleServer(s, local) && (s.Node.Role != "client" || len(s.Bindings) == 0) {
+		if err := CheckBootstrap(s.Node.Role, local); err != nil {
+			return bad(err.Error())
+		}
 	}
-	if local.Reality.Enabled() && (local.CertFile != "" || local.KeyFile != "" || local.CAFile != "") {
-		return bad("REALITY cannot be combined with data-plane certificate files")
+	if local.Reality.Enabled() && (local.CertPEM != "" || local.KeyPEM != "" || local.CAPEM != "") {
+		return bad("REALITY cannot be combined with data-plane certificate PEM")
 	}
 	if s.Revision < 0 || !identifier.MatchString(s.Node.ID) || s.Node.Revoked || (s.Node.Role != "server" && s.Node.Role != "client") {
 		return bad("node or revision")
@@ -84,11 +97,16 @@ func validate(s model.Snapshot, local model.LocalTLS) error {
 			return bad("foreign binding")
 		}
 		n, ok := gateways[b.ServerID]
-		if !ok || !portOK(n.Port) {
-			return bad("missing gateway or transport port")
+		if !ok {
+			return bad("missing gateway")
 		}
-		if s.Node.Role == "client" && (!hostOK(n.Address) || !hostOK(n.ServerName)) {
-			return bad("gateway address or verified server name")
+		if s.Node.Role == "client" && len(enabledEndpoints(n)) == 0 {
+			return bad("gateway has no enabled connect endpoint")
+		}
+		if s.Node.Role == "client" {
+			if _, err := gatewayClientConfig(local, n); err != nil {
+				return bad("gateway " + n.ID + ": " + err.Error())
+			}
 		}
 		bindings[b.ID] = b
 		domains[b.Domain] = true
@@ -102,8 +120,9 @@ func validate(s model.Snapshot, local model.LocalTLS) error {
 	}
 	var listeners []endpoint
 	if s.Node.Role == "server" {
-		if len(s.Bindings) > 0 && !portOK(s.Node.Port) {
-			return bad("transport port")
+		listenPort := local.ListenPort
+		if len(s.Bindings) > 0 && !portOK(listenPort) {
+			return bad("transport listen port")
 		}
 		if net.ParseIP(listenHost(local.ListenHost)) == nil {
 			return bad("transport listen IP")
@@ -113,21 +132,24 @@ func validate(s model.Snapshot, local model.LocalTLS) error {
 				if err := checkRealityServer(local.Reality, s.Node.ServerName); err != nil {
 					return bad(err.Error())
 				}
-			} else if decryptionEnabled(local.Decryption) {
-				if (local.CertFile == "") != (local.KeyFile == "") {
-					return bad("server TLS certificate and key must be paired")
-				}
-			} else if local.CertFile == "" || local.KeyFile == "" {
+			} else if (local.Hysteria2.Enabled() || local.TransportSecurity == "tls") && (local.CertPEM == "" || local.KeyPEM == "") {
 				return bad("server TLS certificate and key required")
 			}
 		}
 		if len(s.Bindings) > 0 {
-			listeners = append(listeners, endpoint{listenHost(local.ListenHost), s.Node.Port, "tcp"})
+			network := "tcp"
+			if local.Hysteria2.Enabled() {
+				network = "udp"
+			}
+			listeners = append(listeners, endpoint{listenHost(local.ListenHost), listenPort, network})
 		}
 	}
 	ids := map[string]bool{}
 	names := map[string]bool{}
 	for _, m := range s.Mappings {
+		if _, err := m.EffectiveMuxType(); err != nil {
+			return bad(err.Error())
+		}
 		if !identifier.MatchString(m.ID) || strings.TrimSpace(m.Name) == "" || ids[m.ID] || names[m.Name] {
 			return bad("mapping ID or name")
 		}
@@ -135,6 +157,9 @@ func validate(s model.Snapshot, local model.LocalTLS) error {
 		names[m.Name] = true
 		if _, ok := bindings[m.BindingID]; !ok {
 			return bad("mapping references missing binding")
+		}
+		if m.Pool < 1 || m.Pool > 32 {
+			return bad("mapping pool must be from 1 to 32")
 		}
 		if m.Network != "" && m.Network != "tcp" && m.Network != "udp" {
 			return bad("mapping network")
@@ -157,12 +182,10 @@ func validate(s model.Snapshot, local model.LocalTLS) error {
 			listeners = append(listeners, endpoint{h, m.ListenPort, network})
 		}
 	}
-	if s.Node.Role == "client" && local.Reality.Enabled() {
+	if s.Node.Role == "client" && len(s.Bindings) == 0 && local.Reality.Enabled() {
 		if err := checkRealityClient(local.Reality); err != nil {
 			return bad(err.Error())
 		}
 	}
 	return nil
 }
-
-func readFile(path string) ([]byte, error) { return os.ReadFile(path) }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -27,55 +26,41 @@ import (
 )
 
 func Run(ctx context.Context, c config.Config) error {
-	if e := c.Validate("master"); e != nil {
+	ctx, stopChildren := context.WithCancel(ctx)
+	defer stopChildren()
+	if c.Database == "" || c.DeploymentKey == "" {
+		return errors.New("database and deployment_key bootstrap paths required")
+	}
+	s, e := store.Open(c.Database, c.DeploymentKey)
+	if e != nil {
 		return e
 	}
-
+	defer s.Close()
+	c, commitConfig, e := config.ResolveMaster(c)
+	if e != nil {
+		return e
+	}
 	ring := logring.New(2000)
 	slog.SetDefault(slog.New(logring.NewHandler(ring, "master", slog.NewTextHandler(os.Stderr, nil))))
 
-	mode := c.EffectiveTLSMode()
+	mode := c.Scheme
 
 	var cert tls.Certificate
 	var tlsConfig *tls.Config
 	if mode == "https" {
 		var e error
-		cert, e = tls.LoadX509KeyPair(c.ControlCert, c.ControlKey)
+		cert, e = tls.LoadX509KeyPair(c.CertFile, c.KeyFile)
 		if e != nil {
 			return e
 		}
 		tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}, NextProtos: []string{"h2", "http/1.1"}}
 	}
 
-	s, e := store.Open(c.Database, c.DeploymentKey)
+	listener, e := net.Listen("tcp", c.ListenAddr)
 	if e != nil {
 		return e
 	}
-	defer s.Close()
-	initPass := os.Getenv("VEILINK_INIT_ADMIN_PASSWORD")
-	if initPass == "" {
-		initPass = os.Getenv("VEILINK_ADMIN_PASSWORD")
-	}
-	if initPass != "" {
-		hasAdmin, err := s.HasAdmin()
-		if err != nil {
-			return err
-		}
-		if !hasAdmin {
-			initUser := os.Getenv("VEILINK_INIT_ADMIN_USERNAME")
-			if initUser == "" {
-				initUser = "admin"
-			}
-			if err := s.InitAdmin(initUser, initPass); err != nil {
-				return fmt.Errorf("auto-init admin failed: %w", err)
-			}
-			slog.Info("initial administrator initialized from environment", "username", initUser)
-		}
-	}
-	listener, e := net.Listen("tcp", c.BindAddr)
-	if e != nil {
-		return e
-	}
+	defer listener.Close()
 	g := grpc.NewServer(grpc.MaxRecvMsgSize(64<<10), grpc.MaxSendMsgSize(4<<20), grpc.MaxConcurrentStreams(16), grpc.KeepaliveParams(keepalive.ServerParameters{MaxConnectionIdle: 5 * time.Minute, Time: time.Minute, Timeout: 10 * time.Second}))
 	pb.RegisterControlServer(g, &control.Service{Store: s, NodeRing: logring.NewNodeRing(ring)})
 
@@ -106,11 +91,22 @@ func Run(ctx context.Context, c config.Config) error {
 	}
 	errc := make(chan error, 2)
 	if mode == "https" {
+		// Serve (unlike ServeTLS) must have HTTP/2 configured explicitly.
+		if err := http2.ConfigureServer(h, &http2.Server{}); err != nil {
+			return err
+		}
+	}
+	// Persist only after TLS, listener binding, and HTTP/2 setup all succeed.
+	// The conditional commit refuses to overwrite a concurrent configuration update.
+	if err := commitConfig(); err != nil {
+		return err
+	}
+	if mode == "https" {
 		go func() { errc <- h.Serve(tls.NewListener(listener, tlsConfig)) }()
 	} else {
 		go func() { errc <- h.Serve(listener) }()
 	}
-	slog.Info("master started", "addr", c.BindAddr, "tls", mode)
+	slog.Info("master started", "addr", c.ListenAddr, "scheme", mode)
 	embeddedDone := make(chan struct{})
 	if c.EmbeddedServer.Enabled {
 		go func() {
@@ -128,6 +124,7 @@ func Run(ctx context.Context, c config.Config) error {
 		e = nil
 	case e = <-errc:
 	}
+	stopChildren() // Stop embedded work even when the HTTP server failed.
 	stop, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = h.Shutdown(stop)

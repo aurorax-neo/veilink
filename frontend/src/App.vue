@@ -2,11 +2,11 @@
 import { onMounted, onUnmounted, provide, reactive, ref, watch } from 'vue'
 import { api, ApiError, clearCsrf, setCsrf, setUnauthorized } from './api'
 import { deskKey, navigateKey, type Desk } from './desk'
-import { pageFromHash, pages, type Audit, type Binding, type Mapping, type Node, type PageId } from './types'
+import { pageFromHash, pages, type Audit, type Mapping, type Node, type PageId } from './types'
 import ConsoleView from './views/ConsoleView.vue'
 import LoginView from './views/LoginView.vue'
 
-const phase = ref<'boot' | 'login' | 'app'>('boot')
+const phase = ref<'boot' | 'setup-error' | 'register' | 'login' | 'app'>('boot')
 const loginError = ref('')
 const loginBusy = ref(false)
 const account = ref('')
@@ -15,7 +15,6 @@ let generation = 0
 
 const desk = reactive<Desk>({
   nodes: [],
-  bindings: [],
   mappings: [],
   audit: [],
   loading: false,
@@ -27,18 +26,16 @@ const desk = reactive<Desk>({
     const ticket = ++generation
     desk.loading = true
     try {
-      const [nodes, bindings, mappings, audit] = await Promise.all([
+      const [nodes, mappings, audit] = await Promise.all([
         api<Node[] | null>('/nodes'),
-        api<Binding[] | null>('/bindings'),
         api<Mapping[] | null>('/mappings'),
         api<Audit[] | null>('/audit'),
       ])
       if (ticket !== generation) return
-      if (![nodes, bindings, mappings, audit].every((item) => item === null || Array.isArray(item))) {
+      if (![nodes, mappings, audit].every((item) => item === null || Array.isArray(item))) {
         throw new ApiError('API 数据格式不正确。', 200)
       }
       desk.nodes = nodes || []
-      desk.bindings = bindings || []
       desk.mappings = mappings || []
       desk.audit = audit || []
       desk.loaded = true
@@ -62,7 +59,6 @@ const desk = reactive<Desk>({
 function resetDesk() {
   generation += 1
   desk.nodes = []
-  desk.bindings = []
   desk.mappings = []
   desk.audit = []
   desk.loaded = false
@@ -99,12 +95,31 @@ async function enter(session: { csrf?: string }, name = '') {
   }
 }
 
+async function loadSetup() {
+  phase.value = 'boot'
+  try {
+    const setup = await api<{ registration_required: boolean }>('/setup')
+    if (typeof setup.registration_required !== 'boolean') throw new Error('初始化状态无效')
+    phase.value = setup.registration_required ? 'register' : 'login'
+  } catch (reason) {
+    phase.value = 'setup-error'
+    loginError.value = reason instanceof Error ? reason.message : '无法确认初始化状态'
+  }
+}
+
 async function submitLogin(username: string, password: string) {
   loginBusy.value = true
   loginError.value = ''
   try {
-    await enter(await api<{ csrf?: string }>('/login', 'POST', { username, password }), username.trim())
+    if (phase.value === 'register') {
+      await api('/register', 'POST', { username, password })
+      phase.value = 'login'
+      loginError.value = '注册成功，请使用新账号登录。'
+    } else {
+      await enter(await api<{ csrf?: string }>('/login', 'POST', { username, password }), username.trim())
+    }
   } catch (reason) {
+    if (reason instanceof ApiError && reason.status === 409) await loadSetup()
     loginError.value = reason instanceof Error ? reason.message : '登录失败'
   } finally {
     loginBusy.value = false
@@ -142,6 +157,8 @@ onMounted(async () => {
     document.title = 'Veilink · 穿透控制台'
   })
   window.addEventListener('hashchange', onHash)
+  await loadSetup()
+  if (phase.value !== 'login') return
   try {
     await enter(await api<{ csrf?: string }>('/session'))
   } catch (reason) {
@@ -158,6 +175,7 @@ onUnmounted(() => window.removeEventListener('hashchange', onHash))
 <template>
   <a class="skip" :href="phase === 'app' ? '#main' : '#login-main'">跳转到主内容</a>
   <p v-if="phase === 'boot'" class="boot">正在确认会话…</p>
-  <LoginView v-else-if="phase === 'login'" :error="loginError" :busy="loginBusy" @submit="submitLogin" />
+  <div v-else-if="phase === 'setup-error'" class="boot" role="alert">{{ loginError }} <button class="btn" @click="loadSetup">重试</button></div>
+  <LoginView v-else-if="phase === 'login' || phase === 'register'" :key="phase" :register="phase === 'register'" :error="loginError" :busy="loginBusy" @submit="submitLogin" />
   <ConsoleView v-else :page="page" :account="account" @navigate="navigate" @logout="logout" />
 </template>

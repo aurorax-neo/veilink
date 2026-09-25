@@ -74,15 +74,16 @@ func TestTLSProtocolAndLiveRevocation(t *testing.T) {
 	if _, e = c.Enroll(ctx, req); status.Code(e) != codes.Unauthenticated {
 		t.Fatal("token reuse", e)
 	}
-	req, _ = Envelope(map[string]any{"node_id": n.ID, "credential": String(enrolled, "credential"), "applied_revision": 0})
+	req, _ = Envelope(map[string]any{"node_id": n.ID, "credential": String(enrolled, "credential")})
 	if _, e = c.Pull(ctx, req); e != nil {
 		t.Fatal(e)
 	}
+	beat, _ := Envelope(map[string]any{"node_id": n.ID, "credential": String(enrolled, "credential"), "applied_revision": 0})
 	stream, e := c.Events(ctx)
 	if e != nil {
 		t.Fatal(e)
 	}
-	if e = stream.Send(req); e != nil {
+	if e = stream.Send(beat); e != nil {
 		t.Fatal(e)
 	}
 	if _, e = stream.Recv(); e != nil {
@@ -91,7 +92,7 @@ func TestTLSProtocolAndLiveRevocation(t *testing.T) {
 	if e = s.RemoveNode(n.ID, false); e != nil {
 		t.Fatal(e)
 	}
-	if e = stream.Send(req); e != nil {
+	if e = stream.Send(beat); e != nil {
 		t.Fatal(e)
 	}
 	if _, e = stream.Recv(); status.Code(e) != codes.Unauthenticated {
@@ -99,5 +100,56 @@ func TestTLSProtocolAndLiveRevocation(t *testing.T) {
 	}
 	if _, e = c.Pull(ctx, req); status.Code(e) != codes.Unauthenticated {
 		t.Fatal("revoked pull", e)
+	}
+}
+
+func TestPullRejectsUploadsAndReturnsDatabaseSnapshot(t *testing.T) {
+	d := t.TempDir()
+	s, err := store.Open(filepath.Join(d, "db"), filepath.Join(d, "key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	n, err := s.SaveNode(model.Node{Name: "database-only", Role: "client"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := s.EnrollToken(n.ID, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := s.Enroll(n.ID, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &Service{Store: s}
+	before, err := s.Snapshot(n.ID, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"bootstrap", "role", "tls"} {
+		req, _ := Envelope(map[string]any{"node_id": n.ID, "credential": credential, field: map[string]any{}})
+		if _, err := service.Pull(context.Background(), req); status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("accepted removed field %s: %v", field, err)
+		}
+	}
+	after, err := s.Snapshot(n.ID, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Revision != before.Revision || after.Node.Tunnel != before.Node.Tunnel {
+		t.Fatal("Pull changed database configuration")
+	}
+	req, _ := Envelope(map[string]any{"node_id": n.ID, "credential": credential})
+	out, err := service.Pull(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if String(out.Fields["node"].GetStructValue(), "id") != n.ID {
+		t.Fatal("wrong database snapshot")
+	}
+	req, _ = Envelope(map[string]any{"node_id": n.ID, "credential": "wrong"})
+	if _, err := service.Pull(context.Background(), req); status.Code(err) != codes.Unauthenticated {
+		t.Fatal("bad credential accepted", err)
 	}
 }

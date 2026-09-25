@@ -50,7 +50,15 @@ func tlsFiles(t *testing.T) model.LocalTLS {
 	if err = os.WriteFile(k, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: kd}), 0600); err != nil {
 		t.Fatal(err)
 	}
-	return model.LocalTLS{CertFile: c, KeyFile: k, CAFile: c}
+	certPEM, err := os.ReadFile(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM, err := os.ReadFile(k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return model.LocalTLS{TransportSecurity: "tls", CertPEM: string(certPEM), KeyPEM: string(keyPEM), CAPEM: string(certPEM)}
 }
 func freePort(t *testing.T) int {
 	t.Helper()
@@ -64,9 +72,10 @@ func freePort(t *testing.T) int {
 }
 func fixtures(t *testing.T, target int) (model.Snapshot, model.Snapshot) {
 	t.Helper()
-	n := model.Node{ID: "server", Role: "server", Address: "127.0.0.1", ServerName: "gateway.test", Port: freePort(t)}
+	port := freePort(t)
+	n := model.Node{ID: "server", Role: "server", Address: "127.0.0.1", ServerName: "gateway.test", Port: port, Tunnel: model.LocalTLS{TransportSecurity: "tls", ListenPort: port}}
 	b := model.Binding{ID: "one", ServerID: n.ID, ClientID: "client-one", UUID: "e2587f5e-b746-4e68-a131-184984fa56a0", Domain: "one.reverse.test"}
-	m := model.Mapping{ID: "echo", Name: "echo", BindingID: b.ID, ListenPort: freePort(t), TargetHost: "127.0.0.1", TargetPort: target, Enabled: true}
+	m := model.Mapping{ID: "echo", Name: "echo", BindingID: b.ID, ListenPort: freePort(t), TargetHost: "127.0.0.1", TargetPort: target, Pool: 1, Enabled: true}
 	s := model.Snapshot{Revision: 1, Node: n, Bindings: []model.Binding{b}, Mappings: []model.Mapping{m}}
 	c := model.Snapshot{Revision: 1, Node: model.Node{ID: b.ClientID, Role: "client"}, Nodes: []model.Node{n}, Bindings: []model.Binding{b}, Mappings: []model.Mapping{m}}
 	return s, c
@@ -79,6 +88,14 @@ func clone(s model.Snapshot) model.Snapshot {
 }
 func run(t *testing.T, s model.Snapshot, local model.LocalTLS) *Runtime {
 	t.Helper()
+	// Test settings describe an authoritative gateway template, never a local
+	// client override. Populate the snapshot before creating the runtime.
+	if s.Node.Role == "client" && local != (model.LocalTLS{}) {
+		for i := range s.Nodes {
+			s.Nodes[i].Tunnel = model.DeriveClientTunnel(local, s.Nodes[i])
+		}
+		local = model.LocalTLS{}
+	}
 	r := New(local)
 	t.Cleanup(func() { _ = r.Close() })
 	if err := r.Apply(s); err != nil {
@@ -150,10 +167,16 @@ func assertBlocked(t *testing.T, port int) {
 }
 
 func TestBuildRules(t *testing.T) {
-	local := tlsFiles(t)
 	s, c := fixtures(t, 8080)
+	local := tlsFiles(t)
+	local.ListenPort = s.Node.Tunnel.ListenPort
 	for _, snapshot := range []model.Snapshot{s, c} {
-		doc, err := Build(snapshot, local)
+		settings := local
+		if snapshot.Node.Role == "client" {
+			snapshot.Nodes[0].Tunnel = model.DeriveClientTunnel(local, snapshot.Nodes[0])
+			settings = model.LocalTLS{}
+		}
+		doc, err := Build(snapshot, settings)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -194,10 +217,11 @@ func TestBuildRules(t *testing.T) {
 	}
 }
 func TestValidation(t *testing.T) {
-	local := tlsFiles(t)
 	s, c := fixtures(t, 8080)
+	local := tlsFiles(t)
+	local.ListenPort = s.Node.Tunnel.ListenPort
 	cases := map[string]func(*model.Snapshot){
-		"role": func(s *model.Snapshot) { s.Node.Role = "master" }, "UUID": func(s *model.Snapshot) { s.Bindings[0].UUID = "bad" }, "foreign": func(s *model.Snapshot) { s.Bindings[0].ServerID = "other" }, "binding": func(s *model.Snapshot) { s.Mappings[0].BindingID = "absent" }, "port": func(s *model.Snapshot) { s.Mappings[0].TargetPort = 0 }, "target": func(s *model.Snapshot) { s.Mappings[0].TargetHost = "" }, "name": func(s *model.Snapshot) { s.Mappings[0].Name = "" }, "overlap": func(s *model.Snapshot) { s.Mappings[0].ListenPort = s.Node.Port }, "domain": func(s *model.Snapshot) { s.Bindings[0].Domain = "regexp:.*" }, "control-target": func(s *model.Snapshot) { s.Mappings[0].TargetHost = s.Bindings[0].Domain }, "revoked": func(s *model.Snapshot) { s.Node.Revoked = true },
+		"role": func(s *model.Snapshot) { s.Node.Role = "master" }, "UUID": func(s *model.Snapshot) { s.Bindings[0].UUID = "bad" }, "foreign": func(s *model.Snapshot) { s.Bindings[0].ServerID = "other" }, "binding": func(s *model.Snapshot) { s.Mappings[0].BindingID = "absent" }, "port": func(s *model.Snapshot) { s.Mappings[0].TargetPort = 0 }, "target": func(s *model.Snapshot) { s.Mappings[0].TargetHost = "" }, "name": func(s *model.Snapshot) { s.Mappings[0].Name = "" }, "overlap": func(s *model.Snapshot) { s.Mappings[0].ListenPort = local.ListenPort }, "domain": func(s *model.Snapshot) { s.Bindings[0].Domain = "regexp:.*" }, "control-target": func(s *model.Snapshot) { s.Mappings[0].TargetHost = s.Bindings[0].Domain }, "revoked": func(s *model.Snapshot) { s.Node.Revoked = true },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -376,9 +400,9 @@ func TestUntrustedTLS(t *testing.T) {
 		})
 	}
 }
-func camouflage(t *testing.T, certFile, keyFile string) string {
+func camouflage(t *testing.T, certPEM, keyPEM string) string {
 	t.Helper()
-	pair, err := tls.LoadX509KeyPair(certFile, keyFile)
+	pair, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -405,9 +429,11 @@ func TestRealityReverse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	serverLocal := model.LocalTLS{Reality: model.Reality{Dest: camouflage(t, files.CertFile, files.KeyFile), PrivateKey: priv, ShortIDs: "0123456789abcdef", ServerNames: "gateway.test"}}
-	clientLocal := model.LocalTLS{Reality: model.Reality{PublicKey: pub, ShortID: "0123456789abcdef"}}
+	serverLocal := model.LocalTLS{Reality: model.Reality{Dest: camouflage(t, files.CertPEM, files.KeyPEM), PrivateKey: priv, ShortIDs: "0123456789abcdef", ServerNames: "first-cover.test,gateway.test"}}
+	clientLocal := model.LocalTLS{Reality: model.Reality{PublicKey: pub, ShortID: "0123456789abcdef", ServerNames: "gateway.test"}}
 	serverSnap, clientSnap := fixtures(t, echoServer(t))
+	serverSnap.Node.ServerName = "metadata.test"
+	clientSnap.Nodes[0].ServerName = "metadata.test"
 	run(t, serverSnap, serverLocal)
 	run(t, clientSnap, clientLocal)
 	awaitEcho(t, serverSnap.Mappings[0].ListenPort)
@@ -419,7 +445,7 @@ func TestRealityRejectsShortID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	serverLocal := model.LocalTLS{Reality: model.Reality{Dest: camouflage(t, files.CertFile, files.KeyFile), PrivateKey: priv, ShortIDs: "0123456789abcdef", ServerNames: "gateway.test"}}
+	serverLocal := model.LocalTLS{Reality: model.Reality{Dest: camouflage(t, files.CertPEM, files.KeyPEM), PrivateKey: priv, ShortIDs: "0123456789abcdef", ServerNames: "gateway.test"}}
 	clientLocal := model.LocalTLS{Reality: model.Reality{PublicKey: pub, ShortID: "0000000000000000"}}
 	serverSnap, clientSnap := fixtures(t, echoServer(t))
 	run(t, serverSnap, serverLocal)
@@ -537,6 +563,7 @@ func TestTCPAndUDPCoexist(t *testing.T) {
 		TargetHost: "127.0.0.1",
 		TargetPort: udpTarget,
 		Network:    "udp",
+		Pool:       1,
 		Enabled:    true,
 	}
 	serverSnap.Mappings = append(serverSnap.Mappings, udpMap)
