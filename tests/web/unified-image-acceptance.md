@@ -38,7 +38,7 @@ docker build --build-arg HTTP_PROXY= --build-arg HTTPS_PROXY= \
 
 三个容器的 image ID 完全一致；都包含非空 `/usr/local/html/index.html`；二进制 SHA-256 均为 `66d987c4d019310624a1636fffc3a6c8bf25dbaa9bcf3c445c19ec233c75e9f4`。每个容器手动执行镜像内健康脚本也通过。无角色及非法角色启动均退出 1。
 
-节点测试使用不可达的测试 Master 地址与假令牌：**Server/Client healthy 仅表示 PID 1 存活，不表示接入、授权或数据面就绪**。完整业务回归由上述 integration 测试覆盖。本轮 Master HTTP 仅用于隔离的本机冒烟，生产仍须按 README 配置 HTTPS 和可信网络首次注册。
+节点测试使用不可达的测试 Master 地址与假令牌：**Server/Client healthy 仅表示 PID 1 存活，不表示接入、授权或数据面就绪**。完整业务回归由上述 integration 测试覆盖。本轮 Master 使用默认 HTTP 做本机冒烟。产品默认 HTTP，内置 HTTPS 可选；生产可由 nginx 等终止 HTTPS 后转发到本机/内网 HTTP，可信网络也可直接 HTTP。首次注册须限制访问防抢占，不强制 HTTPS；此镜像验收未测试 nginx 反代。
 
 ## 清理与交付边界
 

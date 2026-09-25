@@ -4,7 +4,7 @@
 
 ## 结果
 
-在 README 明确的运行与协议边界内，本轮发布验收通过，可生产使用。未 push、未部署远端。生产必须 HTTPS、可信网络首次注册，并遵守一次性令牌清除和持久化目录要求。
+在当时 README 明确的运行与协议边界内，本轮发布验收通过。未 push、未部署远端。产品部署模型纠正为：默认 HTTP，内置 HTTPS 可选；生产常见 nginx 等终止 HTTPS 后转发到 Veilink HTTP，可信内网也可直接 HTTP。首次注册要求可信网络防抢占，不以 HTTPS 为前提；仍须遵守一次性令牌清除和持久化目录要求。此处更新部署叙事，不改变下述历史测试事实，也不表示当时测试过 nginx。
 
 - TCP mux 真正使用 sing-mux 的 smux/yamux/h2mux，默认关闭，开启空类型默认为 smux；旧类型拒绝。
 - h2mux 使用 HTTP/2 CONNECT 发起端与 sing-mux codec/Service；真实 mux 流内的 Veilink FIN 记录只解决半关闭，不承担多路复用，不宣称 mihomo 节点直连互通。
