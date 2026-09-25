@@ -14,6 +14,32 @@ HY2 默认使用 Xray `standard` BBR：Client/Server 均在认证成功后、业
 
 分发源码、二进制、镜像或前端产物时，须保留适用的第三方版权、许可和 NOTICE，并按 GPL/MPL 等适用条款提供对应源码与获取说明；本段不表示发布物已经完成合规审计。直接依赖许可核查、REALITY 标准 MPL Exhibit B 的说明及分发义务见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)，不构成法律意见或保证。
 
+## 手动开发构建（GitHub Actions）
+
+工作流：`.github/workflows/development-artifacts.yml`。仅支持 `workflow_dispatch`，不响应 push、PR 或 tag；默认只检查和构建，不创建 Release、不上传镜像、不部署。它需先经另行授权推送到远端并存在于默认分支，才能在 **Actions → Development artifacts → Run workflow** 选择目标分支运行。本次本地开发不执行该推送或远端运行。
+
+也可在已登录的 GitHub CLI 中手动触发（将 `master` 替换为目标分支）：
+
+```sh
+# 默认：仅构建
+gh workflow run development-artifacts.yml --ref master
+# 可选：只创建草稿，不正式发布
+gh workflow run development-artifacts.yml --ref master -f draft_release=true
+# 可选：上传开发标签镜像；两个选项可组合
+gh workflow run development-artifacts.yml --ref master -f push_dev_image=true
+```
+
+两个布尔选项默认均为 `false`。`draft_release=true` 只创建 `dev-<run-id>-<attempt>` 的 draft prerelease，附带六个归档、当前提交的 `veilink-source.tar.gz` 和汇总 `SHA256SUMS`，不执行 publish。`push_dev_image=true` 使用仓库 `GITHUB_TOKEN` 推送到单一镜像名 `ghcr.io/<owner>/<repo>:dev-<run-id>-<attempt>`（名称转小写），需仓库允许 Packages 写入且该包允许仓库访问；不会写入 `latest`、`stable` 或角色标签。关闭推送时镜像只保留在 Buildx 缓存，不生成可下载镜像归档。
+
+| 产物 | 平台 | 名称 |
+| --- | --- | --- |
+| 统一开发二进制包 | Linux amd64 / arm64 | `veilink-linux-{amd64,arm64}.tar.gz` |
+| 统一开发二进制包 | macOS amd64 / arm64 | `veilink-darwin-{amd64,arm64}.tar.gz` |
+| 统一开发二进制包 | Windows amd64 / arm64 | `veilink-windows-{amd64,arm64}.tar.gz` |
+| 单名多架构镜像 | linux/amd64 + linux/arm64 | `ghcr.io/<owner>/<repo>:dev-<run-id>-<attempt>` |
+
+每个二进制包包含一个 `veilink`（Windows 为 `veilink.exe`）、`html/`、许可证与 NOTICE、README 和注明源码提交的 `BUILD.txt`；通过 `master|server|client` 子命令选择角色，没有角色包矩阵。Master 可用 `-html-dir` 指定随包 Web 资源。Actions 的 `package-<os>-<arch>` 下载项包含归档及其 `SHA256SUMS`，保留 14 天；共享 Web 中间产物保留 7 天。交叉编译不代表各系统原生运行验证；这些包用于开发检查，**不是宿主机生产部署指南**，生产仍使用下文 Docker Run。
+
 ## 发布与目录
 
 统一镜像包含一个原生 Go 可执行文件、系统信任证书、`/usr/local/html/` 管理页面及健康检查依赖。只有 Master 启用 Web，Server/Client 不启动 Web 服务。Go/UI 多阶段构建只是构建实现，不是多个发布产品；一次构建生成一个镜像：

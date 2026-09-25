@@ -1,0 +1,185 @@
+name: Development artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      draft_release:
+        description: Create a draft prerelease with platform archives (never publish)
+        type: boolean
+        default: false
+      push_dev_image:
+        description: Push the unified multi-architecture image under a unique dev tag
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: development-artifacts-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Go checks
+        run: |
+          go test ./...
+          go vet ./...
+          go test -race ./internal/httpapi ./internal/master ./internal/node ./internal/control ./internal/tunnel ./tests/deployment
+          go test -tags integration ./tests/integration -count=1
+      - name: Frontend checks and shared Web assets
+        working-directory: frontend
+        run: |
+          npm ci
+          node --test tests/*.mjs
+          npm run typecheck
+          npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shared-web
+          path: html/
+          if-no-files-found: error
+          retention-days: 7
+
+  binaries:
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [linux, darwin, windows]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/download-artifact@v4
+        with:
+          name: shared-web
+          path: bundle/html
+      - name: Build one executable for all roles and package
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          suffix=''
+          if [[ "$GOOS" == windows ]]; then suffix='.exe'; fi
+          go build -trimpath -ldflags='-s -w' -o "bundle/veilink${suffix}" ./cmd/veilink
+          cp LICENSE NOTICE THIRD_PARTY_NOTICES.md README.md bundle/
+          printf '%s\n' "Source: https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}" \
+            'Unified executable: master|server|client subcommands; no role-specific packages.' \
+            'Development archive, not a host production deployment guide.' \
+            'Master Web assets are in html/ (select with -html-dir); default management transport is HTTP, TLS is optional.' > bundle/BUILD.txt
+          mkdir -p dist
+          tar -czf "dist/veilink-${GOOS}-${GOARCH}.tar.gz" -C bundle .
+          (cd dist && sha256sum ./*.tar.gz > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  image:
+    needs: [checks, binaries]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Unique development image name
+        id: names
+        run: |
+          echo "tag=ghcr.io/${GITHUB_REPOSITORY,,}:dev-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: ${{ inputs.push_dev_image }}
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # One final Dockerfile product, never a master/server/client target matrix.
+      # Master defaults to HTTP; optional HTTPS may terminate at nginx upstream.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ inputs.push_dev_image }}
+          tags: ${{ steps.names.outputs.tag }}
+          build-args: |
+            GOPROXY=https://proxy.golang.org,direct
+            NPM_REGISTRY=https://registry.npmjs.org
+            APK_MIRROR=https://dl-cdn.alpinelinux.org/alpine
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+      - name: Report image mode
+        env:
+          IMAGE: ${{ steps.names.outputs.tag }}
+          PUSHED: ${{ inputs.push_dev_image }}
+        run: |
+          printf 'Image: `%s`\n\nPushed: `%s` (false = build cache only).\n' "$IMAGE" "$PUSHED" >> "$GITHUB_STEP_SUMMARY"
+
+  draft:
+    if: ${{ inputs.draft_release }}
+    needs: [binaries, image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: packages
+      - name: Collect archives, checksums and exact source
+        run: |
+          mkdir release
+          find packages -name 'veilink-*.tar.gz' -exec cp '{}' release/ \;
+          git archive --format=tar.gz --prefix=veilink-source/ -o release/veilink-source.tar.gz HEAD
+          (cd release && sha256sum ./*.tar.gz > SHA256SUMS)
+          printf '%s\n' 'Development artifacts only. This release must remain a draft.' \
+            "Source commit: ${GITHUB_SHA}" \
+            'All platform archives contain the same role-selectable application plus Web assets.' \
+            'Use master|server|client subcommands. Default HTTP; built-in TLS is optional.' > release-notes.md
+      - name: Create draft only (no publish operation)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="dev-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          gh release create "$tag" release/* --target "$GITHUB_SHA" \
+            --title "Development ${tag}" --notes-file release-notes.md \
+            --draft --prerelease --latest=false
