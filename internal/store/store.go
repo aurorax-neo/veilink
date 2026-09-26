@@ -180,6 +180,16 @@ func (s *Store) load() (state, error) {
 		decoder := json.NewDecoder(bytes.NewReader(b))
 		decoder.DisallowUnknownFields()
 		e = decoder.Decode(&st)
+		if e == nil {
+			for _, node := range st.Nodes {
+				if node.Role == "server" {
+					if _, err := publicTunnel(node); err != nil {
+						e = fmt.Errorf("server %q has invalid or custom client_tunnel: %w", node.ID, err)
+						break
+					}
+				}
+			}
+		}
 		if e != nil {
 			e = fmt.Errorf("unsupported persisted configuration: %w; back up before explicitly resetting obsolete data", e)
 		}

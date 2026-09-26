@@ -48,6 +48,20 @@ func TestEmbeddedAPISafeguards(t *testing.T) {
 		h.ServeHTTP(w, r)
 		return w
 	}
+	for _, method := range []string{"POST", "PUT"} {
+		path := "/api/nodes"
+		if method == "PUT" {
+			path += "/" + n.ID
+		}
+		for _, field := range []string{"client_tunnel", "CLIENT_TUNNEL"} {
+			for _, value := range []string{`null`, `{}`, `{"server_name":"override.example"}`} {
+				body := `{"name":"server","role":"server","address":"localhost","port":8444,"` + field + `":` + value + `}`
+				if w := call(method, path, body); w.Code != http.StatusBadRequest {
+					t.Fatalf("%s accepted %s=%s: %d %s", method, field, value, w.Code, w.Body.String())
+				}
+			}
+		}
+	}
 	token, err := s.EnrollToken(n.ID, time.Hour)
 	if err != nil {
 		t.Fatal(err)

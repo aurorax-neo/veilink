@@ -287,10 +287,21 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case r.Method == "GET" && len(p) == 1:
 			result, err = a.store.Nodes()
 		case (r.Method == "POST" && len(p) == 1) || (r.Method == "PUT" && len(p) == 2):
-			var n model.Node
-			if !decode(w, r, &n) {
+			// Shadow the response-only field with RawMessage so even explicit
+			// null (and case-insensitive JSON spellings) cannot bypass rejection.
+			type nodeInput model.Node // Do not inherit Node.UnmarshalJSON.
+			var in struct {
+				nodeInput
+				ClientTunnel json.RawMessage `json:"client_tunnel"`
+			}
+			if !decode(w, r, &in) {
 				return
 			}
+			if in.ClientTunnel != nil {
+				failure(w, http.StatusBadRequest)
+				return
+			}
+			n := model.Node(in.nodeInput)
 			n.ID = id
 			result, err = a.store.SaveNode(n)
 		case r.Method == "DELETE" && len(p) == 2:

@@ -23,7 +23,7 @@ function setup(role = 'server', respond = async () => undefined) {
     defineProps: () => ({ role, saved: async () => {} }), defineExpose: () => {},
     api: async (...args) => { requests.push(args); return respond(...args) },
   })
-  vm.runInContext(transpile(script + '\nglobalThis.editor = { open, save, draft, endpoints, addEndpoint, removeEndpoint, uploadPEM, uploads, clearSecrets, pemFields, reading, uploadError, generate, generation, options, shownPair, pair, pairDirty, editingPair, editPair, resetPair, preservePair };'), context)
+  vm.runInContext(transpile(script + '\nglobalThis.editor = { open, save, draft, endpoints, addEndpoint, removeEndpoint, uploadPEM, uploads, clearSecrets, pemFields, reading, uploadError, generate, generation, options };'), context)
   const editor = context.editor
   editor.open()
   Object.assign(editor.draft, { name: 'Demo node', address: 'example.com', listenPort: '8444', cert, key })
@@ -160,61 +160,28 @@ const tlsNode = () => ({ id: 'server', name: 'Server', address: 'example.com', p
 const realityNode = () => ({ id: 'reality', name: 'Reality', address: 'example.com', port: 443, connect_endpoints: [{ id: 'primary', name: '首选地址', host: 'example.com', port: 443, enabled: true }], tunnel: { listen_port: 8444, reality: { private_key: 'private', short_ids: 'aa,bb', server_names: 'example.com', dest: 'example.com:443' } }, client_tunnel: { reality: { public_key: 'public', short_id: 'bb', fingerprint: 'firefox', server_names: 'example.com', max_time_diff: '1m' } } })
 const body = e => e.requests.at(-1)[2]
 
-test('persisted CA and selected short ID are shown and preserved on metadata saves', async () => {
+test('server metadata and material saves never submit a separate client template', async () => {
   for (const node of [tlsNode(), realityNode()]) {
-    const e = setup()
-    e.open(node)
-    assert.equal(e.preservePair.value, true)
-    assert.equal(e.shownPair.value.ca, node.client_tunnel.ca_pem || '')
-    assert.equal(e.shownPair.value.shortID, node.client_tunnel.reality?.short_id || '')
-    e.draft.name = 'Renamed'; e.draft.address = 'new.example.com'; e.draft.port = '8443'; e.draft.listen = '127.0.0.1'
-    await e.save()
-    assert.equal(JSON.stringify(body(e).client_tunnel), JSON.stringify(node.client_tunnel))
-    e.editPair()
-    assert.equal(e.pair.ca, e.shownPair.value.ca)
-    assert.equal(e.pair.shortID, e.shownPair.value.shortID)
-    assert.equal(e.pair.fingerprint, e.shownPair.value.fingerprint)
-    await e.save() // Merely opening the editor does not rewrite unexposed public fields.
-    assert.equal(JSON.stringify(body(e).client_tunnel), JSON.stringify(node.client_tunnel))
-    e.resetPair()
-    assert.equal(e.preservePair.value, false)
-    assert.equal(e.shownPair.value.ca, node.tunnel.ca_pem || '')
-    assert.equal(e.shownPair.value.shortID, node.tunnel.reality ? 'aa' : '')
+    const e = setup(); e.open(node)
+    e.draft.name = 'Renamed'
     await e.save()
     assert.equal('client_tunnel' in body(e), false)
-  }
-})
-
-test('server material edits derive automatically, including while pair editor is untouched', async () => {
-  for (const [field, value] of Object.entries({ cert: ca, key: key.replace('ZGVtbw==', 'bmV3'), ca: '', enc: 'new-decryption', flow: 'xtls-rprx-vision', security: 'reality' })) {
-    const e = setup(); e.open(tlsNode()); e.editPair()
-    e.draft[field] = value
-    assert.equal(e.preservePair.value, false, field)
-    assert.equal(e.pair.ca, e.shownPair.value.ca, field)
+    assert.equal(body(e).tunnel.ca_pem || '', node.tunnel.ca_pem || '')
+    e.draft.enc = 'new-decryption'
     await e.save()
-    assert.equal('client_tunnel' in body(e), false, field)
+    assert.equal('client_tunnel' in body(e), false)
+    assert.equal(body(e).tunnel.decryption, 'new-decryption')
   }
-  const e = setup(); e.open(realityNode()); e.editPair()
-  e.draft.privateKey = 'new-private'; e.draft.shortIDs = 'cc,dd'
-  assert.equal(e.shownPair.value.publicKey, '')
-  assert.equal(e.pair.publicKey, '')
-  assert.equal(e.shownPair.value.shortID, 'cc')
-  e.editPair()
-  assert.equal(e.pair.shortID, 'cc')
-  await e.save()
-  assert.equal(payload(e).reality.public_key, undefined)
-  assert.equal('client_tunnel' in body(e), false)
+  assert.doesNotMatch(editorSource, /client_tunnel|editingPair|pairDirty|preservePair|editPair|resetPair|下发客户端配置|编辑下发模板|重置为自动派生/)
+  assert.match(editorSource, /创建或关联映射后统一下发/)
 })
 
-test('explicit mismatches stay explicit and backend save rejection propagates', async () => {
-  const e = setup('server', async () => { throw Error('backend rejected mismatched pair') })
-  e.open(realityNode()); e.editPair()
-  e.pair.publicKey = 'explicit-mismatch'; e.pairDirty.value = true
-  e.draft.privateKey = 'new-private'
-  assert.equal(e.shownPair.value.publicKey, 'explicit-mismatch')
+test('backend save errors propagate without changing the server draft', async () => {
+  const e = setup('server', async () => { throw Error('backend rejected') })
+  e.open(realityNode()); e.draft.privateKey = 'new-private'
   await assert.rejects(e.save(), /backend rejected/)
-  assert.equal(body(e).client_tunnel.reality.public_key, 'explicit-mismatch')
-  assert.equal(e.pairDirty.value, true)
+  assert.equal(e.draft.privateKey, 'new-private')
+  assert.equal('client_tunnel' in body(e), false)
 })
 
 const generated = {
@@ -225,28 +192,24 @@ const generated = {
   certificate: { cert_pem: ca, key_pem: key, ca_pem: ca, expires_at: '2030-01-01T00:00:00Z' },
 }
 
-test('all generator kinds update pairs without saving; certificate defaults and bounds match API', async () => {
+test('all generator kinds update server material without saving; bounds match API', async () => {
   const e = setup('server', async (_path, _method, request) => generated[request.kind])
   e.open(realityNode())
   await e.generate('reality')
   assert.equal(e.draft.privateKey, generated.reality.private_key)
-  assert.equal(e.shownPair.value.publicKey, generated.reality.public_key)
-  assert.equal(e.shownPair.value.shortID, 'cc')
+  assert.equal(e.draft.shortIDs, 'cc')
   await e.generate('short_id')
-  assert.equal(e.shownPair.value.shortID, 'dd')
+  assert.equal(e.draft.shortIDs, 'dd')
   await e.generate('vless')
   assert.equal(e.draft.enc, generated.vless.decryption)
-  assert.equal(e.shownPair.value.encryption, generated.vless.encryption)
-  e.draft.enc = 'manually-changed'
-  assert.equal(e.shownPair.value.encryption, '')
   e.draft.transport = 'hysteria2'
   await e.generate('hysteria2')
-  assert.equal(e.shownPair.value.password, generated.hysteria2.password)
+  assert.equal(e.draft.password, generated.hysteria2.password)
   await e.generate('certificate')
   assert.equal(e.options.ttl, 30)
   assert.equal(body(e).ttl_days, 30)
   assert.equal(e.draft.cert, ca)
-  assert.equal(e.shownPair.value.ca, ca)
+  assert.equal(e.draft.ca, ca)
   assert.equal(e.requests.length, 5)
   assert.ok(e.requests.every(([path, method]) => path === '/nodes/generate' && method === 'POST'))
   assert.equal(e.generation.busy, '')
@@ -261,17 +224,9 @@ test('all generator kinds update pairs without saving; certificate defaults and 
   assert.match(editorSource, /id="cert-ttl"[^>]+max="365"/)
 })
 
-test('generation preserves explicit paired edits', async () => {
-  const e = setup('server', async () => generated.reality)
-  e.open(realityNode()); e.editPair(); e.pair.shortID = 'bb'; e.pairDirty.value = true
-  await e.generate('reality')
-  assert.equal(e.draft.shortIDs, 'cc')
-  assert.equal(e.shownPair.value.shortID, 'bb')
-  assert.match(e.generation.status, /核对已编辑/)
-})
 
 test('generation blocks saves and duplicate requests, drops stale results and ignores closed sessions', async () => {
-  for (const change of [e => { e.draft.name = 'Changed' }, e => { e.options.mode = 'random' }, e => e.resetPair(), e => e.clearSecrets()]) {
+  for (const change of [e => { e.draft.name = 'Changed' }, e => { e.options.mode = 'random' }, e => e.clearSecrets()]) {
     let resolve
     const e = setup('server', () => new Promise(done => { resolve = done }))
     const pending = e.generate('reality')
@@ -289,7 +244,7 @@ test('generation blocks saves and duplicate requests, drops stale results and ig
   const e = setup('server', () => new Promise(done => { resolve = done }))
   const pending = e.generate('certificate'); e.open(tlsNode()); resolve(generated.certificate); await pending
   assert.equal(e.draft.cert, cert)
-  assert.equal(e.shownPair.value.ca, ca)
+  assert.equal(e.draft.ca, cert)
   assert.equal(e.generation.status, '')
 })
 
@@ -303,7 +258,7 @@ test('generator failures and malformed responses preserve material and hide back
     assert.equal(e.generation.busy, '')
     assert.equal(e.draft.cert, cert)
     assert.equal(e.draft.key, key)
-    assert.equal(e.shownPair.value.ca, ca)
+    assert.equal(e.draft.ca, cert)
   }
   let reject
   const e = setup('server', () => new Promise((_resolve, fail) => { reject = fail }))
@@ -340,57 +295,22 @@ test('node and endpoint saves never send removed SNI or priority fields', async 
     assert.ok(body(e).connect_endpoints.every(endpoint => !('server_name' in endpoint) && !('priority' in endpoint)))
   }
   assert.doesNotMatch(editorSource + tableSource + source('../src/types.ts') + source('../src/format.ts'), /\bserver_name\b|\bserverName\b|\bpriority\b|SNI|优先级/)
-  assert.match(editorSource, /endpoint-\$\{index\}-host`">监听地址<\/label>/)
+  assert.match(editorSource, /endpoint-\$\{index\}-host`">主机\/域名<\/label>/)
+  assert.match(editorSource, /endpoint-\$\{index\}-port`">端口<\/label>/)
+  assert.doesNotMatch(editorSource, /Client 可达的监听地址|连接地址需要名称、监听地址|Port（连接端口）/)
 })
 
-test('API empty nested objects do not enable HY2 or REALITY in persisted pair fields', async () => {
-  const plain = { ...tlsNode(), tunnel: { transport_security: 'plain', decryption: 'private-encryption' }, client_tunnel: { transport_security: 'plain', encryption: 'public-encryption' } }
-  const hy2 = tlsNode(); hy2.tunnel.hysteria2 = { password: 'hy-password' }; hy2.client_tunnel.hysteria2 = { password: 'hy-password' }
+test('API empty nested objects do not enable HY2 or REALITY; only server material is saved', async () => {
+  const plain = { ...tlsNode(), tunnel: { listen_port: 8444, transport_security: 'plain', decryption: 'private-encryption' } }
+  const hy2 = tlsNode(); hy2.tunnel.hysteria2 = { password: 'hy-password' }
   for (const [node, transport, security] of [[tlsNode(), 'tcp', 'tls'], [plain, 'tcp', 'encryption'], [realityNode(), 'tcp', 'reality'], [hy2, 'hysteria2', 'tls']]) {
     node.tunnel = { reality: {}, hysteria2: {}, ...node.tunnel }
-    node.client_tunnel = { reality: {}, hysteria2: {}, ...node.client_tunnel }
     const e = setup(); e.open(node)
-    for (const fields of [e.shownPair.value, (e.editPair(), e.pair)]) {
-      assert.equal(fields.transport, transport)
-      assert.equal(fields.security, security)
-      assert.equal(fields.ca, node.client_tunnel.ca_pem || '')
-      assert.equal(fields.publicKey, node.client_tunnel.reality.public_key || '')
-      assert.equal(fields.shortID, node.client_tunnel.reality.short_id || '')
-      assert.equal(fields.encryption, node.client_tunnel.encryption || '')
-      assert.equal(fields.password, node.client_tunnel.hysteria2.password || '')
-    }
+    assert.equal(e.draft.transport, transport)
+    assert.equal(e.draft.security, security)
     await e.save()
-    assert.equal(JSON.stringify(body(e).client_tunnel), JSON.stringify(node.client_tunnel))
+    assert.equal('client_tunnel' in body(e), false)
   }
-})
-
-test('fingerprint edits preserve alternate approved REALITY names and other public settings after reopen', async () => {
-  const node = realityNode()
-  node.tunnel.reality.server_names = 'example.com,alternate.example.com'
-  node.client_tunnel.reality.server_names = 'alternate.example.com'
-  const e = setup(); e.open(node); e.editPair()
-  e.pair.fingerprint = 'chrome'; e.pairDirty.value = true
-  await e.save()
-  const saved = JSON.parse(JSON.stringify(body(e)))
-  assert.deepEqual(saved.client_tunnel.reality, { ...node.client_tunnel.reality, fingerprint: 'chrome' })
-  e.open({ ...node, ...saved }); e.editPair()
-  assert.equal(e.shownPair.value.fingerprint, 'chrome')
-  e.pair.fingerprint = 'safari'; e.pairDirty.value = true
-  await e.save()
-  assert.deepEqual(JSON.parse(JSON.stringify(body(e).client_tunnel.reality)), { ...node.client_tunnel.reality, fingerprint: 'safari' })
-  e.resetPair(); e.editPair(); e.pair.fingerprint = 'chrome'; e.pairDirty.value = true
-  await e.save()
-  assert.equal(body(e).client_tunnel.reality.server_names, undefined)
-  assert.equal(body(e).client_tunnel.reality.max_time_diff, undefined)
-})
-
-test('untouched pair editing follows derivation without restoring old hidden public settings', async () => {
-  const e = setup(); e.open(realityNode()); e.editPair()
-  e.draft.names = 'new.example.com'
-  e.pair.fingerprint = 'safari'; e.pairDirty.value = true
-  await e.save()
-  assert.equal(body(e).client_tunnel.reality.server_names, undefined)
-  assert.equal(body(e).client_tunnel.reality.max_time_diff, undefined)
 })
 
 test('onboarding displays role-specific flag commands and blocks embedded or insecure generation', async () => {

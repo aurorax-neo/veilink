@@ -206,6 +206,11 @@ func TestGatewayDefaultsRemainLiveAndPrivate(t *testing.T) {
 			t.Fatal("client snapshot lost public connect endpoints")
 		}
 		for _, peer := range snap.Nodes {
+			for _, server := range servers {
+				if server.ID == peer.ID && (server.ClientTunnel == nil || peer.Tunnel != *server.ClientTunnel) {
+					t.Fatal("mapped snapshot differs from derived stored template")
+				}
+			}
 			if peer.Tunnel.ListenHost != "" || peer.Tunnel.ListenPort != 0 {
 				t.Fatal("client snapshot leaked server local bind endpoint")
 			}
@@ -229,7 +234,9 @@ func TestGatewayDefaultsRemainLiveAndPrivate(t *testing.T) {
 	check(map[string]string{servers[0].ID: "aa", servers[1].ID: "cc"})
 	servers[0].Tunnel.Reality.ShortIDs = "ee,ff"
 	servers[0].ClientTunnel = nil
-	if _, err := s.SaveNode(servers[0]); err != nil {
+	var err error
+	servers[0], err = s.SaveNode(servers[0])
+	if err != nil {
 		t.Fatal(err)
 	}
 	check(map[string]string{servers[0].ID: "ee", servers[1].ID: "cc"})
@@ -301,7 +308,7 @@ func TestEncryptionAcrossTransportsAndFlowValidation(t *testing.T) {
 				server := testNode(t, s, "server", transport)
 				client := testNode(t, s, "client", transport+"-client")
 				server.Tunnel = model.LocalTLS{ListenPort: 8444, Decryption: keys[0]}
-				server.ClientTunnel = &model.LocalTLS{Encryption: keys[1]}
+				server.ClientTunnel = nil
 				switch transport {
 				case "raw":
 					server.Tunnel.TransportSecurity = "plain"
@@ -387,6 +394,7 @@ func TestNativeCryptoValidationAndCorruptSnapshotFailure(t *testing.T) {
 	if _, err := s.SaveMapping(testMapping(server.ID, client.ID, 8080)); err != nil {
 		t.Fatal(err)
 	}
+	credential := testCredential(t, s, client.ID)
 	if err := s.mutate("test.corrupt", server.ID, func(st *state) error {
 		n := st.Nodes[server.ID]
 		n.Tunnel.Decryption = "malformed-key"
@@ -395,8 +403,62 @@ func TestNativeCryptoValidationAndCorruptSnapshotFailure(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	snap, err := s.Snapshot(client.ID, testCredential(t, s, client.ID))
+	snap, err := s.Snapshot(client.ID, credential)
 	if !errors.Is(err, ErrInvalid) || len(snap.Nodes) != 0 {
 		t.Fatal("invalid crypto silently downgraded", err)
+	}
+}
+
+func TestClientTemplateReadOnlyAndLegacyFailure(t *testing.T) {
+	s, _, _ := testStore(t)
+	server := testNode(t, s, "server", "server")
+	cert, key := testPEM(t)
+	server.Tunnel = model.LocalTLS{TransportSecurity: "tls", CertPEM: cert, KeyPEM: key, CAPEM: cert}
+	server.ClientTunnel = nil
+	server, err := s.SaveNode(server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SaveNode(server); err != nil {
+		t.Fatal("identical derived roundtrip rejected", err)
+	}
+	for _, change := range []func(*model.LocalTLS){
+		func(c *model.LocalTLS) { c.Reality.Fingerprint = "firefox" },
+		func(c *model.LocalTLS) { c.Flow = "xtls-rprx-vision" },
+		func(c *model.LocalTLS) { c.CAPEM = "" },
+		func(c *model.LocalTLS) { *c = model.LocalTLS{} },
+	} {
+		candidate := server
+		public := *server.ClientTunnel
+		change(&public)
+		candidate.ClientTunnel = &public
+		if _, err := s.SaveNode(candidate); !errors.Is(err, ErrInvalid) {
+			t.Fatal("custom template accepted", err)
+		}
+		if _, err := publicTunnel(candidate); !errors.Is(err, ErrInvalid) {
+			t.Fatal("custom persisted template accepted", err)
+		}
+	}
+	if err := s.mutate("test.legacy", server.ID, func(st *state) error {
+		n := st.Nodes[server.ID]
+		n.ClientTunnel.Reality.Fingerprint = "firefox"
+		st.Nodes[server.ID] = n
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var before, after []byte
+	if err := s.db.QueryRow("SELECT data FROM config WHERE id=1").Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Nodes(); !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "unsupported persisted configuration") {
+		t.Fatal("legacy override not explicitly rejected", err)
+	}
+	server.ClientTunnel = nil
+	if _, err := s.SaveNode(server); !errors.Is(err, ErrInvalid) {
+		t.Fatal("legacy override silently replaced", err)
+	}
+	if err := s.db.QueryRow("SELECT data FROM config WHERE id=1").Scan(&after); err != nil || !bytes.Equal(before, after) {
+		t.Fatal("legacy data changed", err)
 	}
 }

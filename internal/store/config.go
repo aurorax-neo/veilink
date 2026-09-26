@@ -118,14 +118,13 @@ func validateTunnel(role string, local model.LocalTLS) error {
 	return nil
 }
 
-// clientTemplate pairs the public settings with server authentication material.
-// Omission derives a fresh template, never retaining stale settings. Explicit
-// templates merge nonempty fields over derived defaults.
+// clientTemplate derives the read-only public settings solely from server.Tunnel.
+// Existing objects may roundtrip only when their template is exactly derived.
 func clientTemplate(server model.Node) (*model.LocalTLS, error) {
 	unconfigured := server.Tunnel
 	unconfigured.ListenHost, unconfigured.ListenPort = "", 0
 	if unconfigured == (model.LocalTLS{}) {
-		if server.ClientTunnel != nil && *server.ClientTunnel != (model.LocalTLS{}) {
+		if server.ClientTunnel != nil {
 			return nil, ErrInvalid
 		}
 		return nil, nil
@@ -141,16 +140,11 @@ func clientTemplate(server model.Node) (*model.LocalTLS, error) {
 		return nil, ErrInvalid
 	}
 	paired := derived
-	if server.ClientTunnel != nil {
-		paired = derived.Merge(*server.ClientTunnel)
+	if server.ClientTunnel != nil && *server.ClientTunnel != derived {
+		return nil, fmt.Errorf("client_tunnel is read-only and must equal the derived configuration: %w", ErrInvalid)
 	}
 	if err := validateTunnel("client", paired); err != nil {
 		return nil, err
-	}
-	if paired.TransportSecurity != derived.TransportSecurity || normalNone(paired.Flow) != normalNone(derived.Flow) ||
-		!matchingEncryption(paired.Encryption, derived.Encryption) || paired.Hysteria2 != derived.Hysteria2 ||
-		paired.Reality.PublicKey != derived.Reality.PublicKey || paired.Reality.MaxTimeDiff != derived.Reality.MaxTimeDiff {
-		return nil, ErrInvalid
 	}
 	if derived.Reality.Enabled() {
 		// Validate the effective server allowlist, including metadata fallback,
@@ -178,32 +172,8 @@ func clientTemplate(server model.Node) (*model.LocalTLS, error) {
 				return nil, ErrInvalid
 			}
 		}
-	} else if paired.Reality != derived.Reality {
-		return nil, ErrInvalid
 	}
 	return &paired, nil
-}
-
-func normalNone(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "none" {
-		return ""
-	}
-	return value
-}
-
-// Ticket preference may differ; scheme, mode, padding and every public key must match.
-func matchingEncryption(got, want string) bool {
-	got, want = normalNone(got), normalNone(want)
-	if got == want {
-		return true
-	}
-	a, b := strings.Split(got, "."), strings.Split(want, ".")
-	if len(a) < 4 || len(a) != len(b) || (a[2] != "0rtt" && a[2] != "1rtt") {
-		return false
-	}
-	a[2] = b[2]
-	return strings.Join(a, ".") == want
 }
 
 func listed(value, list string) bool {
