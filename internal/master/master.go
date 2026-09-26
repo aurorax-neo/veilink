@@ -85,6 +85,7 @@ func Run(ctx context.Context, c config.Config) error {
 	h := &http.Server{
 		Handler:           handler,
 		TLSConfig:         tlsConfig,
+		ErrorLog:          newHTTPErrorLog(slog.Default()),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       5 * time.Minute,
 		MaxHeaderBytes:    16 << 10,
