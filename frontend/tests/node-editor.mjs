@@ -133,7 +133,7 @@ function setupTable(role = 'server') {
   const desk = reactive({ nodes: [], mappings: [], reload: async () => {}, notify: () => {} })
   const tableScript = tableSource.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import .*$/gm, '')
   const context = vm.createContext({ exports: {}, computed, ref, inject: () => desk, deskKey: {}, defineProps: () => ({ role }), api: async (...args) => { requests.push(args) } })
-  vm.runInContext(transpile(tableScript + '\nglobalThis.table = { tunnelLabel, effectiveSources, ask, run, pending };'), context)
+  vm.runInContext(transpile(tableScript + '\nglobalThis.table = { tunnelLabel, effectiveSources, openConfig, ask, run, pending, configNode };'), context)
   return { ...context.table, desk, requests }
 }
 
@@ -153,8 +153,15 @@ test('labels and read-only effective configuration use authoritative mapped serv
   assert.match(tableSource, /JSON.stringify\(source.client_tunnel, null, 2\)[^\n]+readonly/)
   assert.doesNotMatch(editorSource + tableSource + source('../src/types.ts'), /cert_file|key_file|ca_file|pool\?:/)
   assert.doesNotMatch(editorSource + source('../src/format.ts'), /override|v-html|console\./)
-})
+  assert.match(tableSource, /查看配置/)
+  assert.match(tableSource, /<Modal ref="configModal" title="有效隧道配置（只读）"/)
+  assert.match(tableSource, /@click="openConfig\(node\)"/)
+  assert.doesNotMatch(tableSource, /<section v-if="role === 'client'" aria-label="有效隧道配置">[\s\S]*JSON.stringify/)
+  c.openConfig(client)
+  assert.equal(c.configNode.value.id, client.id)
+  assert.doesNotMatch(tableSource.slice(tableSource.indexOf('<section v-if="selected"'), tableSource.indexOf('<Modal ref="configModal"')), /JSON.stringify\(source\.client_tunnel/)
 
+})
 const ca = cert.replace('ZGVtbw==', 'Y3VzdG9t')
 const tlsNode = () => ({ id: 'server', name: 'Server', address: 'example.com', port: 443, connect_endpoints: [{ id: 'primary', name: '首选地址', host: 'example.com', port: 443, enabled: true }], tunnel: { listen_port: 8444, transport_security: 'tls', cert_pem: cert, key_pem: key, ca_pem: cert }, client_tunnel: { transport_security: 'tls', ca_pem: ca } })
 const realityNode = () => ({ id: 'reality', name: 'Reality', address: 'example.com', port: 443, connect_endpoints: [{ id: 'primary', name: '首选地址', host: 'example.com', port: 443, enabled: true }], tunnel: { listen_port: 8444, reality: { private_key: 'private', short_ids: 'aa,bb', server_names: 'example.com', dest: 'example.com:443' } }, client_tunnel: { reality: { public_key: 'public', short_id: 'bb', fingerprint: 'firefox', server_names: 'example.com', max_time_diff: '1m' } } })

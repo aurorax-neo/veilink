@@ -18,6 +18,8 @@ const editor = ref<InstanceType<typeof NodeEditor> | null>(null)
 const onboarding = ref<InstanceType<typeof NodeOnboarding> | null>(null)
 const confirm = ref<InstanceType<typeof Modal> | null>(null)
 const pending = ref<Node | null>(null)
+const configModal = ref<InstanceType<typeof Modal> | null>(null)
+const configNode = ref<Node | null>(null)
 const action = ref<'revoke' | 'delete'>('delete')
 const label = computed(() => props.role === 'server' ? '服务端' : '客户端')
 const rows = computed(() => desk.nodes.filter(n => n.role === props.role && [n.name, n.id, n.address, n.error].join(' ').toLowerCase().includes(query.value.trim().toLowerCase())).sort((a, b) => Number(needsAttention(b)) - Number(needsAttention(a)) || a.name.localeCompare(b.name, 'zh-CN')))
@@ -40,6 +42,7 @@ function tunnelLabel(node: Node) {
 }
 function localListen(node: Node) { return endpoint(node.tunnel?.listen_host || '127.0.0.1', node.tunnel?.listen_port || 0) }
 function connectList(node: Node) { return (node.connect_endpoints || []).filter(item => item.enabled) }
+function openConfig(node: Node) { configNode.value = node; configModal.value?.open() }
 async function saved() { await desk.reload(); desk.notify('节点已保存。') }
 function ask(node: Node, operation: 'revoke' | 'delete') { if (node.embedded) return; pending.value = node; action.value = operation; confirm.value?.open() }
 async function run() {
@@ -70,7 +73,7 @@ async function run() {
           <td><template v-if="role === 'server'"><small>监听：{{ localListen(node) }} · {{ node.tunnel?.hysteria2?.password ? 'UDP' : 'TCP' }}</small><small v-for="item in connectList(node)" :key="item.id">{{ item.name }} · {{ endpoint(item.host, item.port) }}</small></template><template v-else>—</template></td>
           <td>{{ tunnelLabel(node) }}</td><td>{{ mappings(node.id).length }}</td>
           <td><Badge :text="revisionState(node).text" :tone="revisionState(node).tone" /><small>r{{ node.applied_revision }} / r{{ node.desired_revision }}</small></td>
-          <td><div class="actions"><button type="button" class="btn small" :disabled="node.revoked" @click="editor?.open(node)">编辑</button><button v-if="!node.embedded" type="button" class="btn small" :disabled="node.revoked" @click="onboarding?.open(node)">快捷接入</button><button v-if="!node.embedded" type="button" class="btn small danger" @click="ask(node, 'delete')">删除</button></div></td>
+          <td><div class="actions"><button type="button" class="btn small" :disabled="node.revoked" @click="editor?.open(node)">编辑</button><button v-if="role === 'client'" type="button" class="btn small" :disabled="node.revoked || !effectiveSources(node).length" @click="openConfig(node)">查看配置</button><button v-if="!node.embedded" type="button" class="btn small" :disabled="node.revoked" @click="onboarding?.open(node)">快捷接入</button><button v-if="!node.embedded" type="button" class="btn small danger" @click="ask(node, 'delete')">删除</button></div></td>
         </tr></tbody>
       </table>
     </div>
@@ -78,15 +81,6 @@ async function run() {
       <header class="panel-head"><h2>{{ selected.name }}</h2><button class="btn quiet" type="button" @click="selectedId = ''">收起</button></header>
       <dl class="detail-grid"><div><dt>ID</dt><dd><code>{{ selected.id }}</code></dd></div><div><dt>心跳</dt><dd>{{ seenText(selected.last_seen) }}</dd></div></dl>
       <p v-if="selected.error" class="detail-error" role="status">{{ selected.error }}</p>
-      <section v-if="role === 'client'" aria-label="有效隧道配置">
-        <h3>有效隧道配置（只读）</h3>
-        <p class="help">由映射服务端的已保存下发模板统一提供，不支持客户端覆盖。此处为期望配置，实际应用状态请查看节点版本。</p>
-        <p v-if="!effectiveSources(selected).length" class="help">未关联可用服务端，暂无下发配置。</p>
-        <div v-for="source in effectiveSources(selected)" :key="source.id">
-          <label :for="`effective-${source.id}`">来源：{{ source.name }} · {{ endpoint(source.address, source.port) }}</label>
-          <textarea :id="`effective-${source.id}`" class="mono" :value="source.client_tunnel ? JSON.stringify(source.client_tunnel, null, 2) : '服务端尚无下发模板'" readonly rows="8" :spellcheck="false" />
-        </div>
-      </section>
       <p v-if="selected.embedded" class="help">内置节点由管理中心维护；支持编辑配置，不支持快捷接入、吊销或删除。</p>
       <div v-if="!selected.embedded" class="actions"><button class="btn" type="button" :disabled="selected.revoked" @click="onboarding?.open(selected)">快捷接入</button><button class="btn danger" type="button" :disabled="selected.revoked" @click="ask(selected, 'revoke')">吊销节点</button></div>
     </section>
@@ -96,5 +90,13 @@ async function run() {
   <Modal ref="confirm" :title="action === 'revoke' ? '吊销节点' : '删除节点'" save-label="确认" danger :submit="run">
     <p v-if="action === 'revoke'">吊销「{{ pending?.name }}」的节点凭据？此操作不可撤销。</p>
     <p v-else>删除「{{ pending?.name }}」及其 {{ pending ? mappings(pending.id).length : 0 }} 条映射？此操作不可撤销。</p>
+  </Modal>
+  <Modal ref="configModal" title="有效隧道配置（只读）" :hide-save="true">
+    <p class="help">由映射服务端自动派生并统一下发。此处为期望配置，实际应用状态请查看节点版本。</p>
+    <p v-if="!configNode || !effectiveSources(configNode).length" class="help">未关联可用服务端，暂无下发配置。</p>
+    <div v-for="source in configNode ? effectiveSources(configNode) : []" :key="source.id">
+      <label :for="`effective-modal-${source.id}`">来源：{{ source.name }} · {{ endpoint(source.address, source.port) }}</label>
+      <textarea :id="`effective-modal-${source.id}`" class="mono" :value="source.client_tunnel ? JSON.stringify(source.client_tunnel, null, 2) : '服务端尚无下发模板'" readonly rows="10" :spellcheck="false" />
+    </div>
   </Modal>
 </template>
