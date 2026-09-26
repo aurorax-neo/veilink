@@ -5,11 +5,13 @@ ARG APK_MIRROR=https://mirrors.ustc.edu.cn/alpine
 FROM golang:alpine AS build
 WORKDIR /src
 ARG GOPROXY
+ARG VERSION=dev
+ARG COMMIT=unknown
 ENV GOPROXY=${GOPROXY}
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/veilink ./cmd/veilink
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X veilink/internal/buildinfo.Version=${VERSION} -X veilink/internal/buildinfo.Commit=${COMMIT}" -o /out/veilink ./cmd/veilink
 
 FROM node:alpine AS ui
 WORKDIR /src/frontend

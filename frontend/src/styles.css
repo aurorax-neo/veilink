@@ -99,7 +99,7 @@ input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--teal); }
 .panel-head { padding: 12px; border-bottom: 1px solid var(--line); }
 .table-scroll { overflow-x: auto; min-width: 0; }
 table { width: 100%; border-collapse: collapse; min-width: 720px; table-layout: fixed; }
-th, td { text-align: left; padding: 10px 12px; vertical-align: top; }
+th, td { text-align: left; padding: 10px 12px; vertical-align: middle; }
 th { font-size: 12px; font-weight: 600; color: var(--muted); background: #f8fbfa; }
 td { border-top: 1px solid #edf2f0; }
 td strong, td small { display: block; }
@@ -111,6 +111,16 @@ tbody tr:hover td { background: #f4f9f7; }
 .badge.warn { background: #fff4dc; color: var(--warn); }
 .badge.bad { background: #fdeceb; color: var(--danger); }
 .actions, .reasons { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; justify-content: flex-start; }
+.actions .btn, .badge { white-space: nowrap; }
+.nodes-table { min-width: 1040px; }
+.nodes-table th:first-child { width: 18%; }
+.nodes-table th:nth-child(2) { width: 10%; }
+.nodes-table th:nth-child(3) { width: 21%; }
+.nodes-table th:nth-child(4) { width: 12%; }
+.nodes-table th:nth-child(5) { width: 6%; }
+.nodes-table th:nth-child(6) { width: 13%; }
+.nodes-table th:last-child { width: 20%; }
+.node-id, .software-version { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attention, .timeline, .log-list { list-style: none; margin: 0; padding: 0; }
 .attention li { display: flex; justify-content: space-between; gap: 12px; padding: 12px; border-top: 1px solid #edf2f0; }
 .node-detail { min-width: 0; background: var(--surface); padding: 12px; }
@@ -126,12 +136,14 @@ tbody tr:hover td { background: #f4f9f7; }
 .empty p { margin-bottom: 0; }
 .empty-mark { color: #7eaea3; }
 .notice { margin: 0 0 16px; padding: 8px 12px; border-radius: var(--radius); background: #e7f6f1; }
-.modal { width: min(560px, calc(100% - 24px)); max-height: calc(100dvh - 32px); border: 1px solid var(--line); border-radius: 8px; padding: 20px; color: var(--text); box-shadow: 0 16px 64px rgba(7, 24, 32, .2); }
+.modal { inset: 0; margin: auto; width: min(560px, calc(100% - 24px)); max-height: calc(100dvh - 32px); overflow: hidden; border: 1px solid var(--line); border-radius: 8px; padding: 20px; color: var(--text); box-shadow: 0 16px 64px rgba(7, 24, 32, .2); }
+.modal > form { display: flex; flex-direction: column; max-height: calc(100dvh - 74px); min-height: 0; }
 .modal::backdrop { background: rgba(10, 24, 30, .5); }
 .modal[open] { animation: enter var(--motion-enter); }
-.modal-head { align-items: flex-start; margin-bottom: 8px; }
-.modal-body { display: grid; gap: 0; min-width: 0; padding: 0; margin: 0; border: 0; }
-.modal-foot { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line); justify-content: flex-end; }
+.modal-head { align-items: center; margin-bottom: 8px; flex: none; }
+.modal-head .icon-btn { flex: none; display: grid; place-items: center; width: 32px; height: 32px; }
+.modal-body { display: block; min-width: 0; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 0 4px 4px; margin: 0 -4px; border: 0; }
+.modal-foot { flex: none; margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line); justify-content: flex-end; }
 .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .grid-2 > * { min-width: 0; }
 .secret { margin: 0 0 8px; padding: 12px; background: #f4f8f6; white-space: pre-wrap; overflow-wrap: anywhere; user-select: all; font: 12px/1.6 ui-monospace, monospace; }
@@ -171,4 +183,13 @@ tbody tr:hover td { background: #f4f9f7; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+.build-version { position: relative; color: var(--muted); font-size: 12px; }
+.build-version summary { cursor: pointer; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.build-details { position: absolute; right: 0; top: 28px; z-index: 3; width: min(320px, calc(100vw - 32px)); padding: 12px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: 0 8px 24px #12262d20; overflow-wrap: anywhere; }
+.build-details p + p { margin-top: 8px; }
+@media (max-width: 640px) {
+  .build-version { position: static; }
+  .topbar { position: relative; }
+  .build-details { right: 12px; top: 100%; }
 }

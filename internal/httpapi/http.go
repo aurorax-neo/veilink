@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 	"veilink/internal/auth"
+	"veilink/internal/buildinfo"
 	"veilink/internal/logring"
 	"veilink/internal/model"
 	"veilink/internal/store"
@@ -231,6 +232,12 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var err error
 	matched := true
 	switch p[0] {
+	case "version":
+		if r.Method == "GET" && len(p) == 1 {
+			result = map[string]string{"version": buildinfo.Version, "commit": buildinfo.Commit}
+		} else {
+			matched = false
+		}
 	case "logs":
 		if r.Method == "GET" && len(p) == 1 {
 			q := r.URL.Query()
@@ -285,7 +292,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			generate(w, r)
 			return
 		case r.Method == "GET" && len(p) == 1:
-			result, err = a.store.Nodes()
+			result, err = a.store.ReportedNodes()
 		case (r.Method == "POST" && len(p) == 1) || (r.Method == "PUT" && len(p) == 2):
 			// Shadow the response-only field with RawMessage so even explicit
 			// null (and case-insensitive JSON spellings) cannot bypass rejection.

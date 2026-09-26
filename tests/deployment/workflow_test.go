@@ -24,6 +24,8 @@ func TestDevelopmentWorkflowContract(t *testing.T) {
 		"ghcr.io/${GITHUB_REPOSITORY,,}:dev-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}",
 		"--draft --prerelease --latest=false", "git archive --format=tar.gz",
 		"sha256sum", "LICENSE NOTICE THIRD_PARTY_NOTICES.md",
+		"-X veilink/internal/buildinfo.Version=dev", "-X veilink/internal/buildinfo.Commit=${GITHUB_SHA}",
+		"VERSION=dev", "COMMIT=${{ github.sha }}",
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Errorf("missing development workflow contract %q", required)
@@ -43,5 +45,17 @@ func TestDevelopmentWorkflowContract(t *testing.T) {
 	}
 	if strings.Count(workflow, "gh release create") != 1 {
 		t.Error("expected exactly one guarded draft creation command")
+	}
+}
+
+func TestDockerSoftwareIdentity(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join(projectRoot(t), "Dockerfile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{"ARG VERSION=dev", "ARG COMMIT=unknown", "-X veilink/internal/buildinfo.Version=${VERSION}", "-X veilink/internal/buildinfo.Commit=${COMMIT}"} {
+		if !strings.Contains(string(body), value) {
+			t.Errorf("missing build identity %q", value)
+		}
 	}
 }

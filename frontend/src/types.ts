@@ -45,6 +45,8 @@ export interface Node {
   tunnel?: TunnelConfig
   client_tunnel?: TunnelConfig
   embedded?: boolean
+  software_version?: string
+  software_commit?: string
   revoked: boolean
   desired_revision: number
   applied_revision: number

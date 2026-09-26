@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { inject } from 'vue'
+import { inject, onMounted, ref } from 'vue'
+import { api } from '../api'
 import { deskKey } from '../desk'
 import { pages, type PageId } from '../types'
 import AuditView from './AuditView.vue'
@@ -13,6 +14,13 @@ defineProps<{ page: PageId; account: string }>()
 const emit = defineEmits<{ navigate: [page: PageId]; logout: [] }>()
 const desk = inject(deskKey)!
 const nav: PageId[] = ['dashboard', 'servers', 'clients', 'proxies', 'logs', 'audit']
+const software = ref<{ version: string; commit: string } | null>(null)
+const versionError = ref(false)
+async function loadVersion() {
+  versionError.value = false
+  try { software.value = await api('/version') } catch { versionError.value = true }
+}
+onMounted(loadVersion)
 async function refresh() {
   try { await desk.reload() } catch { /* desk displays the error. */ }
 }
@@ -45,6 +53,15 @@ async function refresh() {
       <header class="topbar">
         <p>管理中心 <span>/ {{ pages[page].title }}</span></p>
         <div class="top-actions">
+          <details class="build-version">
+            <summary :title="software?.version">软件 {{ software?.version || (versionError ? '未获取' : '加载中…') }}</summary>
+            <div class="build-details">
+              <p>管理中心：{{ software?.version || '未知' }}</p>
+              <p>构建提交：<code>{{ software?.commit || '未知' }}</code></p>
+              <p class="help">统一镜像随附 Web；节点运行版本以节点上报为准。配置修订 rN 不代表软件升级。</p>
+              <button v-if="versionError" type="button" class="btn small" @click="loadVersion">重试</button>
+            </div>
+          </details>
           <span class="who">{{ account || '管理员会话' }}</span>
           <button type="button" class="btn quiet" @click="emit('logout')">退出登录</button>
         </div>

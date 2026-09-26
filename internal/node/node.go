@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 	pb "veilink/api/control/v1"
+	"veilink/internal/buildinfo"
 	"veilink/internal/config"
 	"veilink/internal/control"
 	"veilink/internal/logring"
@@ -298,7 +299,7 @@ func heartbeatEnvelope(id, credential string, revision int64, failed bool, ring 
 	if revision < 0 {
 		revision = 0
 	}
-	m, err := control.Envelope(map[string]any{"node_id": id, "credential": credential, "applied_revision": revision, "error": errText, "logs": []any{}})
+	m, err := control.Envelope(map[string]any{"node_id": id, "credential": credential, "applied_revision": revision, "error": errText, "logs": []any{}, "software_version": buildinfo.Version, "software_commit": buildinfo.Commit})
 	if err != nil {
 		return nil, err
 	}

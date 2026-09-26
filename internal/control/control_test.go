@@ -78,7 +78,7 @@ func TestTLSProtocolAndLiveRevocation(t *testing.T) {
 	if _, e = c.Pull(ctx, req); e != nil {
 		t.Fatal(e)
 	}
-	beat, _ := Envelope(map[string]any{"node_id": n.ID, "credential": String(enrolled, "credential"), "applied_revision": 0})
+	beat, _ := Envelope(map[string]any{"node_id": n.ID, "credential": String(enrolled, "credential"), "applied_revision": 0, "software_version": "v1.2.3", "software_commit": "abc123"})
 	stream, e := c.Events(ctx)
 	if e != nil {
 		t.Fatal(e)
@@ -88,6 +88,27 @@ func TestTLSProtocolAndLiveRevocation(t *testing.T) {
 	}
 	if _, e = stream.Recv(); e != nil {
 		t.Fatal(e)
+	}
+	nodes, err := s.ReportedNodes()
+	if err != nil || len(nodes) != 1 || nodes[0].SoftwareVersion != "v1.2.3" || nodes[0].SoftwareCommit != "abc123" {
+		t.Fatalf("heartbeat identity: %+v %v", nodes, err)
+	}
+	for _, bad := range []any{123, nil, "bad\nvalue"} {
+		invalid, err := c.Events(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		message, _ := Envelope(map[string]any{"node_id": n.ID, "credential": String(enrolled, "credential"), "software_version": bad})
+		if err := invalid.Send(message); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := invalid.Recv(); status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("invalid version accepted: %v", err)
+		}
+	}
+	nodes, err = s.ReportedNodes()
+	if err != nil || nodes[0].SoftwareVersion != "v1.2.3" {
+		t.Fatalf("invalid report replaced identity: %+v %v", nodes, err)
 	}
 	if e = s.RemoveNode(n.ID, false); e != nil {
 		t.Fatal(e)

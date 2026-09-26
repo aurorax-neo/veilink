@@ -87,7 +87,7 @@ jobs:
         run: |
           suffix=''
           if [[ "$GOOS" == windows ]]; then suffix='.exe'; fi
-          go build -trimpath -ldflags='-s -w' -o "bundle/veilink${suffix}" ./cmd/veilink
+          go build -trimpath -ldflags="-s -w -X veilink/internal/buildinfo.Version=dev -X veilink/internal/buildinfo.Commit=${GITHUB_SHA}" -o "bundle/veilink${suffix}" ./cmd/veilink
           cp LICENSE NOTICE THIRD_PARTY_NOTICES.md README.md bundle/
           printf '%s\n' "Source: https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}" \
             'Unified executable: master|server|client subcommands; no role-specific packages.' \
@@ -135,6 +135,8 @@ jobs:
           push: ${{ inputs.push_dev_image }}
           tags: ${{ steps.names.outputs.tag }}
           build-args: |
+            VERSION=dev
+            COMMIT=${{ github.sha }}
             GOPROXY=https://proxy.golang.org,direct
             NPM_REGISTRY=https://registry.npmjs.org
             APK_MIRROR=https://dl-cdn.alpinelinux.org/alpine

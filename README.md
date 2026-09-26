@@ -48,6 +48,12 @@ gh workflow run development-artifacts.yml --ref master -f push_dev_image=true
 docker build -t veilink:latest .
 ```
 
+软件版本与配置修订不同：`rN` 表示期望/已应用的配置修订，不是软件版本，也不存在“期望软件自动升级版本”。`version` 命令与已认证 `GET /api/version` 返回同一 Master 构建身份（API 为 `{version,commit}`）；默认软件版本为 `dev`，提交独立为 `unknown`。常见 tag 版可在构建时指定 `--build-arg VERSION=v1.2.3 --build-arg COMMIT="$(git rev-parse HEAD)"`；不以 `git describe` 长串拼接版本，`git describe` 仅用于构建诊断，不当配置修订。
+
+Go 构建使用常见的 `-ldflags "-X veilink/internal/buildinfo.Version=dev -X veilink/internal/buildinfo.Commit=<commit>"` 注入；手动 development-artifacts workflow 为全部平台归档和同一镜像统一注入 `dev` 与 `GITHUB_SHA`。镜像 tag 是分发定位符，不等于配置修订；Web 从认证 API 展示 Master 版本，提交哈希单独放详情，不拼进列表短标签。
+
+已认证 `GET /api/nodes` 的 `software_version` / `software_commit` 只来自各节点（含内置 Server）的认证心跳，未上报时字段省略，不能用 Master 版本代替。上报只保存在 Master 内存，重启后等待节点重新上报；不是二进制真实性证明或在线/目标健康证明，不进入配置快照，节点编辑 API 拒绝写入这些字段。
+
 国内网络默认使用 USTC Alpine 镜像源、npmmirror 和 goproxy.cn，采用 linuxmirrors.cn 的替换软件源思路，不执行远程安装脚本。可用 `--build-arg APK_MIRROR=https://dl-cdn.alpinelinux.org/alpine` 覆盖 APK 源（地址不带末尾斜线），也可覆盖 `NPM_REGISTRY` 和 `GOPROXY`。
 
 若使用已发布的统一镜像，无需在宿主机编译。镜像入口是 `/usr/local/bin/veilink`，必须在镜像名后指定 **`master|server|client` 子命令，再跟角色 flags**；不指定角色会退出，不接受 `-config`。所有持久化内容位于容器内 `/data/`，宿主机挂载根目录统一为 `/opt/docker/<app_name>/`；不在项目目录创建 `.local`。镜像用户是 UID/GID `65532:65532`。日志从 `docker logs <app_name>` 读取，不创建未被程序使用的 `logs` 目录。

@@ -8,6 +8,8 @@ import "google/protobuf/struct.proto";
 // field names (revision, node, nodes, bindings, mappings). UUID exists only here.
 // Events client: node_id:string, credential:string, applied_revision:number,
 // error:string (presence indicates failure; content never persisted).
+// software_version:string, software_commit:string: optional authenticated node
+// reports, each <=128 ASCII label characters; management-only, not snapshots.
 // Events server: revision:number. Client sends heartbeat at least every 15s,
 // pulls on every new revision and retries failed applications of same revision.
 // Numeric revisions are limited to protobuf Struct exact integers (<2^53).

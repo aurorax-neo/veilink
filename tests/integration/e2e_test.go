@@ -154,10 +154,19 @@ func (a *api) login(t *testing.T) {
 		t.Fatal("missing CSRF token")
 	}
 }
+
+// Management responses include software reports; snapshot Node decoding stays strict.
+type managementNodeFields model.Node
+type managementNode struct {
+	managementNodeFields
+	SoftwareVersion string `json:"software_version"`
+	SoftwareCommit  string `json:"software_commit"`
+}
+
 func (a *api) applied(t *testing.T, ids ...string) {
 	t.Helper()
 	eventually(t, "desired revisions applied", func() error {
-		var ns []model.Node
+		var ns []managementNode
 		if e := a.call("GET", "/nodes", nil, &ns); e != nil {
 			return e
 		}
@@ -347,7 +356,7 @@ func TestCLIEndToEnd(t *testing.T) {
 	master = launch(t, bin, "master", masterFlags...)
 	a.login(t)
 	a.applied(t, server.ID, client.ID)
-	var persistedNodes []model.Node
+	var persistedNodes []managementNode
 	a.must(t, "GET", "/nodes", nil, &persistedNodes)
 	foundServer, foundClient := false, false
 	for _, n := range persistedNodes {

@@ -65,14 +65,14 @@ async function run() {
     </div>
     <EmptyState v-if="!rows.length" title="暂无节点" text="新建节点或调整搜索。" />
     <div v-else class="panel table-scroll" tabindex="0" role="region" :aria-label="`${label}列表`">
-      <table>
-        <thead><tr><th scope="col">名称</th><th scope="col">状态</th><th scope="col">本地监听 / 客户端连接地址</th><th scope="col">隧道</th><th scope="col">映射</th><th scope="col">版本</th><th scope="col">操作</th></tr></thead>
+      <table class="nodes-table">
+        <thead><tr><th scope="col">名称 / 软件版本</th><th scope="col">状态</th><th scope="col">本地监听 / 客户端连接地址</th><th scope="col">隧道</th><th scope="col">映射</th><th scope="col">配置修订</th><th scope="col">操作</th></tr></thead>
         <tbody><tr v-for="node in rows" :key="node.id" :class="{ selected: selectedId === node.id }">
-          <td><button type="button" class="text-btn" :aria-expanded="selectedId === node.id" @click="selectedId = selectedId === node.id ? '' : node.id">{{ node.name }}</button><small>{{ node.id }}{{ node.embedded ? ' · 内置节点' : '' }}</small></td>
+          <td><button type="button" class="text-btn" :aria-expanded="selectedId === node.id" @click="selectedId = selectedId === node.id ? '' : node.id">{{ node.name }}</button><small class="node-id" :title="node.id">{{ node.id }}</small><small v-if="node.embedded">内置节点</small><small class="software-version" :title="node.software_version || '等待节点上报运行版本'">软件：{{ node.software_version || '未上报' }}</small></td>
           <td><Badge :text="presence(node).text" :tone="presence(node).tone" /></td>
           <td><template v-if="role === 'server'"><small>监听：{{ localListen(node) }} · {{ node.tunnel?.hysteria2?.password ? 'UDP' : 'TCP' }}</small><small v-for="item in connectList(node)" :key="item.id">{{ item.name }} · {{ endpoint(item.host, item.port) }}</small></template><template v-else>—</template></td>
           <td>{{ tunnelLabel(node) }}</td><td>{{ mappings(node.id).length }}</td>
-          <td><Badge :text="revisionState(node).text" :tone="revisionState(node).tone" /><small>r{{ node.applied_revision }} / r{{ node.desired_revision }}</small></td>
+          <td><Badge :text="revisionState(node).text" :tone="revisionState(node).tone" /><small>期望 r{{ node.desired_revision }}</small><small>已应用 r{{ node.applied_revision }}</small></td>
           <td><div class="actions"><button type="button" class="btn small" :disabled="node.revoked" @click="editor?.open(node)">编辑</button><button v-if="role === 'client'" type="button" class="btn small" :disabled="node.revoked || !effectiveSources(node).length" @click="openConfig(node)">查看配置</button><button v-if="!node.embedded" type="button" class="btn small" :disabled="node.revoked" @click="onboarding?.open(node)">快捷接入</button><button v-if="!node.embedded" type="button" class="btn small danger" @click="ask(node, 'delete')">删除</button></div></td>
         </tr></tbody>
       </table>
@@ -80,6 +80,7 @@ async function run() {
     <section v-if="selected" class="node-detail" aria-label="节点详情">
       <header class="panel-head"><h2>{{ selected.name }}</h2><button class="btn quiet" type="button" @click="selectedId = ''">收起</button></header>
       <dl class="detail-grid"><div><dt>ID</dt><dd><code>{{ selected.id }}</code></dd></div><div><dt>心跳</dt><dd>{{ seenText(selected.last_seen) }}</dd></div></dl>
+      <dl class="detail-grid"><div><dt>软件版本（节点上报）</dt><dd>{{ selected.software_version || '未上报' }}</dd></div><div><dt>构建提交</dt><dd><code>{{ selected.software_commit || '未上报' }}</code></dd></div></dl>
       <p v-if="selected.error" class="detail-error" role="status">{{ selected.error }}</p>
       <p v-if="selected.embedded" class="help">内置节点由管理中心维护；支持编辑配置，不支持快捷接入、吊销或删除。</p>
       <div v-if="!selected.embedded" class="actions"><button class="btn" type="button" :disabled="selected.revoked" @click="onboarding?.open(selected)">快捷接入</button><button class="btn danger" type="button" :disabled="selected.revoked" @click="ask(selected, 'revoke')">吊销节点</button></div>
@@ -92,7 +93,7 @@ async function run() {
     <p v-else>删除「{{ pending?.name }}」及其 {{ pending ? mappings(pending.id).length : 0 }} 条映射？此操作不可撤销。</p>
   </Modal>
   <Modal ref="configModal" title="有效隧道配置（只读）" :hide-save="true">
-    <p class="help">由映射服务端自动派生并统一下发。此处为期望配置，实际应用状态请查看节点版本。</p>
+    <p class="help">由映射服务端自动派生并统一下发。此处为期望配置，实际应用状态请查看节点的配置修订；rN 不是软件版本。</p>
     <p v-if="!configNode || !effectiveSources(configNode).length" class="help">未关联可用服务端，暂无下发配置。</p>
     <div v-for="source in configNode ? effectiveSources(configNode) : []" :key="source.id">
       <label :for="`effective-modal-${source.id}`">来源：{{ source.name }} · {{ endpoint(source.address, source.port) }}</label>

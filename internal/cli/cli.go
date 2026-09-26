@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 
+	"veilink/internal/buildinfo"
 	"veilink/internal/client"
 	"veilink/internal/config"
 	"veilink/internal/master"
@@ -16,9 +17,6 @@ import (
 	"veilink/internal/store"
 	"veilink/internal/tunnel"
 )
-
-var Version = "dev"
-var Commit = "unknown"
 
 func Run(ctx context.Context, args []string, out io.Writer) error {
 	return RunWithInput(ctx, args, os.Stdin, out)
@@ -32,7 +30,7 @@ func RunWithInput(ctx context.Context, args []string, in io.Reader, out io.Write
 		return errors.New("unexpected arguments")
 	}
 	if args[0] == "version" {
-		fmt.Fprintf(out, "veilink %s (%s)\n", Version, Commit)
+		fmt.Fprintf(out, "veilink %s (%s)\n", buildinfo.Version, buildinfo.Commit)
 		return nil
 	}
 	if args[0] == "x25519" {

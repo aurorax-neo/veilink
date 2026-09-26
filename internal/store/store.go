@@ -30,9 +30,10 @@ type state struct {
 	Secrets  map[string][]byte
 }
 type Store struct {
-	mu  sync.Mutex
-	db  *sql.DB
-	key []byte
+	mu       sync.Mutex
+	db       *sql.DB
+	key      []byte
+	software map[string]SoftwareReport
 }
 
 func Open(path, keyPath string) (*Store, error) {
@@ -493,6 +494,7 @@ func (s *Store) RemoveNode(id string, remove bool) error {
 				}
 			}
 		}
+		delete(s.software, id)
 		return nil
 	})
 }
@@ -602,6 +604,11 @@ func (s *Store) Snapshot(id, credential string) (model.Snapshot, error) {
 	return out, nil
 }
 func (s *Store) Heartbeat(id, credential string, applied int64, failed bool) (int64, error) {
+	return s.HeartbeatSoftware(id, credential, applied, failed, SoftwareReport{})
+}
+
+// HeartbeatSoftware records authenticated, bounded software metadata only in memory.
+func (s *Store) HeartbeatSoftware(id, credential string, applied int64, failed bool, software SoftwareReport) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st, e := s.load()
@@ -610,6 +617,9 @@ func (s *Store) Heartbeat(id, credential string, applied int64, failed bool) (in
 	}
 	if !s.authorized(st, id, credential) {
 		return 0, ErrAuth
+	}
+	if !validSoftwareLabel(software.SoftwareVersion) || !validSoftwareLabel(software.SoftwareCommit) {
+		return 0, ErrInvalid
 	}
 	n := st.Nodes[id]
 	if applied < 0 || applied > st.Revision {
@@ -624,6 +634,12 @@ func (s *Store) Heartbeat(id, credential string, applied int64, failed bool) (in
 	st.Nodes[id] = n
 	b, _ := json.Marshal(st)
 	_, e = s.db.Exec("UPDATE config SET data=? WHERE id=1", b)
+	if e == nil {
+		if s.software == nil {
+			s.software = make(map[string]SoftwareReport)
+		}
+		s.software[id] = software
+	}
 	return st.Revision, e
 }
 func removeBinding(st *state, id string) {

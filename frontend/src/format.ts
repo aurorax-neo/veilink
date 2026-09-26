@@ -37,15 +37,17 @@ export function presence(node: Node, now = Date.now()): { text: string; tone: To
 export function revisionState(node: Node): { text: string; tone: Tone } {
   if (node.revoked) return { text: '不再同步', tone: '' }
   if (node.error) return { text: '应用失败', tone: 'bad' }
-  if (node.applied_revision === node.desired_revision) return { text: '版本一致', tone: 'good' }
-  return { text: '待生效', tone: 'warn' }
+  if (!node.desired_revision) return { text: '尚无配置', tone: '' }
+  if (!node.applied_revision) return { text: '待应用', tone: 'warn' }
+  if (node.applied_revision === node.desired_revision) return { text: '已应用', tone: 'good' }
+  return { text: '待应用', tone: 'warn' }
 }
 
 export function attentionReasons(node: Node, now = Date.now()): string[] {
   if (node.revoked) return []
   const reasons: string[] = []
   if (node.error) reasons.push('应用失败')
-  if (node.applied_revision !== node.desired_revision) reasons.push('版本未对齐')
+  if (node.applied_revision !== node.desired_revision) reasons.push('配置待应用')
   if (!heartbeatOnline(node, now)) reasons.push(node.last_seen ? '心跳超过 90 秒' : '尚未上报心跳')
   return reasons
 }

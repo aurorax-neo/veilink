@@ -19,8 +19,11 @@ test('heartbeat boundaries and failed revisions remain distinct', () => {
   for (const last_seen of [0, 910, 909, 1001]) assert.equal(heartbeatOnline({ ...node, last_seen }, now), false)
   assert.equal(heartbeatOnline({ ...node, last_seen: 911 }, now), true)
   assert.equal(heartbeatOnline({ ...node, revoked: true }, now), false)
-  assert.equal(revisionState({ ...node, error: '' }).text, '待生效')
-  assert.equal(revisionState({ ...node, error: '', applied_revision: 3 }).text, '版本一致')
+  assert.equal(revisionState({ ...node, error: '' }).text, '待应用')
+  assert.equal(revisionState({ ...node, error: '', applied_revision: 3 }).text, '已应用')
+  assert.equal(revisionState({ ...node, error: '', desired_revision: 0, applied_revision: 0 }).text, '尚无配置')
+  assert.equal(revisionState({ ...node, error: '', applied_revision: 0 }).text, '待应用')
+  assert.equal(revisionState({ ...node, revoked: true }).text, '不再同步')
 })
 
 test('Dashboard metrics use actual node and mapping state', () => {

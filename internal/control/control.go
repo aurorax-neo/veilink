@@ -106,7 +106,16 @@ func (s *Service) Events(stream grpc.BidiStreamingServer[structpb.Struct, struct
 			if v < 0 || v > 9007199254740991 || v != float64(int64(v)) {
 				return status.Error(codes.InvalidArgument, "invalid revision")
 			}
-			rev, e := s.Store.Heartbeat(id, String(r.m, "credential"), int64(v), String(r.m, "error") != "")
+			for _, field := range []string{"software_version", "software_commit"} {
+				if value, ok := r.m.GetFields()[field]; ok {
+					if _, ok := value.GetKind().(*structpb.Value_StringValue); !ok {
+						return status.Error(codes.InvalidArgument, "invalid software identity")
+					}
+				}
+			}
+			rev, e := s.Store.HeartbeatSoftware(id, String(r.m, "credential"), int64(v), String(r.m, "error") != "", store.SoftwareReport{
+				SoftwareVersion: String(r.m, "software_version"), SoftwareCommit: String(r.m, "software_commit"),
+			})
 			if e != nil {
 				return rpcError(e)
 			}
