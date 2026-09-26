@@ -23,7 +23,7 @@ func TestDeriveClientTunnelPublicKeys(t *testing.T) {
 		for _, pair := range [][2][]byte{{x.Bytes(), x.PublicKey().Bytes()}, {pq.Bytes(), pq.EncapsulationKey().Bytes()}} {
 			dec := "mlkem768x25519plus." + mode + ".600s." + enc(pair[0])
 			server := LocalTLS{Decryption: dec, CertPEM: "server-cert", KeyPEM: "server-key", CAPEM: "server-ca", Flow: "xtls-rprx-vision", Hysteria2: Hysteria2{Password: "secret"}, Reality: Reality{PrivateKey: enc(x.Bytes()), Dest: "example.com:443", ShortIDs: "ab,cd"}}
-			got := DeriveClientTunnel(server, Node{ServerName: "example.com"})
+			got := DeriveClientTunnel(server, Node{Address: "example.com"})
 			want := "mlkem768x25519plus." + mode + ".0rtt." + enc(pair[1])
 			if got.Encryption != want {
 				t.Fatalf("incorrect public encryption for %s", mode)

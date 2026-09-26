@@ -125,7 +125,7 @@ export function validatePEM(value: string, kind: 'cert' | 'key' | 'ca'): string 
   return null
 }
 
-export function validateNode(input: { name: string; role: string; address: string; port: string; serverName: string; listen: string; listenPort?: string; transport: string; security: string; cert: string; key: string; ca: string }): string | null {
+export function validateNode(input: { name: string; role: string; address: string; port: string; listen: string; listenPort?: string; transport: string; security: string; cert: string; key: string; ca: string }): string | null {
   const name = input.name.trim()
   if (!name || name.length > 128) return '节点名称需要 1 到 128 个字符。'
   if (input.role !== 'server' && input.role !== 'client') return '角色只能是公网网关或内网节点。'
@@ -134,7 +134,6 @@ export function validateNode(input: { name: string; role: string; address: strin
     if (portNumber(input.port) === null) return '客户端接入端口要在 1 到 65535 之间。'
   }
   if (input.role === 'client') return null
-  if (input.serverName && !validHost(input.serverName, true)) return 'TLS 名称格式无效。'
   if (input.listen.trim() && !looksLikeIP(input.listen.trim())) return '隧道监听地址必须是 IP，例如 0.0.0.0、127.0.0.1 或 ::。'
   if (portNumber(input.listenPort || '') === null) return '本地监听端口要在 1 到 65535 之间。'
   const tls = input.transport === 'hysteria2' || input.security === 'tls'

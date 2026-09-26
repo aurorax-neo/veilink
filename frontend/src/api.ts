@@ -56,7 +56,7 @@ export async function api<T>(path: string, method = 'GET', data?: unknown): Prom
       429: '请求过于频繁，请稍后重试。',
     }
     if (response.status === 400 && (method === 'POST' || method === 'PUT') && /^\/nodes(?:\/[^/]+)?$/.test(path)) {
-      throw new ApiError('节点保存失败：请核对字段、端口和配对模板。TLS 核对证书/私钥、CA 与 SNI；plain 必须有 VLESS Encryption；REALITY 核对密钥、Short ID 与域名；Hysteria2 核对 TLS 与密码且不能配 REALITY；Vision 仅支持 TCP + TLS/REALITY。', 400)
+      throw new ApiError('节点保存失败：请核对字段、端口和配对模板。TLS 核对证书/私钥、CA 与连接地址；plain 必须有 VLESS Encryption；REALITY 核对密钥、Short ID 与域名；Hysteria2 核对 TLS 与密码且不能配 REALITY；Vision 仅支持 TCP + TLS/REALITY。', 400)
     }
     throw new ApiError(hints[response.status] || body?.error || `请求失败（${response.status}）`, response.status)
   }

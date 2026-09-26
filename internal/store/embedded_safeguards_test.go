@@ -17,7 +17,7 @@ func TestEmbeddedIdentitySafeguards(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { s.Close() }()
-	seed := model.Node{Name: "embedded-server", Role: "server", Address: "localhost", ServerName: "localhost", Port: 8444}
+	seed := model.Node{Name: "embedded-server", Role: "server", Address: "localhost", Port: 8444}
 	spoof := seed
 	spoof.Embedded = true
 	if _, err := s.SaveNode(spoof); !errors.Is(err, ErrInvalid) {

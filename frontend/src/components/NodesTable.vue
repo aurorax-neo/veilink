@@ -39,7 +39,7 @@ function tunnelLabel(node: Node) {
   return '未配置安全模式'
 }
 function localListen(node: Node) { return endpoint(node.tunnel?.listen_host || '127.0.0.1', node.tunnel?.listen_port || 0) }
-function connectList(node: Node) { return (node.connect_endpoints || []).filter(item => item.enabled).sort((a, b) => a.priority - b.priority) }
+function connectList(node: Node) { return (node.connect_endpoints || []).filter(item => item.enabled) }
 async function saved() { await desk.reload(); desk.notify('节点已保存。') }
 function ask(node: Node, operation: 'revoke' | 'delete') { if (node.embedded) return; pending.value = node; action.value = operation; confirm.value?.open() }
 async function run() {
@@ -67,7 +67,7 @@ async function run() {
         <tbody><tr v-for="node in rows" :key="node.id" :class="{ selected: selectedId === node.id }">
           <td><button type="button" class="text-btn" :aria-expanded="selectedId === node.id" @click="selectedId = selectedId === node.id ? '' : node.id">{{ node.name }}</button><small>{{ node.id }}{{ node.embedded ? ' · 内置节点' : '' }}</small></td>
           <td><Badge :text="presence(node).text" :tone="presence(node).tone" /></td>
-          <td><template v-if="role === 'server'"><small>监听：{{ localListen(node) }} · {{ node.tunnel?.hysteria2?.password ? 'UDP' : 'TCP' }}</small><small v-for="item in connectList(node)" :key="item.id">{{ item.name }} · {{ endpoint(item.host, item.port) }} · SNI {{ item.server_name }}</small></template><template v-else>—</template></td>
+          <td><template v-if="role === 'server'"><small>监听：{{ localListen(node) }} · {{ node.tunnel?.hysteria2?.password ? 'UDP' : 'TCP' }}</small><small v-for="item in connectList(node)" :key="item.id">{{ item.name }} · {{ endpoint(item.host, item.port) }}</small></template><template v-else>—</template></td>
           <td>{{ tunnelLabel(node) }}</td><td>{{ mappings(node.id).length }}</td>
           <td><Badge :text="revisionState(node).text" :tone="revisionState(node).tone" /><small>r{{ node.applied_revision }} / r{{ node.desired_revision }}</small></td>
           <td><div class="actions"><button type="button" class="btn small" :disabled="node.revoked" @click="editor?.open(node)">编辑</button><button v-if="!node.embedded" type="button" class="btn small" :disabled="node.revoked" @click="onboarding?.open(node)">快捷接入</button><button v-if="!node.embedded" type="button" class="btn small danger" @click="ask(node, 'delete')">删除</button></div></td>
@@ -76,14 +76,14 @@ async function run() {
     </div>
     <section v-if="selected" class="node-detail" aria-label="节点详情">
       <header class="panel-head"><h2>{{ selected.name }}</h2><button class="btn quiet" type="button" @click="selectedId = ''">收起</button></header>
-      <dl class="detail-grid"><div><dt>ID</dt><dd><code>{{ selected.id }}</code></dd></div><div><dt>心跳</dt><dd>{{ seenText(selected.last_seen) }}</dd></div><div><dt>TLS 名称</dt><dd>{{ selected.server_name || '默认' }}</dd></div></dl>
+      <dl class="detail-grid"><div><dt>ID</dt><dd><code>{{ selected.id }}</code></dd></div><div><dt>心跳</dt><dd>{{ seenText(selected.last_seen) }}</dd></div></dl>
       <p v-if="selected.error" class="detail-error" role="status">{{ selected.error }}</p>
       <section v-if="role === 'client'" aria-label="有效隧道配置">
         <h3>有效隧道配置（只读）</h3>
         <p class="help">由映射服务端的已保存下发模板统一提供，不支持客户端覆盖。此处为期望配置，实际应用状态请查看节点版本。</p>
         <p v-if="!effectiveSources(selected).length" class="help">未关联可用服务端，暂无下发配置。</p>
         <div v-for="source in effectiveSources(selected)" :key="source.id">
-          <label :for="`effective-${source.id}`">来源：{{ source.name }} · {{ endpoint(source.address, source.port) }} · TLS 名称：{{ source.server_name || '默认' }}</label>
+          <label :for="`effective-${source.id}`">来源：{{ source.name }} · {{ endpoint(source.address, source.port) }}</label>
           <textarea :id="`effective-${source.id}`" class="mono" :value="source.client_tunnel ? JSON.stringify(source.client_tunnel, null, 2) : '服务端尚无下发模板'" readonly rows="8" :spellcheck="false" />
         </div>
       </section>

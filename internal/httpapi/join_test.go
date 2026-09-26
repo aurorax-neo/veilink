@@ -156,7 +156,7 @@ func TestJoinCommandAuthenticationRotationAndRevocation(t *testing.T) {
 			t.Fatal("accepted invalid join", w.Code)
 		}
 	}
-	server, err := s.SaveNode(model.Node{Name: "join-server", Role: "server", Address: "example.com", ServerName: "example.com", Port: 8443})
+	server, err := s.SaveNode(model.Node{Name: "join-server", Role: "server", Address: "example.com", Port: 8443})
 	if err != nil {
 		t.Fatal(err)
 	}

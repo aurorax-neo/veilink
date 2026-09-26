@@ -26,7 +26,7 @@ func TestPersistenceIsolationRevocation(t *testing.T) {
 	if !s.Login("admin", "test password long") || s.Login("admin", "wrong") {
 		t.Fatal("login")
 	}
-	server, e := s.SaveNode(model.Node{Name: "gateway", Role: "server", Address: "localhost", ServerName: "localhost", Port: 443, Tunnel: testTLS(t)})
+	server, e := s.SaveNode(model.Node{Name: "gateway", Role: "server", Address: "localhost", Port: 443, Tunnel: testTLS(t)})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -140,7 +140,7 @@ func TestUDPMappingValidationAndPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server, err := s.SaveNode(model.Node{Name: "gw", Role: "server", Address: "localhost", ServerName: "localhost", Port: 8443, Tunnel: testTLS(t)})
+	server, err := s.SaveNode(model.Node{Name: "gw", Role: "server", Address: "localhost", Port: 8443, Tunnel: testTLS(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,11 +297,10 @@ func TestStoreHasAdminAndFindNodeByName(t *testing.T) {
 	}
 
 	node, err := s.SaveNode(model.Node{
-		Name:       "server-local",
-		Role:       "server",
-		Address:    "127.0.0.1",
-		Port:       8444,
-		ServerName: "localhost",
+		Name:    "server-local",
+		Role:    "server",
+		Address: "127.0.0.1",
+		Port:    8444,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -336,11 +335,10 @@ func TestTunnelConfigPersistenceAndAutoDerivation(t *testing.T) {
 	}
 
 	server, err := s.SaveNode(model.Node{
-		Name:       "gateway-reality",
-		Role:       "server",
-		Address:    "1.2.3.4",
-		Port:       443,
-		ServerName: "gateway.example.com",
+		Name:    "gateway-reality",
+		Role:    "server",
+		Address: "1.2.3.4",
+		Port:    443,
 		Tunnel: model.LocalTLS{
 			ListenPort: 8444,
 			Flow:       "xtls-rprx-vision",
@@ -486,6 +484,7 @@ func TestFreshSchemaAndUnsupportedDatabases(t *testing.T) {
 		{"unversioned", ""},
 		{"version-one", "CREATE TABLE schema_version(version INTEGER PRIMARY KEY); INSERT INTO schema_version VALUES(1);"},
 		{"version-two", "CREATE TABLE schema_version(version INTEGER PRIMARY KEY); INSERT INTO schema_version VALUES(1),(2);"},
+		{"version-four", "CREATE TABLE schema_version(version INTEGER PRIMARY KEY); INSERT INTO schema_version VALUES(4);"},
 		{"future", "CREATE TABLE schema_version(version INTEGER PRIMARY KEY); INSERT INTO schema_version VALUES(999);"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -518,5 +517,22 @@ func TestFreshSchemaAndUnsupportedDatabases(t *testing.T) {
 				t.Fatal("unsupported database was modified or deleted", err)
 			}
 		})
+	}
+}
+
+func TestPersistedRemovedEndpointFieldsRejected(t *testing.T) {
+	for _, node := range []string{
+		`{"server_name":"example.com"}`,
+		`{"connect_endpoints":[{"server_name":"example.com"}]}`,
+		`{"connect_endpoints":[{"priority":0}]}`,
+	} {
+		s, _, _ := testStore(t)
+		data := `{"Nodes":{"legacy":` + node + `}}`
+		if _, err := s.db.Exec("UPDATE config SET data=? WHERE id=1", data); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Nodes(); err == nil || !strings.Contains(err.Error(), "unknown field") {
+			t.Fatalf("obsolete persisted JSON accepted: %s: %v", node, err)
+		}
 	}
 }

@@ -129,7 +129,7 @@ func validate(s model.Snapshot, local model.LocalTLS) error {
 		}
 		if len(s.Bindings) > 0 {
 			if local.Reality.Enabled() {
-				if err := checkRealityServer(local.Reality, s.Node.ServerName); err != nil {
+				if err := checkRealityServer(local.Reality, s.Node.Address); err != nil {
 					return bad(err.Error())
 				}
 			} else if (local.Hysteria2.Enabled() || local.TransportSecurity == "tls") && (local.CertPEM == "" || local.KeyPEM == "") {

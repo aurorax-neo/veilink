@@ -42,7 +42,7 @@ func TestEmbeddedServerLifecycleAndRegistration(t *testing.T) {
 	t.Setenv("VEILINK_INIT_ADMIN_PASSWORD", "SuperSecureAdminPassword123!")
 	t.Setenv("VEILINK_INIT_ADMIN_USERNAME", "admin-root")
 
-	c, err := config.ParseFlags("master", []string{"-database", dbPath, "-deployment-key", keyPath, "-listen-addr", masterAddr, "-state-dir", filepath.Join(dir, "state"), "-scheme=https", "-cert-file", cert, "-key-file", key, "-embedded-server-enabled", "-embedded-server-name=integrated-gateway", "-embedded-server-port", strconv.Itoa(serverPort), "-embedded-server-address=127.0.0.1", "-embedded-server-server-name=localhost"})
+	c, err := config.ParseFlags("master", []string{"-database", dbPath, "-deployment-key", keyPath, "-listen-addr", masterAddr, "-state-dir", filepath.Join(dir, "state"), "-scheme=https", "-cert-file", cert, "-key-file", key, "-embedded-server-enabled", "-embedded-server-name=integrated-gateway", "-embedded-server-port", strconv.Itoa(serverPort), "-embedded-server-address=127.0.0.1"})
 	if err != nil {
 		t.Fatal(err)
 	}

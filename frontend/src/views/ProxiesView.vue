@@ -15,28 +15,27 @@ const editor = ref<InstanceType<typeof Modal> | null>(null)
 const confirm = ref<InstanceType<typeof Modal> | null>(null)
 const pending = ref<Mapping | null>(null)
 const action = ref<'toggle' | 'delete'>('toggle')
-const draft = reactive({ id: '', name: '', serverId: '', clientId: '', pool: 1, mux: false, listenHost: '0.0.0.0', listenPort: '', targetHost: '', targetPort: '', network: 'tcp', enabled: true })
+const draft = reactive({ id: '', name: '', serverId: '', clientId: '', pool: 1, listenHost: '0.0.0.0', listenPort: '', targetHost: '', targetPort: '', network: 'tcp', enabled: true })
 const defaultMuxType = 'smux'
 const muxType = ref('')
-watch(() => draft.mux, enabled => { muxType.value = enabled ? muxType.value || defaultMuxType : '' }, { flush: 'sync' })
-watch(() => draft.network, network => { if (network !== 'tcp') { draft.mux = false; muxType.value = '' } }, { flush: 'sync' })
+watch(() => draft.network, network => { if (network !== 'tcp') muxType.value = '' }, { flush: 'sync' })
 const servers = computed(() => desk.nodes.filter(n => n.role === 'server' && !n.revoked))
 const clients = computed(() => desk.nodes.filter(n => n.role === 'client' && !n.revoked))
 const rows = computed(() => desk.mappings.filter(m => (filter.value === 'all' || m.enabled === (filter.value === 'on')) && [m.name, m.listen_host, m.target_host, nodeName(desk.nodes, m.server_id), nodeName(desk.nodes, m.client_id)].join(' ').toLowerCase().includes(query.value.trim().toLowerCase())))
 function fields(m: Mapping) {
-  return { id: m.id, name: m.name, serverId: m.server_id, clientId: m.client_id, pool: m.pool || 1, mux: m.mux, listenHost: m.listen_host, listenPort: String(m.listen_port), targetHost: m.target_host, targetPort: String(m.target_port), network: m.network || 'tcp', enabled: m.enabled }
+  return { id: m.id, name: m.name, serverId: m.server_id, clientId: m.client_id, pool: m.pool || 1, listenHost: m.listen_host, listenPort: String(m.listen_port), targetHost: m.target_host, targetPort: String(m.target_port), network: m.network || 'tcp', enabled: m.enabled }
 }
 function open(mapping?: Mapping) {
-  Object.assign(draft, mapping ? fields(mapping) : { id: '', name: '', serverId: servers.value[0]?.id || '', clientId: clients.value[0]?.id || '', pool: 1, mux: false, listenHost: '0.0.0.0', listenPort: '', targetHost: '127.0.0.1', targetPort: '', network: 'tcp', enabled: true })
-  muxType.value = draft.network === 'tcp' && draft.mux ? mapping?.mux_type || defaultMuxType : ''
+  Object.assign(draft, mapping ? fields(mapping) : { id: '', name: '', serverId: servers.value[0]?.id || '', clientId: clients.value[0]?.id || '', pool: 1, listenHost: '0.0.0.0', listenPort: '', targetHost: '127.0.0.1', targetPort: '', network: 'tcp', enabled: true })
+  muxType.value = draft.network === 'tcp' && mapping?.mux ? mapping.mux_type || defaultMuxType : ''
   editor.value?.open()
 }
 async function save() {
   const problem = validateMapping(draft, desk.nodes, desk.mappings, draft.id)
   if (problem) throw new Error(problem)
   await api(draft.id ? `/mappings/${encodeURIComponent(draft.id)}` : '/mappings', draft.id ? 'PUT' : 'POST', {
-    name: draft.name.trim(), server_id: draft.serverId, client_id: draft.clientId, pool: draft.pool, mux: draft.network === 'tcp' && draft.mux,
-    mux_type: draft.network === 'tcp' && draft.mux ? muxType.value : '',
+    name: draft.name.trim(), server_id: draft.serverId, client_id: draft.clientId, pool: draft.pool, mux: draft.network === 'tcp' && muxType.value !== '',
+    mux_type: draft.network === 'tcp' ? muxType.value : '',
     listen_host: draft.listenHost.trim(), listen_port: Number(draft.listenPort), target_host: draft.targetHost.trim(), target_port: Number(draft.targetPort), network: draft.network, enabled: draft.enabled,
   })
   await desk.reload(); desk.notify('映射已保存。')
@@ -92,11 +91,8 @@ async function run() {
       <div><label for="map-network">协议</label><select id="map-network" v-model="draft.network"><option value="tcp">TCP</option><option value="udp">UDP</option></select></div>
       <div><label for="map-pool">Pool</label><select id="map-pool" v-model.number="draft.pool"><option v-for="n in 32" :key="n" :value="n">{{ n }}</option></select></div>
     </div>
-    <label class="check" for="map-mux"><input id="map-mux" v-model="draft.mux" type="checkbox" :disabled="draft.network !== 'tcp'" /> TCP mux（默认关闭）</label>
-    <div v-if="draft.network === 'tcp' && draft.mux">
-      <label for="map-mux-type">mux 类型</label>
-      <select id="map-mux-type" v-model="muxType" required><option value="smux">smux</option><option value="yamux">yamux</option><option value="h2mux">h2mux</option></select>
-    </div>
+    <label for="map-mux-type">TCP mux（默认关闭）</label>
+    <select id="map-mux-type" v-model="muxType" :disabled="draft.network !== 'tcp'"><option value="">关闭</option><option value="smux">smux</option><option value="yamux">yamux</option><option value="h2mux">h2mux</option></select>
     <p class="help">关闭：每条 TCP 流使用独立认证连接；开启：多条 TCP 流共享连接，Vision 不直拷。UDP 始终使用 XUDP，不受此开关影响。Pool 控制共享会话或独立连接的预备数量。保存后自动重建相关隧道，现有连接会断开。</p>
     <div class="grid-2">
       <div><label for="map-listen">监听 IP</label><input id="map-listen" v-model="draft.listenHost" required spellcheck="false" /></div>

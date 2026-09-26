@@ -31,7 +31,7 @@ func testNode(t *testing.T, s *Store, role, name string) model.Node {
 	if role == "server" {
 		local = testTLS(t)
 	}
-	n, err := s.SaveNode(model.Node{Name: name, Role: role, Address: "localhost", ServerName: "localhost", Port: 443, Tunnel: local})
+	n, err := s.SaveNode(model.Node{Name: name, Role: role, Address: "localhost", Port: 443, Tunnel: local})
 	if err != nil {
 		t.Fatal(err)
 	}

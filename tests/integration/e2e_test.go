@@ -232,8 +232,8 @@ func TestCLIEndToEnd(t *testing.T) {
 		KeyPEM  string `json:"key_pem"`
 		CAPEM   string `json:"ca_pem"`
 	}
-	a.must(t, "POST", "/nodes/generate", map[string]any{"role": "server", "kind": "certificate", "server_name": "localhost", "ttl_days": 1}, &generated)
-	a.must(t, "POST", "/nodes", model.Node{Name: "gateway", Role: "server", Address: "127.0.0.1", Port: tunnelPort, ServerName: "localhost", Tunnel: model.LocalTLS{TransportSecurity: "tls", CertPEM: generated.CertPEM, KeyPEM: generated.KeyPEM, CAPEM: generated.CAPEM, ListenHost: "127.0.0.1", ListenPort: tunnelPort}}, &server)
+	a.must(t, "POST", "/nodes/generate", map[string]any{"role": "server", "kind": "certificate", "host": "127.0.0.1", "ttl_days": 1}, &generated)
+	a.must(t, "POST", "/nodes", model.Node{Name: "gateway", Role: "server", Address: "127.0.0.1", Port: tunnelPort, Tunnel: model.LocalTLS{TransportSecurity: "tls", CertPEM: generated.CertPEM, KeyPEM: generated.KeyPEM, CAPEM: generated.CAPEM, ListenHost: "127.0.0.1", ListenPort: tunnelPort}}, &server)
 	if server.ClientTunnel == nil || server.ClientTunnel.CAPEM != generated.CAPEM || server.ClientTunnel.KeyPEM != "" {
 		t.Fatal("server paired client settings not persisted safely")
 	}
@@ -288,7 +288,7 @@ func TestCLIEndToEnd(t *testing.T) {
 		}
 	}
 	// Rotating only the server updates the persisted client template and both runtimes.
-	a.must(t, "POST", "/nodes/generate", map[string]any{"role": "server", "kind": "certificate", "server_name": "localhost", "ttl_days": 1}, &generated)
+	a.must(t, "POST", "/nodes/generate", map[string]any{"role": "server", "kind": "certificate", "host": "127.0.0.1", "ttl_days": 1}, &generated)
 	server.Tunnel.CertPEM, server.Tunnel.KeyPEM, server.Tunnel.CAPEM = generated.CertPEM, generated.KeyPEM, generated.CAPEM
 	server.ClientTunnel = nil // derive the matching client template atomically
 	a.must(t, "PUT", "/nodes/"+server.ID, server, &server)

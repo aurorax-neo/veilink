@@ -67,7 +67,7 @@ func TestStatsHeartbeatAndMappingLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := s.SaveNode(model.Node{Name: "gateway", Role: "server", Address: "localhost", ServerName: "localhost", Port: 8444, Tunnel: model.LocalTLS{TransportSecurity: "plain", Decryption: dec, ListenHost: "127.0.0.1", ListenPort: 8444}})
+	server, err := s.SaveNode(model.Node{Name: "gateway", Role: "server", Address: "localhost", Port: 8444, Tunnel: model.LocalTLS{TransportSecurity: "plain", Decryption: dec, ListenHost: "127.0.0.1", ListenPort: 8444}})
 	if err != nil {
 		t.Fatal(err)
 	}

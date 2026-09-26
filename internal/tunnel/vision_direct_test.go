@@ -102,7 +102,7 @@ func TestVisionApplicationRuntime(t *testing.T) {
 					t.Fatal(err)
 				}
 				serverLocal = model.LocalTLS{Flow: flowVision, Reality: model.Reality{Dest: camouflage(t, files.CertPEM, files.KeyPEM), PrivateKey: priv, ShortIDs: "0123456789abcdef", ServerNames: "gateway.test"}}
-				clientLocal = model.LocalTLS{Flow: flowVision, Reality: model.Reality{PublicKey: pub, ShortID: "0123456789abcdef"}}
+				clientLocal = model.LocalTLS{Flow: flowVision, Reality: model.Reality{PublicKey: pub, ShortID: "0123456789abcdef", ServerNames: "gateway.test"}}
 			}
 			sr := run(t, server, serverLocal)
 			cr := run(t, client, clientLocal)

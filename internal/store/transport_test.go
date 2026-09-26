@@ -210,7 +210,7 @@ func TestPEMValidationPersistenceAndDistribution(t *testing.T) {
 
 func TestUnconfiguredServerEnrollmentAndMapping(t *testing.T) {
 	s, _, _ := testStore(t)
-	server, err := s.SaveNode(model.Node{Name: "unconfigured", Role: "server", Address: "localhost", ServerName: "localhost", Port: 8443})
+	server, err := s.SaveNode(model.Node{Name: "unconfigured", Role: "server", Address: "localhost", Port: 8443})
 	if err != nil {
 		t.Fatal(err)
 	}

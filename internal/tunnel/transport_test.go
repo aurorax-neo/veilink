@@ -2,8 +2,10 @@ package tunnel
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"os/exec"
@@ -93,8 +95,8 @@ func TestClientEndpointFailover(t *testing.T) {
 	server.Node.Tunnel = local
 	client.Nodes[0].Tunnel = peer
 	client.Nodes[0].ConnectEndpoints = []model.ConnectEndpoint{
-		{ID: "failed", Name: "failed", Host: "127.0.0.1", Port: freePort(t), ServerName: "gateway.test", Priority: 0, Enabled: true},
-		{ID: "working", Name: "working", Host: "127.0.0.1", Port: local.ListenPort, ServerName: "gateway.test", Priority: 1, Enabled: true},
+		{ID: "failed", Name: "failed", Host: "127.0.0.1", Port: freePort(t), Enabled: true},
+		{ID: "working", Name: "working", Host: "127.0.0.1", Port: local.ListenPort, Enabled: true},
 	}
 	run(t, server, model.LocalTLS{})
 	run(t, client, model.LocalTLS{})
@@ -111,15 +113,15 @@ func TestConnectEndpointStrictJSON(t *testing.T) {
 		}
 	}
 	var node model.Node
-	decoder := json.NewDecoder(strings.NewReader(`{"connect_endpoints":[{"id":"public","name":"Public","host":"public.example.com","port":443,"server_name":"tls.example.com","enabled":true}]}`))
+	decoder := json.NewDecoder(strings.NewReader(`{"connect_endpoints":[{"id":"public","name":"Public","host":"public.example.com","port":443,"enabled":true}]}`))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&node); err != nil {
 		t.Fatal(err)
 	}
 	node.Tunnel.ListenHost, node.Tunnel.ListenPort = "127.0.0.1", 8443
 	endpoints := enabledEndpoints(node)
-	if len(endpoints) != 1 || endpoints[0].Host != "public.example.com" || endpoints[0].Port != 443 || endpoints[0].ServerName != "tls.example.com" {
-		t.Fatalf("dial address or independent SNI changed: %+v", endpoints)
+	if len(endpoints) != 1 || endpoints[0].Host != "public.example.com" || endpoints[0].Port != 443 {
+		t.Fatalf("dial address changed: %+v", endpoints)
 	}
 }
 
@@ -429,10 +431,86 @@ func TestGatewayConsumesExactPublicTemplate(t *testing.T) {
 		{CAPEM: tlsFiles(t).CAPEM, Hysteria2: model.Hysteria2{Password: "authoritative-password"}},
 		{Reality: model.Reality{PublicKey: pub, ShortID: "bb", ServerNames: "selected-cover.test,other-cover.test", Fingerprint: "firefox"}},
 	} {
-		gateway := model.Node{ServerName: "metadata.test", Tunnel: template}
+		gateway := model.Node{Address: "metadata.test", Tunnel: template}
 		got, err := gatewayClientConfig(model.LocalTLS{}, gateway)
 		if err != nil || got != template {
 			t.Fatal("authoritative public template was rederived or changed", err)
+		}
+	}
+}
+
+func TestRemovedEndpointFieldsRejected(t *testing.T) {
+	for _, raw := range []string{
+		`{"server_name":"example.com"}`,
+		`{"connect_endpoints":[{"server_name":"example.com"}]}`,
+		`{"connect_endpoints":[{"priority":0}]}`,
+	} {
+		decoder := json.NewDecoder(strings.NewReader(raw))
+		decoder.DisallowUnknownFields()
+		var node model.Node
+		if err := json.Unmarshal([]byte(raw), &node); err == nil {
+			t.Fatalf("ordinary snapshot unmarshal accepted obsolete JSON: %s", raw)
+		}
+		if err := decoder.Decode(&node); err == nil || !strings.Contains(err.Error(), "unknown field") {
+			t.Fatalf("obsolete JSON accepted: %s: %v", raw, err)
+		}
+	}
+}
+
+func TestEndpointListOrder(t *testing.T) {
+	node := model.Node{ConnectEndpoints: []model.ConnectEndpoint{
+		{ID: "z", Host: "z.example.com", Port: 443, Enabled: true},
+		{ID: "disabled", Host: "disabled.example.com", Port: 443},
+		{ID: "a", Host: "a.example.com", Port: 443, Enabled: true},
+	}}
+	got := enabledEndpoints(node)
+	if len(got) != 2 || got[0].ID != "z" || got[1].ID != "a" || node.ConnectEndpoints[1].ID != "disabled" {
+		t.Fatalf("list order lost or input mutated: %+v", got)
+	}
+}
+
+func TestGatewayTLSVerifiesEndpointHost(t *testing.T) {
+	local := tlsFiles(t)
+	pair, err := tls.X509KeyPair([]byte(local.CertPEM), []byte(local.KeyPEM))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{pair}, MinVersion: tls.VersionTLS12})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.(*tls.Conn).Handshake()
+			conn.Close()
+		}
+	}()
+	defer func() { ln.Close(); <-done }()
+	s := &service{ctx: context.Background()}
+	peer := &clientGateway{local: model.LocalTLS{TransportSecurity: "tls", CAPEM: local.CAPEM}}
+	for _, host := range []string{"127.0.0.1", "localhost"} {
+		gateway := model.Node{Address: "ignored.example", ConnectEndpoints: []model.ConnectEndpoint{{Host: host, Port: ln.Addr().(*net.TCPAddr).Port, Enabled: true}}}
+		conn, err := s.dialGateway(gateway, peer)
+		if host == "127.0.0.1" {
+			if err != nil {
+				t.Fatal(err)
+			}
+			conn.Close()
+		} else {
+			if conn != nil {
+				conn.Close()
+			}
+			var mismatch x509.HostnameError
+			if !errors.As(err, &mismatch) {
+				t.Fatalf("expected certificate host mismatch, got %v", err)
+			}
 		}
 	}
 }

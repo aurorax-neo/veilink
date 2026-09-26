@@ -24,7 +24,7 @@ func TestMasterPersistenceRedeployAndOverrides(t *testing.T) {
 		}
 		return c
 	}
-	first := load("-listen-addr=0.0.0.0:9443", "-state-dir=durable-state", "-scheme=http", "-cert-file=/local/cert.pem", "-key-file=/local/key.pem", "-embedded-server-enabled", "-embedded-server-address=gateway.example.com", "-embedded-server-port=9444", "-embedded-server-server-name=gateway.example.com")
+	first := load("-listen-addr=0.0.0.0:9443", "-state-dir=durable-state", "-scheme=http", "-cert-file=/local/cert.pem", "-key-file=/local/key.pem", "-embedded-server-enabled", "-embedded-server-address=gateway.example.com", "-embedded-server-port=9444")
 	second := load()
 	if second.ListenAddr != first.ListenAddr || second.StateDir != first.StateDir || second.EmbeddedServer != first.EmbeddedServer || second.CertFile != first.CertFile || second.Scheme != "http" {
 		t.Fatal("redeploy defaults replaced persisted settings")

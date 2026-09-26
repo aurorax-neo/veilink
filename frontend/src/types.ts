@@ -18,8 +18,6 @@ export interface ConnectEndpoint {
   name: string
   host: string
   port: number
-  server_name: string
-  priority: number
   enabled: boolean
 }
 
@@ -43,7 +41,6 @@ export interface Node {
   role: 'server' | 'client' | string
   address: string
   port: number
-  server_name: string
   connect_endpoints?: ConnectEndpoint[]
   tunnel?: TunnelConfig
   client_tunnel?: TunnelConfig

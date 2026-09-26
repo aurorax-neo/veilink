@@ -18,7 +18,7 @@ func TestDefaultsAndFlags(t *testing.T) {
 	if err != nil || c.Scheme != "http" || c.ListenAddr != "127.0.0.1:8443" {
 		t.Fatal(c, err)
 	}
-	c, err = ParseFlags("master", []string{"-listen-addr", "127.0.0.1:9443", "-control-server-name", "panel.example.com", "-control-ca", "/config/master-ca.pem", "-embedded-server-enabled", "-embedded-server-port", "9999", "-embedded-server-name", "gateway", "-embedded-server-address", "127.0.0.1", "-embedded-server-server-name", "localhost", "-embedded-server-state-dir", "/tmp/gateway"})
+	c, err = ParseFlags("master", []string{"-listen-addr", "127.0.0.1:9443", "-control-server-name", "panel.example.com", "-control-ca", "/config/master-ca.pem", "-embedded-server-enabled", "-embedded-server-port", "9999", "-embedded-server-name", "gateway", "-embedded-server-address", "127.0.0.1", "-embedded-server-state-dir", "/tmp/gateway"})
 	if err != nil || c.Validate("master") != nil || c.ControlServerName != "panel.example.com" || c.ControlCA != "/config/master-ca.pem" || !c.EmbeddedServer.Enabled || c.EmbeddedServer.Port != 9999 || c.EmbeddedServer.Name != "gateway" || c.EmbeddedServer.StateDir != "/tmp/gateway" {
 		t.Fatal(c, err)
 	}
@@ -38,6 +38,7 @@ func TestRemovedAndWrongRoleFlags(t *testing.T) {
 		args []string
 	}{
 		{"master", []string{"-config", "old.yaml"}}, {"client", []string{"-config=old.yaml"}}, {"init-admin", []string{"-config", "old.yaml"}},
+		{"master", []string{"-embedded-server-server-name=localhost"}},
 		{"server", []string{"-database", "db"}}, {"client", []string{"-cert-file", "cert"}}, {"master", []string{"-enroll-token", "secret"}},
 		{"master", []string{"-embedded-server-port", "bad"}}, {"master", []string{"-embedded-server-enabled=bad"}}, {"master", []string{"stray"}},
 	} {

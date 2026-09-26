@@ -33,15 +33,10 @@ func embeddedNode(c config.Config, s *store.Store) (model.Node, error) {
 			addr = "127.0.0.1"
 		}
 	}
-	srvName := c.EmbeddedServer.ServerName
-	if srvName == "" {
-		srvName = addr
-	}
 	n, err := s.EnsureEmbeddedNode(model.Node{
 		Name: name, Role: "server", Address: addr, Port: port,
-		ServerName:       srvName,
 		Tunnel:           model.LocalTLS{ListenPort: port},
-		ConnectEndpoints: []model.ConnectEndpoint{{ID: "primary", Name: "启动参数默认接入", Host: addr, Port: port, ServerName: srvName, Enabled: true}},
+		ConnectEndpoints: []model.ConnectEndpoint{{ID: "primary", Name: "启动参数默认接入", Host: addr, Port: port, Enabled: true}},
 	})
 	if err != nil {
 		return n, fmt.Errorf("failed to auto-register embedded server node: %w", err)

@@ -33,7 +33,7 @@ func tlsFiles(t *testing.T) model.LocalTLS {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cert := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "gateway.test"}, DNSNames: []string{"gateway.test"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, IsCA: true, BasicConstraintsValid: true}
+	cert := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "gateway.test"}, DNSNames: []string{"gateway.test"}, IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, IsCA: true, BasicConstraintsValid: true}
 	der, err := x509.CreateCertificate(rand.Reader, cert, cert, &key.PublicKey, key)
 	if err != nil {
 		t.Fatal(err)
@@ -73,7 +73,7 @@ func freePort(t *testing.T) int {
 func fixtures(t *testing.T, target int) (model.Snapshot, model.Snapshot) {
 	t.Helper()
 	port := freePort(t)
-	n := model.Node{ID: "server", Role: "server", Address: "127.0.0.1", ServerName: "gateway.test", Port: port, Tunnel: model.LocalTLS{TransportSecurity: "tls", ListenPort: port}}
+	n := model.Node{ID: "server", Role: "server", Address: "127.0.0.1", Port: port, Tunnel: model.LocalTLS{TransportSecurity: "tls", ListenPort: port}}
 	b := model.Binding{ID: "one", ServerID: n.ID, ClientID: "client-one", UUID: "e2587f5e-b746-4e68-a131-184984fa56a0", Domain: "one.reverse.test"}
 	m := model.Mapping{ID: "echo", Name: "echo", BindingID: b.ID, ListenPort: freePort(t), TargetHost: "127.0.0.1", TargetPort: target, Pool: 1, Enabled: true}
 	s := model.Snapshot{Revision: 1, Node: n, Bindings: []model.Binding{b}, Mappings: []model.Mapping{m}}
@@ -390,7 +390,7 @@ func TestUntrustedTLS(t *testing.T) {
 			bad := clone(c)
 			trust := local
 			if mode == "wrong-name" {
-				bad.Nodes[0].ServerName = "other.test"
+				bad.Nodes[0].Address = "localhost"
 			} else {
 				trust = tlsFiles(t)
 			}
@@ -432,8 +432,6 @@ func TestRealityReverse(t *testing.T) {
 	serverLocal := model.LocalTLS{Reality: model.Reality{Dest: camouflage(t, files.CertPEM, files.KeyPEM), PrivateKey: priv, ShortIDs: "0123456789abcdef", ServerNames: "first-cover.test,gateway.test"}}
 	clientLocal := model.LocalTLS{Reality: model.Reality{PublicKey: pub, ShortID: "0123456789abcdef", ServerNames: "gateway.test"}}
 	serverSnap, clientSnap := fixtures(t, echoServer(t))
-	serverSnap.Node.ServerName = "metadata.test"
-	clientSnap.Nodes[0].ServerName = "metadata.test"
 	run(t, serverSnap, serverLocal)
 	run(t, clientSnap, clientLocal)
 	awaitEcho(t, serverSnap.Mappings[0].ListenPort)
@@ -446,7 +444,7 @@ func TestRealityRejectsShortID(t *testing.T) {
 		t.Fatal(err)
 	}
 	serverLocal := model.LocalTLS{Reality: model.Reality{Dest: camouflage(t, files.CertPEM, files.KeyPEM), PrivateKey: priv, ShortIDs: "0123456789abcdef", ServerNames: "gateway.test"}}
-	clientLocal := model.LocalTLS{Reality: model.Reality{PublicKey: pub, ShortID: "0000000000000000"}}
+	clientLocal := model.LocalTLS{Reality: model.Reality{PublicKey: pub, ShortID: "0000000000000000", ServerNames: "gateway.test"}}
 	serverSnap, clientSnap := fixtures(t, echoServer(t))
 	run(t, serverSnap, serverLocal)
 	run(t, clientSnap, clientLocal)

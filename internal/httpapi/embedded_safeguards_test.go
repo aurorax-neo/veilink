@@ -22,7 +22,7 @@ func TestEmbeddedAPISafeguards(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	n, err := s.EnsureEmbeddedNode(model.Node{Name: "embedded", Role: "server", Address: "localhost", ServerName: "localhost", Port: 8444})
+	n, err := s.EnsureEmbeddedNode(model.Node{Name: "embedded", Role: "server", Address: "localhost", Port: 8444})
 	if err != nil {
 		t.Fatal(err)
 	}

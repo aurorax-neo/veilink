@@ -9,9 +9,9 @@ import SecretField from './SecretField.vue'
 const props = defineProps<{ role: 'server' | 'client'; saved: () => Promise<void> }>()
 const modal = ref<InstanceType<typeof Modal> | null>(null)
 const server = computed(() => props.role === 'server')
-const draft = reactive({ id: '', name: '', address: '', port: '443', serverName: '', listenPort: '443', transport: 'tcp', security: 'tls', flow: '', enc: '', cert: '', key: '', ca: '', listen: '', dest: '', privateKey: '', publicKey: '', shortIDs: '', names: '', password: '' })
+const draft = reactive({ id: '', name: '', address: '', port: '443', listenPort: '443', transport: 'tcp', security: 'tls', flow: '', enc: '', cert: '', key: '', ca: '', listen: '', dest: '', privateKey: '', publicKey: '', shortIDs: '', names: '', password: '' })
 const endpoints = reactive<ConnectEndpoint[]>([])
-function addEndpoint() { endpoints.push({ id: `endpoint-${Date.now()}-${endpoints.length}`, name: '备用地址', host: '', port: 443, server_name: '', priority: endpoints.length, enabled: true }) }
+function addEndpoint() { endpoints.push({ id: `endpoint-${Date.now()}-${endpoints.length}`, name: '备用地址', host: '', port: 443, enabled: true }) }
 function removeEndpoint(index: number) { if (endpoints.length > 1) endpoints.splice(index, 1) }
 let original: TunnelConfig = {}
 let persisted: TunnelConfig = {}
@@ -26,7 +26,7 @@ const pairDirty = ref(false)
 const hasPersistedPair = ref(false)
 const autoPair = ref(false)
 const initialMaterial = ref('')
-function materialSnapshot() { return JSON.stringify([draft.transport, draft.security, draft.serverName, draft.flow, draft.enc, draft.cert, draft.key, draft.ca, draft.dest, draft.privateKey, draft.shortIDs, draft.names, draft.password]) }
+function materialSnapshot() { return JSON.stringify([draft.transport, draft.security, draft.flow, draft.enc, draft.cert, draft.key, draft.ca, draft.dest, draft.privateKey, draft.shortIDs, draft.names, draft.password]) }
 const preservePair = computed(() => hasPersistedPair.value && !autoPair.value && materialSnapshot() === initialMaterial.value)
 const pair = reactive({ transport: 'tcp', security: 'tls', publicKey: '', shortID: '', fingerprint: '', encryption: '', ca: '', flow: '', password: '' })
 const savedPair = reactive({ ...pair })
@@ -106,7 +106,7 @@ async function generate(kind: GenerateKind) {
   try {
     const result = await api<Record<string, string>>('/nodes/generate', 'POST', {
       role: 'server', kind,
-      ...(kind === 'certificate' ? { server_name: primary?.server_name?.trim() || primary?.host.trim() || '', ttl_days: Number(options.ttl) } : {}),
+      ...(kind === 'certificate' ? { host: primary?.host.trim() || '', ttl_days: Number(options.ttl) } : {}),
       ...(kind === 'vless' ? { mode: options.mode, authentication: options.authentication } : {}),
     })
     if (revision !== generation.revision) return
@@ -136,11 +136,11 @@ function open(node?: Node) {
   original = structuredClone(node?.tunnel ? JSON.parse(JSON.stringify(node.tunnel)) : {})
   persisted = structuredClone(node?.client_tunnel ? JSON.parse(JSON.stringify(node.client_tunnel)) : {})
   const t = original
-  const savedEndpoints = node?.connect_endpoints?.length ? node.connect_endpoints : node?.address ? [{ id: 'primary', name: '首选地址', host: node.address, port: node.port || 443, server_name: node.server_name || node.address, priority: 0, enabled: true }] : []
+  const savedEndpoints = node?.connect_endpoints?.length ? node.connect_endpoints : node?.address ? [{ id: 'primary', name: '首选地址', host: node.address, port: node.port || 443, enabled: true }] : []
   endpoints.splice(0, endpoints.length, ...savedEndpoints.map(endpoint => ({ ...endpoint })))
   if (!endpoints.length && server.value) addEndpoint()
   Object.assign(draft, {
-    id: node?.id || '', name: node?.name || '', address: node?.address || '', port: String(node?.port || 443), serverName: node?.server_name || '', listenPort: String(t.listen_port || node?.port || 443),
+    id: node?.id || '', name: node?.name || '', address: node?.address || '', port: String(node?.port || 443), listenPort: String(t.listen_port || node?.port || 443),
     transport: t.hysteria2?.password ? 'hysteria2' : 'tcp',
     security: t.hysteria2?.password ? 'tls' : t.reality && Object.values(t.reality).some(Boolean) ? 'reality' : t.transport_security === 'plain' ? 'encryption' : 'tls',
     flow: t.flow || '', enc: t.decryption || '', cert: t.cert_pem || '', key: t.key_pem || '', ca: t.ca_pem || '', listen: t.listen_host || '',
@@ -173,16 +173,15 @@ async function save() {
   if (generation.busy) throw new Error('请等待生成完成。')
   const primary = endpoints.find(endpoint => endpoint.enabled) || endpoints[0]
   if (server.value && primary && !primary.host.trim() && draft.address.trim()) {
-    primary.host = draft.address.trim(); primary.port = Number(draft.port); primary.server_name = draft.serverName.trim() || draft.address.trim()
+    primary.host = draft.address.trim(); primary.port = Number(draft.port)
   }
-  const serverName = server.value ? (primary?.server_name || '').trim() || (primary?.host || '').trim() : ''
-  const problem = validateNode({ ...draft, address: primary?.host || '', port: String(primary?.port || ''), serverName, role: props.role })
+  const problem = validateNode({ ...draft, address: primary?.host || '', port: String(primary?.port || ''), role: props.role })
   if (uploadError.value) throw new Error(uploadError.value)
   if (problem) { section.value = 'server'; throw new Error(problem) }
   if (server.value) {
     if (!endpoints.length || !endpoints.some(endpoint => endpoint.enabled)) throw new Error('至少启用一个客户端连接地址。')
     for (const endpoint of endpoints) {
-      if (!endpoint.name?.trim() || !endpoint.host?.trim() || !(endpoint.server_name || '').trim() || Number(endpoint.port) < 1 || Number(endpoint.port) > 65535) throw new Error('连接地址需要名称、Host、端口和 SNI。')
+      if (!endpoint.name?.trim() || !endpoint.host?.trim() || Number(endpoint.port) < 1 || Number(endpoint.port) > 65535) throw new Error('连接地址需要名称、监听地址和端口。')
     }
   }
   const tunnel: TunnelConfig = {}
@@ -207,8 +206,7 @@ async function save() {
   }
   await api(draft.id ? `/nodes/${encodeURIComponent(draft.id)}` : '/nodes', draft.id ? 'PUT' : 'POST', {
     name: draft.name.trim(), role: props.role, address: server.value ? primary?.host.trim() : '', port: server.value ? Number(primary?.port) : 0,
-    server_name: server.value ? (primary?.server_name || '').trim() : '',
-    ...(server.value ? { connect_endpoints: endpoints.map(endpoint => ({ ...endpoint, name: endpoint.name.trim(), host: endpoint.host.trim(), server_name: (endpoint.server_name || '').trim(), port: Number(endpoint.port), priority: Number(endpoint.priority) })), tunnel } : {}),
+    ...(server.value ? { connect_endpoints: endpoints.map(endpoint => ({ id: endpoint.id, name: endpoint.name.trim(), host: endpoint.host.trim(), port: Number(endpoint.port), enabled: endpoint.enabled })), tunnel } : {}),
     ...(server.value && pairDirty.value ? { client_tunnel: pairedTunnel() } : server.value && preservePair.value ? { client_tunnel: persisted } : {}),
   })
   await props.saved()
@@ -234,11 +232,10 @@ defineExpose({ open })
         </div>
         <small class="help">Server 只绑定这里的 IP、端口和传输网络；与客户端连接地址分离。</small>
         <h3>客户端连接地址</h3>
-        <small class="help">Host / Port 是 Client 拨号使用的公网可达地址，不是 Server 本地监听地址。SNI 独立设置，须匹配 TLS 证书或 REALITY 域名；多候选按优先级失败切换。</small>
+        <small class="help">这里填写 Client 可达的监听地址与端口，可与 Server 本地绑定地址不同。TLS 证书须覆盖该域名或 IP；REALITY 使用伪装域名。多候选按列表顺序失败切换。</small>
         <div v-for="(endpoint, index) in endpoints" :key="endpoint.id" class="panel paired-fields">
           <div><label :for="`endpoint-${index}-name`">名称</label><input :id="`endpoint-${index}-name`" v-model="endpoint.name" /></div>
-          <div class="grid-2"><div><label :for="`endpoint-${index}-host`">Host（公网可达地址）</label><input :id="`endpoint-${index}-host`" v-model="endpoint.host" placeholder="域名或 IP" /></div><div><label :for="`endpoint-${index}-port`">Port（连接端口）</label><input :id="`endpoint-${index}-port`" v-model="endpoint.port" type="number" min="1" max="65535" /></div></div>
-          <div class="grid-2"><div><label :for="`endpoint-${index}-sni`">SNI</label><input :id="`endpoint-${index}-sni`" v-model="endpoint.server_name" /></div><div><label :for="`endpoint-${index}-priority`">优先级</label><input :id="`endpoint-${index}-priority`" v-model="endpoint.priority" type="number" /></div></div>
+          <div class="grid-2"><div><label :for="`endpoint-${index}-host`">监听地址</label><input :id="`endpoint-${index}-host`" v-model="endpoint.host" placeholder="域名或 IP" /></div><div><label :for="`endpoint-${index}-port`">Port（连接端口）</label><input :id="`endpoint-${index}-port`" v-model="endpoint.port" type="number" min="1" max="65535" /></div></div>
           <div class="actions"><label :for="`endpoint-${index}-enabled`"><input :id="`endpoint-${index}-enabled`" v-model="endpoint.enabled" type="checkbox" /> 启用</label><button type="button" class="btn small danger" :disabled="endpoints.length === 1" @click="removeEndpoint(index)">删除</button></div>
         </div>
         <button type="button" class="btn small" @click="addEndpoint">添加连接地址</button>
@@ -248,8 +245,8 @@ defineExpose({ open })
           <div><label for="node-transport">传输</label><select id="node-transport" v-model="draft.transport"><option value="tcp">TCP</option><option value="hysteria2">Hysteria2</option></select></div>
         </div>
         <small v-if="draft.transport === 'hysteria2'" class="help">Hysteria2 基于 QUIC/UDP 且使用 TLS，当前上游和本实现不支持 REALITY。</small>
-        <small v-if="draft.transport === 'hysteria2'" class="help">请放行监听端口的 UDP 并核对 NAT 的 UDP 转发；生成密码后保存，客户端密码须一致。证书、信任 CA 和 SNI 仍须匹配；不能启用 Vision。</small>
-        <small v-else-if="draft.security === 'tls'" class="help">TLS 使用 TCP：上传配对证书与私钥，或生成自签证书。接入候选的 SNI 须匹配证书；私有 CA 须随模板下发，验证失败时不要关闭证书校验。</small>
+        <small v-if="draft.transport === 'hysteria2'" class="help">请放行监听端口的 UDP 并核对 NAT 的 UDP 转发；生成密码后保存，客户端密码须一致。证书须覆盖连接地址且受下发 CA 信任；不能启用 Vision。</small>
+        <small v-else-if="draft.security === 'tls'" class="help">TLS 使用 TCP：上传配对证书与私钥，或生成自签证书。证书须覆盖连接地址的域名或 IP；私有 CA 须随模板下发，验证失败时不要关闭证书校验。</small>
         <small v-else-if="draft.security === 'reality'" class="help">REALITY 使用 TCP：填写可达的回落目标与允许的伪装域名，生成密钥对和 Short ID。客户端公钥、Short ID 与域名须匹配；不要同时填写 TLS PEM。</small>
         <small v-else class="help">plain 使用 TCP 且没有外层 TLS，必须启用 VLESS Encryption；不接受证书 PEM、REALITY、Hysteria2 或 Vision。请生成配对配置后保存，而非填 none。</small>
         <template v-if="pemFields.length">

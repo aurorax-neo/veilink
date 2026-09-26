@@ -22,7 +22,7 @@ import (
 type generationRequest struct {
 	Role           string `json:"role"`
 	Kind           string `json:"kind"`
-	ServerName     string `json:"server_name,omitempty"`
+	Host           string `json:"host,omitempty"`
 	Mode           string `json:"mode,omitempty"`
 	Authentication string `json:"authentication,omitempty"`
 	TTLDays        *int   `json:"ttl_days,omitempty"`
@@ -37,7 +37,7 @@ func generate(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.Role != "server" ||
 		(in.Kind != "vless" && (in.Mode != "" || in.Authentication != "")) ||
-		(in.Kind != "certificate" && (in.ServerName != "" || in.TTLDays != nil)) {
+		(in.Kind != "certificate" && (in.Host != "" || in.TTLDays != nil)) {
 		failure(w, http.StatusBadRequest)
 		return
 	}
@@ -88,11 +88,11 @@ func generate(w http.ResponseWriter, r *http.Request) {
 		if in.TTLDays != nil {
 			days = *in.TTLDays
 		}
-		if days < 1 || days > 365 || !validGenerationServerName(in.ServerName) {
+		if days < 1 || days > 365 || !validGenerationHost(in.Host) {
 			failure(w, http.StatusBadRequest)
 			return
 		}
-		result, err = generateCertificate(in.ServerName, days)
+		result, err = generateCertificate(in.Host, days)
 	default:
 		failure(w, http.StatusBadRequest)
 		return
@@ -123,7 +123,7 @@ func generationVLESSMode(value, mode string) (string, error) {
 	return strings.Join(parts, "."), nil
 }
 
-func validGenerationServerName(name string) bool {
+func validGenerationHost(name string) bool {
 	if net.ParseIP(name) != nil {
 		return true
 	}

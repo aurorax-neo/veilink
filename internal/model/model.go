@@ -2,24 +2,24 @@
 package model
 
 import (
+	"bytes"
 	"crypto/ecdh"
 	"crypto/mlkem"
 	"encoding/base64"
+	"encoding/json"
 	"strconv"
 	"strings"
 )
 
 // ConnectEndpoint is a public Client dial candidate for a Server. Host and Port
 // are the Client dial address, independent of the Server's local listen address.
-// ServerName is the independent TLS SNI; candidates preserve transport end to end.
+// Host is also the certificate verification name; candidates retain list order.
 type ConnectEndpoint struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	Host       string `json:"host"`
-	Port       int    `json:"port"`
-	ServerName string `json:"server_name"`
-	Priority   int    `json:"priority"`
-	Enabled    bool   `json:"enabled"`
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Host    string `json:"host"`
+	Port    int    `json:"port"`
+	Enabled bool   `json:"enabled"`
 }
 
 // Node contains master-managed metadata and role-scoped tunnel configuration.
@@ -29,7 +29,6 @@ type Node struct {
 	Role             string            `json:"role"`
 	Address          string            `json:"address"` // compatibility/default connect endpoint
 	Port             int               `json:"port"`
-	ServerName       string            `json:"server_name"`
 	ConnectEndpoints []ConnectEndpoint `json:"connect_endpoints,omitempty"`
 	Revoked          bool              `json:"revoked"`
 	DesiredRevision  int64             `json:"desired_revision"`
@@ -40,6 +39,31 @@ type Node struct {
 	// ClientTunnel is the persisted, public client template owned by a server.
 	ClientTunnel *LocalTLS `json:"client_tunnel,omitempty"`
 	Embedded     bool      `json:"embedded"` // master-owned registration metadata
+}
+
+// UnmarshalJSON rejects obsolete/unknown fields even in cached and gRPC snapshots.
+func (n *Node) UnmarshalJSON(data []byte) error {
+	type wire Node
+	var value wire
+	d := json.NewDecoder(bytes.NewReader(data))
+	d.DisallowUnknownFields()
+	if err := d.Decode(&value); err != nil {
+		return err
+	}
+	*n = Node(value)
+	return nil
+}
+
+func (e *ConnectEndpoint) UnmarshalJSON(data []byte) error {
+	type wire ConnectEndpoint
+	var value wire
+	d := json.NewDecoder(bytes.NewReader(data))
+	d.DisallowUnknownFields()
+	if err := d.Decode(&value); err != nil {
+		return err
+	}
+	*e = ConnectEndpoint(value)
+	return nil
 }
 
 type Binding struct {
@@ -225,7 +249,7 @@ func DeriveClientTunnel(serverTunnel LocalTLS, serverNode Node) LocalTLS {
 		}
 		res.Reality.ServerNames = strings.TrimSpace(strings.Split(r.ServerNames, ",")[0])
 		if res.Reality.ServerNames == "" {
-			res.Reality.ServerNames = serverNode.ServerName
+			res.Reality.ServerNames = serverNode.Address
 		}
 		res.Reality.Fingerprint = r.Fingerprint
 		if res.Reality.Fingerprint == "" {

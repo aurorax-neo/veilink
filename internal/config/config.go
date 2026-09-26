@@ -10,12 +10,11 @@ import (
 )
 
 type EmbeddedServerConfig struct {
-	Enabled    bool
-	Name       string
-	Address    string
-	Port       int
-	ServerName string
-	StateDir   string
+	Enabled  bool
+	Name     string
+	Address  string
+	Port     int
+	StateDir string
 }
 
 type Config struct {
@@ -48,7 +47,7 @@ func ParseFlags(role string, args []string) (Config, error) {
 	c := Defaults()
 	f := flag.NewFlagSet(role, flag.ContinueOnError)
 	f.Usage = func() {
-		_, _ = f.Output().Write([]byte("Usage: veilink " + role + " [flags]\nTunnel settings are managed in the Master Web UI, not local flags: TLS needs matching certificate/CA/SNI; plain requires VLESS Encryption; REALITY needs matching public key/Short ID/name; Hysteria2 needs UDP, TLS and a shared password. Vision requires TCP + TLS/REALITY and may use encrypted fallback. -control-ca trusts Master HTTPS only, not tunnel TLS.\n"))
+		_, _ = f.Output().Write([]byte("Usage: veilink " + role + " [flags]\nTunnel settings are managed in the Master Web UI, not local flags: TLS needs a certificate matching the endpoint host and a trusted CA; plain requires VLESS Encryption; REALITY needs matching public key/Short ID/name; Hysteria2 needs UDP, TLS and a shared password. Vision requires TCP + TLS/REALITY and may use encrypted fallback. -control-ca trusts Master HTTPS only, not tunnel TLS.\n"))
 		f.PrintDefaults()
 	}
 	fields := make(map[string]string)
@@ -74,7 +73,6 @@ func ParseFlags(role string, args []string) (Config, error) {
 		stringFlag("embedded-server-address", "embedded_server.address", &c.EmbeddedServer.Address)
 		f.IntVar(&c.EmbeddedServer.Port, "embedded-server-port", c.EmbeddedServer.Port, "")
 		fields["embedded-server-port"] = "embedded_server.port"
-		stringFlag("embedded-server-server-name", "embedded_server.server_name", &c.EmbeddedServer.ServerName)
 		stringFlag("embedded-server-state-dir", "embedded_server.state_dir", &c.EmbeddedServer.StateDir)
 	case "server", "client":
 		stringFlag("master-addr", "master_addr", &c.MasterAddr)

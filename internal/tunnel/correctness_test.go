@@ -368,7 +368,6 @@ func TestSameConfigurationPreservesMeaningfulChanges(t *testing.T) {
 		"gateway password":    func(s *model.Snapshot) { s.Nodes[0].Tunnel.Hysteria2.Password = "new-key" },
 		"gateway address":     func(s *model.Snapshot) { s.Nodes[0].Address = "other.test" },
 		"gateway port":        func(s *model.Snapshot) { s.Nodes[0].Port++ },
-		"gateway server name": func(s *model.Snapshot) { s.Nodes[0].ServerName = "other.test" },
 		"binding key":         func(s *model.Snapshot) { s.Bindings[0].UUID = "new-key" },
 		"mapping pool":        func(s *model.Snapshot) { s.Mappings[0].Pool++ },
 		"local CA":            func(s *model.Snapshot) { s.Node.Tunnel.CAPEM = "new-ca" },

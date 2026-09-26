@@ -72,11 +72,21 @@ func TestSessionCSRFAndLimits(t *testing.T) {
 			t.Fatalf("invalid PEM accepted: %s (%d)", invalid, w.Code)
 		}
 	}
+	for _, legacy := range []string{
+		`"server_name":"example.com"`,
+		`"connect_endpoints":[{"server_name":"example.com"}]`,
+		`"connect_endpoints":[{"priority":0}]`,
+	} {
+		body := `{"name":"legacy","role":"client",` + legacy + `}`
+		if got := call("POST", "/api/nodes", body, csrf, cookie); got.Code != http.StatusBadRequest {
+			t.Fatalf("obsolete node JSON accepted: %s (%d)", legacy, got.Code)
+		}
+	}
 	dec, _, _, _, err := tunnel.GenerateVLESSEnc()
 	if err != nil {
 		t.Fatal(err)
 	}
-	w = call("POST", "/api/nodes", fmt.Sprintf(`{"name":"gateway","role":"server","address":"localhost","server_name":"localhost","port":443,"tunnel":{"listen_port":8444,"transport_security":"plain","decryption":%q}}`, dec), csrf, cookie)
+	w = call("POST", "/api/nodes", fmt.Sprintf(`{"name":"gateway","role":"server","address":"localhost","port":443,"tunnel":{"listen_port":8444,"transport_security":"plain","decryption":%q}}`, dec), csrf, cookie)
 	if w.Code != http.StatusOK {
 		t.Fatal(w.Code, w.Body.String())
 	}

@@ -18,7 +18,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -96,7 +95,7 @@ func (s *service) prepareReality() error {
 	if s.snapshot.Node.Role != "server" || !s.local.Reality.Enabled() {
 		return nil
 	}
-	cfg, err := newRealityConfig(s.local.Reality, s.snapshot.Node.ServerName)
+	cfg, err := newRealityConfig(s.local.Reality, s.snapshot.Node.Address)
 	if err != nil {
 		return err
 	}
@@ -137,15 +136,14 @@ func (s *service) acceptOne(conn net.Conn) {
 func enabledEndpoints(gateway model.Node) []model.ConnectEndpoint {
 	endpoints := append([]model.ConnectEndpoint(nil), gateway.ConnectEndpoints...)
 	if len(endpoints) == 0 && gateway.Address != "" && gateway.Port > 0 {
-		endpoints = []model.ConnectEndpoint{{ID: "primary", Name: "primary", Host: gateway.Address, Port: gateway.Port, ServerName: gateway.ServerName, Enabled: true}}
+		endpoints = []model.ConnectEndpoint{{ID: "primary", Name: "primary", Host: gateway.Address, Port: gateway.Port, Enabled: true}}
 	}
 	out := endpoints[:0]
 	for _, ep := range endpoints {
-		if ep.Enabled && hostOK(ep.Host) && portOK(ep.Port) && hostOK(ep.ServerName) {
+		if ep.Enabled && hostOK(ep.Host) && portOK(ep.Port) {
 			out = append(out, ep)
 		}
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
 	return out
 }
 
@@ -157,7 +155,7 @@ func (s *service) dialGateway(gateway model.Node, peer *clientGateway) (net.Conn
 	var last error
 	for _, endpoint := range enabledEndpoints(gateway) {
 		addr := net.JoinHostPort(endpoint.Host, strconv.Itoa(endpoint.Port))
-		serverName := endpoint.ServerName
+		serverName := endpoint.Host
 		if local.Hysteria2.Enabled() {
 			if conn, err := dialHysteria(s.ctx, addr, serverName, local); err == nil {
 				return conn, nil

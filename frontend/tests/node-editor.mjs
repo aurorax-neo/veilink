@@ -27,7 +27,7 @@ function setup(role = 'server', respond = async () => undefined) {
   const editor = context.editor
   editor.open()
   Object.assign(editor.draft, { name: 'Demo node', address: 'example.com', listenPort: '8444', cert, key })
-  if (role === 'server') Object.assign(editor.endpoints[0], { name: '首选地址', host: 'example.com', port: 443, server_name: 'example.com', priority: 0, enabled: true })
+  if (role === 'server') Object.assign(editor.endpoints[0], { name: '首选地址', host: 'example.com', port: 443, enabled: true })
   return { ...editor, requests }
 }
 const payload = e => e.requests.at(-1)[2].tunnel
@@ -156,8 +156,8 @@ test('labels and read-only effective configuration use authoritative mapped serv
 })
 
 const ca = cert.replace('ZGVtbw==', 'Y3VzdG9t')
-const tlsNode = () => ({ id: 'server', name: 'Server', address: 'example.com', port: 443, server_name: 'example.com', connect_endpoints: [{ id: 'primary', name: '首选地址', host: 'example.com', port: 443, server_name: 'example.com', priority: 0, enabled: true }], tunnel: { listen_port: 8444, transport_security: 'tls', cert_pem: cert, key_pem: key, ca_pem: cert }, client_tunnel: { transport_security: 'tls', ca_pem: ca } })
-const realityNode = () => ({ id: 'reality', name: 'Reality', address: 'example.com', port: 443, server_name: 'example.com', connect_endpoints: [{ id: 'primary', name: '首选地址', host: 'example.com', port: 443, server_name: 'example.com', priority: 0, enabled: true }], tunnel: { listen_port: 8444, reality: { private_key: 'private', short_ids: 'aa,bb', server_names: 'example.com', dest: 'example.com:443' } }, client_tunnel: { reality: { public_key: 'public', short_id: 'bb', fingerprint: 'firefox', server_names: 'example.com', max_time_diff: '1m' } } })
+const tlsNode = () => ({ id: 'server', name: 'Server', address: 'example.com', port: 443, connect_endpoints: [{ id: 'primary', name: '首选地址', host: 'example.com', port: 443, enabled: true }], tunnel: { listen_port: 8444, transport_security: 'tls', cert_pem: cert, key_pem: key, ca_pem: cert }, client_tunnel: { transport_security: 'tls', ca_pem: ca } })
+const realityNode = () => ({ id: 'reality', name: 'Reality', address: 'example.com', port: 443, connect_endpoints: [{ id: 'primary', name: '首选地址', host: 'example.com', port: 443, enabled: true }], tunnel: { listen_port: 8444, reality: { private_key: 'private', short_ids: 'aa,bb', server_names: 'example.com', dest: 'example.com:443' } }, client_tunnel: { reality: { public_key: 'public', short_id: 'bb', fingerprint: 'firefox', server_names: 'example.com', max_time_diff: '1m' } } })
 const body = e => e.requests.at(-1)[2]
 
 test('persisted CA and selected short ID are shown and preserved on metadata saves', async () => {
@@ -186,7 +186,7 @@ test('persisted CA and selected short ID are shown and preserved on metadata sav
 })
 
 test('server material edits derive automatically, including while pair editor is untouched', async () => {
-  for (const [field, value] of Object.entries({ cert: ca, key: key.replace('ZGVtbw==', 'bmV3'), ca: '', enc: 'new-decryption', serverName: 'new.example.com', flow: 'xtls-rprx-vision', security: 'reality' })) {
+  for (const [field, value] of Object.entries({ cert: ca, key: key.replace('ZGVtbw==', 'bmV3'), ca: '', enc: 'new-decryption', flow: 'xtls-rprx-vision', security: 'reality' })) {
     const e = setup(); e.open(tlsNode()); e.editPair()
     e.draft[field] = value
     assert.equal(e.preservePair.value, false, field)
@@ -330,18 +330,17 @@ test('embedded nodes retain editing but cannot enroll, revoke or delete through 
   assert.equal(t.requests[0][1], 'DELETE')
 })
 
-test('blank server TLS name defaults to address for TLS and encryption-only saves', async () => {
-  const e = setup()
-  e.draft.serverName = '  '
-  await e.save()
-  assert.equal(body(e).server_name, e.draft.address)
-  e.draft.security = 'encryption'
-  e.draft.enc = 'demo-encryption'
-  await e.save()
-  assert.equal(body(e).server_name, e.draft.address)
-  e.endpoints[0].server_name = 'tunnel.example.com'
-  await e.save()
-  assert.equal(body(e).server_name, 'tunnel.example.com')
+test('node and endpoint saves never send removed SNI or priority fields', async () => {
+  for (const security of ['tls', 'encryption']) {
+    const e = setup()
+    e.draft.security = security
+    e.draft.enc = 'demo-encryption'
+    await e.save()
+    assert.equal('server_name' in body(e), false)
+    assert.ok(body(e).connect_endpoints.every(endpoint => !('server_name' in endpoint) && !('priority' in endpoint)))
+  }
+  assert.doesNotMatch(editorSource + tableSource + source('../src/types.ts') + source('../src/format.ts'), /\bserver_name\b|\bserverName\b|\bpriority\b|SNI|优先级/)
+  assert.match(editorSource, /endpoint-\$\{index\}-host`">监听地址<\/label>/)
 })
 
 test('API empty nested objects do not enable HY2 or REALITY in persisted pair fields', async () => {
@@ -441,13 +440,12 @@ test('listen validation, NAT port independence, and transport copy stay explicit
   await assert.rejects(e.save(), /监听地址必须是 IP/)
   e.draft.listen = '0.0.0.0'
   e.draft.listenPort = '8444'
-  Object.assign(e.endpoints[0], { host: 'public.example.com', port: 443, server_name: 'tunnel.example.com' })
+  Object.assign(e.endpoints[0], { host: 'public.example.com', port: 443 })
   await e.save()
   assert.equal(body(e).tunnel.listen_port, 8444)
   assert.equal(body(e).connect_endpoints[0].port, 443)
   assert.equal('kind' in body(e).connect_endpoints[0], false)
   assert.equal(body(e).connect_endpoints[0].host, 'public.example.com')
-  assert.equal(body(e).connect_endpoints[0].server_name, 'tunnel.example.com')
   assert.match(editorSource, /<label for="node-security">安全<\/label>[\s\S]*<label for="node-transport">传输<\/label>/)
   assert.match(editorSource, /Hysteria2 基于 QUIC\/UDP 且使用 TLS，当前上游和本实现不支持 REALITY/)
   assert.match(editorSource, /HTTP-only 或终止、改写协议的 CDN 不支持/)
@@ -463,23 +461,21 @@ test('reactive server endpoints open as isolated editable copies', async () => {
   assert.equal(body(e).connect_endpoints[0].host, 'edited.example.com')
 })
 
-test('certificate generation uses current enabled endpoint SNI or Host', async () => {
+test('certificate generation uses current enabled endpoint host', async () => {
   const e = setup('server', async () => generated.certificate)
   e.endpoints[0].enabled = false
   e.addEndpoint()
-  Object.assign(e.endpoints[1], { host: 'new.example.com', server_name: ' sni.example.com ' })
+  e.endpoints[1].host = ' new.example.com '
   await e.generate('certificate')
-  assert.equal(body(e).server_name, 'sni.example.com')
-  e.endpoints[1].server_name = ' '
-  await e.generate('certificate')
-  assert.equal(body(e).server_name, 'new.example.com')
+  assert.equal(body(e).host, 'new.example.com')
+  assert.equal('server_name' in body(e), false)
 })
 
 test('endpoint edits invalidate pending certificate results', async () => {
   let resolve
   const e = setup('server', () => new Promise(done => { resolve = done }))
   const pending = e.generate('certificate')
-  e.endpoints[0].server_name = 'changed.example.com'
+  e.endpoints[0].host = 'changed.example.com'
   resolve(generated.certificate)
   await pending
   assert.equal(e.draft.cert, cert)
@@ -490,8 +486,8 @@ test('candidate inputs have unique explicit labels and no protocol classificatio
   const candidate = editorSource.match(/<div v-for="\(endpoint, index\) in endpoints"[\s\S]*?添加连接地址/)[0]
   const ids = [...candidate.matchAll(/:id="([^"]+)"/g)].map(match => match[1])
   const labels = [...candidate.matchAll(/:for="([^"]+)"/g)].map(match => match[1])
-  assert.equal(ids.length, 6)
-  assert.equal(new Set(ids).size, 6)
+  assert.equal(ids.length, 4)
+  assert.equal(new Set(ids).size, 4)
   assert.deepEqual(labels, ids)
   assert.ok(ids.every(id => id.includes('${index}')))
   assert.doesNotMatch(candidate + tableSource, /endpoint.kind|item.kind|value="(?:direct|nat|cdn)"/)
@@ -500,12 +496,12 @@ test('candidate inputs have unique explicit labels and no protocol classificatio
 test('multiple connection addresses survive edits and removal without kind', async () => {
   const e = setup()
   e.addEndpoint()
-  Object.assign(e.endpoints[1], { host: 'backup.example.com', port: 9443, server_name: 'tls.example.com', priority: 5 })
+  Object.assign(e.endpoints[1], { host: 'backup.example.com', port: 9443 })
   await e.save()
   assert.equal(body(e).connect_endpoints.length, 2)
   assert.ok(body(e).connect_endpoints.every(endpoint => !('kind' in endpoint)))
   e.open({ ...tlsNode(), ...JSON.parse(JSON.stringify(body(e))) })
-  assert.equal(e.endpoints[1].server_name, 'tls.example.com')
+  assert.equal(e.endpoints[1].host, 'backup.example.com')
   e.removeEndpoint(0)
   await e.save()
   assert.equal(body(e).connect_endpoints[0].port, 9443)

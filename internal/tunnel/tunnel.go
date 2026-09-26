@@ -281,7 +281,7 @@ func gatewayClientConfig(local model.LocalTLS, gateway model.Node) (model.LocalT
 		return model.LocalTLS{}, err
 	}
 	if config.Reality.Enabled() {
-		if _, err := realityNames(config.Reality, gateway.ServerName); err != nil {
+		if _, err := realityNames(config.Reality, gateway.Address); err != nil {
 			return model.LocalTLS{}, err
 		}
 	}

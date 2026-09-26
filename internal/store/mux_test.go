@@ -15,7 +15,7 @@ func TestMappingMuxPersistenceAndSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { s.Close() }()
-	server, err := s.SaveNode(model.Node{Name: "gateway", Role: "server", Address: "localhost", ServerName: "localhost", Port: 443, Tunnel: testTLS(t)})
+	server, err := s.SaveNode(model.Node{Name: "gateway", Role: "server", Address: "localhost", Port: 443, Tunnel: testTLS(t)})
 	if err != nil {
 		t.Fatal(err)
 	}

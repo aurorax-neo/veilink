@@ -28,10 +28,10 @@ func TestEmbeddedNodePreservesDatabaseSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !n.Embedded || n.ClientTunnel != nil || n.Address != "gateway.example.com" || n.ServerName != n.Address || n.Tunnel != (model.LocalTLS{ListenPort: 8444}) {
+	if !n.Embedded || n.ClientTunnel != nil || n.Address != "gateway.example.com" || n.Tunnel != (model.LocalTLS{ListenPort: 8444}) {
 		t.Fatal("registration must seed only the explicit local listen port, never master certificates")
 	}
-	n.Address, n.Port, n.ServerName = "updated.example.com", 9999, "sni.example.com"
+	n.Address, n.Port = "updated.example.com", 9999
 	n.Name, n.Embedded = "renamed-in-web", false // API cannot clear master metadata.
 	cert, key := writeCert(t, dir)
 	certPEM, err := os.ReadFile(cert)
@@ -50,7 +50,7 @@ func TestEmbeddedNodePreservesDatabaseSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !next.Embedded || next.ID != n.ID || next.Name != n.Name || next.ClientTunnel == nil || next.Address != n.Address || next.Port != n.Port || next.ServerName != n.ServerName || next.Tunnel != n.Tunnel {
+	if !next.Embedded || next.ID != n.ID || next.Name != n.Name || next.ClientTunnel == nil || next.Address != n.Address || next.Port != n.Port || next.Tunnel != n.Tunnel {
 		t.Fatal("registration reset administrative settings")
 	}
 	for _, remove := range []bool{false, true} {

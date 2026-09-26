@@ -129,10 +129,11 @@ func TestGenerationAPI(t *testing.T) {
 			`{"role":"server","kind":"short_id","mode":"native"}`,
 			`{"role":"server","kind":"short_id","ttl_days":30}`,
 			`{"role":"server","kind":"certificate"}`,
-			`{"role":"server","kind":"certificate","server_name":"example.com","ttl_days":0}`,
-			`{"role":"server","kind":"certificate","server_name":"example.com","ttl_days":-1}`,
-			`{"role":"server","kind":"certificate","server_name":"example.com","ttl_days":366}`,
-			`{"role":"server","kind":"certificate","server_name":"example.com","ttl_days":1.5}`,
+			`{"role":"server","kind":"certificate","server_name":"example.com","host":"example.com"}`,
+			`{"role":"server","kind":"certificate","host":"example.com","ttl_days":0}`,
+			`{"role":"server","kind":"certificate","host":"example.com","ttl_days":-1}`,
+			`{"role":"server","kind":"certificate","host":"example.com","ttl_days":366}`,
+			`{"role":"server","kind":"certificate","host":"example.com","ttl_days":1.5}`,
 			`{"role":"server","kind":"short_id","unknown":true}`,
 			`{"role":"server","kind":"short_id"} {}`, `{"role":"server",`,
 			`{"role":"server","kind":"short_id"}` + strings.Repeat(" ", 4096),
@@ -142,7 +143,7 @@ func TestGenerationAPI(t *testing.T) {
 			}
 		}
 		for _, name := range []string{"", "*.example.com", "https://example.com", "example.com:443", "host/path", "a..b", "-host", "host-", "host\n", " host", "host.", "host_name", "[::1]", "fe80::1%eth0", strings.Repeat("a", 64) + ".com", strings.Repeat("a.", 127) + "a"} {
-			body := fmt.Sprintf(`{"role":"server","kind":"certificate","server_name":%q}`, name)
+			body := fmt.Sprintf(`{"role":"server","kind":"certificate","host":%q}`, name)
 			if got := call("POST", body, csrf, cookie).Code; got != 400 {
 				t.Fatalf("unsafe name accepted: %q (%d)", name, got)
 			}
@@ -233,7 +234,7 @@ func TestGenerationAPI(t *testing.T) {
 			} else {
 				extra = fmt.Sprintf(`,"ttl_days":%d`, days)
 			}
-			out := generate(fmt.Sprintf(`{"role":"server","kind":"certificate","server_name":%q%s}`, tc.name, extra))
+			out := generate(fmt.Sprintf(`{"role":"server","kind":"certificate","host":%q%s}`, tc.name, extra))
 			pair, err := tls.X509KeyPair([]byte(out["cert_pem"]), []byte(out["key_pem"]))
 			if err != nil {
 				t.Fatal(err)

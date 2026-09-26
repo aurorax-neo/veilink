@@ -157,7 +157,7 @@ func clientTemplate(server model.Node) (*model.LocalTLS, error) {
 		// with the same rules used by the REALITY listener at runtime.
 		effective := server.Tunnel
 		if strings.TrimSpace(effective.Reality.ServerNames) == "" {
-			effective.Reality.ServerNames = server.ServerName
+			effective.Reality.ServerNames = server.Address
 		}
 		if err := tunnel.CheckBootstrap("server", effective); err != nil {
 			return nil, ErrInvalid
@@ -171,7 +171,7 @@ func clientTemplate(server model.Node) (*model.LocalTLS, error) {
 		}
 		names := server.Tunnel.Reality.ServerNames
 		if strings.TrimSpace(names) == "" {
-			names = server.ServerName
+			names = server.Address
 		}
 		for _, name := range strings.Split(paired.Reality.ServerNames, ",") {
 			if !listed(name, names) {

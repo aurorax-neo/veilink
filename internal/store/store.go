@@ -123,7 +123,7 @@ func OpenExisting(path, keyPath string) (*Store, error) {
 	return &Store{db: db, key: key}, nil
 }
 
-const schemaVersion = 4
+const schemaVersion = 5
 
 // Only fresh databases and this exact schema are supported. Never migrate or
 // discard an existing deployment implicitly.
@@ -374,14 +374,14 @@ func connectEndpoints(n model.Node) []model.ConnectEndpoint {
 	if n.Address == "" || n.Port == 0 {
 		return nil
 	}
-	return []model.ConnectEndpoint{{ID: "primary", Name: "首选", Host: n.Address, Port: n.Port, ServerName: n.ServerName, Enabled: true}}
+	return []model.ConnectEndpoint{{ID: "primary", Name: "首选", Host: n.Address, Port: n.Port, Enabled: true}}
 }
 
 func validateConnectEndpoints(n model.Node) error {
 	seen := map[string]bool{}
 	enabled := 0
 	for _, ep := range connectEndpoints(n) {
-		if ep.ID == "" || len(ep.ID) > 128 || seen[ep.ID] || ep.Name == "" || len(ep.Name) > 128 || !host(ep.Host) || ep.Port < 1 || ep.Port > 65535 || !host(ep.ServerName) {
+		if ep.ID == "" || len(ep.ID) > 128 || seen[ep.ID] || ep.Name == "" || len(ep.Name) > 128 || !host(ep.Host) || ep.Port < 1 || ep.Port > 65535 {
 			return ErrInvalid
 		}
 		seen[ep.ID] = true
@@ -433,7 +433,7 @@ func (s *Store) saveNode(n model.Node, embedded bool) (model.Node, error) {
 			return ErrInvalid
 		}
 		if n.Role == "server" {
-			if !host(n.Address) || n.Port < 1 || n.Port > 65535 || !host(n.ServerName) || validateConnectEndpoints(n) != nil {
+			if !host(n.Address) || n.Port < 1 || n.Port > 65535 || validateConnectEndpoints(n) != nil {
 				return ErrInvalid
 			}
 			n.ConnectEndpoints = connectEndpoints(n)
