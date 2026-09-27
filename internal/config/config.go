@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"flag"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -44,8 +45,14 @@ func Defaults() Config {
 // ParseFlags accepts only flags belonging to the requested role. Visited flags,
 // including false and empty values, take precedence over persisted master settings.
 func ParseFlags(role string, args []string) (Config, error) {
+	return ParseFlagsOutput(role, args, os.Stderr)
+}
+
+// ParseFlagsOutput uses the same role schema for CLI usage and normal parsing.
+func ParseFlagsOutput(role string, args []string, out io.Writer) (Config, error) {
 	c := Defaults()
 	f := flag.NewFlagSet(role, flag.ContinueOnError)
+	f.SetOutput(out)
 	f.Usage = func() {
 		_, _ = f.Output().Write([]byte("Usage: veilink " + role + " [flags]\nTunnel settings are managed in the Master Web UI, not local flags: TLS needs a certificate matching the endpoint host and a trusted CA; plain requires VLESS Encryption; REALITY needs matching public key/Short ID/name; Hysteria2 needs UDP, TLS and a shared password. Vision requires TCP + TLS/REALITY and may use encrypted fallback. -control-ca trusts Master HTTPS only, not tunnel TLS.\n"))
 		f.PrintDefaults()

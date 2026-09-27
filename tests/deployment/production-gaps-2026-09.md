@@ -42,7 +42,7 @@ SOURCE_URL 表示源码仓库，revision 表示提交。手动 workflow 同步�
 
 ### P2：安装与 UX 待办
 
-9. **帮助命令退出码**：本轮实际执行三角色 `--help`，均显示帮助但返回 `flag: help requested` 错误并退出 1，属于安装探测体验缺陷，非角色启动失败。本轮未修，后续应专门测试成功帮助与真实非法参数的区别。
+9. **帮助命令退出码（已修复，CLI help 专项收口）**：原三角色 `--help` 显示帮助却返回 `flag: help requested`、退出 1。现顶层 `--help` / `-h` / `help`，以及 8 个子命令的 `--help` / `-h` / `help` 和 `help <command>` 均正常显示帮助、退出 0；仅实际 `flag.ErrHelp` 视为成功，帮助前的非法参数不被掩盖。`internal/cli/help_test.go` 覆盖 35 种成功形式、13 种非法调用，并构建真实二进制校验退出码；同时检查帮助不读取 stdin、不生成密钥、不创建数据库，非法 reset 密码参数不回显秘密。专项实际执行 `go test ./internal/cli ./internal/config -count=1`、对应两包 `go test -race ... -count=1`、`go vet ./internal/cli ./internal/config` 与 `git diff --check`，均通过。本次只收口 CLI help，不改变 xhttp 或其它生产缺口结论。
 10. **跨平台/浏览器矩阵**：交叉编译不等于原生运行；现有窄屏/状态测试不等于生产浏览器完整兼容。关闭需对应系统/浏览器验收。批量操作和更细错误提示按使用场景评估，不冒充安全阻塞。
 
 ## 本轮实际验证

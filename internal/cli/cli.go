@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -25,6 +26,22 @@ func Run(ctx context.Context, args []string, out io.Writer) error {
 func RunWithInput(ctx context.Context, args []string, in io.Reader, out io.Writer) error {
 	if len(args) == 0 {
 		return errors.New("usage: veilink master|server|client|reset-admin-username|reset-admin-password|x25519|vlessenc|version [flags]")
+	}
+	if args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
+		if len(args) == 1 {
+			_, err := fmt.Fprintln(out, "Usage: veilink master|server|client|reset-admin-username|reset-admin-password|x25519|vlessenc|version [flags]\nUse veilink help <command> for command help.")
+			return err
+		}
+		if args[0] != "help" || len(args) != 2 {
+			return errors.New("unexpected help arguments")
+		}
+		args = []string{args[1], "--help"}
+	} else if len(args) == 2 && args[1] == "help" {
+		args = []string{args[0], "--help"}
+	}
+	if (args[0] == "version" || args[0] == "x25519" || args[0] == "vlessenc") && len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
+		_, err := fmt.Fprintf(out, "Usage: veilink %s\nThis command accepts no flags.\n", args[0])
+		return err
 	}
 	if (args[0] == "version" || args[0] == "x25519" || args[0] == "vlessenc") && len(args) != 1 {
 		return errors.New("unexpected arguments")
@@ -52,7 +69,8 @@ func RunWithInput(ctx context.Context, args []string, in io.Reader, out io.Write
 	if args[0] == "reset-admin-username" || args[0] == "reset-admin-password" {
 		rename := args[0] == "reset-admin-username"
 		f := flag.NewFlagSet(args[0], flag.ContinueOnError)
-		f.SetOutput(io.Discard)
+		var usage bytes.Buffer
+		f.SetOutput(&usage)
 		var user, db, key string
 		var stdin bool
 		f.StringVar(&db, "database", "/data/veilink.db", "")
@@ -63,6 +81,10 @@ func RunWithInput(ctx context.Context, args []string, in io.Reader, out io.Write
 			f.BoolVar(&stdin, "password-stdin", false, "read password from stdin")
 		}
 		if err := f.Parse(args[1:]); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				_, err = io.Copy(out, &usage)
+				return err
+			}
 			return fmt.Errorf("invalid %s flags", args[0])
 		}
 		if f.NArg() != 0 {
@@ -102,7 +124,10 @@ func RunWithInput(ctx context.Context, args []string, in io.Reader, out io.Write
 		return errors.New("unknown command")
 	}
 	roleArgs := args[1:]
-	c, e := config.ParseFlags(args[0], roleArgs)
+	c, e := config.ParseFlagsOutput(args[0], roleArgs, out)
+	if errors.Is(e, flag.ErrHelp) {
+		return nil
+	}
 	if e != nil {
 		return e
 	}
