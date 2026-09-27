@@ -90,7 +90,17 @@ func TestUnifiedImageContents(t *testing.T) {
 		t.Fatal(err)
 	}
 	file := string(body)
-	for _, required := range []string{`ENTRYPOINT ["/usr/local/bin/veilink"]`, "USER 65532:65532", "COPY --from=ui /src/html /usr/local/html", "COPY --from=build /out/veilink /usr/local/bin/veilink", `CMD ["/usr/local/bin/docker-healthcheck.sh"]`, "ca-certificates tzdata curl sqlite"} {
+	for _, required := range []string{"FROM golang:1.27-alpine3.23 AS build", "FROM node:22-alpine3.23 AS ui", "FROM alpine:3.23", "org.opencontainers.image.version", "org.opencontainers.image.revision", "org.opencontainers.image.source"} {
+		if !strings.Contains(file, required) {
+			t.Errorf("image build provenance missing %q", required)
+		}
+	}
+	for _, floating := range []string{"FROM golang:alpine", "FROM node:alpine"} {
+		if strings.Contains(file, floating) {
+			t.Errorf("floating build base remains %q", floating)
+		}
+	}
+	for _, required := range []string{`ENTRYPOINT ["/usr/local/bin/veilink"]`, "USER 65532:65532", "COPY --from=ui /src/html /usr/local/html", "COPY --from=build /out/veilink /usr/local/bin/veilink", `CMD ["/usr/local/bin/docker-healthcheck.sh"]`, "ca-certificates tzdata curl sqlite", "&& chown 65532:65532 /data"} {
 		if !strings.Contains(file, required) {
 			t.Errorf("unified image missing %q", required)
 		}

@@ -2,7 +2,7 @@ ARG NPM_REGISTRY=https://registry.npmmirror.com
 ARG GOPROXY=https://goproxy.cn,direct
 ARG APK_MIRROR=https://mirrors.ustc.edu.cn/alpine
 
-FROM golang:alpine AS build
+FROM golang:1.27-alpine3.23 AS build
 WORKDIR /src
 ARG GOPROXY
 ARG VERSION=dev
@@ -13,7 +13,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X veilink/internal/buildinfo.Version=${VERSION} -X veilink/internal/buildinfo.Commit=${COMMIT}" -o /out/veilink ./cmd/veilink
 
-FROM node:alpine AS ui
+FROM node:22-alpine3.23 AS ui
 WORKDIR /src/frontend
 ARG NPM_REGISTRY
 RUN npm config set registry ${NPM_REGISTRY}
@@ -25,10 +25,18 @@ RUN npm run build
 # One release image; the required subcommand selects the runtime role.
 FROM alpine:3.23
 ARG APK_MIRROR
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG SOURCE_URL=local
 RUN printf '%s/v3.23/main\n%s/v3.23/community\n' "$APK_MIRROR" "$APK_MIRROR" > /etc/apk/repositories \
  && apk add --no-cache ca-certificates tzdata curl sqlite \
  && mkdir -p /data \
  && chown 65532:65532 /data
+LABEL org.opencontainers.image.title="veilink" \
+      org.opencontainers.image.description="Unified Veilink master/server/client image" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${COMMIT}" \
+      org.opencontainers.image.source="${SOURCE_URL}"
 COPY --from=build /out/veilink /usr/local/bin/veilink
 COPY --from=ui /src/html /usr/local/html
 COPY docker-healthcheck.sh /usr/local/bin/docker-healthcheck.sh

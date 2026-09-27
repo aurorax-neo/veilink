@@ -137,6 +137,7 @@ jobs:
           build-args: |
             VERSION=dev
             COMMIT=${{ github.sha }}
+            SOURCE_URL=https://github.com/${{ github.repository }}
             GOPROXY=https://proxy.golang.org,direct
             NPM_REGISTRY=https://registry.npmjs.org
             APK_MIRROR=https://dl-cdn.alpinelinux.org/alpine

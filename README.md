@@ -52,6 +52,8 @@ docker build -t veilink:latest .
 
 Go 构建使用常见的 `-ldflags "-X veilink/internal/buildinfo.Version=dev -X veilink/internal/buildinfo.Commit=<commit>"` 注入；手动 development-artifacts workflow 为全部平台归档和同一镜像统一注入 `dev` 与 `GITHUB_SHA`。镜像 tag 是分发定位符，不等于配置修订；Web 从认证 API 展示 Master 版本，提交哈希单独放详情，不拼进列表短标签。
 
+Docker 构建阶段使用 `golang:1.27-alpine3.23` 与 `node:22-alpine3.23`，避免跟随最新工具链大版本；这些版本 tag 仍可变，不等于 digest 锁定或可复现构建。最终镜像的 OCI `version` / `revision` 标签与 `VERSION` / `COMMIT` 构建参数一致，`--build-arg SOURCE_URL=<源码仓库URL>` 设置 source 标签（本地默认 `local`）。可用 `docker image inspect --format '{{json .Config.Labels}}' veilink:latest` 查看。标签仅是构建者声明，不是签名验真；脏工作区即使注入旧 HEAD 也不能当作该提交的精确发布产物。更新后的生产缺口与本机验收边界见 [生产缺口复审](tests/deployment/production-gaps-2026-09.md)。
+
 已认证 `GET /api/nodes` 的 `software_version` / `software_commit` 只来自各节点（含内置 Server）的认证心跳，未上报时字段省略，不能用 Master 版本代替。上报只保存在 Master 内存，重启后等待节点重新上报；不是二进制真实性证明或在线/目标健康证明，不进入配置快照，节点编辑 API 拒绝写入这些字段。
 
 国内网络默认使用 USTC Alpine 镜像源、npmmirror 和 goproxy.cn，采用 linuxmirrors.cn 的替换软件源思路，不执行远程安装脚本。可用 `--build-arg APK_MIRROR=https://dl-cdn.alpinelinux.org/alpine` 覆盖 APK 源（地址不带末尾斜线），也可覆盖 `NPM_REGISTRY` 和 `GOPROXY`。

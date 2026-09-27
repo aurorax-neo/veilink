@@ -26,6 +26,9 @@ func TestDevelopmentWorkflowContract(t *testing.T) {
 		"sha256sum", "LICENSE NOTICE THIRD_PARTY_NOTICES.md",
 		"-X veilink/internal/buildinfo.Version=dev", "-X veilink/internal/buildinfo.Commit=${GITHUB_SHA}",
 		"VERSION=dev", "COMMIT=${{ github.sha }}",
+		"SOURCE_URL=https://github.com/${{ github.repository }}",
+		"org.opencontainers.image.source=https://github.com/${{ github.repository }}",
+		"org.opencontainers.image.revision=${{ github.sha }}",
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Errorf("missing development workflow contract %q", required)
