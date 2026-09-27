@@ -33,6 +33,7 @@ export interface TunnelConfig {
   encryption?: string
   reality?: RealityConfig
   hysteria2?: Hysteria2Config
+  xhttp?: { path: string; mode: 'packet-up'; tls: boolean }
 }
 
 export interface Node {

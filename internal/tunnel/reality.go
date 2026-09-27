@@ -156,6 +156,14 @@ func (s *service) dialGateway(gateway model.Node, peer *clientGateway) (net.Conn
 	for _, endpoint := range enabledEndpoints(gateway) {
 		addr := net.JoinHostPort(endpoint.Host, strconv.Itoa(endpoint.Port))
 		serverName := endpoint.Host
+		if local.XHTTP.Enabled() {
+			if conn, err := dialXHTTP(s.ctx, addr, serverName, local); err == nil {
+				return conn, nil
+			} else {
+				last = err
+			}
+			continue
+		}
 		if local.Hysteria2.Enabled() {
 			if conn, err := dialHysteria(s.ctx, addr, serverName, local); err == nil {
 				return conn, nil

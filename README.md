@@ -220,8 +220,9 @@ mkdir -p /opt/docker/veilink-client/config /opt/docker/veilink-client/data && ch
 
 - **仅通过角色 flags 配置运行参数**：不接受 YAML 配置文件、`-config` 或 `VEILINK_CONFIG`；Master 的持久化设置优先级是首次默认值 → SQLite 已存设置 → 显式传入的 flags。`-database`、`-deployment-key` 是 Master 存储位置，数据库与 key 必须一起备份。容器默认绝对路径为 `/data/veilink.db`、`/data/veilink.key` 与 `/data/state`，不会在源码目录创建 `.local`。管理员仅通过首次 Web 注册创建，不接受初始化环境变量。
 - **所有隧道参数均从 Web 管理**：仅编辑 Server 私有 `tunnel`，保存时由管理中心自动派生并保存只读 `client_tunnel`；没有独立的下发模板编辑入口，节点写入 API 不接受 `client_tunnel`。创建/关联映射后，授权快照只把派生的公共参数/共享认证发给 Client，不包含 Server 私钥；服务端配置修改后同步重新派生。客户端详情可只读查看期望配置，实际应用状态以节点修订为准。Client 不允许用启动参数或本地文件覆写。Master 身份证书来自只读 `/config`，与隧道 TLS/Hysteria2 的 Web PEM 不同。映射直接选择 Server、Client 与 Pool（1–32）。
-- **客户端连接地址与监听分离**：Server 私有 `tunnel.listen_host/listen_port` 是本地绑定的监听 IP/端口；`connect_endpoints` 的 `host/port`（Web 标签为「主机/域名」「端口」）是 Client 拨号使用的可达主机与端口，可与本地绑定不同（例如端口转发）。TLS/Hysteria2 按连接地址的域名或 IP 校验证书，REALITY 使用自身伪装域名配置；不再提供节点或候选的独立 SNI 字段。保留多个具名候选与启用状态，Client 按列表顺序失败切换，不再提供优先级或 direct/nat/cdn 分类。旧 `server_name`、`priority`、`kind` 字段及旧数据库 schema 明确报错，不自动迁移或删库；已有数据须先备份，任何清除须另行明确授权。证书生成 API 使用 `host` 指定证书名称。Client 永不接收或覆盖本地监听字段。中间代理须保持原始 TCP 或 UDP/QUIC 的 L4 透传；HTTP-only 或终止、改写协议的 CDN 不支持。
+- **客户端连接地址与监听分离**：Server 私有 `tunnel.listen_host/listen_port` 是本地绑定的监听 IP/端口；`connect_endpoints` 的 `host/port`（Web 标签为「主机/域名」「端口」）是 Client 拨号使用的可达主机与端口，可与本地绑定不同（例如端口转发或 CDN 域名）。TLS/Hysteria2/XHTTP HTTPS 按连接地址的域名或 IP 校验证书，REALITY 使用自身伪装域名配置；不再提供节点或候选的独立 SNI 字段。保留多个具名候选与启用状态，Client 按列表顺序失败切换，不再提供优先级或 direct/nat/cdn 分类。旧 `server_name`、`priority`、`kind` 字段及旧数据库 schema 明确报错，不自动迁移或删库；已有数据须先备份，任何清除须另行明确授权。证书生成 API 使用 `host` 指定证书名称。Client 永不接收或覆盖本地监听字段。TCP/REALITY/Hysteria2 仍要求原始 TCP 或 UDP/QUIC 的 L4 透传；**XHTTP packet-up 可通过 HTTP/HTTPS 路径透传 CDN，允许边缘终止 TLS**，具体前提与限制见下节。
 - **Hysteria2 安全边界**：Hysteria2 基于 QUIC/UDP 且使用 TLS；当前上游和本实现不支持 REALITY，配置会被拒绝。
+- **XHTTP 安全边界**：Web 传输选择 XHTTP，对应 JSON `tunnel.xhttp`；仅支持 `packet-up`、HTTP/1.1。`xhttp.tls` 控制 Client 到连接地址的 HTTPS，`transport_security` 控制 Server 源站监听 TLS/plain，互相独立。任一配置为 HTTP 时必须启用 VLESS Encryption；不支持 REALITY、Hysteria2、Vision 混用。Client 模板仍由 Server 配置自动派生，映射/mux/XUDP 授权逻辑不变；不宣称 Xray 线协议互通或任意公网 CDN 兼容。
 - **认证**：管理员使用密码会话、CSRF；节点一次性接入令牌最长 24 小时，凭据有效期 30 天。内置 Server 身份持久且不可通过外部令牌接管。Web 的“快捷接入”生成统一镜像加角色子命令的 Docker Run 命令和挂载准备步骤；令牌可能暴露于 Shell 历史及 Docker inspect，关闭弹窗会从页面内存移除。
 - **TCP mux 可选**：Web「映射 → 新建/编辑 → TCP mux」对应映射 JSON 字段 `mux`，默认 `false`（省略也是关闭），不是节点或全局设置。关闭时每条 TCP 流使用独立认证反向连接；开启时多条 TCP 流共享 mux 会话。同一 Server/Client 的不同映射可独立选择。Pool（1–32）控制该节点对的共享会话或独立连接预备数量，取启用映射的最大值，不限制业务并发。保存开关或类型后授权快照触发相关节点重建，现有连接会断开；以已应用修订确认生效。控制连接仍保留，UDP 始终使用 XUDP/共享帧通道，不受 TCP mux 开关影响。
 - **mux 类型**：Web 使用与其他字段同风格的单一下拉框，选项为「关闭 / smux / yamux / h2mux」，新建默认关闭，不使用 checkbox 或 radio。Mapping API 保留布尔 `mux` 和字符串 `mux_type`；选择协议时发送 `mux=true` 与明确类型，关闭时发送 `mux=false` 并清空类型。API 开启 mux 但省略/留空类型仍采用 `smux`，未知非空类型拒绝，不静默回退。切换 UDP 立即关闭 mux、清空类型并禁用下拉；切回 TCP 仍保持关闭，API 拒绝 UDP + mux=true。不提供额外 padding 或流数配置。反向隧道仍是 Veilink 协议，使用这些 mux 类型不代表兼容 mihomo 节点直连，也不宣称 Xray 通用互通。
@@ -230,3 +231,55 @@ mkdir -p /opt/docker/veilink-client/config /opt/docker/veilink-client/data && ch
 - **查看状态**：使用 `docker logs veilink-master` 等读取日志。Master 的 Docker 健康检查实际请求 `/healthz`；节点健康检查仅检查进程，不表示目标端口可达。Veilink 默认 HTTP，内置 HTTPS 可选；生产可由 nginx 等终止 HTTPS 后转发至本机/内网 HTTP，也可在可信网络直接使用 HTTP。打开防火墙时仅放行必需的控制、隧道与映射端口。项目尚未发布，旧数据库 schema 明确报错，不自动迁移或清除。
 
 项目的持续开发约束与验收要求单独保存在 [AGENTS.md](AGENTS.md)，不与本部署说明混写。
+
+## XHTTP 业务传输与 CDN
+
+在 Server 编辑器选择 XHTTP，填写规范路径（例如 `/veilink/`），模式固定为 `packet-up`。连接地址填 Client 真正拨号的 CDN 域名与端口，监听地址填 Server 本地 IP 与端口。所有候选共用协议和路径，Host 与 HTTPS 证书校验名称来自候选主机，无独立 Host/SNI 覆盖。此传输不改变 Master Web/API/gRPC 的管理面反代、Origin/CSRF/Cookie 保护。
+
+Server `tunnel` JSON 示例（`decryption` 占位值须替换为 Web 生成的真实配置，不是启动配置文件）：
+
+```json
+{
+  "listen_host": "127.0.0.1",
+  "listen_port": 8444,
+  "transport_security": "plain",
+  "decryption": "REPLACE_WITH_GENERATED_VLESS_DECRYPTION",
+  "xhttp": { "path": "/veilink/", "mode": "packet-up", "tls": true }
+}
+```
+
+- `xhttp.tls` 控制 Client → 连接地址：true 为 HTTPS，false 为 HTTP。`transport_security` 独立控制源站监听：tls 需要 Web 保存 `cert_pem/key_pem`；plain 为 HTTP，不能带源站证书/私钥。允许 HTTPS CDN → HTTP 回源，**不要求 TLS 原样透传**；直连时两端协议必须匹配。
+- 任一配置为 HTTP 时强制 VLESS Encryption；HTTPS 双段也建议启用，避免 TLS 终止者读取业务明文。HTTP-only 会暴露会话 URL 和流量元数据，且可能被篡改/阻断；Encryption 不替代 HTTPS。
+- `ca_pem` 用于 **Client 信任连接地址**，留空使用系统根。公共 CDN 通常留空；源站自签 CA 不等于 CDN 边缘 CA。源站 HTTPS 证书由 CDN 校验，边缘证书由 Client 校验，不提供跳过验证选项。证书续期由各自 TLS 终止组件管理。
+- 路径以 `/` 开头和结尾，最大 256 字节，只含 ASCII 字母、数字、`/`、`_`、`-`；重复 `/`、点路径、转义、查询串拒绝。仅支持 HTTP/1.1 `packet-up`，不接受 auto/stream-up/stream-one、downloadSettings、XMUX、padding、自定义 headers 等未实现选项；不支持与 REALITY/Hysteria2/Vision 混用。
+- 业务 TCP off/smux/yamux/h2mux 和 UDP XUDP 仍受原授权限制；此处 HTTP/1.1 不限制内层业务 h2mux。Client 不接收私钥、源站监听或 decryption，不支持本地覆盖。
+
+### CDN / 反代条件
+
+支持 **HTTP-only 或终止 TLS 的 HTTP CDN**，不限于 L4 透传；但不保证任意厂商可用：
+
+1. 原样转发完整路径及会话/序号后缀，允许二进制 POST、空 POST 和 `X-Veilink-EOF` 半关闭头；禁止重定向、登录页、验证码、JS challenge 或内容改写。Client 拒绝重定向，不使用环境 HTTP 代理。
+2. GET 必须立即发送响应头并持续流式下行，禁用响应缓存、缓冲、压缩和内容转换。上行 POST 每片最多 32 KiB，可有限缓冲，不依赖无限流式上传。成功响应须保留 HTTP 状态码。
+3. 同一会话的 GET/POST 必须到达同一源站实例；会话在内存，不跨实例共享。乱序/重复 POST 会拒绝，不自动重放。
+4. CDN 必须支持 HTTP/1.1 接入/回源；本实现无 HTTP/2/h2c/HTTP/3 xhttp。CDN 内部版本转换不在控制范围，需自行验证。长响应/空闲时限可能断开业务，自动重连不保证既有 TCP 流无损恢复。
+5. 原生实现限制为每 Server 128 个活动会话、256 个底层连接/HTTP handler，单次上传和阻塞下行写入限时 15 秒，读取请求头 5 秒，下行空闲 90 秒；下行 EOF 后剩余上传也限时 90 秒。Pool 不是业务并发上限，较多独立 TCP 连接可能达到会话上限。源站建议只允许可信回源来源。
+
+nginx 业务路径示例（与管理面分开；源站 HTTP 须启用 Encryption）：
+
+```nginx
+location ^~ /veilink/ {
+    proxy_pass http://127.0.0.1:8444;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header Connection "";
+    proxy_buffering off;
+    proxy_request_buffering on;
+    proxy_cache off;
+    gzip off;
+    client_max_body_size 64k;
+    proxy_read_timeout 300s;
+    proxy_send_timeout 60s;
+}
+```
+
+外层 HTTPS 证书由 nginx/CDN 管理。该示例不是公网 CDN 厂商认证。参考 Xray Splithttp 的 packet-up 行为与配置语义，独立实现、不复制参考源码或 AGPL 代码；保留 Veilink 私有授权协议与半关闭扩展，**不宣称 Xray 互通**。实际本机覆盖与限制见 [XHTTP 验收](tests/deployment/xhttp.md)。

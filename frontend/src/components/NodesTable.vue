@@ -34,6 +34,7 @@ function tunnelLabel(node: Node) {
   const t = node.tunnel
   const enc = t?.decryption
   const additive = enc && enc !== 'none' ? ' + Encryption' : ''
+  if (t?.xhttp?.path) return `XHTTP / packet-up · 连接 ${t.xhttp.tls ? 'HTTPS' : 'HTTP'} · 回源 ${t.transport_security === 'tls' ? 'HTTPS' : 'HTTP'}${additive}`
   if (t?.hysteria2?.password) return `Hysteria2 / TLS${additive}`
   if (t?.reality && Object.values(t.reality).some(Boolean)) return `TCP / REALITY${additive}`
   if (t?.transport_security === 'plain') return 'TCP / Encryption'

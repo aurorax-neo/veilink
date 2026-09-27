@@ -115,7 +115,18 @@ type LocalTLS struct {
 	Encryption        string    `json:"encryption"`
 	Reality           Reality   `json:"reality"`
 	Hysteria2         Hysteria2 `json:"hysteria2"`
+	XHTTP             XHTTP     `json:"xhttp,omitempty"`
 }
+
+// XHTTP configures packet-up HTTP transport. TLS selects HTTPS at the Client
+// dial candidate; TransportSecurity independently selects the origin listener.
+type XHTTP struct {
+	Path string `json:"path"`
+	Mode string `json:"mode"`
+	TLS  bool   `json:"tls"`
+}
+
+func (x XHTTP) Enabled() bool { return x.Path != "" || x.Mode != "" || x.TLS }
 
 // Reality is optional camouflage for the data plane. Private keys stay on the
 // server; the master never distributes them. An empty value keeps certificate TLS.
@@ -201,6 +212,9 @@ func (base LocalTLS) Merge(override LocalTLS) LocalTLS {
 	if override.Hysteria2.Password != "" {
 		res.Hysteria2.Password = override.Hysteria2.Password
 	}
+	if override.XHTTP.Enabled() {
+		res.XHTTP = override.XHTTP
+	}
 	return res
 }
 
@@ -233,6 +247,7 @@ func DeriveClientTunnel(serverTunnel LocalTLS, serverNode Node) LocalTLS {
 		Flow:              serverTunnel.Flow,
 		CAPEM:             serverTunnel.CAPEM,
 		Hysteria2:         serverTunnel.Hysteria2,
+		XHTTP:             serverTunnel.XHTTP,
 		Encryption:        serverTunnel.Encryption,
 	}
 	if serverTunnel.Decryption != "" {

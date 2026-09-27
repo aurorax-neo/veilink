@@ -352,6 +352,7 @@ type service struct {
 	flow               string
 	inbound            *encServer
 	tlsConfig          *tls.Config
+	xhttpClose         func()
 	applicationChanged chan struct{}
 	applicationWaiting map[string]int
 	applications       map[string][]*applicationSlot
@@ -440,6 +441,9 @@ func (s *service) stop() {
 			_ = s.quic.Close()
 		}
 		s.cancel()
+		if s.xhttpClose != nil {
+			s.xhttpClose()
+		}
 		for _, ln := range s.listeners {
 			_ = ln.Close()
 		}
@@ -487,7 +491,11 @@ func (s *service) listenServer() error {
 				return err
 			}
 			s.listeners = append(s.listeners, ln)
-			go s.acceptTransport(ln)
+			if s.local.XHTTP.Enabled() {
+				s.serveXHTTP(ln)
+			} else {
+				go s.acceptTransport(ln)
+			}
 		}
 	}
 

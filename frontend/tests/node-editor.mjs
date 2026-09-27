@@ -373,9 +373,9 @@ test('listen validation, NAT port independence, and transport copy stay explicit
   assert.equal(body(e).connect_endpoints[0].port, 443)
   assert.equal('kind' in body(e).connect_endpoints[0], false)
   assert.equal(body(e).connect_endpoints[0].host, 'public.example.com')
-  assert.match(editorSource, /<label for="node-security">安全<\/label>[\s\S]*<label for="node-transport">传输<\/label>/)
+  assert.match(editorSource, /Server 回源监听安全/)
   assert.match(editorSource, /Hysteria2 基于 QUIC\/UDP 且使用 TLS，当前上游和本实现不支持 REALITY/)
-  assert.match(editorSource, /HTTP-only 或终止、改写协议的 CDN 不支持/)
+  assert.match(editorSource, /XHTTP packet-up 可走 HTTP\/HTTPS CDN，允许边缘终止 TLS/)
 })
 
 test('reactive server endpoints open as isolated editable copies', async () => {
@@ -433,4 +433,45 @@ test('multiple connection addresses survive edits and removal without kind', asy
   await e.save()
   assert.equal(body(e).connect_endpoints[0].port, 9443)
   assert.equal(body(e).tunnel.listen_port, 8444)
+})
+
+test('XHTTP saves JSON packet-up and separates HTTPS candidate from HTTP origin', async () => {
+  const e = setup()
+  e.draft.transport = 'xhttp'
+  e.draft.security = 'encryption'
+  await assert.rejects(e.save(), /必须启用 VLESS Encryption/)
+  e.draft.enc = 'generated-decryption'
+  e.draft.ca = cert
+  e.draft.flow = 'xtls-rprx-vision'
+  await e.save()
+  assert.equal(payload(e).transport_security, 'plain')
+  assert.equal(payload(e).xhttp.mode, 'packet-up')
+  assert.equal(payload(e).xhttp.path, '/veilink/')
+  assert.equal(payload(e).xhttp.tls, true)
+  assert.equal(payload(e).ca_pem, cert)
+  assert.equal(payload(e).cert_pem, undefined)
+  assert.equal(payload(e).flow, undefined)
+  assert.equal(e.requests.at(-1)[2].client_tunnel, undefined)
+  e.draft.transport = 'tcp'
+  await e.save()
+  assert.equal(payload(e).xhttp, undefined)
+})
+
+test('XHTTP restores HTTP options and rejects invalid paths and insecure HTTP', async () => {
+  const e = setup()
+  const node = tlsNode()
+  node.tunnel.xhttp = { path: '/cdn/', mode: 'packet-up', tls: false }
+  e.open(node)
+  assert.equal(e.draft.transport, 'xhttp')
+  assert.equal(e.draft.xhttpTLS, false)
+  assert.equal(e.draft.xhttpPath, '/cdn/')
+  await assert.rejects(e.save(), /必须启用 VLESS Encryption/)
+  e.draft.enc = 'generated-decryption'
+  for (const path of ['', '/missing', '//', '/a//b/', '/a/../b/', '/a/?x=1', '/a%2fb/', '/' + 'a'.repeat(256) + '/']) {
+    e.draft.xhttpPath = path
+    await assert.rejects(e.save(), /XHTTP 路径/)
+  }
+  e.draft.xhttpPath = '/cdn/'
+  await e.save()
+  assert.equal(payload(e).xhttp.tls, false)
 })

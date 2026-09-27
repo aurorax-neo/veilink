@@ -22,6 +22,7 @@ func TestProtocolMatrixRoundTrip(t *testing.T) {
 		{"tls", false, true}, {"reality", false, true},
 		// Bound the combined Encryption + Vision coverage to dedicated TCP.
 		{"tls", true, true}, {"reality", true, true},
+		{"xhttp-https", false, false}, {"xhttp-https", true, false}, {"xhttp-http", true, false},
 	}
 	modes := []struct{ network, mux string }{
 		{"tcp", ""}, {"tcp", model.MuxTypeSMux},
@@ -43,6 +44,10 @@ func TestProtocolMatrixRoundTrip(t *testing.T) {
 				files := tlsFiles(t)
 				local := files
 				switch profile.transport {
+				case "xhttp-https":
+					local.XHTTP = model.XHTTP{Path: "/veilink/", Mode: "packet-up", TLS: true}
+				case "xhttp-http":
+					local = model.LocalTLS{TransportSecurity: "plain", XHTTP: model.XHTTP{Path: "/veilink/", Mode: "packet-up"}}
 				case "plain":
 					local = model.LocalTLS{TransportSecurity: "plain"}
 				case "reality":
@@ -122,7 +127,7 @@ func TestProtocolMatrixRoundTrip(t *testing.T) {
 			})
 		}
 	}
-	if count != 47 {
+	if count != 62 {
 		t.Fatalf("matrix size changed: %d", count)
 	}
 }

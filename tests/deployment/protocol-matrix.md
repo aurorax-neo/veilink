@@ -32,7 +32,7 @@ Hysteria2 的外层使用 UDP/QUIC；表中的 TCP/UDP 指业务映射，不是�
 
 ## 新增实际覆盖
 
-`internal/tunnel/protocol_matrix_test.go:13` 的 `TestProtocolMatrixRoundTrip` 共 **47 个往返组合**：
+`internal/tunnel/protocol_matrix_test.go:13` 的 `TestProtocolMatrixRoundTrip` 当前共 **62 个往返组合**（原有 47 + XHTTP 15）：
 
 | 配置分组 | 组合数 |
 | --- | ---: |
@@ -40,6 +40,7 @@ Hysteria2 的外层使用 UDP/QUIC；表中的 TCP/UDP 指业务映射，不是�
 | TLS / REALITY / Hysteria2 各增加 Encryption × 五种业务模式 | 15 |
 | TLS / REALITY 各增加 Vision、无 Encryption × 五种业务模式 | 10 |
 | TLS / REALITY 各增加 Encryption + Vision，仅 TCP off | 2 |
+| XHTTP HTTPS / HTTPS+Encryption / HTTP+Encryption × 五种业务模式 | 15 |
 
 复用 `tlsFiles`、`fixtures`、`run`、`awaitEcho`、`awaitUDPEcho`、`exchange`、`exchangeUDP`、`camouflage`。每个组合在 ready 往返后使用三个并发业务连接：TCP 每连接 64 KiB 二进制内容并 CloseWrite，UDP 每 peer 1 KiB 数据报，逐字节校验。通过 `PublicPeerTunnel` 生成授权模板并检查服务端秘密没有泄漏；HY2 密码按现有测试单独注入授权 Client。
 
@@ -53,3 +54,9 @@ Hysteria2 的外层使用 UDP/QUIC；表中的 TCP/UDP 指业务映射，不是�
 - 根因：QUIC 包装器缺少写侧半关闭，同时拨号端结束流后立即关闭整个连接，丢弃尚未送达的响应。修复为流级 FIN；正常读 EOF 后等待反向服务端消费响应 FIN 并关闭连接，受运行上下文取消及 1 分钟空闲超时约束，异常路径立即清理。不增加自定义协议确认帧。
 - 修复后原失败组合 `-count=30` 通过（0.779s）。`go test ./internal/tunnel -run 'TestProtocolMatrixRoundTrip|TestHysteriaGracefulCleanupBounded' -count=2 -timeout=5m` 全部通过（196.993s），共 94 次矩阵组合；附加测试覆盖对端结束、运行取消、超时三条释放路径。
 - 最终 `go test ./...`、`go vet ./...`、tunnel/node/control/httpapi/store race、integration（138.974s）全部通过。生产验收汇总见 `production-gaps-347.md`。
+
+## XHTTP 扩展
+
+XHTTP 的 15 个组合使用 HTTP/1.1 packet-up。每组同样执行 3 个并发 peer，TCP 每 peer 64 KiB 加 CloseWrite，UDP 每 peer 1 KiB；保持 off/smux/yamux/h2mux 与授权 XUDP，不新增公开绑定管理。HTTPS 和 HTTP 分别验证对应监听；CDN TLS 终止/HTTP 回源另由 `internal/tunnel/xhttp_test.go` 的反向代理用例覆盖。
+
+XHTTP 不支持 Vision/REALITY/Hysteria2 叠加；任一段 HTTP 强制 VLESS Encryption。原有未覆盖的 8 个 Encryption+Vision 交叉保持未覆盖，不在本任务扩展范围。上文执行结果为历史记录，本次执行结果见 [xhttp.md](xhttp.md)。

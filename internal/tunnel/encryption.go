@@ -66,6 +66,9 @@ func checkVLESS(role string, local model.LocalTLS) error {
 			return errors.New("plain transport_security requires VLESS encryption")
 		}
 	}
+	if local.XHTTP.Enabled() && !local.XHTTP.TLS && ((role == "server" && !decryptionEnabled(local.Decryption)) || (role == "client" && !decryptionEnabled(local.Encryption))) {
+		return errors.New("xhttp HTTP dial candidates require VLESS encryption")
+	}
 	flow, err := normalizeFlow(local.Flow)
 	if err != nil {
 		return err
@@ -1021,6 +1024,7 @@ func decodeHeader(h []byte) (int, error) {
 type recordConn struct {
 	net.Conn
 	aes         bool
+	ticketMu    sync.Mutex // protects client across concurrent Read/Write errors
 	client      *encClient
 	united      []byte
 	pre         []byte
@@ -1122,13 +1126,14 @@ func (c *recordConn) Read(p []byte) (int, error) {
 	}
 	n, err := decodeHeader(header)
 	if err != nil {
-		if c.client != nil && strings.Contains(err.Error(), "invalid header: ") {
-			c.expireTicket()
+		if strings.Contains(err.Error(), "invalid header: ") && c.expireTicket() {
 			return 0, errors.New("new handshake needed")
 		}
 		return 0, err
 	}
+	c.ticketMu.Lock()
 	c.client = nil
+	c.ticketMu.Unlock()
 	blob := make([]byte, n)
 	if _, err = io.ReadFull(c.Conn, blob); err != nil {
 		return 0, err
@@ -1151,14 +1156,17 @@ func (c *recordConn) Read(p []byte) (int, error) {
 	return copied, nil
 }
 
-func (c *recordConn) expireTicket() {
+func (c *recordConn) expireTicket() bool {
+	c.ticketMu.Lock()
+	defer c.ticketMu.Unlock()
 	if c.client == nil {
-		return
+		return false
 	}
 	c.client.mu.Lock()
 	c.client.expire = time.Now()
 	c.client.mu.Unlock()
 	c.client = nil
+	return true
 }
 
 func newCTR(key, iv []byte) cipher.Stream {
