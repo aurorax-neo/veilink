@@ -24,10 +24,13 @@ func TestUnifiedImageAndDockerRunOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	readme := string(body)
-	for _, required := range []string{"GET /api/setup", "POST /api/register", "docker exec -i veilink-master /usr/local/bin/veilink reset-admin-username -username", "docker exec -i veilink-master /usr/local/bin/veilink reset-admin-password -password-stdin", "可信网络"} {
+	for _, required := range []string{"GET /api/setup", "POST /api/register", "docker exec -i veilink-master /usr/local/bin/veilink reset-admin-username -username", "docker exec -i veilink-master /usr/local/bin/veilink reset-admin-password -password-stdin", "可信网络", "tools/backup-master.sh backup", "tools/backup-master.sh restore", "manifest.json", "nginx -t && nginx -s reload", "grpc_pass"} {
 		if !strings.Contains(readme, required) {
-			t.Errorf("missing registration/reset contract %q", required)
+			t.Errorf("missing registration/reset/operations contract %q", required)
 		}
+	}
+	if _, err := os.Stat(filepath.Join(root, "tools", "backup-master.sh")); err != nil {
+		t.Fatalf("backup/restore tool missing: %v", err)
 	}
 	for _, obsolete := range []string{"--env-file", "VEILINK_INIT_ADMIN_PASSWORD=", "VEILINK_INIT_ADMIN_USERNAME=", "/usr/local/bin/veilink reset-admin "} {
 		if strings.Contains(readme, obsolete) {

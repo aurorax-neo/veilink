@@ -29,8 +29,8 @@ SOURCE_URL 表示源码仓库，revision 表示提交。手动 workflow 同步�
 ### P0：目标环境验收门槛
 
 1. **真实多机 24–72h 长稳**：跨机 WAN 丢包/抖动/MTU、断网重连、节点/控制面重启、修订漂移、业务与资源曲线尚无证据。关闭需目标环境连续日志、业务成功率/延迟、资源趋势及恢复记录。Docker Bridge 不能替代。
-2. **备份恢复与授权恢复**：已有管理员重置、会话吊销和凭据测试，但未有生产数据/key/节点状态成套备份恢复演练。关闭需隔离恢复副本、管理员/节点授权验证、明确 RPO/RTO；不允许自动删库或迁移旧 schema。
-3. **生产 HTTPS/反代运维**：已有 nginx TLS/h2c 自动化证明；生产 CA、续期/reload、私钥权限、访问控制、首次注册防抢占未在目标环境演练。关闭需完整证书生命周期和安全回归。HTTP 在可信网络仍受支持，HTTPS 本身不能防抢占。
+2. **备份恢复与授权恢复（本机路径已落地，目标环境仍开放）**：新增 `tools/backup-master.sh`，停机收集 SQLite `veilink.db`、`veilink.key`、`state/`，生成 SHA-256 manifest；恢复只接受 manifest 校验通过的备份并写入全新目录，拒绝篡改、缺失文件和覆盖已有目录。README 已补 Docker Run 下的停机备份、隔离恢复、管理员/节点/业务验证与 RPO/RTO 记录步骤；`tests/deployment/backup_test.go` 已验证 SQLite/key/state 恢复和篡改拒绝。仍未在生产数据、独立备份介质和真实节点上演练，故不关闭目标环境门槛；需要继续验证备份加密/保留、管理员会话吊销、节点授权恢复、RPO/RTO。
+3. **生产 HTTPS/反代运维（本机路径已文档化，目标 CA 生命周期仍开放）**：README 已把现有 nginx TLS→HTTP/h2c 快捷接入整理为证书权限、续期后证书检查、`nginx -t && nginx -s reload`、失败不替换、Cookie/Origin/CSRF、错误 CA 和 h2c 心跳验收顺序，并复用 `tests/deployment/proxy_check.py`。该脚本覆盖本机隔离 nginx TLS/API/gRPC 回归；不等同于生产 CA 自动续期、reload 监控、访问控制和首次注册防抢占演练，目标环境门槛仍开放。
 4. **发布供应链**：digest 锁定、SBOM、漏洞扫描、Actions SHA 锁定、签名/provenance、可信摘要来源及发布审批未完成。verify-node 仅受信运维通道的时点对账；OCI 标签也不是签名。正式 release/push 必须另行授权。
 
 ### P1：协议、公网和容量覆盖
@@ -50,11 +50,15 @@ SOURCE_URL 表示源码仓库，revision 表示提交。手动 workflow 同步�
 - `go test ./internal/tunnel -run '^TestProtocolMatrixRoundTrip$' -count=1 -timeout=10m`：70/70 组合通过，130.158 秒；包含新增 8 个 Encryption+Vision 交叉。
 - `tests/deployment/protocol-matrix.md` 已同步 70 组合分组和剩余覆盖边界。
 - `go test -tags=integration ./tests/integration -count=1`：通过，138.858 秒。
-- `cd frontend && node --test tests/*.mjs && npm run build`：32/32，通过 TypeScript/Vite 构建。UI 无变更，不重复截图。
-- 统一镜像 `veilink:gaps-audit` 构建通过，ID `de98426df409`；inspect 标签与二进制 version 对齐。
-  构建参数为 VERSION=dev-audit、COMMIT=1b366b3 全 SHA、SOURCE_URL=local://veilink/该 SHA；包含本轮未提交构建改动，**不是最终提交的发布身份**。
-- `PYTHONDONTWRITEBYTECODE=1 python3 tests/deployment/soak.py --image veilink:gaps-audit --duration 60 --output "$PI_SCRATCH_DIR/gaps-audit-soak"`：266.8 秒通过，100 秒断网、恢复、三角色重启后新心跳、两次 rollout、12 次业务采样；三角色 healthy、静态资源存在、二进制摘要一致：`3faac8b26106b9169651ffa6f819f082cbefb1062e7ec12c7f01ae111611a98c`，cleanup_remaining 为空。
-- actionlint 不在 PATH 或已检查的 Go bin 路径，本轮未运行；工作流契约测试通过，未运行远端 Actions。
-- 原始日志在会话 scratch 的 `gaps-audit-*`，无生产数据或密钥进入仓库；未 push、未部署、未创建盯梢任务。
+ - `cd frontend && node --test tests/*.mjs && npm run build`：34/34，通过 TypeScript/Vite 构建。
+ - 统一镜像 `veilink:gaps-audit` 构建通过，ID `de98426df409`；该镜像为历史本机审计产物，不是本次最终提交身份。
+ - 历史 `veilink:gaps-audit` soak：266.8 秒通过，三角色 healthy、静态资源存在、二进制摘要一致，cleanup_remaining 为空。
+ - actionlint 不在 PATH，本轮未运行；未运行远端 Actions、未 push、未部署。
+### 本轮新增验证
+
+ - `sh -n tools/backup-master.sh`、`go test ./tests/deployment -run 'TestMasterBackupRestorePreservesStore|TestNodeOnlyBackupAndFailClosed' -count=1`：通过；真实 SQLite/admin、节点稳定 ID/credential、嵌套 state、node-only 和 fail-closed 校验均覆盖。
+ - `go test -race ./tests/deployment -run 'TestMasterBackupRestorePreservesStore|TestNodeOnlyBackupAndFailClosed' -count=1`：通过。
+ - `PYTHONDONTWRITEBYTECODE=1 python3 tests/deployment/proxy_check.py --image veilink:xhttp-check --nginx-image nginx:alpine --output "$PI_SCRATCH_DIR/p0-proxy-renewal-3"`：通过；坏证书候选被拒绝，证书 reload 后新 serial 生效，节点 h2c 重连、TLS/错误 CA、Cookie flags、Origin/CSRF、快捷接入均通过，`cleanup_remaining` 为空。使用既有本地镜像，不是公网或生产 CA 自动续期认证。
+ - `go test ./... -count=1`、`go vet ./...`、`git diff --check`：通过；本轮另执行 integration 138.793 秒、前端 34/34 与生产构建、`veilink:p0-check` 镜像构建通过。
 
 结论：本轮关闭一个有限的发布构建缺口，**仍不宣称无条件生产就绪**。优先继续目标环境长稳、备份恢复与 CA/反代演练，然后补供应链与协议/性能覆盖。

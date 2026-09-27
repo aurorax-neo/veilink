@@ -135,12 +135,44 @@ server {
 ```
 
 这里假设 nginx 与 Master 共用宿主机网络；若 nginx 在独立 Bridge 容器，`127.0.0.1` 指向 nginx 自己，须改用双方可达的受限内网地址。后端端口不直接暴露公网；反代入口仍需限制首次注册访问。Veilink 当前不依据任意 `X-Forwarded-Proto` 放宽 Origin 校验，因此上例精确转换本站 Origin，并由 HTTPS 入口为会话 Cookie 加 `Secure`；跨站 Origin、`Sec-Fetch-Site` 和 CSRF token 校验保持有效。使用非默认外部端口时，map 和 Host 必须同时包含该端口。修改后先执行 `nginx -t` 再重载。
+**nginx 运维验收顺序：** 证书私钥文件设为 `0600`、目录仅允许 nginx 运行用户读取，公开 CA/证书可设为 `0644`；续期工具写入新文件后先检查证书域名和有效期，再执行 `nginx -t && nginx -s reload`，失败时不要替换当前配置。reload 后用 `curl --cacert <CA> https://panel.example.com/api/setup` 验证 HTTPS 和证书链，用错误 CA 验证连接被拒绝；登录后检查 Cookie 的 `Secure/HttpOnly/SameSite`，跨站 Origin 和缺失 CSRF 仍应被拒绝。节点控制面必须继续走 `grpc_pass`，用部署验收脚本验证 h2c 双向心跳、期望/已应用修订和业务探针；可执行：
+
+```sh
+docker exec <nginx-container> nginx -t
+PYTHONDONTWRITEBYTECODE=1 python3 tests/deployment/proxy_check.py \
+  --image veilink:latest --nginx-image nginx:alpine \
+  --output "$PI_SCRATCH_DIR/proxy-check"
+```
+
+脚本使用隔离网络和临时 CA/数据，完成后清理容器；它证明本机 nginx TLS 终止、管理 API、Cookie/Origin/CSRF 和 h2c gRPC 路径，不证明公网 CDN、跨机 WAN 或 CA 供应商的自动续期。
 
 反代仅处理管理 Web/API/gRPC，不是业务隧道的 HTTP 代理。TLS/REALITY TCP 与 HY2 UDP/QUIC 业务仍须按各自协议直达或 L4 透传。
 
 ### 可选：Veilink 内置 HTTPS
 
 不使用前置 TLS 终止、希望由 Master 自身提供 HTTPS 时，准备包含控制台域名的 `cert.pem`、`key.pem`，放入 `/opt/docker/veilink-master/config/` 并允许 UID 65532 读取。把 Master 命令的 `-scheme http` 替换为 `-scheme https -cert-file /config/cert.pem -key-file /config/key.pem`；监听地址按需要改为可达地址。启用内置 Server 时追加 `-control-server-name panel.example.com`；私有 CA 另用 `-control-ca /config/master-ca.pem`。这只改变管理端 TLS，不改变隧道自身的 TLS/REALITY/HY2 设置。
+### Master 备份与隔离恢复
+
+Master 的成套持久化数据是 SQLite `veilink.db`、`veilink.key` 和 `state/`；三者必须来自同一停机快照。不要只备份数据库，也不要在线复制 SQLite 的 WAL 文件。先停止 Master 并确认没有其它进程写入 `/opt/docker/veilink-master/data`，在宿主机执行：
+
+```sh
+docker stop veilink-master
+mkdir -p /opt/docker/veilink-master/backups
+tools/backup-master.sh backup master \
+  /opt/docker/veilink-master/data \
+  /opt/docker/veilink-master/backups/$(date +%Y%m%d-%H%M%S)
+docker start veilink-master
+```
+
+脚本生成受权限保护的 `manifest.json`，覆盖数据库、deployment key 和所有节点 state 文件；备份目录应再复制到受限的独立存储，并按组织策略加密、保留和定期抽样恢复。恢复必须使用新的空目录，脚本会先校验完整文件树、权限和 SHA-256，拒绝篡改、缺失文件、额外文件、符号链接和覆盖已有目录，不会迁移 schema、删除旧数据或覆盖已有目录：
+
+```sh
+tools/backup-master.sh restore master \
+  /opt/docker/veilink-master/backups/<timestamp> \
+  /opt/docker/veilink-master/recovery-data
+```
+
+独立 Server/Client 的 `/data` 也可只备份节点身份和最后快照，不包含 Master 数据库：`tools/backup-master.sh backup node <node-data-dir> <backup-dir>`，恢复时使用 `restore node`。将恢复目录以 `-database /data/veilink.db -deployment-key /data/veilink.key -state-dir /data/state` 挂载到隔离的临时 Master，先验证管理员登录、会话失效/重置、节点身份和最后成功快照，再验证节点重新心跳及业务探针，记录 RPO/RTO 后才替换正式容器。恢复验证通过前不要让旧 Master 和恢复 Master 同时对外提供写服务；备份包含授权凭据，禁止进入日志、工单或公开对象存储。`tests/deployment/backup_test.go` 是本机回归烟雾，验证真实 SQLite/key/state、节点凭据和稳定身份恢复及 fail-closed 校验。
 
 ### 重置已有管理员
 

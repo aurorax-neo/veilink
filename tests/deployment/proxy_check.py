@@ -27,8 +27,27 @@ def main():
     csrf = ''
     result = {'passed': False}
     certs = a.output / 'certs'
-    command('go', 'run', './tools/devcert', '-out', str(certs), '-hosts', 'panel.test')
-    os.chmod(certs / 'ca.pem', 0o644)  # Public CA only; private key remains restricted.
+    certs.mkdir(mode=0o700)
+    command('openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '2',
+            '-subj', '/CN=Veilink operations TEST CA', '-keyout', str(certs / 'ca.key'),
+            '-out', str(certs / 'ca.pem'))
+    os.chmod(certs / 'ca.key', 0o600)
+    (certs / 'extensions').write_text('subjectAltName=DNS:panel.test\nextendedKeyUsage=serverAuth\n')
+
+    def issue_leaf(serial):
+        command('openssl', 'req', '-new', '-newkey', 'rsa:2048', '-nodes',
+                '-subj', '/CN=panel.test', '-keyout', str(certs / 'key.next'),
+                '-out', str(certs / 'leaf.csr'))
+        os.chmod(certs / 'key.next', 0o600)
+        command('openssl', 'x509', '-req', '-in', str(certs / 'leaf.csr'),
+                '-CA', str(certs / 'ca.pem'), '-CAkey', str(certs / 'ca.key'),
+                '-set_serial', str(serial), '-days', '2', '-extfile', str(certs / 'extensions'),
+                '-out', str(certs / 'cert.next'))
+        (certs / 'key.pem').write_bytes((certs / 'key.next').read_bytes())
+        (certs / 'cert.pem').write_bytes((certs / 'cert.next').read_bytes())
+        os.chmod(certs / 'key.pem', 0o600)
+    issue_leaf(1)
+    os.chmod(certs / 'ca.pem', 0o644)  # Public CA only; private keys remain restricted.
     conf = '''events {}
 http {
  map $http_origin $veilink_origin {
@@ -132,6 +151,33 @@ http {
         time.sleep(12)
         nodes = request('/api/nodes')
         assert all(n['last_seen'] > before[n['id']] for n in nodes)
+        # A broken candidate must fail validation without taking down active workers.
+        original_cert = (certs / 'cert.pem').read_bytes()
+        (certs / 'cert.pem').write_text('invalid certificate\n')
+        assert command('docker', 'exec', names['nginx'], 'nginx', '-t', check=False).returncode != 0
+        (certs / 'cert.pem').write_bytes(original_cert)
+        issue_leaf(2)
+        command('docker', 'exec', names['nginx'], 'nginx', '-t')
+        command('docker', 'exec', names['nginx'], 'nginx', '-s', 'reload')
+        # A fresh request after HUP verifies the renewed certificate remains usable.
+        request('/api/setup')
+        assert 'serial=02' in command('openssl', 'x509', '-in', str(certs / 'cert.pem'), '-noout', '-serial').stdout.decode().lower()
+        request('/api/nodes', {'name': 'blocked', 'role': 'client'}, expected=403, token=False)
+        request('/api/nodes', {'name': 'blocked', 'role': 'client'}, expected=403, origin='https://evil.example')
+        before = {n['id']: n['last_seen'] for n in request('/api/nodes')}
+        for role in ('server', 'client'):
+            command('docker', 'restart', names[role])
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            nodes = request('/api/nodes')
+            if len(nodes) == 2 and all(n['last_seen'] > before[n['id']] and
+                                      n['desired_revision'] == n['applied_revision'] and not n['error'] for n in nodes):
+                break
+            time.sleep(2)
+        else:
+            raise RuntimeError('gRPC reconnect after certificate renewal timed out')
+        result.update(invalid_certificate_candidate_rejected=True, certificate_reload=True,
+                      renewed_serial_verified=True, h2c_reconnect_after_reload=True)
         result.update(passed=True, tls_verification=True, untrusted_ca_rejected=True, cookie_flags=True,
                       cross_origin_rejected=True, csrf_required=True, web=True, shortcut_enrollment=True,
                       h2c_heartbeat_advanced=True, nodes=[{k: n[k] for k in ('role', 'desired_revision', 'applied_revision')} for n in nodes])
