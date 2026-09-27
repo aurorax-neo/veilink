@@ -35,7 +35,7 @@ SOURCE_URL 表示源码仓库，revision 表示提交。手动 workflow 同步�
 
 ### P1：协议、公网和容量覆盖
 
-5. **协议矩阵**：47 组合只覆盖有限 X25519/native 配置。8 个 Encryption+Vision 交叉、ML-KEM、xorpub/random、1rtt/0rtt、padding、票据恢复、IPv6、大 UDP、取消/恶意输入组合仍开放。关闭需扩展逐项矩阵与真实往返/race/取消结果；现有 HY2 半关闭修复不等于全部交叉通过。
+5. **协议矩阵（定向交叉已补齐，整体仍开放）**：本轮将 `TestProtocolMatrixRoundTrip` 从 62 扩至 70 个本机真实往返组合，补齐 TLS/REALITY 的 Encryption+Vision ×（smux/yamux/h2mux + UDP XUDP）8 个合法交叉；单次矩阵通过，耗时约 130 秒。仍未覆盖 ML-KEM、xorpub/random、1rtt/0rtt、padding、票据恢复、IPv6、大 UDP、完整取消/恶意输入笛卡尔积及公网路径。关闭整体项仍需逐项矩阵与真实往返/race/取消结果；本轮不宣称公网、WAN 或容量覆盖。
 6. **公网拨号候选/NAT**：本地配置已区分候选地址和监听，但真实公网端口转发、UDP NAT 超时、双栈、候选切换、L4 透传路径尚无证据。关闭需受控公网测试与每种路径证据。HTTP-only CDN 或终止业务 TLS 的代理不是支持路径，不把对称 NAT 打洞视为已实现功能。
 7. **性能复测/容量**：未复测不同 mux/pool、TLS/REALITY/HY2、大 UDP、连接数/CPU/内存与 WAN 基准。用户已有 `tests/perf/` 未跟踪材料保持不动，本轮不作为新结论。关闭需固定机器/版本/负载、重复对照与容量上限。
 8. **监控与审计运维**：心跳不等于业务可达性；当前日志/状态不替代外部业务探针、告警和审计留存。关闭需指标、阈值、留存/磁盘耗尽与告警演练；不把缺少批量 UI 功能直接列为阻止所有部署的缺陷。
@@ -47,8 +47,8 @@ SOURCE_URL 表示源码仓库，revision 表示提交。手动 workflow 同步�
 
 ## 本轮实际验证
 
-- `go test ./...`、`go vet ./...`：通过（部分使用 Go 缓存）。
-- `go test -race ./tests/deployment ./internal/cli`：通过。
+- `go test ./internal/tunnel -run '^TestProtocolMatrixRoundTrip$' -count=1 -timeout=10m`：70/70 组合通过，130.158 秒；包含新增 8 个 Encryption+Vision 交叉。
+- `tests/deployment/protocol-matrix.md` 已同步 70 组合分组和剩余覆盖边界。
 - `go test -tags=integration ./tests/integration -count=1`：通过，138.858 秒。
 - `cd frontend && node --test tests/*.mjs && npm run build`：32/32，通过 TypeScript/Vite 构建。UI 无变更，不重复截图。
 - 统一镜像 `veilink:gaps-audit` 构建通过，ID `de98426df409`；inspect 标签与二进制 version 对齐。

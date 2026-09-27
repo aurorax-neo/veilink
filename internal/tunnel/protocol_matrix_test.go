@@ -20,7 +20,6 @@ func TestProtocolMatrixRoundTrip(t *testing.T) {
 		{"plain", true, false}, {"hysteria2", false, false},
 		{"tls", true, false}, {"reality", true, false}, {"hysteria2", true, false},
 		{"tls", false, true}, {"reality", false, true},
-		// Bound the combined Encryption + Vision coverage to dedicated TCP.
 		{"tls", true, true}, {"reality", true, true},
 		{"xhttp-https", false, false}, {"xhttp-https", true, false}, {"xhttp-http", true, false},
 	}
@@ -31,9 +30,6 @@ func TestProtocolMatrixRoundTrip(t *testing.T) {
 	count := 0
 	for _, profile := range profiles {
 		for _, mode := range modes {
-			if profile.encryption && profile.vision && (mode.network != "tcp" || mode.mux != "") {
-				continue
-			}
 			count++
 			mux := mode.mux
 			if mux == "" {
@@ -127,7 +123,7 @@ func TestProtocolMatrixRoundTrip(t *testing.T) {
 			})
 		}
 	}
-	if count != 62 {
+	if count != 70 {
 		t.Fatalf("matrix size changed: %d", count)
 	}
 }
