@@ -1,0 +1,39 @@
+{
+  "verified": false,
+  "checks": {
+    "binary_sha256": false,
+    "process_node_id": true,
+    "process_role": true,
+    "binary_version": true,
+    "reported_version": true,
+    "reported_commit": true,
+    "api_node_id": true,
+    "not_revoked": true,
+    "process_stable": true
+  },
+  "expected": {
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "node_id": "OoKaTVQ6HWDT9j7qD-Iv1ZWnS_xornLbiydg_2rsfzQ",
+    "version": "dev",
+    "commit": "eb2f24181ccc75ce05abac3da76dc898ec3396bb"
+  },
+  "observed": {
+    "sha256": "3bc3e90ad3445e4ded4c7ba23d6e1df038474423f869c96c0c3cb6a757eaf479",
+    "node_id": "OoKaTVQ6HWDT9j7qD-Iv1ZWnS_xornLbiydg_2rsfzQ",
+    "role": "client",
+    "version_output": "veilink dev (eb2f24181ccc75ce05abac3da76dc898ec3396bb)"
+  },
+  "reported": {
+    "id": "OoKaTVQ6HWDT9j7qD-Iv1ZWnS_xornLbiydg_2rsfzQ",
+    "role": "client",
+    "software_version": "dev",
+    "software_commit": "eb2f24181ccc75ce05abac3da76dc898ec3396bb",
+    "last_seen": 1790476469
+  },
+  "trust_boundary": "Trusted Docker daemon/host and independently trusted expected binary digest; not remote attestation. Point-in-time only.",
+  "master": {
+    "commit": "eb2f24181ccc75ce05abac3da76dc898ec3396bb",
+    "version": "dev"
+  },
+  "container": "veilink-followup-client"
+}
