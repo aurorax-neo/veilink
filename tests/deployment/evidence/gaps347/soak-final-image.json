@@ -1,0 +1,191 @@
+{
+  "passed": true,
+  "duration_requested": 60,
+  "image": "veilink:gaps347",
+  "events": [
+    {
+      "seconds": 0.29,
+      "event": "master_ready",
+      "recovery_seconds": 0.04
+    },
+    {
+      "seconds": 11.13,
+      "event": "initial_convergence",
+      "recovery_seconds": 10.34
+    },
+    {
+      "seconds": 11.17,
+      "event": "initial_business",
+      "recovery_seconds": 0.04
+    },
+    {
+      "seconds": 11.21,
+      "event": "partition_started",
+      "role": "client",
+      "seconds_planned": 100
+    },
+    {
+      "seconds": 115.37,
+      "event": "partition_observed",
+      "heartbeat_age": 101.0,
+      "business_available": false
+    },
+    {
+      "seconds": 115.46,
+      "event": "offline_drift",
+      "desired": 4,
+      "applied": 3
+    },
+    {
+      "seconds": 134.1,
+      "event": "partition_recovered",
+      "recovery_seconds": 18.61
+    },
+    {
+      "seconds": 134.14,
+      "event": "partition_business_recovered",
+      "recovery_seconds": 0.04
+    },
+    {
+      "seconds": 134.27,
+      "event": "process_restart",
+      "role": "client"
+    },
+    {
+      "seconds": 142.58,
+      "event": "client_new_heartbeat",
+      "recovery_seconds": 8.31
+    },
+    {
+      "seconds": 142.62,
+      "event": "client_restart_converged",
+      "recovery_seconds": 0.04
+    },
+    {
+      "seconds": 142.65,
+      "event": "client_restart_business",
+      "recovery_seconds": 0.03
+    },
+    {
+      "seconds": 142.79,
+      "event": "process_restart",
+      "role": "server"
+    },
+    {
+      "seconds": 144.87,
+      "event": "server_new_heartbeat",
+      "recovery_seconds": 2.08
+    },
+    {
+      "seconds": 144.91,
+      "event": "server_restart_converged",
+      "recovery_seconds": 0.03
+    },
+    {
+      "seconds": 144.94,
+      "event": "server_restart_business",
+      "recovery_seconds": 0.03
+    },
+    {
+      "seconds": 145.08,
+      "event": "process_restart",
+      "role": "master"
+    },
+    {
+      "seconds": 145.16,
+      "event": "master_relogin",
+      "recovery_seconds": 0.08
+    },
+    {
+      "seconds": 155.5,
+      "event": "master_new_heartbeat",
+      "recovery_seconds": 10.34
+    },
+    {
+      "seconds": 155.53,
+      "event": "master_restart_converged",
+      "recovery_seconds": 0.03
+    },
+    {
+      "seconds": 155.57,
+      "event": "master_restart_business",
+      "recovery_seconds": 0.03
+    },
+    {
+      "seconds": 176.29,
+      "event": "rollout_converged",
+      "recovery_seconds": 20.65
+    },
+    {
+      "seconds": 176.33,
+      "event": "rollout_business",
+      "recovery_seconds": 0.04
+    },
+    {
+      "seconds": 206.95,
+      "event": "steady_cycle",
+      "mux": "off",
+      "nodes": [
+        {
+          "role": "client",
+          "desired_revision": 5,
+          "applied_revision": 5,
+          "last_seen": 1790475629
+        },
+        {
+          "role": "server",
+          "desired_revision": 5,
+          "applied_revision": 5,
+          "last_seen": 1790475627
+        }
+      ]
+    },
+    {
+      "seconds": 225.62,
+      "event": "rollout_converged",
+      "recovery_seconds": 18.63
+    },
+    {
+      "seconds": 225.66,
+      "event": "rollout_business",
+      "recovery_seconds": 0.04
+    },
+    {
+      "seconds": 256.39,
+      "event": "steady_cycle",
+      "mux": "smux",
+      "nodes": [
+        {
+          "role": "client",
+          "desired_revision": 6,
+          "applied_revision": 6,
+          "last_seen": 1790475679
+        },
+        {
+          "role": "server",
+          "desired_revision": 6,
+          "applied_revision": 6,
+          "last_seen": 1790475677
+        }
+      ]
+    }
+  ],
+  "roles": {
+    "master": {
+      "content": "3bc3e90ad3445e4ded4c7ba23d6e1df038474423f869c96c0c3cb6a757eaf479  /usr/local/bin/veilink",
+      "health": "healthy"
+    },
+    "server": {
+      "content": "3bc3e90ad3445e4ded4c7ba23d6e1df038474423f869c96c0c3cb6a757eaf479  /usr/local/bin/veilink",
+      "health": "healthy"
+    },
+    "client": {
+      "content": "3bc3e90ad3445e4ded4c7ba23d6e1df038474423f869c96c0c3cb6a757eaf479  /usr/local/bin/veilink",
+      "health": "healthy"
+    }
+  },
+  "cycles": 2,
+  "business_samples": 12,
+  "elapsed_seconds": 256.78,
+  "cleanup_remaining": ""
+}

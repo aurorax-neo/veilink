@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -216,7 +217,23 @@ func dialHysteria(ctx context.Context, addr, serverName string, local model.Loca
 		cleanup()
 		return nil, err
 	}
-	return &quicConn{Stream: stream, local: conn.LocalAddr(), remote: conn.RemoteAddr(), done: cleanup}, nil
+	graceful := func() {
+		go finishQUIC(ctx, conn.Context(), hysteriaQUIC.MaxIdleTimeout, cleanup)
+	}
+	return &quicConn{Stream: stream, local: conn.LocalAddr(), remote: conn.RemoteAddr(), done: cleanup, graceful: graceful}, nil
+}
+
+// The reverse server closes QUIC after consuming response FIN. Until then keep
+// queued bytes alive, bounded by runtime cancellation and the idle timeout.
+func finishQUIC(runtime, peer context.Context, timeout time.Duration, cleanup func()) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-peer.Done():
+	case <-runtime.Done():
+	case <-timer.C:
+	}
+	cleanup()
 }
 
 var hysteriaQUIC = &quic.Config{EnableDatagrams: true, MaxIdleTimeout: time.Minute}
@@ -226,14 +243,29 @@ type quicConn struct {
 	local, remote net.Addr
 	done          func()
 	once          sync.Once
+	graceful      func()
+	readEOF       atomic.Bool
 }
 
+func (c *quicConn) Read(p []byte) (int, error) {
+	n, err := c.Stream.Read(p)
+	if err == io.EOF {
+		c.readEOF.Store(true)
+	}
+	return n, err
+}
 func (c *quicConn) LocalAddr() net.Addr  { return c.local }
 func (c *quicConn) RemoteAddr() net.Addr { return c.remote }
+
+// QUIC Stream.Close sends FIN on the write direction only. Keep the connection
+// and read direction alive so a TCP half-close can still receive its response.
+func (c *quicConn) CloseWrite() error { return c.Stream.Close() }
 func (c *quicConn) Close() error {
 	err := c.Stream.Close()
 	c.once.Do(func() {
-		if c.done != nil {
+		if c.graceful != nil && c.readEOF.Load() {
+			c.graceful()
+		} else if c.done != nil {
 			c.done()
 		}
 	})

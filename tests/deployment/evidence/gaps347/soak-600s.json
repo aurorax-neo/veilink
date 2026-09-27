@@ -1,0 +1,452 @@
+{
+  "passed": true,
+  "duration_requested": 600,
+  "image": "veilink:version-ui",
+  "events": [
+    {
+      "seconds": 0.4,
+      "event": "master_ready",
+      "recovery_seconds": 0.04
+    },
+    {
+      "seconds": 11.3,
+      "event": "initial_convergence",
+      "recovery_seconds": 10.33
+    },
+    {
+      "seconds": 11.35,
+      "event": "initial_business",
+      "recovery_seconds": 0.05
+    },
+    {
+      "seconds": 11.39,
+      "event": "partition_started",
+      "role": "client",
+      "seconds_planned": 100
+    },
+    {
+      "seconds": 115.55,
+      "event": "partition_observed",
+      "heartbeat_age": 101.5,
+      "business_available": false
+    },
+    {
+      "seconds": 115.64,
+      "event": "offline_drift",
+      "desired": 4,
+      "applied": 3
+    },
+    {
+      "seconds": 132.19,
+      "event": "partition_recovered",
+      "recovery_seconds": 16.53
+    },
+    {
+      "seconds": 132.22,
+      "event": "partition_business_recovered",
+      "recovery_seconds": 0.03
+    },
+    {
+      "seconds": 132.33,
+      "event": "process_restart",
+      "role": "client"
+    },
+    {
+      "seconds": 132.36,
+      "event": "client_restart_converged",
+      "recovery_seconds": 0.03
+    },
+    {
+      "seconds": 132.39,
+      "event": "client_restart_business",
+      "recovery_seconds": 0.03
+    },
+    {
+      "seconds": 132.48,
+      "event": "process_restart",
+      "role": "server"
+    },
+    {
+      "seconds": 132.51,
+      "event": "server_restart_converged",
+      "recovery_seconds": 0.03
+    },
+    {
+      "seconds": 132.61,
+      "event": "server_restart_business",
+      "recovery_seconds": 0.11
+    },
+    {
+      "seconds": 132.72,
+      "event": "process_restart",
+      "role": "master"
+    },
+    {
+      "seconds": 132.8,
+      "event": "master_relogin",
+      "recovery_seconds": 0.07
+    },
+    {
+      "seconds": 132.83,
+      "event": "master_restart_converged",
+      "recovery_seconds": 0.03
+    },
+    {
+      "seconds": 132.85,
+      "event": "master_restart_business",
+      "recovery_seconds": 0.03
+    },
+    {
+      "seconds": 155.7,
+      "event": "rollout_converged",
+      "recovery_seconds": 22.78
+    },
+    {
+      "seconds": 155.73,
+      "event": "rollout_business",
+      "recovery_seconds": 0.03
+    },
+    {
+      "seconds": 186.38,
+      "event": "steady_cycle",
+      "mux": "off",
+      "nodes": [
+        {
+          "role": "server",
+          "desired_revision": 5,
+          "applied_revision": 5,
+          "last_seen": 1790473952
+        },
+        {
+          "role": "client",
+          "desired_revision": 5,
+          "applied_revision": 5,
+          "last_seen": 1790473952
+        }
+      ]
+    },
+    {
+      "seconds": 205.04,
+      "event": "rollout_converged",
+      "recovery_seconds": 18.62
+    },
+    {
+      "seconds": 205.07,
+      "event": "rollout_business",
+      "recovery_seconds": 0.03
+    },
+    {
+      "seconds": 235.75,
+      "event": "steady_cycle",
+      "mux": "smux",
+      "nodes": [
+        {
+          "role": "server",
+          "desired_revision": 6,
+          "applied_revision": 6,
+          "last_seen": 1790474002
+        },
+        {
+          "role": "client",
+          "desired_revision": 6,
+          "applied_revision": 6,
+          "last_seen": 1790474002
+        }
+      ]
+    },
+    {
+      "seconds": 254.37,
+      "event": "rollout_converged",
+      "recovery_seconds": 18.58
+    },
+    {
+      "seconds": 254.4,
+      "event": "rollout_business",
+      "recovery_seconds": 0.04
+    },
+    {
+      "seconds": 285.04,
+      "event": "steady_cycle",
+      "mux": "yamux",
+      "nodes": [
+        {
+          "role": "server",
+          "desired_revision": 7,
+          "applied_revision": 7,
+          "last_seen": 1790474052
+        },
+        {
+          "role": "client",
+          "desired_revision": 7,
+          "applied_revision": 7,
+          "last_seen": 1790474052
+        }
+      ]
+    },
+    {
+      "seconds": 303.77,
+      "event": "rollout_converged",
+      "recovery_seconds": 18.69
+    },
+    {
+      "seconds": 303.8,
+      "event": "rollout_business",
+      "recovery_seconds": 0.04
+    },
+    {
+      "seconds": 334.45,
+      "event": "steady_cycle",
+      "mux": "h2mux",
+      "nodes": [
+        {
+          "role": "server",
+          "desired_revision": 8,
+          "applied_revision": 8,
+          "last_seen": 1790474102
+        },
+        {
+          "role": "client",
+          "desired_revision": 8,
+          "applied_revision": 8,
+          "last_seen": 1790474102
+        }
+      ]
+    },
+    {
+      "seconds": 355.21,
+      "event": "rollout_converged",
+      "recovery_seconds": 20.72
+    },
+    {
+      "seconds": 355.25,
+      "event": "rollout_business",
+      "recovery_seconds": 0.04
+    },
+    {
+      "seconds": 385.92,
+      "event": "steady_cycle",
+      "mux": "off",
+      "nodes": [
+        {
+          "role": "server",
+          "desired_revision": 9,
+          "applied_revision": 9,
+          "last_seen": 1790474152
+        },
+        {
+          "role": "client",
+          "desired_revision": 9,
+          "applied_revision": 9,
+          "last_seen": 1790474152
+        }
+      ]
+    },
+    {
+      "seconds": 404.62,
+      "event": "rollout_converged",
+      "recovery_seconds": 18.67
+    },
+    {
+      "seconds": 404.65,
+      "event": "rollout_business",
+      "recovery_seconds": 0.03
+    },
+    {
+      "seconds": 435.22,
+      "event": "steady_cycle",
+      "mux": "smux",
+      "nodes": [
+        {
+          "role": "server",
+          "desired_revision": 10,
+          "applied_revision": 10,
+          "last_seen": 1790474202
+        },
+        {
+          "role": "client",
+          "desired_revision": 10,
+          "applied_revision": 10,
+          "last_seen": 1790474202
+        }
+      ]
+    },
+    {
+      "seconds": 453.78,
+      "event": "rollout_converged",
+      "recovery_seconds": 18.52
+    },
+    {
+      "seconds": 453.81,
+      "event": "rollout_business",
+      "recovery_seconds": 0.03
+    },
+    {
+      "seconds": 484.4,
+      "event": "steady_cycle",
+      "mux": "yamux",
+      "nodes": [
+        {
+          "role": "server",
+          "desired_revision": 11,
+          "applied_revision": 11,
+          "last_seen": 1790474252
+        },
+        {
+          "role": "client",
+          "desired_revision": 11,
+          "applied_revision": 11,
+          "last_seen": 1790474252
+        }
+      ]
+    },
+    {
+      "seconds": 505.04,
+      "event": "rollout_converged",
+      "recovery_seconds": 20.6
+    },
+    {
+      "seconds": 505.08,
+      "event": "rollout_business",
+      "recovery_seconds": 0.04
+    },
+    {
+      "seconds": 535.72,
+      "event": "steady_cycle",
+      "mux": "h2mux",
+      "nodes": [
+        {
+          "role": "server",
+          "desired_revision": 12,
+          "applied_revision": 12,
+          "last_seen": 1790474302
+        },
+        {
+          "role": "client",
+          "desired_revision": 12,
+          "applied_revision": 12,
+          "last_seen": 1790474302
+        }
+      ]
+    },
+    {
+      "seconds": 554.37,
+      "event": "rollout_converged",
+      "recovery_seconds": 18.61
+    },
+    {
+      "seconds": 554.4,
+      "event": "rollout_business",
+      "recovery_seconds": 0.03
+    },
+    {
+      "seconds": 585.04,
+      "event": "steady_cycle",
+      "mux": "off",
+      "nodes": [
+        {
+          "role": "server",
+          "desired_revision": 13,
+          "applied_revision": 13,
+          "last_seen": 1790474352
+        },
+        {
+          "role": "client",
+          "desired_revision": 13,
+          "applied_revision": 13,
+          "last_seen": 1790474352
+        }
+      ]
+    },
+    {
+      "seconds": 605.8,
+      "event": "rollout_converged",
+      "recovery_seconds": 20.72
+    },
+    {
+      "seconds": 605.83,
+      "event": "rollout_business",
+      "recovery_seconds": 0.03
+    },
+    {
+      "seconds": 636.53,
+      "event": "steady_cycle",
+      "mux": "smux",
+      "nodes": [
+        {
+          "role": "server",
+          "desired_revision": 14,
+          "applied_revision": 14,
+          "last_seen": 1790474402
+        },
+        {
+          "role": "client",
+          "desired_revision": 14,
+          "applied_revision": 14,
+          "last_seen": 1790474402
+        }
+      ]
+    },
+    {
+      "seconds": 655.22,
+      "event": "rollout_converged",
+      "recovery_seconds": 18.65
+    },
+    {
+      "seconds": 655.25,
+      "event": "rollout_business",
+      "recovery_seconds": 0.03
+    },
+    {
+      "seconds": 685.86,
+      "event": "steady_cycle",
+      "mux": "yamux",
+      "nodes": [
+        {
+          "role": "server",
+          "desired_revision": 15,
+          "applied_revision": 15,
+          "last_seen": 1790474452
+        },
+        {
+          "role": "client",
+          "desired_revision": 15,
+          "applied_revision": 15,
+          "last_seen": 1790474452
+        }
+      ]
+    },
+    {
+      "seconds": 704.48,
+      "event": "rollout_converged",
+      "recovery_seconds": 18.6
+    },
+    {
+      "seconds": 704.52,
+      "event": "rollout_business",
+      "recovery_seconds": 0.04
+    },
+    {
+      "seconds": 735.22,
+      "event": "steady_cycle",
+      "mux": "h2mux",
+      "nodes": [
+        {
+          "role": "client",
+          "desired_revision": 16,
+          "applied_revision": 16,
+          "last_seen": 1790474502
+        },
+        {
+          "role": "server",
+          "desired_revision": 16,
+          "applied_revision": 16,
+          "last_seen": 1790474502
+        }
+      ]
+    }
+  ],
+  "cycles": 12,
+  "business_samples": 72,
+  "elapsed_seconds": 735.22,
+  "cleanup_remaining": ""
+}

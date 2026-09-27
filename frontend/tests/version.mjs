@@ -25,6 +25,9 @@ test('software metadata comes from authenticated API, separate from configuratio
   assert.match(nodes, /已应用 r{{ node.applied_revision }}/)
   assert.match(nodes, /node.software_version \|\| '未上报'/)
   assert.doesNotMatch(nodes, /<th[^>]*>版本<\/th>/)
+  assert.match(nodes, /节点上报，未验真/)
+  assert.match(nodes, /tools\/verify-node\.py/)
+  assert.match(nodes, /独立可信的发布 SHA-256/)
 })
 
 test('software metadata failure is visible and retryable without breaking the console', async () => {

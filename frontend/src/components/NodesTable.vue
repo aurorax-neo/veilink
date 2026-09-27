@@ -80,7 +80,8 @@ async function run() {
     <section v-if="selected" class="node-detail" aria-label="节点详情">
       <header class="panel-head"><h2>{{ selected.name }}</h2><button class="btn quiet" type="button" @click="selectedId = ''">收起</button></header>
       <dl class="detail-grid"><div><dt>ID</dt><dd><code>{{ selected.id }}</code></dd></div><div><dt>心跳</dt><dd>{{ seenText(selected.last_seen) }}</dd></div></dl>
-      <dl class="detail-grid"><div><dt>软件版本（节点上报）</dt><dd>{{ selected.software_version || '未上报' }}</dd></div><div><dt>构建提交</dt><dd><code>{{ selected.software_commit || '未上报' }}</code></dd></div></dl>
+      <dl class="detail-grid"><div><dt>软件版本（节点上报，未验真）</dt><dd>{{ selected.software_version || '未上报' }}</dd></div><div><dt>构建提交（节点上报）</dt><dd><code>{{ selected.software_commit || '未上报' }}</code></dd></div></dl>
+      <p class="help">上报信息不等于二进制验真。请通过可信 Docker 管理通道运行 tools/verify-node.py，对照独立可信的发布 SHA-256、实际运行文件与管理 API；结果仅代表核验时刻。</p>
       <p v-if="selected.error" class="detail-error" role="status">{{ selected.error }}</p>
       <p v-if="selected.embedded" class="help">内置节点由管理中心维护；支持编辑配置，不支持快捷接入、吊销或删除。</p>
       <div v-if="!selected.embedded" class="actions"><button class="btn" type="button" :disabled="selected.revoked" @click="onboarding?.open(selected)">快捷接入</button><button class="btn danger" type="button" :disabled="selected.revoked" @click="ask(selected, 'revoke')">吊销节点</button></div>

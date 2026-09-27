@@ -1,0 +1,24 @@
+{
+  "passed": true,
+  "tls_verification": true,
+  "untrusted_ca_rejected": true,
+  "cookie_flags": true,
+  "cross_origin_rejected": true,
+  "csrf_required": true,
+  "web": true,
+  "shortcut_enrollment": true,
+  "h2c_heartbeat_advanced": true,
+  "nodes": [
+    {
+      "role": "server",
+      "desired_revision": 2,
+      "applied_revision": 2
+    },
+    {
+      "role": "client",
+      "desired_revision": 2,
+      "applied_revision": 2
+    }
+  ],
+  "cleanup_remaining": ""
+}

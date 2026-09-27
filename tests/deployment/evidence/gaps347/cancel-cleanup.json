@@ -1,0 +1,36 @@
+{
+  "passed": false,
+  "duration_requested": 60,
+  "image": "veilink:gaps347",
+  "events": [
+    {
+      "seconds": 0.19,
+      "event": "master_ready",
+      "recovery_seconds": 0.03
+    },
+    {
+      "seconds": 11.04,
+      "event": "initial_convergence",
+      "recovery_seconds": 10.36
+    },
+    {
+      "seconds": 11.09,
+      "event": "initial_business",
+      "recovery_seconds": 0.04
+    },
+    {
+      "seconds": 11.13,
+      "event": "partition_started",
+      "role": "client",
+      "seconds_planned": 100
+    },
+    {
+      "seconds": 14.97,
+      "event": "failure",
+      "error": "interrupted by signal 15"
+    }
+  ],
+  "error": "interrupted by signal 15",
+  "elapsed_seconds": 14.97,
+  "cleanup_remaining": ""
+}
