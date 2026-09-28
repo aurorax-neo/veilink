@@ -20,7 +20,7 @@ test('software metadata comes from authenticated API, separate from configuratio
   assert.equal(state.software.value.version, 'v1.2.3')
   assert.equal(state.versionError.value, false)
   const nodes = source('../src/components/NodesTable.vue')
-  assert.match(nodes, /配置修订/)
+  assert.match(nodes, /配置是否最新/)
   assert.match(nodes, /revisionLabel\(node\)/)
   assert.match(nodes, /更新状态/)
   assert.match(nodes, /node.software_version \|\| '未上报'/)

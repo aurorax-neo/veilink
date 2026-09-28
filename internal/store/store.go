@@ -553,6 +553,26 @@ func connectEndpoints(n model.Node) []model.ConnectEndpoint {
 	return []model.ConnectEndpoint{{ID: "primary", Name: "首选", Host: n.Address, Port: n.Port, Enabled: true}}
 }
 
+// Empty selection explicitly means all enabled candidates, in list order.
+func validEndpointSelection(n model.Node, id string) bool {
+	if id == "" {
+		return true
+	}
+	matches := 0
+	valid := false
+	for _, ep := range connectEndpoints(n) {
+		if ep.ID == id {
+			matches++
+			valid = ep.Enabled && host(ep.Host) && ep.Port > 0 && ep.Port <= 65535
+		}
+	}
+	return matches == 1 && valid
+}
+
+func mappingMatchesBinding(m model.Mapping, b model.Binding) bool {
+	return m.ServerID == b.ServerID && m.ClientID == b.ClientID && m.ConnectEndpointID == b.ConnectEndpointID
+}
+
 func validateConnectEndpoints(n model.Node) error {
 	seen := map[string]bool{}
 	enabled := 0
@@ -785,6 +805,9 @@ func (s *Store) Snapshot(id, credential string) (model.Snapshot, error) {
 		if !aok || !cok || a.Revoked || c.Revoked || (b.ServerID != id && b.ClientID != id) {
 			continue
 		}
+		if !validEndpointSelection(a, b.ConnectEndpointID) {
+			return model.Snapshot{}, ErrInvalid
+		}
 		b.UUID, e = auth.Open(s.key, st.Secrets[bid])
 		if e != nil {
 			return model.Snapshot{}, e
@@ -793,6 +816,9 @@ func (s *Store) Snapshot(id, credential string) (model.Snapshot, error) {
 		peers[b.ServerID] = true
 		for _, m := range st.Mappings {
 			if m.BindingID == bid {
+				if !mappingMatchesBinding(m, b) {
+					return model.Snapshot{}, ErrInvalid
+				}
 				out.Mappings = append(out.Mappings, m)
 			}
 		}
@@ -911,6 +937,14 @@ func mappingNet(s string) string {
 }
 
 func validate(st *state) error {
+	pairs := map[[3]string]bool{}
+	for _, b := range st.Bindings {
+		pair := [3]string{b.ServerID, b.ClientID, b.ConnectEndpointID}
+		if pairs[pair] || !validEndpointSelection(st.Nodes[b.ServerID], b.ConnectEndpointID) {
+			return ErrInvalid
+		}
+		pairs[pair] = true
+	}
 	for id, m := range st.Mappings {
 		if _, err := m.EffectiveMuxType(); err != nil {
 			return ErrInvalid
@@ -919,7 +953,7 @@ func validate(st *state) error {
 		if !ok || m.Name == "" || len(m.Name) > 128 || (m.Network != "" && m.Network != "tcp" && m.Network != "udp") || m.ListenPort < 1 || m.ListenPort > 65535 || m.TargetPort < 1 || m.TargetPort > 65535 || !host(m.TargetHost) || net.ParseIP(m.ListenHost) == nil {
 			return ErrInvalid
 		}
-		if m.ServerID != b.ServerID || m.ClientID != b.ClientID || m.Pool < 1 || m.Pool > 32 || st.Nodes[b.ServerID].Role != "server" || st.Nodes[b.ClientID].Role != "client" {
+		if !mappingMatchesBinding(m, b) || m.Pool < 1 || m.Pool > 32 || st.Nodes[b.ServerID].Role != "server" || st.Nodes[b.ClientID].Role != "client" {
 			return ErrInvalid
 		}
 		n := st.Nodes[b.ServerID]
@@ -966,17 +1000,17 @@ func (s *Store) SaveMapping(m model.Mapping) (model.Mapping, error) {
 	}
 	e := s.mutate("mapping.save", m.ID, func(st *state) error {
 		old := st.Mappings[m.ID]
-		if !validPair(st, m.ServerID, m.ClientID) {
+		if !validPair(st, m.ServerID, m.ClientID) || !validEndpointSelection(st.Nodes[m.ServerID], m.ConnectEndpointID) {
 			return ErrInvalid
 		}
 		for _, b := range st.Bindings {
-			if b.ServerID == m.ServerID && b.ClientID == m.ClientID {
+			if mappingMatchesBinding(m, b) {
 				m.BindingID = b.ID
 				break
 			}
 		}
 		if m.BindingID == "" {
-			b, err := s.createBinding(st, m.ServerID, m.ClientID)
+			b, err := s.createBinding(st, m.ServerID, m.ClientID, m.ConnectEndpointID)
 			if err != nil {
 				return err
 			}

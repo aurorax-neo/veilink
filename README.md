@@ -232,7 +232,7 @@ mkdir -p /opt/docker/veilink-server/config /opt/docker/veilink-server/data && ch
 
 **关键参数：** `-control-server-name` 开启并验证到 Master 的 HTTPS，`-master-addr` 是 `host:port`；只有 Master 使用私有 CA 时，才将 CA 放在 `config/master-ca.pem`，并在角色子命令后的 flags 中添加 `-control-ca /config/master-ca.pem`。`/data/state` 保留已获取的节点凭据与最后成功快照；后续重建容器无需再次提供 `-enroll-token`。令牌在启动命令、Shell 历史和 `docker inspect` 中可见；首次接入成功后，**保留 `/data`，删除原容器并以不含令牌的命令重建**。绝不把服务端隧道私钥或证书路径放在节点启动参数中。
 
-若节点通过可信内网直接连接 HTTP Master，将 `-master-addr` 改为可达的内网 `host:8443`，省略 `-control-server-name` 与 `-control-ca`，使用明文 gRPC/h2c。不要把 HTTP 直接暴露到不可信网络。当前 Web“快捷接入”仅接受 HTTPS 管理地址（可填 nginx 入口）；HTTP 直连使用此处的手工 flags，接入令牌可通过已认证且携带 CSRF token 的 `POST /api/nodes/{id}/enroll` 获取（JSON：`{"ttl_seconds":3600}`，手工 API 可选 1–86400 秒）。这一命令生成器限制不影响 HTTP 首次注册、登录和管理 API。
+若节点通过可信内网直接连接 HTTP Master，将 `-master-addr` 改为节点可达的内网 `host:8443`，省略 `-control-server-name` 与 `-control-ca`，使用明文 gRPC/h2c。Web“快捷接入”支持填写 `http://内网地址:8443`，生成的 Server/Client 命令会省略 TLS flags；选择 `https://` 时仍验证证书，可填 nginx HTTPS 入口。HTTP 传输不加密（包含接入令牌和节点凭据），切勿暴露到不可信网络；Master 默认只监听 `127.0.0.1:8443`，仅同主机可达，跨主机须显式配置可信内网监听地址或使用 HTTPS 反代。节点 `已应用 r0 → 期望 rN` 且 `最后在线：尚未上报` 表示它从未成功连接上报；生成命令不等于启动节点，应在节点机器运行并查看容器日志、网络可达性与修订上报。保留已有节点 `/data/state`，不要为清除待应用状态删除凭据或数据库。手工接入令牌仍可通过已认证且携带 CSRF token 的 `POST /api/nodes/{id}/enroll` 获取（JSON：`{"ttl_seconds":3600}`，手工 API 可选 1–86400 秒）。
 
 ### Client
 

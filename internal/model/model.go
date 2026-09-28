@@ -67,28 +67,30 @@ func (e *ConnectEndpoint) UnmarshalJSON(data []byte) error {
 }
 
 type Binding struct {
-	ID       string `json:"id"`
-	ServerID string `json:"server_id"`
-	ClientID string `json:"client_id"`
-	UUID     string `json:"uuid,omitempty"` // secret: snapshots only; redact admin responses
-	Domain   string `json:"domain"`
+	ID                string `json:"id"`
+	ServerID          string `json:"server_id"`
+	ClientID          string `json:"client_id"`
+	ConnectEndpointID string `json:"connect_endpoint_id,omitempty"`
+	UUID              string `json:"uuid,omitempty"` // secret: snapshots only; redact admin responses
+	Domain            string `json:"domain"`
 }
 
 type Mapping struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	BindingID  string `json:"binding_id,omitempty"`
-	ServerID   string `json:"server_id"`
-	ClientID   string `json:"client_id"`
-	ListenHost string `json:"listen_host"`
-	ListenPort int    `json:"listen_port"`
-	TargetHost string `json:"target_host"`
-	TargetPort int    `json:"target_port"`
-	Network    string `json:"network,omitempty"`
-	Pool       int    `json:"pool"`               // 1..32: shared sessions per binding (maximum of enabled mappings)
-	Mux        bool   `json:"mux"`                // TCP stream multiplexing; disabled by default
-	MuxType    string `json:"mux_type,omitempty"` // extensible implementation selector; ignored when mux is off
-	Enabled    bool   `json:"enabled"`
+	ID                string `json:"id"`
+	Name              string `json:"name"`
+	BindingID         string `json:"binding_id,omitempty"`
+	ServerID          string `json:"server_id"`
+	ClientID          string `json:"client_id"`
+	ConnectEndpointID string `json:"connect_endpoint_id,omitempty"`
+	ListenHost        string `json:"listen_host"`
+	ListenPort        int    `json:"listen_port"`
+	TargetHost        string `json:"target_host"`
+	TargetPort        int    `json:"target_port"`
+	Network           string `json:"network,omitempty"`
+	Pool              int    `json:"pool"`               // 1..32: shared sessions per binding (maximum of enabled mappings)
+	Mux               bool   `json:"mux"`                // TCP stream multiplexing; disabled by default
+	MuxType           string `json:"mux_type,omitempty"` // extensible implementation selector; ignored when mux is off
+	Enabled           bool   `json:"enabled"`
 }
 
 // Snapshot is an authorized per-node view. Nodes includes only related gateways.

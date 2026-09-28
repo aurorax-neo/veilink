@@ -141,7 +141,7 @@ function setupTable(role = 'server') {
   const requests = []
   const desk = reactive({ nodes: [], mappings: [], reload: async () => {}, notify: () => {} })
   const tableScript = tableSource.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import .*$/gm, '')
-  const context = vm.createContext({ exports: {}, computed, ref, inject: () => desk, deskKey: {}, defineProps: () => ({ role }), api: async (...args) => { requests.push(args) } })
+  const context = vm.createContext({ exports: {}, computed, ref, inject: () => desk, deskKey: {}, defineProps: () => ({ role }), onMounted: callback => callback(), onUnmounted: () => {}, setInterval: () => 7, clearInterval: () => {}, api: async (...args) => { requests.push(args) } })
   vm.runInContext(transpile(tableScript + '\nglobalThis.table = { tunnelLabel, effectiveSources, openConfig, ask, run, pending, configNode };'), context)
   return { ...context.table, desk, requests }
 }
@@ -331,7 +331,7 @@ test('API empty nested objects do not enable HY2 or REALITY; only server materia
   }
 })
 
-test('onboarding displays role-specific flag commands and blocks embedded or insecure generation', async () => {
+test('onboarding displays role-specific flag commands and accepts HTTP only for trusted networks', async () => {
   const requests = []; let opens = 0
   const onboardingScript = source('../src/components/NodeOnboarding.vue').match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import .*$/gm, '')
   const context = vm.createContext({
@@ -364,16 +364,20 @@ test('onboarding displays role-specific flag commands and blocks embedded or ins
   assert.match(e.result.value.warning, /-control-ca \/config\/ca.pem/)
   assert.match(source('../src/components/NodeOnboarding.vue'), /统一 veilink:latest 镜像.*server 或 client 子命令/)
   assert.match(source('../src/components/NodeOnboarding.vue'), /id="join-prepare"[^>]+:value="result.prepare"/)
-  e.masterURL.value = 'http://insecure.example'
-  await assert.rejects(e.generate(), /https:\/\//)
-  assert.equal(requests.length, 1)
+  e.masterURL.value = 'http://192.168.1.10:8443'
+  await e.generate()
+  assert.equal(JSON.stringify(requests[1][2]), JSON.stringify({ master_url: 'http://192.168.1.10:8443' }))
+  assert.match(source('../src/components/NodeOnboarding.vue'), /HTTP\/h2c 不加密，仅用于可信网络/)
+  e.masterURL.value = 'ftp://insecure.example'
+  await assert.rejects(e.generate(), /http:\/\/ 或 https:\/\//)
+  assert.equal(requests.length, 2)
   e.masterURL.value = 'https://master.example.com'
   e.open(embedded)
   assert.equal(e.result.value, null)
   assert.equal(e.node.value, null)
   assert.equal(opens, 1)
   await assert.rejects(e.generate(), /未选择节点/)
-  assert.equal(requests.length, 1)
+  assert.equal(requests.length, 2)
 })
 
 test('listen validation, NAT port independence, and transport copy stay explicit', async () => {

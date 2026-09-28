@@ -15,6 +15,9 @@ vm.runInContext(transpile(source('../src/format.ts')), format)
 function setup(response = { connected: true }, reload = async () => {}, role = 'server') {
   const calls = [], notices = []
   let reloads = 0
+  let tick = null
+  let unmount = null
+  let cleared = null
   const desk = {
     nodes: [], mappings: [],
     reload: async () => { reloads++; await reload() },
@@ -23,20 +26,33 @@ function setup(response = { connected: true }, reload = async () => {}, role = '
   const context = vm.createContext({
     exports: {}, computed, ref, Error, ...format.exports,
     defineProps: () => ({ role }), inject: () => desk, deskKey: {},
+    onMounted: callback => { tick = callback() },
+    onUnmounted: callback => { unmount = callback },
+    setInterval: callback => { tick = callback; return 7 },
+    clearInterval: id => { cleared = id },
     api: async (...args) => {
       calls.push(structuredClone(args))
       return typeof response === 'function' ? response(...args) : response
     },
   })
-  vm.runInContext(transpile(script + '\nglobalThis.state = { refreshNode, refreshing, revisionLabel, revisionDescription, saved };'), context)
-  return { ...context.state, calls, notices, get reloads() { return reloads } }
+  vm.runInContext(transpile(script + '\nglobalThis.state = { refreshNode, refreshing, revisionLabel, revisionDescription, saved, now };'), context)
+  return { ...context.state, calls, notices, tick: () => tick?.(), unmount: () => unmount?.(), get cleared() { return cleared }, get reloads() { return reloads } }
 }
-const node = { id: 'node/id', revoked: false, desired_revision: 4, applied_revision: 4, error: '' }
+const node = { id: 'node/id', revoked: false, desired_revision: 4, applied_revision: 4, last_seen: 1000, error: '' }
 const deferred = () => {
   let resolve
   const promise = new Promise(done => { resolve = done })
   return { promise, resolve }
 }
+test('node presence clock refreshes locally and clears its interval on unmount', () => {
+  const state = setup()
+  const before = state.now.value
+  assert.equal(state.cleared, null)
+  state.tick()
+  assert.ok(state.now.value >= before)
+  state.unmount()
+  assert.equal(state.cleared, 7)
+})
 
 test('server, client and embedded refresh encode IDs and report requests, not application', async () => {
   for (const role of ['server', 'client']) {
@@ -46,7 +62,7 @@ test('server, client and embedded refresh encode IDs and report requests, not ap
       await state.refreshNode(target)
       assert.deepEqual(state.calls, [['/nodes/node%2Fid/refresh', 'POST', {}]])
       assert.equal(state.reloads, 1)
-      assert.deepEqual(state.notices, [{ text: '已请求节点立即同步并上报，结果以节点上报为准', bad: false }])
+      assert.deepEqual(state.notices, [])
       assert.equal(state.refreshing.value.size, 0)
       assert.equal(target.applied_revision, 4)
     }
@@ -103,17 +119,23 @@ test('revoked nodes cannot refresh', async () => {
   assert.equal(state.reloads, 0)
   assert.equal(state.notices.length, 0)
   assert.equal(state.refreshing.value.size, 0)
-  assert.match(table, /:disabled="node\.revoked \|\| refreshing\.has\(node\.id\)" @click="refreshNode\(node\)"/)
+  assert.match(table, /:title="'已请求节点立即同步并上报，结果以节点上报为准'" :aria-label="'已请求节点立即同步并上报，结果以节点上报为准'"/)
 })
 
-test('revision labels distinguish synced, pending and failed states with accessible descriptions', () => {
+test('revision column shows only latest status and distinguishes pending, failure and missing heartbeat', () => {
   const state = setup()
-  assert.equal(state.revisionLabel({ ...node, applied_revision: 2 }), '已应用 r2 → 期望 r4')
-  assert.equal(state.revisionLabel({ ...node, error: 'failure' }), '已应用 r4 → 期望 r4')
-  assert.equal(state.revisionLabel(node), 'r4')
-  assert.match(state.revisionDescription({ ...node, applied_revision: 2 }), /待应用：已应用 r2，期望 r4/)
-  assert.match(state.revisionDescription({ ...node, error: 'failure' }), /应用失败/)
+  assert.equal(state.revisionLabel({ ...node, applied_revision: 2 }), '未同步')
+  assert.equal(state.revisionLabel({ ...node, error: 'failure' }), '应用失败')
+  assert.equal(state.revisionLabel(node), '最新')
+  assert.equal(state.revisionLabel({ ...node, revoked: true }), '不再同步')
+  assert.equal(state.revisionLabel({ ...node, desired_revision: 0 }), '尚无配置')
+  const unseen = { ...node, last_seen: 0, applied_revision: 0, desired_revision: 17 }
+  assert.equal(state.revisionLabel(unseen), '未上报')
+  assert.match(state.revisionDescription(unseen), /节点尚未上报心跳.*检查节点容器日志、Master 地址和网络连通性/)
+  assert.equal(state.revisionLabel({ ...unseen, last_seen: 1000 }), '未同步')
+  assert.match(table, /配置是否最新/)
   assert.match(table, /:title="revisionDescription\(node\)" :aria-label="revisionDescription\(node\)"/)
+  assert.doesNotMatch(table, /revision-value|已应用 r\$|期望 r\$/)
 })
 
 test('save confirmation awaits reported application rather than claiming success', async () => {

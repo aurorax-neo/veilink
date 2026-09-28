@@ -24,13 +24,16 @@ func TestJoinAddress(t *testing.T) {
 		{"https://panel.example", "panel.example:443", "panel.example"},
 		{"https://127.0.0.1:8080", "127.0.0.1:8080", "127.0.0.1"},
 		{"https://[::1]:8443/", "[::1]:8443", "::1"},
+		{"http://panel.example", "panel.example:80", ""},
+		{"http://192.168.1.10:8443", "192.168.1.10:8443", ""},
+		{"http://[::1]:8443/", "[::1]:8443", ""},
 	} {
 		a, n, e := joinAddress(tc.raw)
 		if e != nil || a != tc.address || n != tc.name {
 			t.Fatalf("%s: %s %s %v", tc.raw, a, n, e)
 		}
 	}
-	for _, raw := range []string{"", "localhost:8443", "ftp://host", "http://host", "http://127.0.0.1:8080", "https://user:pass@host", "https://host/api", "https://host?q=1", "https://host?", "https://host:0", "https://host:65536", "https://evil'$(id)", "https://host\n", "https://host/#x"} {
+	for _, raw := range []string{"", "localhost:8443", "ftp://host", "http://user:pass@host", "http://host/api", "http://host?q=1", "http://host/#x", "https://user:pass@host", "https://host/api", "https://host?q=1", "https://host?", "https://host:0", "https://host:65536", "https://evil'$(id)", "https://host\n", "https://host/#x"} {
 		if _, _, e := joinAddress(raw); e == nil {
 			t.Errorf("accepted %q", raw)
 		}
@@ -158,16 +161,22 @@ func TestJoinCommandAuthenticationRotationAndRevocation(t *testing.T) {
 	if _, err = s.Snapshot(n.ID, credential); err != nil {
 		t.Fatal("token revoke revoked active node", err)
 	}
-	for _, bad := range []string{`{"master_url":"https://host","ttl_seconds":1000000001}`, `{"master_url":"https://host;id"}`, `{"master_url":"http://host"}`, `{"master_url":"https://host","ttl_seconds":-1}`} {
+	for _, bad := range []string{`{"master_url":"https://host","ttl_seconds":1000000001}`, `{"master_url":"https://host;id"}`, `{"master_url":"ftp://host"}`, `{"master_url":"https://host","ttl_seconds":-1}`} {
 		if w = call("POST", path, bad); w.Code != 400 {
 			t.Fatal("accepted invalid join", w.Code)
 		}
+	}
+	body = `{"master_url":"http://192.168.1.10:8443","ttl_seconds":60}`
+	httpClient := generate()
+	if !strings.Contains(httpClient.Command, " -master-addr '192.168.1.10:8443'") || strings.Contains(httpClient.Command, "-control-server-name") || strings.Contains(httpClient.Command, "-control-ca") || !strings.Contains(httpClient.Warning, "HTTP/h2c 管理连接不加密") || strings.Contains(httpClient.Warning, "私有 Master CA") {
+		t.Fatal("HTTP client command must use h2c with an explicit warning", httpClient.Command, httpClient.Warning)
 	}
 	server, err := s.SaveNode(model.Node{Name: "join-server", Role: "server", Address: "example.com", Port: 8443})
 	if err != nil {
 		t.Fatal(err)
 	}
 	serverPath := "/api/nodes/" + server.ID + "/join"
+	body = `{"master_url":"https://panel.example:8443","ttl_seconds":60}`
 	w = call("POST", serverPath, body)
 	if w.Code != 200 {
 		t.Fatal(w.Code, w.Body.String())
@@ -185,6 +194,19 @@ func TestJoinCommandAuthenticationRotationAndRevocation(t *testing.T) {
 	if serverJoin.Command != serverExpected || strings.Contains(serverJoin.Command, " -p ") {
 		t.Fatal("server Docker network policy violated", serverJoin.Command)
 	}
+	body = `{"master_url":"http://192.168.1.10:8443","ttl_seconds":60}`
+	w = call("POST", serverPath, body)
+	if w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	var httpServer response
+	if err := json.Unmarshal(w.Body.Bytes(), &httpServer); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(httpServer.Command, " --net host") || !strings.Contains(httpServer.Command, " -master-addr '192.168.1.10:8443'") || strings.Contains(httpServer.Command, "-control-server-name") || strings.Contains(httpServer.Command, "-control-ca") {
+		t.Fatal("HTTP server command must use h2c and host network", httpServer.Command)
+	}
+	body = `{"master_url":"https://panel.example:8443","ttl_seconds":60}`
 	longID := strings.Repeat("x", 600)
 	longNode, err := s.SaveNode(model.Node{ID: longID, Name: "long-id", Role: "client"})
 	if err != nil {

@@ -20,8 +20,8 @@ func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'
 
 func joinAddress(raw string) (address, serverName string, err error) {
 	u, err := url.Parse(raw)
-	if err != nil || u == nil || u.Scheme != "https" || u.Opaque != "" || u.User != nil || u.Hostname() == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.ContainsAny(raw, "\r\n\t ") {
-		return "", "", fmt.Errorf("master_url must be an HTTPS origin")
+	if err != nil || u == nil || (u.Scheme != "https" && u.Scheme != "http") || u.Opaque != "" || u.User != nil || u.Hostname() == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.ContainsAny(raw, "\r\n\t ") {
+		return "", "", fmt.Errorf("master_url must be an HTTP or HTTPS origin")
 	}
 	host := u.Hostname()
 	if net.ParseIP(host) == nil {
@@ -33,13 +33,19 @@ func joinAddress(raw string) (address, serverName string, err error) {
 	}
 	port := u.Port()
 	if port == "" {
-		port = "443"
+		if u.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
 	}
 	n, err := strconv.Atoi(port)
 	if err != nil || n < 1 || n > 65535 {
 		return "", "", fmt.Errorf("invalid port")
 	}
-	serverName = host
+	if u.Scheme == "https" {
+		serverName = host
+	}
 	return net.JoinHostPort(host, port), serverName, nil
 }
 
@@ -98,10 +104,17 @@ func (a *API) joinCommand(w http.ResponseWriter, r *http.Request, id string) {
 	for _, v := range []struct{ flag, value string }{
 		{"-master-addr", address}, {"-node-id", id},
 		{"-enroll-token", token}, {"-state-dir", "/data/state"},
-		{"-control-server-name", serverName},
 	} {
 		command.WriteString(" " + v.flag + " " + shellQuote(v.value))
 	}
-	warning := "命令包含可重复使用的接入令牌，可能出现在 shell 历史和 Docker inspect 的容器参数中；请勿分享或记录日志。不再需要注册时请撤销令牌。接入成功后保留 /data 状态并重建不带令牌的容器，删除原容器前妥善保护主机访问。私有 Master CA 时，请将证书放入 " + config + "/ca.pem，并在角色子命令后添加 -control-ca /config/ca.pem；不要关闭 TLS 验证。"
+	if serverName != "" {
+		command.WriteString(" -control-server-name " + shellQuote(serverName))
+	}
+	warning := "命令包含可重复使用的接入令牌，可能出现在 shell 历史和 Docker inspect 的容器参数中；请勿分享或记录日志。不再需要注册时请撤销令牌。接入成功后保留 /data 状态并重建不带令牌的容器，删除原容器前妥善保护主机访问。"
+	if serverName == "" {
+		warning += "HTTP/h2c 管理连接不加密，仅用于可信网络；必须填写节点实际可达的 Master 地址，不能用另一台主机的 127.0.0.1。"
+	} else {
+		warning += "私有 Master CA 时，请将证书放入 " + config + "/ca.pem，并在角色子命令后添加 -control-ca /config/ca.pem；不要关闭 TLS 验证。"
+	}
 	output(w, 200, map[string]any{"prepare": prepare, "command": command.String(), "token": token, "expires_at": time.Now().Unix() + in.TTL, "warning": warning})
 }

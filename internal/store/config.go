@@ -207,8 +207,8 @@ func validPair(st *state, serverID, clientID string) bool {
 	return sok && cok && server.Role == "server" && client.Role == "client" && !server.Revoked && !client.Revoked
 }
 
-func (s *Store) createBinding(st *state, serverID, clientID string) (model.Binding, error) {
-	b := model.Binding{ID: auth.Token(), ServerID: serverID, ClientID: clientID}
+func (s *Store) createBinding(st *state, serverID, clientID, endpointID string) (model.Binding, error) {
+	b := model.Binding{ID: auth.Token(), ServerID: serverID, ClientID: clientID, ConnectEndpointID: endpointID}
 	b.Domain = "b-" + strings.ToLower(auth.Hash(b.ID)[:24]) + ".veilink.internal"
 	u := make([]byte, 16)
 	if _, err := rand.Read(u); err != nil {

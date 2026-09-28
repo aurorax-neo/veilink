@@ -147,6 +147,34 @@ func enabledEndpoints(gateway model.Node) []model.ConnectEndpoint {
 	return out
 }
 
+// bindingGateway restricts every protocol/session dial to the chosen candidate.
+// Never turn a stale or disabled explicit selection into automatic failover.
+func bindingGateway(gateway model.Node, b model.Binding) (model.Node, error) {
+	if gateway.ID != b.ServerID {
+		return model.Node{}, errors.New("binding references a foreign gateway")
+	}
+	if b.ConnectEndpointID == "" {
+		return gateway, nil
+	}
+	endpoints := gateway.ConnectEndpoints
+	if len(endpoints) == 0 {
+		endpoints = enabledEndpoints(gateway)
+	}
+	var selected model.ConnectEndpoint
+	matches := 0
+	for _, ep := range endpoints {
+		if ep.ID == b.ConnectEndpointID {
+			selected = ep
+			matches++
+		}
+	}
+	if matches != 1 || !selected.Enabled || !hostOK(selected.Host) || !portOK(selected.Port) {
+		return model.Node{}, errors.New("binding connect endpoint is missing, disabled or invalid")
+	}
+	gateway.ConnectEndpoints = []model.ConnectEndpoint{selected}
+	return gateway, nil
+}
+
 func (s *service) dialGateway(gateway model.Node, peer *clientGateway) (net.Conn, error) {
 	local := peer.local
 	if err := checkVLESS("client", local); err != nil {

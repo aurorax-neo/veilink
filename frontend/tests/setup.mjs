@@ -33,3 +33,10 @@ test('confirmation mismatch is not submitted',()=>{
  vm.runInContext(ts.transpileModule(text+'\npassword.value="long password";confirm.value="different";onSubmit();',{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.CommonJS}}).outputText,c)
  assert.equal(submitted,false)
 })
+test('login copy stays neutral about account identity', () => {
+ const view = readFileSync(new URL('../src/views/LoginView.vue', import.meta.url), 'utf8')
+ assert.match(view, /首次设置控制台登录账号/)
+ assert.match(view, /<label for="username">账号<\/label>/)
+ assert.match(view, /创建账号/)
+ assert.doesNotMatch(view, /管理员/)
+})

@@ -85,12 +85,13 @@ func validate(s model.Snapshot, local model.LocalTLS) error {
 	bindings := map[string]model.Binding{}
 	domains := map[string]bool{}
 	users := map[string]bool{}
-	pairs := map[string]bool{}
+	pairs := map[[3]string]bool{}
 	for _, b := range s.Bindings {
 		if !identifier.MatchString(b.ID) || !identifier.MatchString(b.ServerID) || !identifier.MatchString(b.ClientID) || !uuidPattern.MatchString(b.UUID) || !hostOK(b.Domain) || net.ParseIP(b.Domain) != nil || !strings.Contains(b.Domain, ".") {
 			return bad("binding identity or domain")
 		}
-		if _, ok := bindings[b.ID]; ok || domains[b.Domain] || users[strings.ToLower(b.UUID)] || pairs[b.ServerID+"/"+b.ClientID] {
+		pair := [3]string{b.ServerID, b.ClientID, b.ConnectEndpointID}
+		if _, ok := bindings[b.ID]; ok || domains[b.Domain] || users[strings.ToLower(b.UUID)] || pairs[pair] {
 			return bad("duplicate binding, domain, identity or association")
 		}
 		if s.Node.Role == "server" && b.ServerID != s.Node.ID || s.Node.Role == "client" && b.ClientID != s.Node.ID {
@@ -99,6 +100,10 @@ func validate(s model.Snapshot, local model.LocalTLS) error {
 		n, ok := gateways[b.ServerID]
 		if !ok {
 			return bad("missing gateway")
+		}
+		n, err := bindingGateway(n, b)
+		if err != nil {
+			return bad(err.Error())
 		}
 		if s.Node.Role == "client" && len(enabledEndpoints(n)) == 0 {
 			return bad("gateway has no enabled connect endpoint")
@@ -111,7 +116,7 @@ func validate(s model.Snapshot, local model.LocalTLS) error {
 		bindings[b.ID] = b
 		domains[b.Domain] = true
 		users[strings.ToLower(b.UUID)] = true
-		pairs[b.ServerID+"/"+b.ClientID] = true
+		pairs[pair] = true
 	}
 	type endpoint struct {
 		host    string
@@ -157,6 +162,9 @@ func validate(s model.Snapshot, local model.LocalTLS) error {
 		names[m.Name] = true
 		if _, ok := bindings[m.BindingID]; !ok {
 			return bad("mapping references missing binding")
+		}
+		if m.ConnectEndpointID != bindings[m.BindingID].ConnectEndpointID {
+			return bad("mapping connect endpoint differs from binding")
 		}
 		if m.Pool < 1 || m.Pool > 32 {
 			return bad("mapping pool must be from 1 to 32")

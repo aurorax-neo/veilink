@@ -61,6 +61,7 @@ export interface Mapping {
   name: string
   server_id: string
   client_id: string
+  connect_endpoint_id?: string
   pool: number
   mux: boolean
   mux_type?: string

@@ -15,18 +15,33 @@ const editor = ref<InstanceType<typeof Modal> | null>(null)
 const confirm = ref<InstanceType<typeof Modal> | null>(null)
 const pending = ref<Mapping | null>(null)
 const action = ref<'toggle' | 'delete'>('toggle')
-const draft = reactive({ id: '', name: '', serverId: '', clientId: '', pool: 1, listenHost: '0.0.0.0', listenPort: '', targetHost: '', targetPort: '', network: 'tcp', enabled: true })
+const draft = reactive({ id: '', name: '', serverId: '', clientId: '', connectEndpointId: '', pool: 1, listenHost: '0.0.0.0', listenPort: '', targetHost: '', targetPort: '', network: 'tcp', enabled: true })
 const defaultMuxType = 'smux'
 const muxType = ref('')
 watch(() => draft.network, network => { if (network !== 'tcp') muxType.value = '' }, { flush: 'sync' })
 const servers = computed(() => desk.nodes.filter(n => n.role === 'server' && !n.revoked))
 const clients = computed(() => desk.nodes.filter(n => n.role === 'client' && !n.revoked))
+function connectionOptions(serverId: string) {
+  const server = servers.value.find(node => node.id === serverId)
+  if (!server) return []
+  const candidates = server.connect_endpoints?.length ? server.connect_endpoints : server.address && server.port ? [{ id: 'primary', name: '首选地址', host: server.address, port: server.port, enabled: true }] : []
+  return candidates.filter(candidate => candidate.enabled)
+}
+const connections = computed(() => connectionOptions(draft.serverId))
+const missingConnection = computed(() => !!draft.connectEndpointId && !connections.value.some(candidate => candidate.id === draft.connectEndpointId))
+watch(() => draft.serverId, () => { draft.connectEndpointId = connections.value[0]?.id || '' }, { flush: 'sync' })
+function connectionLabel(mapping: Mapping) {
+  if (!mapping.connect_endpoint_id) return '自动按服务端地址顺序切换'
+  const candidate = connectionOptions(mapping.server_id).find(item => item.id === mapping.connect_endpoint_id)
+  return candidate ? `${candidate.name} · ${endpoint(candidate.host, candidate.port)}` : '连接地址不可用，请重新选择'
+}
 const rows = computed(() => desk.mappings.filter(m => (filter.value === 'all' || m.enabled === (filter.value === 'on')) && [m.name, m.listen_host, m.target_host, nodeName(desk.nodes, m.server_id), nodeName(desk.nodes, m.client_id)].join(' ').toLowerCase().includes(query.value.trim().toLowerCase())))
 function fields(m: Mapping) {
-  return { id: m.id, name: m.name, serverId: m.server_id, clientId: m.client_id, pool: m.pool || 1, listenHost: m.listen_host, listenPort: String(m.listen_port), targetHost: m.target_host, targetPort: String(m.target_port), network: m.network || 'tcp', enabled: m.enabled }
+  return { id: m.id, name: m.name, serverId: m.server_id, clientId: m.client_id, connectEndpointId: m.connect_endpoint_id || '', pool: m.pool || 1, listenHost: m.listen_host, listenPort: String(m.listen_port), targetHost: m.target_host, targetPort: String(m.target_port), network: m.network || 'tcp', enabled: m.enabled }
 }
 function open(mapping?: Mapping) {
   Object.assign(draft, mapping ? fields(mapping) : { id: '', name: '', serverId: servers.value[0]?.id || '', clientId: clients.value[0]?.id || '', pool: 1, listenHost: '0.0.0.0', listenPort: '', targetHost: '127.0.0.1', targetPort: '', network: 'tcp', enabled: true })
+  draft.connectEndpointId = mapping ? mapping.connect_endpoint_id || '' : connections.value[0]?.id || ''
   muxType.value = draft.network === 'tcp' && mapping?.mux ? mapping.mux_type || defaultMuxType : ''
   editor.value?.open()
 }
@@ -36,6 +51,7 @@ async function save() {
   await api(draft.id ? `/mappings/${encodeURIComponent(draft.id)}` : '/mappings', draft.id ? 'PUT' : 'POST', {
     name: draft.name.trim(), server_id: draft.serverId, client_id: draft.clientId, pool: draft.pool, mux: draft.network === 'tcp' && muxType.value !== '',
     mux_type: draft.network === 'tcp' ? muxType.value : '',
+    connect_endpoint_id: draft.connectEndpointId,
     listen_host: draft.listenHost.trim(), listen_port: Number(draft.listenPort), target_host: draft.targetHost.trim(), target_port: Number(draft.targetPort), network: draft.network, enabled: draft.enabled,
   })
   await desk.reload(); desk.notify('映射已保存。')
@@ -72,7 +88,7 @@ async function run() {
         <thead><tr><th scope="col">名称</th><th scope="col">服务端 → 客户端</th><th scope="col">路径</th><th scope="col">Pool</th><th scope="col">状态</th><th scope="col">操作</th></tr></thead>
         <tbody><tr v-for="mapping in rows" :key="mapping.id">
           <td><strong>{{ mapping.name }}</strong><Badge :text="(mapping.network || 'tcp').toUpperCase()" /></td>
-          <td>{{ nodeName(desk.nodes, mapping.server_id) }}<small>→ {{ nodeName(desk.nodes, mapping.client_id) }}</small></td>
+          <td>{{ nodeName(desk.nodes, mapping.server_id) }}<small>→ {{ nodeName(desk.nodes, mapping.client_id) }}</small><small>隧道入口：{{ connectionLabel(mapping) }}</small></td>
           <td><code>{{ endpoint(mapping.listen_host, mapping.listen_port) }}</code><small>→ <code>{{ endpoint(mapping.target_host, mapping.target_port) }}</code></small></td>
           <td>{{ mapping.pool || 1 }}<small>{{ mapping.network === 'udp' ? 'XUDP' : mapping.mux ? (mapping.mux_type || 'smux') : 'mux 关闭' }}</small></td><td><Badge :text="mapping.enabled ? '启用' : '停用'" :tone="mapping.enabled ? 'good' : ''" /></td>
           <td><div class="actions"><button type="button" class="btn small" @click="open(mapping)">编辑</button><button type="button" class="btn small" @click="ask(mapping, 'toggle')">{{ mapping.enabled ? '停用' : '启用' }}</button><button type="button" class="btn small danger" @click="ask(mapping, 'delete')">删除</button></div></td>
@@ -87,6 +103,15 @@ async function run() {
       <div><label for="map-server">服务端</label><select id="map-server" v-model="draft.serverId" required :disabled="!servers.length"><option value="" disabled>请选择</option><option v-for="node in servers" :key="node.id" :value="node.id">{{ node.name }}</option></select></div>
       <div><label for="map-client">客户端</label><select id="map-client" v-model="draft.clientId" required :disabled="!clients.length"><option value="" disabled>请选择</option><option v-for="node in clients" :key="node.id" :value="node.id">{{ node.name }}</option></select></div>
     </div>
+    <label for="map-connection">客户端连接服务端的地址</label>
+    <select id="map-connection" v-model="draft.connectEndpointId" :disabled="!connections.length" aria-describedby="map-connection-help" :aria-invalid="missingConnection">
+      <option value="">自动按服务端地址顺序切换</option>
+      <option v-if="missingConnection" :value="draft.connectEndpointId" disabled>原连接地址不可用，请重新选择</option>
+      <option v-for="candidate in connections" :key="candidate.id" :value="candidate.id">{{ candidate.name }} · {{ endpoint(candidate.host, candidate.port) }}</option>
+    </select>
+    <p id="map-connection-help" class="help">用于 Client 建立到 Server 的隧道，不是映射监听地址或内网目标。指定入口后只连接该地址；选择自动时按服务端启用地址顺序切换。协议、证书信任和密钥仍由服务端统一下发。</p>
+    <p v-if="!connections.length" class="error" role="status">所选服务端没有启用的连接地址，请先编辑服务端。</p>
+    <p v-else-if="missingConnection" class="error" role="status">原连接地址已停用或删除，请重新选择后保存。</p>
     <div class="grid-2">
       <div><label for="map-network">协议</label><select id="map-network" v-model="draft.network"><option value="tcp">TCP</option><option value="udp">UDP</option></select></div>
       <div><label for="map-pool">Pool</label><select id="map-pool" v-model.number="draft.pool"><option v-for="n in 32" :key="n" :value="n">{{ n }}</option></select></div>

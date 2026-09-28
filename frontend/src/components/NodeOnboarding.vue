@@ -28,8 +28,8 @@ function clear() { result.value = null; status.value = ''; copyError.value = '' 
 async function generate() {
   if (node.value?.embedded) throw new Error('内置节点不支持快捷接入。')
   let url: URL
-  try { url = new URL(masterURL.value.trim()) } catch { throw new Error('请输入完整的 https:// 地址。') }
-  if (url.protocol !== 'https:' || url.username || url.password || url.hash || url.search || (url.pathname !== '/' && url.pathname !== '')) throw new Error('地址须使用 https://，不能含路径、凭据、查询或片段。')
+  try { url = new URL(masterURL.value.trim()) } catch { throw new Error('请输入完整的 http:// 或 https:// 地址。') }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash || url.search || (url.pathname !== '/' && url.pathname !== '') || /[\r\n\t ]/.test(masterURL.value)) throw new Error('地址须使用 http:// 或 https://，不能含路径、凭据、查询或片段。')
   if (!node.value) throw new Error('未选择节点。')
   const response = await api<JoinResult>(`/nodes/${encodeURIComponent(node.value.id)}/join`, 'POST', { master_url: masterURL.value.trim() })
   if (!response.prepare || !response.command || !response.token || !Number.isFinite(response.expires_at)) throw new Error('接入响应不完整，请重试。')
@@ -57,8 +57,8 @@ defineExpose({ open })
   <Modal ref="modal" :title="`快捷接入 · ${node?.name || ''}`" save-label="生成命令" :hide-save="!!result" :submit="generate" @close="clear">
     <p class="help">在已安装 Docker 且已准备统一 veilink:latest 镜像的节点上执行，以 server 或 client 子命令选择角色。请先执行目录准备命令，再执行 Docker 接入命令。</p>
     <label for="join-master">管理地址</label>
-    <input id="join-master" v-model="masterURL" type="url" required :disabled="!!result" placeholder="https://master.example.com:8443" />
-    <small class="help">须含 https://；填写节点可达的管理地址及端口，证书须匹配主机名。</small>
+    <input id="join-master" v-model="masterURL" type="url" required :disabled="!!result" placeholder="http://192.168.1.10:8443" />
+    <small class="help">填写节点实际可达的管理地址（http:// 或 https://）及端口；HTTP/h2c 不加密，仅用于可信网络，跨主机不能填写 Master 的 127.0.0.1。HTTPS 证书须匹配主机名。</small>
     <p class="help">接入令牌在有效期内可重复用于此节点；重新生成会替换旧令牌，撤销或过期后不能再接入。</p>
     <p v-if="result?.warning" class="warning" role="note">{{ result.warning }}</p>
     <template v-if="result">

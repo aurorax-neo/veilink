@@ -62,7 +62,7 @@ async function refresh() {
               <button v-if="versionError" type="button" class="btn small" @click="loadVersion">重试</button>
             </div>
           </details>
-          <span class="who">{{ account || '管理员会话' }}</span>
+          <span class="who">{{ account || '当前账号' }}</span>
           <button type="button" class="btn quiet" @click="emit('logout')">退出登录</button>
         </div>
       </header>
@@ -73,7 +73,7 @@ async function refresh() {
           </div>
           <button type="button" class="btn" :disabled="desk.loading" @click="refresh">{{ desk.loading ? '刷新中…' : '刷新' }}</button>
         </div>
-        <p v-if="desk.notice" class="notice" :class="{ bad: desk.noticeBad }" role="status">{{ desk.notice }}</p>
+        <div class="notice-layer" aria-live="polite" aria-atomic="true"><div v-if="desk.notice" class="notice toast" :class="{ bad: desk.noticeBad }"><span>{{ desk.notice }}</span><button type="button" class="icon-btn" aria-label="关闭提示" @click="desk.notice = ''">×</button></div></div>
         <DashboardView v-if="page === 'dashboard'" />
         <ServersView v-else-if="page === 'servers'" />
         <ClientsView v-else-if="page === 'clients'" />

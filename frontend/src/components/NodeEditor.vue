@@ -6,12 +6,15 @@ import type { ConnectEndpoint, Node, TunnelConfig } from '../types'
 import Modal from './Modal.vue'
 import SecretField from './SecretField.vue'
 
-const props = defineProps<{ role: 'server' | 'client'; saved: () => Promise<void> }>()
+const props = defineProps<{ role: 'server' | 'client'; saved: () => Promise<void>; defaultName?: string }>()
 const modal = ref<InstanceType<typeof Modal> | null>(null)
 const server = computed(() => props.role === 'server')
 const draft = reactive({ id: '', name: '', address: '', port: '443', listenPort: '443', protocol: 'vless' as 'vless' | 'hysteria2', transport: 'tcp' as 'tcp' | 'xhttp' | 'quic' | 'hysteria2', security: 'tls', flow: '', enc: '', cert: '', key: '', ca: '', listen: '', dest: '', privateKey: '', shortIDs: '', names: '', password: '', xhttpPath: '/veilink/', xhttpTLS: true })
 const endpoints = reactive<ConnectEndpoint[]>([])
-function addEndpoint() { endpoints.push({ id: `endpoint-${Date.now()}-${endpoints.length}`, name: '备用地址', host: '', port: 443, enabled: true }) }
+let endpointPortAuto = true
+let endpointPortDefault = '443'
+function addEndpoint(host = '127.0.0.1', port = Number(draft.listenPort) || 443) { endpoints.push({ id: `endpoint-${Date.now()}-${endpoints.length}`, name: endpoints.length ? '备用地址' : '首选地址', host, port, enabled: true }) }
+function markEndpointPortEdited(index: number) { if (index === 0) endpointPortAuto = false }
 function removeEndpoint(index: number) { if (endpoints.length > 1) endpoints.splice(index, 1) }
 let original: TunnelConfig = {}
 const session = ref(0)
@@ -23,6 +26,13 @@ watch(() => draft.protocol, protocol => {
 }, { flush: 'sync' })
 watch(() => draft.transport, transport => { if (transport === 'quic' || transport === 'hysteria2') { draft.protocol = 'hysteria2'; draft.transport = 'quic'; draft.security = 'tls' } }, { flush: 'sync' })
 watch(() => draft.security, security => { if (security === 'reality' && draft.transport === 'xhttp') draft.xhttpTLS = false }, { flush: 'sync' })
+watch(() => draft.listenPort, value => {
+  if (!server.value || !endpointPortAuto || !/^\d+$/.test(value)) return
+  const primary = endpoints[0]
+  if (!primary || String(primary.port) !== endpointPortDefault) return
+  primary.port = Number(value)
+  endpointPortDefault = value
+}, { flush: 'sync' })
 type PEMField = 'cert' | 'key' | 'ca'
 const pemLabels = { cert: '证书 PEM', key: '私钥 PEM', ca: 'CA PEM（可选）' }
 const pemFields = computed<PEMField[]>(() => !server.value ? [] : (draft.protocol === 'hysteria2' || draft.security === 'tls') ? ['cert', 'key', 'ca'] : draft.transport === 'xhttp' && draft.xhttpTLS ? ['ca'] : [])
@@ -100,19 +110,22 @@ function open(node?: Node) {
   clearSecrets()
   original = structuredClone(node?.tunnel ? JSON.parse(JSON.stringify(node.tunnel)) : {})
   const t = original
+  const listenPort = String(t.listen_port || node?.port || 443)
   const savedEndpoints = node?.connect_endpoints?.length ? node.connect_endpoints : node?.address ? [{ id: 'primary', name: '首选地址', host: node.address, port: node.port || 443, enabled: true }] : []
   endpoints.splice(0, endpoints.length, ...savedEndpoints.map(endpoint => ({ ...endpoint })))
-  if (!endpoints.length && server.value) addEndpoint()
+  endpointPortAuto = !node && !savedEndpoints.length
+  endpointPortDefault = listenPort
   Object.assign(draft, {
-    id: node?.id || '', name: node?.name || '', address: node?.address || '', port: String(node?.port || 443), listenPort: String(t.listen_port || node?.port || 443),
+    id: node?.id || '', name: node?.name || (props.defaultName || '1'), address: node?.address || '', port: String(node?.port || 443), listenPort,
     protocol: t.protocol || (t.hysteria2?.password ? 'hysteria2' : 'vless'),
     transport: t.protocol === 'hysteria2' || (!t.protocol && t.hysteria2?.password) ? 'quic' : t.xhttp?.path ? 'xhttp' : 'tcp',
     security: t.protocol === 'hysteria2' || t.hysteria2?.password ? 'tls' : t.reality && Object.values(t.reality).some(Boolean) ? 'reality' : t.transport_security === 'plain' ? 'encryption' : 'tls',
-    flow: t.flow || '', enc: t.decryption || '', cert: t.cert_pem || '', key: t.key_pem || '', ca: t.ca_pem || '', listen: t.listen_host || '',
+    flow: t.flow || '', enc: t.decryption || '', cert: t.cert_pem || '', key: t.key_pem || '', ca: t.ca_pem || '', listen: node ? (t.listen_host || '') : '0.0.0.0',
     dest: t.reality?.dest || '', privateKey: t.reality?.private_key || '',
     shortIDs: t.reality?.short_ids || '', names: t.reality?.server_names || '', password: t.hysteria2?.password || '',
     xhttpPath: t.xhttp?.path || '/veilink/', xhttpTLS: t.xhttp?.tls ?? true,
   })
+  if (!endpoints.length && server.value) addEndpoint()
   if (!flowAllowed.value) draft.flow = ''
   modal.value?.open()
 }
@@ -185,7 +198,7 @@ defineExpose({ open })
       <section :key="session" aria-label="服务端配置">
         <h3>本地绑定</h3>
         <div class="grid-2">
-          <div><label for="node-listen">监听地址（IP）</label><input id="node-listen" v-model="draft.listen" placeholder="默认 127.0.0.1；公网监听可填 0.0.0.0" /></div>
+          <div><label for="node-listen">监听地址（IP）</label><input id="node-listen" v-model="draft.listen" placeholder="默认 0.0.0.0；仅本机监听可填 127.0.0.1" /></div>
           <div><label for="node-listen-port">监听端口</label><input id="node-listen-port" v-model="draft.listenPort" type="number" min="1" max="65535" required /></div>
         </div>
         <small class="help">Server 只绑定这里的 IP、端口和传输网络；与客户端连接地址分离。</small>
@@ -193,10 +206,10 @@ defineExpose({ open })
         <small class="help">这里填写 Client 拨号使用的可达主机（域名或 IP）与端口，可与 Server 本地绑定地址不同。TLS 证书须覆盖该域名或 IP；REALITY 使用伪装域名。多候选按列表顺序失败切换。</small>
         <div v-for="(endpoint, index) in endpoints" :key="endpoint.id" class="panel paired-fields">
           <div><label :for="`endpoint-${index}-name`">名称</label><input :id="`endpoint-${index}-name`" v-model="endpoint.name" /></div>
-          <div class="grid-2"><div><label :for="`endpoint-${index}-host`">主机/域名</label><input :id="`endpoint-${index}-host`" v-model="endpoint.host" placeholder="域名或 IP" /></div><div><label :for="`endpoint-${index}-port`">端口</label><input :id="`endpoint-${index}-port`" v-model="endpoint.port" type="number" min="1" max="65535" /></div></div>
+          <div class="grid-2"><div><label :for="`endpoint-${index}-host`">主机/域名</label><input :id="`endpoint-${index}-host`" v-model="endpoint.host" placeholder="默认 127.0.0.1" /></div><div><label :for="`endpoint-${index}-port`">端口</label><input :id="`endpoint-${index}-port`" v-model="endpoint.port" type="number" min="1" max="65535" @input="markEndpointPortEdited(index)" /></div></div>
           <div class="actions"><label :for="`endpoint-${index}-enabled`"><input :id="`endpoint-${index}-enabled`" v-model="endpoint.enabled" type="checkbox" /> 启用</label><button type="button" class="btn small danger" :disabled="endpoints.length === 1" @click="removeEndpoint(index)">删除</button></div>
         </div>
-        <button type="button" class="btn small" @click="addEndpoint">添加连接地址</button>
+        <button type="button" class="btn small" @click="addEndpoint()">添加连接地址</button>
         <small class="warning">TCP / Hysteria2 须 L4 透传；XHTTP packet-up 可走 HTTP/HTTPS CDN，允许边缘终止 TLS，但须路径透传、禁用缓存、流式下行及足够的超时。不保证任意公网 CDN 可用。</small>
         <div class="grid-2">
           <div><label for="node-protocol">协议</label><select id="node-protocol" v-model="draft.protocol"><option value="vless">VLESS</option><option value="hysteria2">Hysteria2</option></select></div>

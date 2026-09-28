@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, inject, ref } from 'vue'
+import { computed, inject, onMounted, onUnmounted, ref } from 'vue'
 import { api } from '../api'
 import { deskKey } from '../desk'
 import { endpoint, needsAttention, presence, revisionState, seenText } from '../format'
@@ -23,7 +23,22 @@ const configNode = ref<Node | null>(null)
 const action = ref<'revoke' | 'delete'>('delete')
 const label = computed(() => props.role === 'server' ? '服务端' : '客户端')
 const refreshing = ref(new Set<string>())
-const rows = computed(() => desk.nodes.filter(n => n.role === props.role && [n.name, n.id, n.address, n.error].join(' ').toLowerCase().includes(query.value.trim().toLowerCase())).sort((a, b) => Number(needsAttention(b)) - Number(needsAttention(a)) || a.name.localeCompare(b.name, 'zh-CN')))
+const now = ref(Date.now())
+let clockTimer: ReturnType<typeof setInterval> | undefined
+onMounted(() => {
+  clockTimer = setInterval(() => { now.value = Date.now() }, 1000)
+})
+onUnmounted(() => {
+  if (clockTimer) clearInterval(clockTimer)
+  clockTimer = undefined
+})
+const defaultName = computed(() => {
+  const used = new Set(desk.nodes.filter(node => node.role === props.role).map(node => node.name.trim()))
+  let number = 1
+  while (used.has(String(number))) number++
+  return String(number)
+})
+const rows = computed(() => desk.nodes.filter(n => n.role === props.role && [n.name, n.id, n.address, n.error].join(' ').toLowerCase().includes(query.value.trim().toLowerCase())).sort((a, b) => Number(needsAttention(b, now.value)) - Number(needsAttention(a, now.value)) || a.name.localeCompare(b.name, 'zh-CN')))
 const selected = computed(() => desk.nodes.find(n => n.id === selectedId.value))
 function mappings(id: string) { return desk.mappings.filter(m => props.role === 'server' ? m.server_id === id : m.client_id === id) }
 function effectiveSources(node: Node) {
@@ -49,12 +64,15 @@ function openConfig(node: Node) { configNode.value = node; configModal.value?.op
 async function saved() { await desk.reload(); desk.notify('节点已保存，配置等待节点上报确认应用状态。') }
 function ask(node: Node, operation: 'revoke' | 'delete') { if (node.embedded) return; pending.value = node; action.value = operation; confirm.value?.open() }
 function revisionLabel(node: Node) {
-  return node.error || node.applied_revision !== node.desired_revision
-    ? `已应用 r${node.applied_revision} → 期望 r${node.desired_revision}`
-    : `r${node.applied_revision}`
+  if (node.revoked) return '不再同步'
+  if (node.error) return '应用失败'
+  if (!node.desired_revision) return '尚无配置'
+  if (!node.last_seen && !node.applied_revision) return '未上报'
+  return node.applied_revision === node.desired_revision ? '最新' : '未同步'
 }
 function revisionDescription(node: Node) {
-  return `${revisionState(node).text}：已应用 r${node.applied_revision}，期望 r${node.desired_revision}；以节点上报为准`
+  if (!node.revoked && !node.last_seen && !node.applied_revision && node.desired_revision) return '节点尚未上报心跳；请检查节点容器日志、Master 地址和网络连通性'
+  return `${revisionLabel(node)}；配置是否最新以节点上报为准，在线状态另见状态列`
 }
 function setRefreshing(id: string, busy: boolean) {
   const next = new Set(refreshing.value)
@@ -66,7 +84,7 @@ async function refreshNode(node: Node) {
   setRefreshing(node.id, true)
   try {
     const result = await api<{ connected: boolean }>(`/nodes/${encodeURIComponent(node.id)}/refresh`, 'POST', {})
-    desk.notify(result.connected ? '已请求节点立即同步并上报，结果以节点上报为准' : '节点未连接，重连后自动同步')
+    if (!result.connected) desk.notify('节点未连接，重连后自动同步')
     await desk.reload()
   } catch (error) {
     desk.notify(error instanceof Error ? error.message : '请求节点更新状态失败，请稍后重试。', true)
@@ -95,20 +113,20 @@ async function run() {
     <EmptyState v-if="!rows.length" title="暂无节点" text="新建节点或调整搜索。" />
     <div v-else class="panel table-scroll" tabindex="0" role="region" :aria-label="`${label}列表`">
       <table class="nodes-table">
-        <thead><tr><th scope="col">名称 / 软件版本</th><th scope="col">状态</th><th scope="col">本地监听 / 客户端连接地址</th><th scope="col">隧道</th><th scope="col">映射</th><th scope="col">配置修订</th><th scope="col">操作</th></tr></thead>
+        <thead><tr><th scope="col">名称 / 软件版本</th><th scope="col">状态</th><th scope="col">本地监听 / 客户端连接地址</th><th scope="col">隧道</th><th scope="col">映射</th><th scope="col">配置是否最新</th><th scope="col">操作</th></tr></thead>
         <tbody><tr v-for="node in rows" :key="node.id" :class="{ selected: selectedId === node.id }">
           <td><button type="button" class="text-btn" :aria-expanded="selectedId === node.id" @click="selectedId = selectedId === node.id ? '' : node.id">{{ node.name }}</button><small class="node-id" :title="node.id">{{ node.id }}</small><small v-if="node.embedded">内置节点</small><small class="software-version" :title="node.software_version || '等待节点上报运行版本'">软件：{{ node.software_version || '未上报' }}</small></td>
-          <td><Badge :text="presence(node).text" :tone="presence(node).tone" /></td>
+          <td><div class="node-presence"><Badge :text="presence(node, now).text" :tone="presence(node, now).tone" /><button type="button" class="icon-btn refresh-node" :disabled="node.revoked || refreshing.has(node.id)" @click="refreshNode(node)" :class="{ spinning: refreshing.has(node.id) }" :title="'已请求节点立即同步并上报，结果以节点上报为准'" :aria-label="'已请求节点立即同步并上报，结果以节点上报为准'"><span aria-hidden="true">↻</span></button></div><small class="last-seen">最后在线：{{ seenText(node.last_seen, now) }}</small></td>
           <td><template v-if="role === 'server'"><small>监听：{{ localListen(node) }} · {{ node.tunnel?.protocol === 'hysteria2' || node.tunnel?.hysteria2?.password ? 'UDP' : 'TCP' }}</small><small v-for="item in connectList(node)" :key="item.id">{{ item.name }} · {{ endpoint(item.host, item.port) }}</small></template><template v-else>—</template></td>
           <td>{{ tunnelLabel(node) }}</td><td>{{ mappings(node.id).length }}</td>
-          <td><div class="revision-status" role="group" :title="revisionDescription(node)" :aria-label="revisionDescription(node)"><Badge :text="revisionState(node).text" :tone="revisionState(node).tone" /><code class="revision-value">{{ revisionLabel(node) }}</code></div></td>
-          <td><div class="actions"><button type="button" class="btn small" :disabled="node.revoked || refreshing.has(node.id)" @click="refreshNode(node)">{{ refreshing.has(node.id) ? '更新中…' : '更新状态' }}</button><button type="button" class="btn small" :disabled="node.revoked" @click="editor?.open(node)">编辑</button><button v-if="role === 'client'" type="button" class="btn small" :disabled="node.revoked || !effectiveSources(node).length" @click="openConfig(node)">查看配置</button><button v-if="!node.embedded" type="button" class="btn small" :disabled="node.revoked" @click="onboarding?.open(node)">快捷接入</button><button v-if="!node.embedded" type="button" class="btn small danger" @click="ask(node, 'delete')">删除</button></div></td>
+          <td><div class="revision-status" role="group" :title="revisionDescription(node)" :aria-label="revisionDescription(node)"><Badge :text="revisionLabel(node)" :tone="revisionState(node).tone" /></div></td>
+          <td><div class="actions"><button type="button" class="btn small" :disabled="node.revoked" @click="editor?.open(node)">编辑</button><button v-if="role === 'client'" type="button" class="btn small" :disabled="node.revoked || !effectiveSources(node).length" @click="openConfig(node)">查看配置</button><button v-if="!node.embedded" type="button" class="btn small" :disabled="node.revoked" @click="onboarding?.open(node)">快捷接入</button><button v-if="!node.embedded" type="button" class="btn small danger" @click="ask(node, 'delete')">删除</button></div></td>
         </tr></tbody>
       </table>
     </div>
     <section v-if="selected" class="node-detail" aria-label="节点详情">
       <header class="panel-head"><h2>{{ selected.name }}</h2><button class="btn quiet" type="button" @click="selectedId = ''">收起</button></header>
-      <dl class="detail-grid"><div><dt>ID</dt><dd><code>{{ selected.id }}</code></dd></div><div><dt>心跳</dt><dd>{{ seenText(selected.last_seen) }}</dd></div></dl>
+      <dl class="detail-grid"><div><dt>ID</dt><dd><code>{{ selected.id }}</code></dd></div><div><dt>心跳</dt><dd>{{ seenText(selected.last_seen, now) }}</dd></div></dl>
       <dl class="detail-grid"><div><dt>软件版本（节点上报，未验真）</dt><dd>{{ selected.software_version || '未上报' }}</dd></div><div><dt>构建提交（节点上报）</dt><dd><code>{{ selected.software_commit || '未上报' }}</code></dd></div></dl>
       <p class="help">上报信息不等于二进制验真。请通过可信 Docker 管理通道运行 tools/verify-node.py，对照独立可信的发布 SHA-256、实际运行文件与管理 API；结果仅代表核验时刻。</p>
       <p v-if="selected.error" class="detail-error" role="status">{{ selected.error }}</p>
@@ -116,7 +134,7 @@ async function run() {
       <div v-if="!selected.embedded" class="actions"><button class="btn" type="button" :disabled="selected.revoked" @click="onboarding?.open(selected)">快捷接入</button><button class="btn danger" type="button" :disabled="selected.revoked" @click="ask(selected, 'revoke')">吊销节点</button></div>
     </section>
   </div>
-  <NodeEditor ref="editor" :role="role" :saved="saved" />
+  <NodeEditor ref="editor" :role="role" :saved="saved" :default-name="defaultName" />
   <NodeOnboarding ref="onboarding" />
   <Modal ref="confirm" :title="action === 'revoke' ? '吊销节点' : '删除节点'" save-label="确认" danger :submit="run">
     <p v-if="action === 'revoke'">吊销「{{ pending?.name }}」的节点凭据？此操作不可撤销。</p>

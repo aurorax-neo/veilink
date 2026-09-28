@@ -426,15 +426,20 @@ func start(s model.Snapshot, local model.LocalTLS) (*service, error) {
 				}
 				peers[b.ServerID] = peer
 			}
+			gateway, selectErr := bindingGateway(gateways[b.ServerID], b)
+			if selectErr != nil {
+				err = selectErr
+				return nil, err
+			}
 			for _, kind := range singKinds {
 				for range singPoolSize(s.Mappings, b.ID, kind) {
-					go svc.maintainSingMux(b, gateways[b.ServerID], peer, kind)
+					go svc.maintainSingMux(b, gateway, peer, kind)
 				}
 			}
 			for range bindingPool(s.Mappings, b.ID) {
-				go svc.maintain(b, gateways[b.ServerID], peer)
+				go svc.maintain(b, gateway, peer)
 				if bindingDedicated(s.Mappings, b.ID) {
-					go svc.maintainApplication(b, gateways[b.ServerID], peer)
+					go svc.maintainApplication(b, gateway, peer)
 				}
 			}
 		}

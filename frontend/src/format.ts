@@ -158,7 +158,7 @@ export function validateNode(input: { name: string; role: string; address: strin
 }
 
 export function validateMapping(
-  input: { name: string; serverId: string; clientId: string; pool: number; listenHost: string; listenPort: string; targetHost: string; targetPort: string; network?: string; enabled?: boolean },
+  input: { name: string; serverId: string; clientId: string; connectEndpointId?: string; pool: number; listenHost: string; listenPort: string; targetHost: string; targetPort: string; network?: string; enabled?: boolean },
   nodes: Node[],
   mappings: Mapping[],
   selfId = '',
@@ -170,6 +170,9 @@ export function validateMapping(
   const server = nodes.find((node) => node.id === input.serverId && node.role === 'server' && !node.revoked)
   const client = nodes.find((node) => node.id === input.clientId && node.role === 'client' && !node.revoked)
   if (!server || !client) return '请选择可用的服务端和客户端。'
+  const candidates = server.connect_endpoints?.length ? server.connect_endpoints : server.address && server.port ? [{ id: 'primary', enabled: true }] : []
+  if (!candidates.some(candidate => candidate.enabled)) return '所选服务端没有启用的客户端连接地址，请先编辑服务端。'
+  if (input.connectEndpointId && !candidates.some(candidate => candidate.enabled && candidate.id === input.connectEndpointId)) return '所选连接地址已停用、删除或不属于此服务端，请重新选择。'
   if (!Number.isInteger(input.pool) || input.pool < 1 || input.pool > 32) return 'Pool 范围为 1–32。'
   if (!looksLikeIP(input.listenHost.trim())) return '公网监听地址必须是 IP。0.0.0.0 表示全部 IPv4 接口。'
   const listenPort = portNumber(input.listenPort)
