@@ -6,7 +6,7 @@
 - 行为参考 `ref/Xray-core/transport/internet/splithttp/{config.go,config.proto}` 及 `infra/conf/transport_internet.go`。参考 LICENSE 声明 MPL-2.0；独立实现，不复制参考代码或 AGPL 代码，不宣称 Xray 互通。
 - 地址语义对照 `ref/frp-panel/idl/common.proto` 的 `frps_url/frps_urls`：Client 拨号地址与 Server 监听分离、多个候选。本项目保留 JSON host/port 候选，不复制其 URL 配置或实现。
 - Server 唯一可编辑源配置，自动派生 Client 公共模板；API/SQLite/快照/状态均为 JSON。没有 YAML、本地 Client 覆盖、私钥下发、认证或 CSRF 放宽。
-- 仅 packet-up、HTTP/1.1；不支持其它 XHTTP 模式、HTTP/2/3、REALITY/Vision 组合。CDN 必须路径透传、禁用缓存和响应缓冲、支持流式 GET 与 EOF 头，并将同一会话路由到同一源站。详细配置在 README。
+- 仅支持 packet-up、HTTP/1.1；可按 Xray 分层方式使用 TCP → REALITY → XHTTP，但 REALITY 模式必须关闭 XHTTP 自身 TLS 且不能经过 CDN 边缘 TLS 终止。普通 XHTTP 可使用 HTTP/HTTPS 路径透传；CDN 必须路径透传、禁用缓存和响应缓冲、支持流式 GET 与 EOF 头，并将同一会话路由到同一源站。详细配置在 README。
 
 ## 测试覆盖与执行
 

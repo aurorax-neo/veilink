@@ -9,17 +9,23 @@ import SecretField from './SecretField.vue'
 const props = defineProps<{ role: 'server' | 'client'; saved: () => Promise<void> }>()
 const modal = ref<InstanceType<typeof Modal> | null>(null)
 const server = computed(() => props.role === 'server')
-const draft = reactive({ id: '', name: '', address: '', port: '443', listenPort: '443', transport: 'tcp', security: 'tls', flow: '', enc: '', cert: '', key: '', ca: '', listen: '', dest: '', privateKey: '', shortIDs: '', names: '', password: '', xhttpPath: '/veilink/', xhttpTLS: true })
+const draft = reactive({ id: '', name: '', address: '', port: '443', listenPort: '443', protocol: 'vless' as 'vless' | 'hysteria2', transport: 'tcp' as 'tcp' | 'xhttp' | 'quic' | 'hysteria2', security: 'tls', flow: '', enc: '', cert: '', key: '', ca: '', listen: '', dest: '', privateKey: '', shortIDs: '', names: '', password: '', xhttpPath: '/veilink/', xhttpTLS: true })
 const endpoints = reactive<ConnectEndpoint[]>([])
 function addEndpoint() { endpoints.push({ id: `endpoint-${Date.now()}-${endpoints.length}`, name: '备用地址', host: '', port: 443, enabled: true }) }
 function removeEndpoint(index: number) { if (endpoints.length > 1) endpoints.splice(index, 1) }
 let original: TunnelConfig = {}
 const session = ref(0)
-const flowAllowed = computed(() => draft.transport === 'tcp' && ['tls', 'reality'].includes(draft.security))
-watch(() => draft.transport, transport => { if (transport === 'hysteria2' || (transport === 'xhttp' && draft.security === 'reality')) draft.security = 'tls' }, { flush: 'sync' })
+const flowAllowed = computed(() => draft.protocol === 'vless' && draft.transport === 'tcp' && ['tls', 'reality'].includes(draft.security))
+watch(flowAllowed, allowed => { if (!allowed) draft.flow = '' }, { flush: 'sync' })
+watch(() => draft.protocol, protocol => {
+  if (protocol === 'hysteria2') { draft.transport = 'quic'; draft.security = 'tls' }
+  else if (draft.transport === 'quic') draft.transport = 'tcp'
+}, { flush: 'sync' })
+watch(() => draft.transport, transport => { if (transport === 'quic' || transport === 'hysteria2') { draft.protocol = 'hysteria2'; draft.transport = 'quic'; draft.security = 'tls' } }, { flush: 'sync' })
+watch(() => draft.security, security => { if (security === 'reality' && draft.transport === 'xhttp') draft.xhttpTLS = false }, { flush: 'sync' })
 type PEMField = 'cert' | 'key' | 'ca'
 const pemLabels = { cert: '证书 PEM', key: '私钥 PEM', ca: 'CA PEM（可选）' }
-const pemFields = computed<PEMField[]>(() => !server.value ? [] : (draft.transport === 'hysteria2' || draft.security === 'tls') ? ['cert', 'key', 'ca'] : draft.transport === 'xhttp' && draft.xhttpTLS ? ['ca'] : [])
+const pemFields = computed<PEMField[]>(() => !server.value ? [] : (draft.protocol === 'hysteria2' || draft.security === 'tls') ? ['cert', 'key', 'ca'] : draft.transport === 'xhttp' && draft.xhttpTLS ? ['ca'] : [])
 const uploads = reactive<Record<PEMField, { busy: boolean; error: string; status: string; revision: number }>>({
   cert: { busy: false, error: '', status: '', revision: 0 }, key: { busy: false, error: '', status: '', revision: 0 }, ca: { busy: false, error: '', status: '', revision: 0 },
 })
@@ -99,13 +105,15 @@ function open(node?: Node) {
   if (!endpoints.length && server.value) addEndpoint()
   Object.assign(draft, {
     id: node?.id || '', name: node?.name || '', address: node?.address || '', port: String(node?.port || 443), listenPort: String(t.listen_port || node?.port || 443),
-    transport: t.xhttp?.path ? 'xhttp' : t.hysteria2?.password ? 'hysteria2' : 'tcp',
-    security: t.hysteria2?.password ? 'tls' : t.reality && Object.values(t.reality).some(Boolean) ? 'reality' : t.transport_security === 'plain' ? 'encryption' : 'tls',
+    protocol: t.protocol || (t.hysteria2?.password ? 'hysteria2' : 'vless'),
+    transport: t.protocol === 'hysteria2' || (!t.protocol && t.hysteria2?.password) ? 'quic' : t.xhttp?.path ? 'xhttp' : 'tcp',
+    security: t.protocol === 'hysteria2' || t.hysteria2?.password ? 'tls' : t.reality && Object.values(t.reality).some(Boolean) ? 'reality' : t.transport_security === 'plain' ? 'encryption' : 'tls',
     flow: t.flow || '', enc: t.decryption || '', cert: t.cert_pem || '', key: t.key_pem || '', ca: t.ca_pem || '', listen: t.listen_host || '',
     dest: t.reality?.dest || '', privateKey: t.reality?.private_key || '',
     shortIDs: t.reality?.short_ids || '', names: t.reality?.server_names || '', password: t.hysteria2?.password || '',
     xhttpPath: t.xhttp?.path || '/veilink/', xhttpTLS: t.xhttp?.tls ?? true,
   })
+  if (!flowAllowed.value) draft.flow = ''
   modal.value?.open()
 }
 async function save() {
@@ -126,12 +134,18 @@ async function save() {
   }
   const tunnel: TunnelConfig = {}
   if (server.value) {
-    tunnel.transport_security = draft.transport === 'hysteria2' || draft.security === 'reality' ? '' : draft.security === 'tls' ? 'tls' : 'plain'
-    if (draft.transport === 'xhttp') {
-      if (draft.security === 'reality') throw new Error('XHTTP 不支持 REALITY。')
+    tunnel.protocol = draft.protocol
+    tunnel.transport_security = draft.protocol === 'hysteria2' || draft.security === 'reality' ? '' : draft.security === 'tls' ? 'tls' : 'plain'
+    if (draft.protocol === 'hysteria2') {
+      if (!draft.password.trim()) throw new Error('请输入 Hysteria2 密码。')
+      tunnel.hysteria2 = { password: draft.password.trim() }
+      tunnel.cert_pem = draft.cert.trim(); tunnel.key_pem = draft.key.trim()
+      if (draft.ca.trim()) tunnel.ca_pem = draft.ca.trim()
+    } else if (draft.transport === 'xhttp') {
       const path = draft.xhttpPath.trim()
       if (path.length > 256 || !/^\/[A-Za-z0-9/_-]*\/$/.test(path) && path !== '/' || path.includes('//')) throw new Error('XHTTP 路径须以 / 开头和结尾，仅含字母、数字、/、_、-，最多 256 字节。')
-      if ((draft.security === 'encryption' || !draft.xhttpTLS) && (!draft.enc.trim() || draft.enc.trim() === 'none')) throw new Error('XHTTP 使用 HTTP 时必须启用 VLESS Encryption。')
+      if (draft.security === 'reality' && draft.xhttpTLS) throw new Error('XHTTP + REALITY 时必须关闭连接 HTTPS；REALITY 已提供外层安全。')
+      if (draft.security !== 'reality' && (draft.security === 'encryption' || !draft.xhttpTLS) && (!draft.enc.trim() || draft.enc.trim() === 'none')) throw new Error('XHTTP 使用 HTTP 时必须启用 VLESS Encryption。')
       tunnel.xhttp = { path, mode: 'packet-up', tls: draft.xhttpTLS }
       if (draft.xhttpTLS && draft.ca.trim()) {
         const problem = validatePEM(draft.ca, 'ca')
@@ -139,19 +153,15 @@ async function save() {
         tunnel.ca_pem = draft.ca.trim()
       }
     }
-    if (draft.transport === 'hysteria2') {
-      if (!draft.password.trim()) throw new Error('请输入 Hysteria2 密码。')
-      tunnel.hysteria2 = { password: draft.password.trim() }
-    }
-    if (draft.transport === 'hysteria2' || draft.security === 'tls') {
+    if (draft.protocol === 'vless' && (draft.transport === 'tcp' || draft.transport === 'xhttp') && draft.security === 'tls') {
       tunnel.cert_pem = draft.cert.trim(); tunnel.key_pem = draft.key.trim()
       if (draft.ca.trim()) tunnel.ca_pem = draft.ca.trim()
-    } else if (draft.security === 'reality') {
+    } else if (draft.protocol === 'vless' && draft.security === 'reality') {
       tunnel.reality = { ...original.reality, dest: draft.dest.trim(), private_key: draft.privateKey.trim(), short_ids: draft.shortIDs.trim(), server_names: draft.names.trim() }
       delete tunnel.reality.public_key
     }
-    if (draft.transport === 'tcp' && draft.security === 'encryption' && (!draft.enc.trim() || draft.enc.trim() === 'none')) throw new Error('plain 无 TLS：请输入 VLESS 解密配置，或点击生成配对配置；不能使用 none。')
-    if (draft.enc.trim()) tunnel.decryption = draft.enc.trim()
+    if (draft.protocol === 'vless' && draft.transport === 'tcp' && draft.security === 'encryption' && (!draft.enc.trim() || draft.enc.trim() === 'none')) throw new Error('plain 无 TLS：请输入 VLESS 解密配置，或点击生成配对配置；不能使用 none。')
+    if (draft.protocol === 'vless' && draft.enc.trim() && draft.enc.trim() !== 'none') tunnel.decryption = draft.enc.trim()
     if (flowAllowed.value && draft.flow) tunnel.flow = draft.flow
     if (draft.listen.trim()) tunnel.listen_host = draft.listen.trim()
     tunnel.listen_port = Number(draft.listenPort)
@@ -189,16 +199,17 @@ defineExpose({ open })
         <button type="button" class="btn small" @click="addEndpoint">添加连接地址</button>
         <small class="warning">TCP / Hysteria2 须 L4 透传；XHTTP packet-up 可走 HTTP/HTTPS CDN，允许边缘终止 TLS，但须路径透传、禁用缓存、流式下行及足够的超时。不保证任意公网 CDN 可用。</small>
         <div class="grid-2">
-          <div><label for="node-security">{{ draft.transport === 'xhttp' ? 'Server 回源监听安全' : '安全' }}</label><select id="node-security" :value="draft.transport === 'hysteria2' ? 'tls' : draft.security" :disabled="draft.transport === 'hysteria2'" @change="draft.security = ($event.target as HTMLSelectElement).value"><option value="tls">TLS</option><option v-if="draft.transport !== 'xhttp'" value="reality">REALITY</option><option value="encryption">Encryption（无 TLS）</option></select></div>
-          <div><label for="node-transport">传输</label><select id="node-transport" v-model="draft.transport"><option value="tcp">TCP</option><option value="hysteria2">Hysteria2</option><option value="xhttp">XHTTP</option></select></div>
+          <div><label for="node-protocol">协议</label><select id="node-protocol" v-model="draft.protocol"><option value="vless">VLESS</option><option value="hysteria2">Hysteria2</option></select></div>
+          <div><label for="node-security">{{ draft.protocol === 'vless' && draft.transport === 'xhttp' ? 'Server 回源监听安全' : '安全' }}</label><select id="node-security" :value="draft.protocol === 'hysteria2' ? 'tls' : draft.security" :disabled="draft.protocol === 'hysteria2'" @change="draft.security = ($event.target as HTMLSelectElement).value"><option value="tls">TLS</option><option v-if="draft.protocol === 'vless'" value="reality">REALITY</option><option v-if="draft.protocol === 'vless'" value="encryption">Encryption（无 TLS）</option></select></div>
         </div>
-        <template v-if="draft.transport === 'xhttp'">
+        <div><label for="node-transport">传输</label><select id="node-transport" v-model="draft.transport" :disabled="draft.protocol === 'hysteria2'"><option value="tcp">TCP</option><option v-if="draft.protocol === 'vless'" value="xhttp">XHTTP</option><option v-if="draft.protocol === 'hysteria2'" value="quic">QUIC</option></select></div>
+        <template v-if="draft.protocol === 'vless' && draft.transport === 'xhttp'">
           <label for="node-xhttp-path">XHTTP 路径（packet-up）</label><input id="node-xhttp-path" v-model="draft.xhttpPath" maxlength="256" placeholder="/veilink/" required />
-          <label for="node-xhttp-tls"><input id="node-xhttp-tls" v-model="draft.xhttpTLS" type="checkbox" /> Client 连接地址使用 HTTPS</label>
-          <small class="help">仅 HTTP/1.1 packet-up；POST 分片上行、GET 流式下行。HTTPS 校验连接地址证书，CA 留空使用系统根。回源 TLS 证书由 Server 管理；边缘证书由 CDN 管理。任一段使用 HTTP 时须启用 VLESS Encryption。不支持 REALITY、Vision、其它 XHTTP 模式或 Xray 互通。</small>
+          <label for="node-xhttp-tls"><input id="node-xhttp-tls" v-model="draft.xhttpTLS" type="checkbox" :disabled="draft.security === 'reality'" /> Client 连接地址使用 HTTPS</label>
+          <small class="help">仅 HTTP/1.1 packet-up；POST 分片上行、GET 流式下行。REALITY 模式须关闭此处 HTTPS，不能走 CDN 边缘终止 TLS。普通 XHTTP 可使用 HTTPS 边缘/回源；任一段使用 HTTP 时须启用 VLESS Encryption。</small>
         </template>
-        <small v-if="draft.transport === 'hysteria2'" class="help">Hysteria2 基于 QUIC/UDP 且使用 TLS，当前上游和本实现不支持 REALITY。</small>
-        <small v-if="draft.transport === 'hysteria2'" class="help">请放行监听端口的 UDP 并核对 NAT 的 UDP 转发；生成密码后保存，客户端密码须一致。证书须覆盖连接地址且受下发 CA 信任；不能启用 Vision。</small>
+        <small v-if="draft.protocol === 'hysteria2'" class="help">Hysteria2 使用 QUIC/UDP + TLS，当前实现不支持 REALITY。</small>
+        <small v-if="draft.protocol === 'hysteria2'" class="help">请放行监听端口的 UDP 并核对 NAT 的 UDP 转发；生成密码后保存，客户端密码须一致。证书须覆盖连接地址且受下发 CA 信任；不能启用 Vision。</small>
         <small v-else-if="draft.security === 'tls'" class="help">TLS 使用 TCP：上传配对证书与私钥。直连时证书须覆盖连接地址；XHTTP 经 CDN 时由 CDN 校验源站证书，Client 校验边缘证书。不要关闭证书校验。</small>
         <small v-else-if="draft.security === 'reality'" class="help">REALITY 使用 TCP：填写可达的回落目标与允许的伪装域名，生成密钥对和 Short ID。客户端公钥、Short ID 与域名须匹配；不要同时填写 TLS PEM。</small>
         <small v-else class="help">plain 使用 TCP 且没有外层 TLS，必须启用 VLESS Encryption；不接受证书 PEM、REALITY、Hysteria2 或 Vision。请生成配对配置后保存，而非填 none。</small>
@@ -213,18 +224,20 @@ defineExpose({ open })
           <small class="help">{{ field === 'ca' ? '用于客户端信任此服务端；留空使用系统根证书。' : '粘贴或上传 PEM，单项最多 64 KiB。' }}</small>
           <small class="help" :class="{ 'detail-error': uploads[field].error }" role="status">{{ uploads[field].busy ? '读取中…' : uploads[field].error || uploads[field].status }}</small>
         </template>
-        <SecretField v-if="draft.transport === 'hysteria2'" id="node-hy-password" v-model="draft.password" label="Hysteria2 密码" required><button type="button" class="btn small" :disabled="!!generation.busy || reading" @click="generate('hysteria2')">生成密码</button></SecretField>
+        <SecretField v-if="draft.protocol === 'hysteria2'" id="node-hy-password" v-model="draft.password" label="Hysteria2 密码" required><button type="button" class="btn small" :disabled="!!generation.busy || reading" @click="generate('hysteria2')">生成密码</button></SecretField>
         <template v-else-if="draft.security === 'reality'">
           <label for="node-dest">回落目标</label><input id="node-dest" v-model="draft.dest" placeholder="example.com:443" />
           <SecretField id="node-private" v-model="draft.privateKey" label="REALITY 私钥"><button type="button" class="btn small" :disabled="!!generation.busy || reading" @click="generate('reality')">生成密钥对</button></SecretField>
           <label for="node-names">伪装域名</label><input id="node-names" v-model="draft.names" placeholder="逗号分隔" />
           <label for="node-short">Short IDs</label><div class="field-actions"><input id="node-short" v-model="draft.shortIDs" placeholder="逗号分隔" /><button type="button" class="btn small" :disabled="!!generation.busy || reading" @click="generate('short_id')">生成 Short ID</button></div>
         </template>
-        <SecretField id="node-encryption" v-model="draft.enc" label="VLESS 解密配置" :required="draft.security === 'encryption' || draft.transport === 'xhttp' && !draft.xhttpTLS"><button type="button" class="btn small" :disabled="!!generation.busy || reading" @click="generate('vless')">生成配对配置</button></SecretField>
-        <small class="help">VLESS Encryption：服务端保存 decryption，客户端只接收配对 encryption，不能互换。TLS、REALITY、Hysteria2 下可选，plain 下必填；重新生成后须保存并等待双方应用新修订。</small>
-        <div class="grid-2"><div><label for="vless-mode">生成模式</label><select id="vless-mode" v-model="options.mode"><option v-for="mode in ['native', 'xorpub', 'random']" :key="mode">{{ mode }}</option></select></div><div><label for="vless-auth">认证算法</label><select id="vless-auth" v-model="options.authentication"><option>x25519</option><option>mlkem768</option></select></div></div>
-        <template v-if="flowAllowed"><label for="node-flow">Flow</label><select id="node-flow" v-model="draft.flow"><option value="">无</option><option>xtls-rprx-vision</option></select></template>
-        <small class="help">Vision 仅用于 TCP + TLS/REALITY。只有独立已认证连接内、满足结构和记录边界的 TLS 1.3 才直拷；启用 Encryption 或无法安全识别时保留加密回退，mux、控制与 UDP 不裸传。选择 Vision 不代表所有流量都会直拷。</small>
+        <template v-if="draft.protocol === 'vless'">
+          <SecretField id="node-encryption" v-model="draft.enc" label="VLESS 解密配置" :required="draft.security === 'encryption' || draft.transport === 'xhttp' && !draft.xhttpTLS"><button type="button" class="btn small" :disabled="!!generation.busy || reading" @click="generate('vless')">生成配对配置</button></SecretField>
+          <small class="help">VLESS Encryption：服务端保存 decryption，客户端只接收配对 encryption，不能互换。TLS、REALITY 下可选，plain 下必填；重新生成后须保存并等待双方应用新修订。</small>
+          <div class="grid-2"><div><label for="vless-mode">生成模式</label><select id="vless-mode" v-model="options.mode"><option v-for="mode in ['native', 'xorpub', 'random']" :key="mode">{{ mode }}</option></select></div><div><label for="vless-auth">认证算法</label><select id="vless-auth" v-model="options.authentication"><option>x25519</option><option>mlkem768</option></select></div></div>
+          <template v-if="flowAllowed"><label for="node-flow">Flow</label><select id="node-flow" v-model="draft.flow"><option value="">无</option><option>xtls-rprx-vision</option></select></template>
+          <small class="help">Vision 仅用于 VLESS TCP + TLS/REALITY。只有独立已认证连接内、满足结构和记录边界的 TLS 1.3 才直拷；启用 Encryption 或无法安全识别时保留加密回退，mux、控制与 UDP 不裸传。</small>
+        </template>
       </section>
       <p v-if="generation.busy || generation.status" class="help" role="status">{{ generation.busy ? '正在生成… 保存将在生成完成后可用。' : generation.status }}</p>
       <p v-if="generation.error" class="error" role="alert">{{ generation.error }}</p>

@@ -57,7 +57,12 @@ test('server TLS requires complete PEM pair; save sends PEM only', async () => {
 
 test('HY2 requires PEM and password; switching modes fully replaces tunnel', async () => {
   const e = setup()
-  e.draft.transport = 'hysteria2'
+  e.draft.transport = 'tcp'
+  e.draft.security = 'tls'
+  e.draft.flow = 'xtls-rprx-vision'
+  e.draft.protocol = 'hysteria2'
+  assert.equal(e.draft.flow, '')
+  assert.equal(e.draft.transport, 'quic')
   await assert.rejects(e.save(), /Hysteria2 密码/)
   e.draft.password = 'demo-password'
   e.draft.key = ''
@@ -66,13 +71,17 @@ test('HY2 requires PEM and password; switching modes fully replaces tunnel', asy
   e.draft.enc = 'demo-encryption'
   e.draft.flow = 'xtls-rprx-vision'
   await e.save()
+  assert.equal(payload(e).protocol, 'hysteria2')
   assert.equal(payload(e).transport_security, '')
   assert.equal(payload(e).cert_pem, cert)
-  assert.equal(payload(e).decryption, 'demo-encryption')
+  assert.equal(payload(e).decryption, undefined)
   assert.equal(payload(e).flow, undefined)
+  assert.equal(payload(e).xhttp, undefined)
+  e.draft.protocol = 'vless'
   e.draft.transport = 'tcp'
   e.draft.security = 'reality'
   await e.save()
+  assert.equal(payload(e).protocol, 'vless')
   assert.equal(payload(e).transport_security, '')
   assert.ok(payload(e).reality)
   assert.equal(payload(e).cert_pem, undefined)
@@ -140,7 +149,8 @@ function setupTable(role = 'server') {
 test('labels and read-only effective configuration use authoritative mapped server templates', () => {
   const s = setupTable()
   assert.equal(s.tunnelLabel({ tunnel: { cert_pem: cert, decryption: 'demo' } }), '未配置安全模式')
-  assert.equal(s.tunnelLabel({ tunnel: { transport_security: 'tls', decryption: 'demo' } }), 'TCP / TLS + Encryption')
+  assert.equal(s.tunnelLabel({ tunnel: { transport_security: 'tls', decryption: 'demo' } }), 'VLESS / TCP · TLS + Encryption')
+  assert.equal(s.tunnelLabel({ tunnel: { protocol: 'hysteria2', hysteria2: { password: 'demo' } } }), 'Hysteria2 / QUIC + TLS')
   const c = setupTable('client')
   const client = { id: 'client' }
   assert.equal(c.tunnelLabel(client), '未关联服务端')
@@ -310,9 +320,10 @@ test('node and endpoint saves never send removed SNI or priority fields', async 
 test('API empty nested objects do not enable HY2 or REALITY; only server material is saved', async () => {
   const plain = { ...tlsNode(), tunnel: { listen_port: 8444, transport_security: 'plain', decryption: 'private-encryption' } }
   const hy2 = tlsNode(); hy2.tunnel.hysteria2 = { password: 'hy-password' }
-  for (const [node, transport, security] of [[tlsNode(), 'tcp', 'tls'], [plain, 'tcp', 'encryption'], [realityNode(), 'tcp', 'reality'], [hy2, 'hysteria2', 'tls']]) {
+  for (const [node, transport, security, protocol] of [[tlsNode(), 'tcp', 'tls', 'vless'], [plain, 'tcp', 'encryption', 'vless'], [realityNode(), 'tcp', 'reality', 'vless'], [hy2, 'quic', 'tls', 'hysteria2']]) {
     node.tunnel = { reality: {}, hysteria2: {}, ...node.tunnel }
     const e = setup(); e.open(node)
+    assert.equal(e.draft.protocol, protocol)
     assert.equal(e.draft.transport, transport)
     assert.equal(e.draft.security, security)
     await e.save()
@@ -343,6 +354,10 @@ test('onboarding displays role-specific flag commands and blocks embedded or ins
   e.open({ id: 'remote/id', embedded: false }); await e.generate()
   assert.equal(opens, 1)
   assert.equal(requests[0][0], '/nodes/remote%2Fid/join')
+  assert.equal(JSON.stringify(requests[0][2]), JSON.stringify({ master_url: 'https://master.example.com' }))
+  assert.match(source('../src/components/NodeOnboarding.vue'), /接入令牌在有效期内可重复用于此节点/)
+  assert.doesNotMatch(source('../src/components/NodeOnboarding.vue'), /ttl_seconds|join-ttl|有效期（秒）/)
+  assert.match(source('../src/components/NodeOnboarding.vue'), /不影响已接入节点的有效凭据/)
   assert.equal(e.result.value.token, 'token')
   assert.equal(e.result.value.command, "docker run -itd --restart unless-stopped --name 'veilink-client-demo' -v '/opt/docker/veilink-client-demo/config:/config:ro' -v '/opt/docker/veilink-client-demo/data:/data' -e TZ=Asia/Shanghai veilink:latest client -master-addr 'master.example.com:443' -node-id 'remote/id' -enroll-token 'token' -state-dir '/data/state' -control-server-name 'master.example.com'")
   assert.match(e.result.value.prepare, /chown -R 65532:65532/)
@@ -374,7 +389,7 @@ test('listen validation, NAT port independence, and transport copy stay explicit
   assert.equal('kind' in body(e).connect_endpoints[0], false)
   assert.equal(body(e).connect_endpoints[0].host, 'public.example.com')
   assert.match(editorSource, /Server 回源监听安全/)
-  assert.match(editorSource, /Hysteria2 基于 QUIC\/UDP 且使用 TLS，当前上游和本实现不支持 REALITY/)
+  assert.match(editorSource, /Hysteria2 使用 QUIC\/UDP \+ TLS，当前实现不支持 REALITY/)
   assert.match(editorSource, /XHTTP packet-up 可走 HTTP\/HTTPS CDN，允许边缘终止 TLS/)
 })
 

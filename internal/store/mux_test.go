@@ -33,6 +33,7 @@ func TestMappingMuxPersistenceAndSnapshot(t *testing.T) {
 	}
 	m := model.Mapping{Name: "mux-test", ServerID: server.ID, ClientID: client.ID, Pool: 1, ListenHost: "127.0.0.1", ListenPort: 19080, TargetHost: "localhost", TargetPort: 80, Enabled: true}
 	var revision int64
+	var previous model.Mapping
 	for _, mode := range []struct {
 		enabled bool
 		kind    string
@@ -60,10 +61,12 @@ func TestMappingMuxPersistenceAndSnapshot(t *testing.T) {
 			t.Fatalf("persistence: %v %+v", err, rows)
 		}
 		snap, err := s.Snapshot(client.ID, credential)
-		if err != nil || len(snap.Mappings) != 1 || snap.Mappings[0].Mux != mode.enabled || snap.Mappings[0].MuxType != wantType || snap.Revision <= revision {
+		unchanged := previous.ID != "" && previous == m
+		if err != nil || len(snap.Mappings) != 1 || snap.Mappings[0].Mux != mode.enabled || snap.Mappings[0].MuxType != wantType || (unchanged && snap.Revision != revision) || (!unchanged && snap.Revision <= revision) {
 			t.Fatalf("snapshot: %v %+v", err, snap)
 		}
 		revision = snap.Revision
+		previous = m
 		invalid := m
 		invalid.BindingID = ""
 		for _, invalidType := range []string{"unknown", "private-session"} {

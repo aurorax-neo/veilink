@@ -104,6 +104,7 @@ type Snapshot struct {
 // Server Tunnel holds private settings; its ClientTunnel holds the paired public
 // settings. Client nodes have an empty Tunnel and consume their related servers.
 type LocalTLS struct {
+	Protocol          string    `json:"protocol,omitempty"`           // vless or hysteria2
 	TransportSecurity string    `json:"transport_security,omitempty"` // tls or plain; empty clients inherit
 	CertPEM           string    `json:"cert_pem"`
 	KeyPEM            string    `json:"key_pem"`
@@ -146,8 +147,9 @@ func (r Reality) Enabled() bool {
 	return strings.TrimSpace(r.Dest) != "" || strings.TrimSpace(r.PrivateKey) != "" || strings.TrimSpace(r.PublicKey) != "" || strings.TrimSpace(r.ShortID) != "" || strings.TrimSpace(r.ShortIDs) != "" || strings.TrimSpace(r.ServerNames) != ""
 }
 
-// Hysteria2 is an optional QUIC transport for the client-to-server data plane.
-// It uses certificate PEM for QUIC TLS and cannot be combined with REALITY.
+// Hysteria2 configures the QUIC/TLS sibling protocol, not a VLESS transport.
+// Password currently enables and validates the HY2 configuration, not enrollment.
+// Each authorized Binding UUID is the standard Hysteria-Auth password.
 type Hysteria2 struct {
 	Password string `json:"password"`
 }
@@ -155,9 +157,24 @@ type Hysteria2 struct {
 // Enabled reports whether a Hysteria2 password is configured.
 func (h Hysteria2) Enabled() bool { return strings.TrimSpace(h.Password) != "" }
 
+// EffectiveProtocol preserves empty-field JSON defaults. Explicit values are
+// validated by the tunnel boundary, never inferred from other fields.
+func (c LocalTLS) EffectiveProtocol() string {
+	if c.Protocol != "" {
+		return c.Protocol
+	}
+	if c.Hysteria2.Enabled() {
+		return "hysteria2"
+	}
+	return "vless"
+}
+
 // Merge returns a new LocalTLS taking non-empty values from override over base.
 func (base LocalTLS) Merge(override LocalTLS) LocalTLS {
 	res := base
+	if override.Protocol != "" {
+		res.Protocol = override.Protocol
+	}
 	if override.TransportSecurity != "" {
 		res.TransportSecurity = override.TransportSecurity
 	}
@@ -243,6 +260,7 @@ func DeriveX25519Public(privateKey string) string {
 // server configuration. Template customization and validation are separate.
 func DeriveClientTunnel(serverTunnel LocalTLS, serverNode Node) LocalTLS {
 	res := LocalTLS{
+		Protocol:          serverTunnel.Protocol,
 		TransportSecurity: serverTunnel.TransportSecurity,
 		Flow:              serverTunnel.Flow,
 		CAPEM:             serverTunnel.CAPEM,

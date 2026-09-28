@@ -71,8 +71,9 @@ func TestTLSProtocolAndLiveRevocation(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	if _, e = c.Enroll(ctx, req); status.Code(e) != codes.Unauthenticated {
-		t.Fatal("token reuse", e)
+	second, e := c.Enroll(ctx, req)
+	if e != nil || String(second, "credential") != String(enrolled, "credential") {
+		t.Fatal("token reuse failed", e)
 	}
 	req, _ = Envelope(map[string]any{"node_id": n.ID, "credential": String(enrolled, "credential")})
 	if _, e = c.Pull(ctx, req); e != nil {

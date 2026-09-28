@@ -322,35 +322,82 @@ func heartbeatEnvelope(id, credential string, revision int64, failed bool, ring 
 	return m, nil
 }
 
-func heartbeat(ctx context.Context, client pb.ControlClient, id, credential string, state *syncState, ring *logring.Ring, interval time.Duration, revisions chan<- int64) error {
+func heartbeat(ctx context.Context, client pb.ControlClient, id, credential string, state *syncState, ring *logring.Ring, interval time.Duration, revisions chan int64, report chan struct{}) error {
 	stream, err := client.Events(ctx)
 	if err != nil {
 		return err
 	}
-	for {
+	type response struct {
+		message *structpb.Struct
+		err     error
+	}
+	received := make(chan response, 1)
+	go func() {
+		for {
+			out, err := stream.Recv()
+			select {
+			case received <- response{out, err}:
+			case <-ctx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	send := func() error {
 		in, err := heartbeatEnvelope(id, credential, state.revision.Load(), state.failed.Load(), ring)
 		if err != nil {
 			return err
 		}
 		if err = stream.Send(in); err != nil {
-			if _, recvErr := stream.Recv(); recvErr != nil {
-				return recvErr
+			select {
+			case out := <-received:
+				if out.err != nil {
+					return out.err
+				}
+			case <-ctx.Done():
+				return ctx.Err()
 			}
-			return err
 		}
-		out, err := stream.Recv()
-		if err != nil {
-			return err
-		}
-		desired := int64(out.GetFields()["revision"].GetNumberValue())
-		select {
-		case revisions <- desired:
-		default:
-		}
+		return err
+	}
+	if err := send(); err != nil {
+		return err
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(interval):
+		case <-ticker.C:
+			if err := send(); err != nil {
+				return err
+			}
+		case <-report:
+			if err := send(); err != nil {
+				return err
+			}
+		case out := <-received:
+			if out.err != nil {
+				return out.err
+			}
+			v := out.message.GetFields()["revision"].GetNumberValue()
+			if v < 0 || v > 9007199254740991 || v != float64(int64(v)) {
+				return errors.New("invalid desired revision")
+			}
+			select {
+			case <-revisions:
+			default:
+			}
+			revisions <- int64(v)
+			if out.message.GetFields()["refresh"].GetBoolValue() {
+				select {
+				case report <- struct{}{}:
+				default:
+				}
+			}
 		}
 	}
 }
@@ -362,9 +409,10 @@ func cycle(ctx context.Context, client pb.ControlClient, c config.Config, role s
 	deadline, _ := streamCtx.Deadline()
 	defer cancel()
 	revisions := make(chan int64, 1)
+	report := make(chan struct{}, 1)
 	terminal := make(chan error, 1)
 	go func() {
-		err := heartbeat(streamCtx, client, c.NodeID, st.Credential, state, ring, timing.heartbeat, revisions)
+		err := heartbeat(streamCtx, client, c.NodeID, st.Credential, state, ring, timing.heartbeat, revisions, report)
 		terminal <- err
 		cancel() // interrupts an outstanding Pull immediately on rejection
 	}()
@@ -406,6 +454,10 @@ func cycle(ctx context.Context, client pb.ControlClient, c config.Config, role s
 				if err := save(path, *st); err != nil {
 					state.failed.Store(true)
 					return errors.New("cannot persist runtime cache")
+				}
+				select {
+				case report <- struct{}{}:
+				default:
 				}
 			}
 		case desired := <-revisions:

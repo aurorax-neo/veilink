@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -30,10 +31,11 @@ type state struct {
 	Secrets  map[string][]byte
 }
 type Store struct {
-	mu       sync.Mutex
-	db       *sql.DB
-	key      []byte
-	software map[string]SoftwareReport
+	mu        sync.Mutex
+	db        *sql.DB
+	key       []byte
+	software  map[string]SoftwareReport
+	listeners map[chan int64]string
 }
 
 func Open(path, keyPath string) (*Store, error) {
@@ -173,6 +175,58 @@ CREATE TABLE audit(at INTEGER NOT NULL,action TEXT NOT NULL,object TEXT NOT NULL
 	return tx.Commit()
 }
 func (s *Store) Close() error { return s.db.Close() }
+
+// Subscribe returns coalescing configuration-change notifications for one node.
+// The revision is only a wake-up hint; callers must Pull the authorized snapshot.
+func (s *Store) Subscribe(nodeID string) (<-chan int64, func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.listeners == nil {
+		s.listeners = make(map[chan int64]string)
+	}
+	ch := make(chan int64, 1)
+	s.listeners[ch] = nodeID
+	return ch, func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if _, ok := s.listeners[ch]; ok {
+			delete(s.listeners, ch)
+			close(ch)
+		}
+	}
+}
+
+func (s *Store) notifyLocked(revision int64, affected map[string]bool) {
+	for ch, nodeID := range s.listeners {
+		if !affected[nodeID] {
+			continue
+		}
+		select {
+		case ch <- revision:
+		default:
+		}
+	}
+}
+
+// RequestRefresh wakes one connected node without changing persisted state.
+func (s *Store) RequestRefresh(id string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, err := s.load()
+	if err != nil {
+		return false, err
+	}
+	n, ok := st.Nodes[id]
+	if !ok || n.Revoked {
+		return false, ErrInvalid
+	}
+	connected := false
+	for _, nodeID := range s.listeners {
+		connected = connected || nodeID == id
+	}
+	s.notifyLocked(n.DesiredRevision, map[string]bool{id: true})
+	return connected, nil
+}
 func (s *Store) load() (state, error) {
 	var b []byte
 	var st state
@@ -197,20 +251,128 @@ func (s *Store) load() (state, error) {
 	}
 	return st, e
 }
+func cloneState(in state) state {
+	out := in
+	out.Nodes = make(map[string]model.Node, len(in.Nodes))
+	for id, n := range in.Nodes {
+		out.Nodes[id] = n
+	}
+	out.Bindings = make(map[string]model.Binding, len(in.Bindings))
+	for id, b := range in.Bindings {
+		out.Bindings[id] = b
+	}
+	out.Mappings = make(map[string]model.Mapping, len(in.Mappings))
+	for id, m := range in.Mappings {
+		out.Mappings[id] = m
+	}
+	out.Secrets = make(map[string][]byte, len(in.Secrets))
+	for id, secret := range in.Secrets {
+		out.Secrets[id] = append([]byte(nil), secret...)
+	}
+	return out
+}
+
+func nodeConfigEqual(a, b model.Node) bool {
+	a.DesiredRevision, a.AppliedRevision, a.LastSeen, a.Error = 0, 0, 0, ""
+	b.DesiredRevision, b.AppliedRevision, b.LastSeen, b.Error = 0, 0, 0, ""
+	return reflect.DeepEqual(a, b)
+}
+
+func bindingPeers(st state, nodeID string) map[string]bool {
+	peers := map[string]bool{}
+	for _, b := range st.Bindings {
+		if b.ServerID == nodeID {
+			peers[b.ClientID] = true
+		}
+		if b.ClientID == nodeID {
+			peers[b.ServerID] = true
+		}
+	}
+	return peers
+}
+
+func affectedNodes(before, after state) map[string]bool {
+	affected := map[string]bool{}
+	for id, n := range before.Nodes {
+		if next, ok := after.Nodes[id]; !ok || !nodeConfigEqual(n, next) {
+			affected[id] = true
+		}
+	}
+	for id, n := range after.Nodes {
+		if old, ok := before.Nodes[id]; !ok || !nodeConfigEqual(old, n) {
+			affected[id] = true
+		}
+	}
+	// Binding and mapping changes alter the authorized snapshot at both ends.
+	for id, b := range before.Bindings {
+		if next, ok := after.Bindings[id]; !ok || !reflect.DeepEqual(b, next) {
+			affected[b.ServerID], affected[b.ClientID] = true, true
+			if next, ok := after.Bindings[id]; ok {
+				affected[next.ServerID], affected[next.ClientID] = true, true
+			}
+		}
+	}
+	for id, b := range after.Bindings {
+		if old, ok := before.Bindings[id]; !ok || !reflect.DeepEqual(old, b) {
+			affected[b.ServerID], affected[b.ClientID] = true, true
+		}
+	}
+	for id, m := range before.Mappings {
+		if next, ok := after.Mappings[id]; !ok || !reflect.DeepEqual(m, next) {
+			if b, ok := before.Bindings[m.BindingID]; ok {
+				affected[b.ServerID], affected[b.ClientID] = true, true
+			}
+			if next, ok := after.Mappings[id]; ok {
+				if b, ok := after.Bindings[next.BindingID]; ok {
+					affected[b.ServerID], affected[b.ClientID] = true, true
+				}
+			}
+		}
+	}
+	for id, m := range after.Mappings {
+		if old, ok := before.Mappings[id]; !ok || !reflect.DeepEqual(old, m) {
+			if b, ok := after.Bindings[m.BindingID]; ok {
+				affected[b.ServerID], affected[b.ClientID] = true, true
+			}
+		}
+	}
+	// Propagate node configuration changes only, not a mapping's revision bump.
+	for id, old := range before.Nodes {
+		next, exists := after.Nodes[id]
+		if exists && nodeConfigEqual(old, next) {
+			continue
+		}
+		if old.Role == "server" || !exists || old.Revoked != next.Revoked {
+			for peer := range bindingPeers(before, id) {
+				affected[peer] = true
+			}
+			for peer := range bindingPeers(after, id) {
+				affected[peer] = true
+			}
+		}
+	}
+	return affected
+}
+
 func (s *Store) mutate(action, id string, fn func(*state) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	st, e := s.load()
+	before, e := s.load()
 	if e != nil {
 		return e
 	}
+	st := cloneState(before)
 	if e = fn(&st); e != nil {
 		return e
 	}
+	affected := affectedNodes(before, st)
 	st.Revision++
-	for id, n := range st.Nodes {
-		n.DesiredRevision = st.Revision
-		st.Nodes[id] = n
+	for nodeID, n := range st.Nodes {
+		n.DesiredRevision = before.Nodes[nodeID].DesiredRevision
+		if affected[nodeID] {
+			n.DesiredRevision = st.Revision
+		}
+		st.Nodes[nodeID] = n
 	}
 	b, e := json.Marshal(st)
 	if e != nil {
@@ -227,7 +389,10 @@ func (s *Store) mutate(action, id string, fn func(*state) error) error {
 	if _, e = tx.Exec("INSERT INTO audit VALUES(?,?,?)", time.Now().Unix(), action, id); e != nil {
 		return e
 	}
-	return tx.Commit()
+	if e = tx.Commit(); e == nil {
+		s.notifyLocked(st.Revision, affected)
+	}
+	return e
 }
 
 var ErrRegistrationClosed = errors.New("registration is closed")
@@ -506,39 +671,84 @@ func (s *Store) EnrollToken(id string, ttl time.Duration) (string, error) {
 		return "", e
 	}
 	n, ok := st.Nodes[id]
-	if !ok || n.Revoked || ttl <= 0 || ttl > 24*time.Hour {
+	if !ok || n.Revoked || ttl <= 0 || ttl > time.Duration(1_000_000_000)*time.Second {
 		return "", ErrInvalid
 	}
 	token := auth.Token()
 	_, e = s.db.Exec("INSERT OR REPLACE INTO enroll VALUES(?,?,?)", id, auth.Hash(token), time.Now().Add(ttl).Unix())
 	return token, e
 }
+func enrollmentCredentialKey(id string) string { return "credential:" + id }
+
 func (s *Store) Enroll(id, token string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	st, e := s.load()
+	tx, e := s.db.Begin()
 	if e != nil {
+		return "", e
+	}
+	defer tx.Rollback()
+	// Acquire a database write lock before checking state, including across Store instances.
+	// This validates but does not consume or extend the enrollment token.
+	checked, e := tx.Exec("UPDATE enroll SET hash=hash WHERE node=? AND hash=? AND expires>?", id, auth.Hash(token), time.Now().Unix())
+	if e != nil {
+		return "", e
+	}
+	count, e := checked.RowsAffected()
+	if e != nil {
+		return "", e
+	}
+	if count != 1 {
+		return "", ErrAuth
+	}
+	var raw []byte
+	if e = tx.QueryRow("SELECT data FROM config WHERE id=1").Scan(&raw); e != nil {
+		return "", e
+	}
+	var st state
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if e = decoder.Decode(&st); e != nil {
 		return "", e
 	}
 	n, ok := st.Nodes[id]
 	if !ok || n.Revoked {
 		return "", ErrAuth
 	}
-	tx, e := s.db.Begin()
-	if e != nil {
-		return "", e
+	var credentialHash string
+	var credentialExpires int64
+	credentialErr := tx.QueryRow("SELECT hash,expires FROM credentials WHERE node=?", id).Scan(&credentialHash, &credentialExpires)
+	if credentialErr != nil && !errors.Is(credentialErr, sql.ErrNoRows) {
+		return "", credentialErr
 	}
-	defer tx.Rollback()
-	r, e := tx.Exec("DELETE FROM enroll WHERE node=? AND hash=? AND expires>?", id, auth.Hash(token), time.Now().Unix())
-	if e != nil {
-		return "", e
-	}
-	count, _ := r.RowsAffected()
-	if count != 1 {
-		return "", ErrAuth
+	if credentialErr == nil && credentialExpires > time.Now().Unix() {
+		sealed, exists := st.Secrets[enrollmentCredentialKey(id)]
+		if !exists {
+			return "", errors.New("existing credential is hash-only; reusable enrollment cannot replace an active credential")
+		}
+		credential, openErr := auth.Open(s.key, sealed)
+		if openErr != nil || auth.Hash(credential) != credentialHash {
+			return "", ErrAuth
+		}
+		return credential, tx.Commit()
 	}
 	credential := auth.Token()
+	sealed, e := auth.Seal(s.key, credential)
+	if e != nil {
+		return "", e
+	}
+	if st.Secrets == nil {
+		st.Secrets = map[string][]byte{}
+	}
+	st.Secrets[enrollmentCredentialKey(id)] = sealed
 	if _, e = tx.Exec("INSERT OR REPLACE INTO credentials(node,hash,expires) VALUES(?,?,?)", id, auth.Hash(credential), time.Now().Add(30*24*time.Hour).Unix()); e != nil {
+		return "", e
+	}
+	b, e := json.Marshal(st)
+	if e != nil {
+		return "", e
+	}
+	if _, e = tx.Exec("UPDATE config SET data=? WHERE id=1", b); e != nil {
 		return "", e
 	}
 	return credential, tx.Commit()
@@ -567,7 +777,7 @@ func (s *Store) Snapshot(id, credential string) (model.Snapshot, error) {
 	if currentNode.Role == "client" {
 		currentNode.Tunnel = model.LocalTLS{}
 	}
-	out := model.Snapshot{Revision: st.Revision, Node: currentNode, Nodes: []model.Node{}, Bindings: []model.Binding{}, Mappings: []model.Mapping{}}
+	out := model.Snapshot{Revision: currentNode.DesiredRevision, Node: currentNode, Nodes: []model.Node{}, Bindings: []model.Binding{}, Mappings: []model.Mapping{}}
 	peers := map[string]bool{}
 	for bid, b := range st.Bindings {
 		a, aok := st.Nodes[b.ServerID]
@@ -622,7 +832,7 @@ func (s *Store) HeartbeatSoftware(id, credential string, applied int64, failed b
 		return 0, ErrInvalid
 	}
 	n := st.Nodes[id]
-	if applied < 0 || applied > st.Revision {
+	if applied < 0 || applied > n.DesiredRevision {
 		return 0, ErrInvalid
 	}
 	n.AppliedRevision = applied
@@ -640,7 +850,7 @@ func (s *Store) HeartbeatSoftware(id, credential string, applied int64, failed b
 		}
 		s.software[id] = software
 	}
-	return st.Revision, e
+	return n.DesiredRevision, e
 }
 func removeBinding(st *state, id string) {
 	delete(st.Bindings, id)

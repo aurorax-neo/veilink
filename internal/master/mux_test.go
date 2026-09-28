@@ -37,7 +37,7 @@ func TestWebAndGRPCShareOnePort(t *testing.T) {
 	}
 	addr := ln.Addr().String()
 	_ = ln.Close()
-	c, err := config.ParseFlags("master", []string{"-database", filepath.Join(dir, "veilink.db"), "-deployment-key", filepath.Join(dir, "veilink.key"), "-listen-addr", addr, "-scheme=https", "-cert-file", cert, "-key-file", key})
+	c, err := config.ParseFlags("master", []string{"-database", filepath.Join(dir, "veilink.db"), "-deployment-key", filepath.Join(dir, "veilink.key"), "-listen-addr", addr, "-scheme=https", "-cert-file", cert, "-key-file", key, "-embedded-server-enabled=false"})
 	if err != nil {
 		t.Fatal(err)
 	}

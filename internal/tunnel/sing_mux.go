@@ -199,7 +199,7 @@ func (s *service) maintainSingMux(b model.Binding, gateway model.Node, peer *cli
 	}
 }
 func (s *service) runSingMux(b model.Binding, gateway model.Node, peer *clientGateway, kind string, id [16]byte) {
-	conn, err := s.dialGateway(gateway, peer)
+	conn, err := s.dialProtocol(gateway, peer, b, singMuxPort)
 	if err != nil {
 		return
 	}
@@ -210,15 +210,6 @@ func (s *service) runSingMux(b model.Binding, gateway model.Node, peer *clientGa
 	}
 	defer s.untrack(tracked)
 	conn.SetDeadline(time.Now().Add(15 * time.Second))
-	if peer.outbound != nil {
-		conn, err = peer.outbound.Handshake(conn)
-		if err != nil {
-			return
-		}
-	}
-	if writeVLESS(conn, id, b.Domain, singMuxPort, peer.flow) != nil || readVLESSResponse(conn) != nil {
-		return
-	}
 	var protocol byte
 	for i, k := range singKinds {
 		if k == kind {

@@ -84,10 +84,21 @@ func (s *Service) Events(stream grpc.BidiStreamingServer[structpb.Struct, struct
 	timer := time.NewTimer(45 * time.Second)
 	defer timer.Stop()
 	identity := ""
+	credential := ""
+	var updates <-chan int64
 	for {
 		select {
 		case <-stream.Context().Done():
 			return stream.Context().Err()
+		case <-updates:
+			snap, err := s.Store.Snapshot(identity, credential)
+			if err != nil {
+				return rpcError(err)
+			}
+			out, _ := Envelope(map[string]any{"revision": snap.Revision, "refresh": true})
+			if err := stream.Send(out); err != nil {
+				return err
+			}
 		case <-timer.C:
 			return status.Error(codes.DeadlineExceeded, "heartbeat timeout")
 		case r := <-ch:
@@ -119,6 +130,18 @@ func (s *Service) Events(stream grpc.BidiStreamingServer[structpb.Struct, struct
 			if e != nil {
 				return rpcError(e)
 			}
+			if updates == nil {
+				var unsubscribe func()
+				updates, unsubscribe = s.Store.Subscribe(id)
+				defer unsubscribe()
+				// Close the gap between the first heartbeat and subscription.
+				snap, err := s.Store.Snapshot(id, String(r.m, "credential"))
+				if err != nil {
+					return rpcError(err)
+				}
+				rev = snap.Revision
+			}
+			credential = String(r.m, "credential")
 			// Ingest node logs if present
 			if s.NodeRing != nil {
 				if logsVal, ok := r.m.GetFields()["logs"]; ok {

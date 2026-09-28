@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"math/big"
+	"reflect"
 	"testing"
 	"time"
 
@@ -244,7 +245,7 @@ func TestUnconfiguredServerEnrollmentAndMapping(t *testing.T) {
 		}
 	}
 	after, _ := s.load()
-	if before.Revision != after.Revision || len(after.Bindings) != 0 || len(after.Secrets) != 0 || len(after.Mappings) != 0 {
+	if !reflect.DeepEqual(before, after) {
 		t.Fatal("rejected mapping persisted state")
 	}
 	server.Tunnel = testTLS(t)

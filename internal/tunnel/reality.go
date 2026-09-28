@@ -157,20 +157,21 @@ func (s *service) dialGateway(gateway model.Node, peer *clientGateway) (net.Conn
 		addr := net.JoinHostPort(endpoint.Host, strconv.Itoa(endpoint.Port))
 		serverName := endpoint.Host
 		if local.XHTTP.Enabled() {
-			if conn, err := dialXHTTP(s.ctx, addr, serverName, local); err == nil {
+			dial := func(ctx context.Context) (net.Conn, error) {
+				return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", addr)
+			}
+			if local.Reality.Enabled() {
+				dial = func(ctx context.Context) (net.Conn, error) { return dialReality(ctx, addr, serverName, local.Reality) }
+			}
+			if conn, err := dialXHTTPWithDialer(s.ctx, addr, serverName, local, dial); err == nil {
 				return conn, nil
 			} else {
 				last = err
 			}
 			continue
 		}
-		if local.Hysteria2.Enabled() {
-			if conn, err := dialHysteria(s.ctx, addr, serverName, local); err == nil {
-				return conn, nil
-			} else {
-				last = err
-			}
-			continue
+		if local.EffectiveProtocol() == "hysteria2" {
+			return nil, errors.New("Hysteria2 requires an authorized protocol session")
 		}
 		if local.Reality.Enabled() {
 			if conn, err := dialReality(s.ctx, addr, serverName, local.Reality); err == nil {

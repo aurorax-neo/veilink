@@ -70,7 +70,11 @@ func TestEmbeddedExpiredCredentialRecovery(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, c) }()
+	stopped := false
 	defer func() {
+		if stopped {
+			return
+		}
 		cancel()
 		select {
 		case err := <-done:
@@ -105,6 +109,16 @@ func TestEmbeddedExpiredCredentialRecovery(t *testing.T) {
 	got, err := s.Snapshot(n.ID, cached.Credential)
 	if err != nil || got.Node.Name != n.Name || !got.Node.Embedded {
 		t.Fatal("recovery lost database identity/settings", err)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+		stopped = true
+	case <-time.After(7 * time.Second):
+		t.Fatal("embedded recovery shutdown hung")
 	}
 	nodes, err := s.Nodes()
 	if err != nil || len(nodes) != 1 {

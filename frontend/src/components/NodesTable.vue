@@ -22,6 +22,7 @@ const configModal = ref<InstanceType<typeof Modal> | null>(null)
 const configNode = ref<Node | null>(null)
 const action = ref<'revoke' | 'delete'>('delete')
 const label = computed(() => props.role === 'server' ? '服务端' : '客户端')
+const refreshing = ref(new Set<string>())
 const rows = computed(() => desk.nodes.filter(n => n.role === props.role && [n.name, n.id, n.address, n.error].join(' ').toLowerCase().includes(query.value.trim().toLowerCase())).sort((a, b) => Number(needsAttention(b)) - Number(needsAttention(a)) || a.name.localeCompare(b.name, 'zh-CN')))
 const selected = computed(() => desk.nodes.find(n => n.id === selectedId.value))
 function mappings(id: string) { return desk.mappings.filter(m => props.role === 'server' ? m.server_id === id : m.client_id === id) }
@@ -32,20 +33,47 @@ function effectiveSources(node: Node) {
 function tunnelLabel(node: Node) {
   if (props.role === 'client') return effectiveSources(node).length ? '服务端统一下发' : '未关联服务端'
   const t = node.tunnel
-  const enc = t?.decryption
+  const protocol = t?.protocol || (t?.hysteria2?.password ? 'hysteria2' : 'vless')
+  const enc = protocol === 'vless' ? t?.decryption : ''
   const additive = enc && enc !== 'none' ? ' + Encryption' : ''
-  if (t?.xhttp?.path) return `XHTTP / packet-up · 连接 ${t.xhttp.tls ? 'HTTPS' : 'HTTP'} · 回源 ${t.transport_security === 'tls' ? 'HTTPS' : 'HTTP'}${additive}`
-  if (t?.hysteria2?.password) return `Hysteria2 / TLS${additive}`
-  if (t?.reality && Object.values(t.reality).some(Boolean)) return `TCP / REALITY${additive}`
-  if (t?.transport_security === 'plain') return 'TCP / Encryption'
-  if (t?.transport_security === 'tls') return `TCP / TLS${additive}`
+  if (protocol === 'hysteria2') return 'Hysteria2 / QUIC + TLS'
+  if (t?.xhttp?.path) return `VLESS / XHTTP · packet-up · 连接 ${t.xhttp.tls ? 'HTTPS' : 'HTTP'} · 回源 ${t.transport_security === 'tls' ? 'HTTPS' : 'HTTP'}${additive}`
+  if (t?.reality && Object.values(t.reality).some(Boolean)) return `VLESS / TCP · REALITY${additive}`
+  if (t?.transport_security === 'plain') return `VLESS / TCP · Encryption`
+  if (t?.transport_security === 'tls') return `VLESS / TCP · TLS${additive}`
   return '未配置安全模式'
 }
 function localListen(node: Node) { return endpoint(node.tunnel?.listen_host || '127.0.0.1', node.tunnel?.listen_port || 0) }
 function connectList(node: Node) { return (node.connect_endpoints || []).filter(item => item.enabled) }
 function openConfig(node: Node) { configNode.value = node; configModal.value?.open() }
-async function saved() { await desk.reload(); desk.notify('节点已保存。') }
+async function saved() { await desk.reload(); desk.notify('节点已保存，配置等待节点上报确认应用状态。') }
 function ask(node: Node, operation: 'revoke' | 'delete') { if (node.embedded) return; pending.value = node; action.value = operation; confirm.value?.open() }
+function revisionLabel(node: Node) {
+  return node.error || node.applied_revision !== node.desired_revision
+    ? `已应用 r${node.applied_revision} → 期望 r${node.desired_revision}`
+    : `r${node.applied_revision}`
+}
+function revisionDescription(node: Node) {
+  return `${revisionState(node).text}：已应用 r${node.applied_revision}，期望 r${node.desired_revision}；以节点上报为准`
+}
+function setRefreshing(id: string, busy: boolean) {
+  const next = new Set(refreshing.value)
+  if (busy) next.add(id); else next.delete(id)
+  refreshing.value = next
+}
+async function refreshNode(node: Node) {
+  if (node.revoked || refreshing.value.has(node.id)) return
+  setRefreshing(node.id, true)
+  try {
+    const result = await api<{ connected: boolean }>(`/nodes/${encodeURIComponent(node.id)}/refresh`, 'POST', {})
+    desk.notify(result.connected ? '已请求节点立即同步并上报，结果以节点上报为准' : '节点未连接，重连后自动同步')
+    await desk.reload()
+  } catch (error) {
+    desk.notify(error instanceof Error ? error.message : '请求节点更新状态失败，请稍后重试。', true)
+  } finally {
+    setRefreshing(node.id, false)
+  }
+}
 async function run() {
   if (!pending.value || pending.value.embedded) return false
   const path = `/nodes/${encodeURIComponent(pending.value.id)}`
@@ -71,10 +99,10 @@ async function run() {
         <tbody><tr v-for="node in rows" :key="node.id" :class="{ selected: selectedId === node.id }">
           <td><button type="button" class="text-btn" :aria-expanded="selectedId === node.id" @click="selectedId = selectedId === node.id ? '' : node.id">{{ node.name }}</button><small class="node-id" :title="node.id">{{ node.id }}</small><small v-if="node.embedded">内置节点</small><small class="software-version" :title="node.software_version || '等待节点上报运行版本'">软件：{{ node.software_version || '未上报' }}</small></td>
           <td><Badge :text="presence(node).text" :tone="presence(node).tone" /></td>
-          <td><template v-if="role === 'server'"><small>监听：{{ localListen(node) }} · {{ node.tunnel?.hysteria2?.password ? 'UDP' : 'TCP' }}</small><small v-for="item in connectList(node)" :key="item.id">{{ item.name }} · {{ endpoint(item.host, item.port) }}</small></template><template v-else>—</template></td>
+          <td><template v-if="role === 'server'"><small>监听：{{ localListen(node) }} · {{ node.tunnel?.protocol === 'hysteria2' || node.tunnel?.hysteria2?.password ? 'UDP' : 'TCP' }}</small><small v-for="item in connectList(node)" :key="item.id">{{ item.name }} · {{ endpoint(item.host, item.port) }}</small></template><template v-else>—</template></td>
           <td>{{ tunnelLabel(node) }}</td><td>{{ mappings(node.id).length }}</td>
-          <td><Badge :text="revisionState(node).text" :tone="revisionState(node).tone" /><small>期望 r{{ node.desired_revision }}</small><small>已应用 r{{ node.applied_revision }}</small></td>
-          <td><div class="actions"><button type="button" class="btn small" :disabled="node.revoked" @click="editor?.open(node)">编辑</button><button v-if="role === 'client'" type="button" class="btn small" :disabled="node.revoked || !effectiveSources(node).length" @click="openConfig(node)">查看配置</button><button v-if="!node.embedded" type="button" class="btn small" :disabled="node.revoked" @click="onboarding?.open(node)">快捷接入</button><button v-if="!node.embedded" type="button" class="btn small danger" @click="ask(node, 'delete')">删除</button></div></td>
+          <td><div class="revision-status" role="group" :title="revisionDescription(node)" :aria-label="revisionDescription(node)"><Badge :text="revisionState(node).text" :tone="revisionState(node).tone" /><code class="revision-value">{{ revisionLabel(node) }}</code></div></td>
+          <td><div class="actions"><button type="button" class="btn small" :disabled="node.revoked || refreshing.has(node.id)" @click="refreshNode(node)">{{ refreshing.has(node.id) ? '更新中…' : '更新状态' }}</button><button type="button" class="btn small" :disabled="node.revoked" @click="editor?.open(node)">编辑</button><button v-if="role === 'client'" type="button" class="btn small" :disabled="node.revoked || !effectiveSources(node).length" @click="openConfig(node)">查看配置</button><button v-if="!node.embedded" type="button" class="btn small" :disabled="node.revoked" @click="onboarding?.open(node)">快捷接入</button><button v-if="!node.embedded" type="button" class="btn small danger" @click="ask(node, 'delete')">删除</button></div></td>
         </tr></tbody>
       </table>
     </div>

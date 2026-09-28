@@ -18,10 +18,11 @@ func TestProtocolMatrixRoundTrip(t *testing.T) {
 	}{
 		{"tls", false, false}, {"reality", false, false},
 		{"plain", true, false}, {"hysteria2", false, false},
-		{"tls", true, false}, {"reality", true, false}, {"hysteria2", true, false},
+		{"tls", true, false}, {"reality", true, false},
 		{"tls", false, true}, {"reality", false, true},
 		{"tls", true, true}, {"reality", true, true},
 		{"xhttp-https", false, false}, {"xhttp-https", true, false}, {"xhttp-http", true, false},
+		{"xhttp-reality", false, false}, {"xhttp-reality", true, false},
 	}
 	modes := []struct{ network, mux string }{
 		{"tcp", ""}, {"tcp", model.MuxTypeSMux},
@@ -46,7 +47,7 @@ func TestProtocolMatrixRoundTrip(t *testing.T) {
 					local = model.LocalTLS{TransportSecurity: "plain", XHTTP: model.XHTTP{Path: "/veilink/", Mode: "packet-up"}}
 				case "plain":
 					local = model.LocalTLS{TransportSecurity: "plain"}
-				case "reality":
+				case "reality", "xhttp-reality":
 					priv, _, err := GenerateX25519()
 					if err != nil {
 						t.Fatal(err)
@@ -55,10 +56,14 @@ func TestProtocolMatrixRoundTrip(t *testing.T) {
 						Dest: camouflage(t, files.CertPEM, files.KeyPEM), PrivateKey: priv,
 						ShortIDs: "0123456789abcdef", ServerNames: "gateway.test",
 					}}
+					if profile.transport == "xhttp-reality" {
+						local.XHTTP = model.XHTTP{Path: "/veilink/", Mode: "packet-up"}
+					}
 				case "hysteria2":
 					local.TransportSecurity = ""
 					local.Hysteria2.Password = "protocol-matrix-secret"
 				}
+				local.Protocol = local.EffectiveProtocol()
 				if profile.encryption {
 					local.Decryption = mustEncryption(t)
 				}
@@ -123,7 +128,7 @@ func TestProtocolMatrixRoundTrip(t *testing.T) {
 			})
 		}
 	}
-	if count != 70 {
+	if count != 75 {
 		t.Fatalf("matrix size changed: %d", count)
 	}
 }

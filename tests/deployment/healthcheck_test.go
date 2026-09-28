@@ -46,7 +46,7 @@ func TestMasterHealthcheckPersistedListenerAfterRestart(t *testing.T) {
 			cert, key := healthcheckCert(t, dir)
 			tlsFlags := []string{"-cert-file", cert, "-key-file", key}
 			bootstrap := []string{"-database", db, "-deployment-key", filepath.Join(dir, "key")}
-			initial, err := config.ParseFlags("master", append(append(append([]string{}, bootstrap...), tlsFlags...), "-listen-addr", tc.storedListen, "-scheme", tc.storedScheme))
+			initial, err := config.ParseFlags("master", append(append(append([]string{}, bootstrap...), tlsFlags...), append([]string{"-embedded-server-enabled=false"}, "-listen-addr", tc.storedListen, "-scheme", tc.storedScheme)...))
 			if err != nil {
 				t.Fatal(err)
 			}

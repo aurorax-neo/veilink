@@ -7,7 +7,7 @@ import (
 
 func TestDefaultsAndFlags(t *testing.T) {
 	c := Defaults()
-	if c.Database != "/data/veilink.db" || c.DeploymentKey != "/data/veilink.key" || c.StateDir != "/data/state" || c.ListenAddr != "127.0.0.1:8443" || c.Scheme != "http" {
+	if !c.EmbeddedServer.Enabled || c.Database != "/data/veilink.db" || c.DeploymentKey != "/data/veilink.key" || c.StateDir != "/data/state" || c.ListenAddr != "127.0.0.1:8443" || c.Scheme != "http" {
 		t.Fatalf("defaults: %+v", c)
 	}
 	t.Setenv("VEILINK_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -96,7 +97,7 @@ func TestDirectMappingSessionsRollbackAndCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	after, _ := s.load()
-	if before.Revision != after.Revision || len(after.Bindings) != 1 || len(after.Secrets) != 1 {
+	if !reflect.DeepEqual(before, after) {
 		t.Fatal("failed save mutated state")
 	}
 	// Failure of the SQL audit write must roll back config and encrypted session.
@@ -110,7 +111,7 @@ func TestDirectMappingSessionsRollbackAndCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	after, _ = s.load()
-	if before.Revision != after.Revision || len(after.Bindings) != 1 {
+	if !reflect.DeepEqual(before, after) {
 		t.Fatal("SQL rollback failed")
 	}
 	snap, err := s.Snapshot(client.ID, credential)
@@ -147,7 +148,7 @@ func TestDirectMappingSessionsRollbackAndCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	state, _ = s.load()
-	if len(state.Bindings) != 1 || len(state.Secrets) != 1 {
+	if len(state.Bindings) != 1 || len(state.Secrets) != 2 || state.Secrets[shared.BindingID] != nil || !bytes.Equal(state.Secrets[enrollmentCredentialKey(client.ID)], before.Secrets[enrollmentCredentialKey(client.ID)]) {
 		t.Fatal("orphan session retained")
 	}
 	m.BindingID, m.ServerID = "", server.ID
@@ -163,7 +164,7 @@ func TestDirectMappingSessionsRollbackAndCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	state, _ = s.load()
-	if len(state.Bindings) != 0 || len(state.Secrets) != 0 {
+	if len(state.Bindings) != 0 || len(state.Secrets) != 1 || !bytes.Equal(state.Secrets[enrollmentCredentialKey(client.ID)], before.Secrets[enrollmentCredentialKey(client.ID)]) {
 		t.Fatal("delete retained orphan")
 	}
 	if err := s.RemoveNode(client.ID, false); err != nil {
@@ -271,9 +272,19 @@ func TestCredentialTTLRotationAndRevocation(t *testing.T) {
 	if _, err := s.Snapshot(n.ID, credential); err != nil {
 		t.Fatal("revocation affected active credential", err)
 	}
+	reused := testCredential(t, s, n.ID)
+	if reused != credential {
+		t.Fatal("new enrollment token changed an active credential")
+	}
+	if _, err := s.db.Exec("UPDATE credentials SET expires=? WHERE node=?", time.Now().Unix(), n.ID); err != nil {
+		t.Fatal(err)
+	}
 	rotated := testCredential(t, s, n.ID)
+	if rotated == credential {
+		t.Fatal("expired credential was not replaced")
+	}
 	if _, err := s.Snapshot(n.ID, credential); !errors.Is(err, ErrAuth) {
-		t.Fatal("old credential accepted")
+		t.Fatal("expired credential revived")
 	}
 	if _, err := s.db.Exec("UPDATE credentials SET expires=?", time.Now().Unix()); err != nil {
 		t.Fatal(err)
@@ -307,7 +318,7 @@ func TestEncryptionAcrossTransportsAndFlowValidation(t *testing.T) {
 				cert, key := testPEM(t)
 				server := testNode(t, s, "server", transport)
 				client := testNode(t, s, "client", transport+"-client")
-				server.Tunnel = model.LocalTLS{ListenPort: 8444, Decryption: keys[0]}
+				server.Tunnel = model.LocalTLS{Protocol: "vless", ListenPort: 8444, Decryption: keys[0]}
 				server.ClientTunnel = nil
 				switch transport {
 				case "raw":
@@ -320,6 +331,11 @@ func TestEncryptionAcrossTransportsAndFlowValidation(t *testing.T) {
 				case "hysteria2":
 					server.Tunnel.CertPEM, server.Tunnel.KeyPEM = cert, key
 					server.Tunnel.Hysteria2.Password = "shared-password"
+					server.Tunnel.Protocol = "hysteria2"
+					if _, err := s.SaveNode(server); !errors.Is(err, ErrInvalid) {
+						t.Fatal("HY2 accepted VLESS Encryption", err)
+					}
+					server.Tunnel.Decryption = ""
 				}
 				server, err = s.SaveNode(server)
 				if err != nil {
@@ -336,7 +352,11 @@ func TestEncryptionAcrossTransportsAndFlowValidation(t *testing.T) {
 					t.Fatal(err)
 				}
 				peer := snap.Nodes[0].Tunnel
-				if peer.Encryption != keys[1] || peer.Decryption != "" || peer.KeyPEM != "" || peer.CertPEM != "" || peer.Reality.PrivateKey != "" {
+				expectedEncryption := keys[1]
+				if transport == "hysteria2" {
+					expectedEncryption = ""
+				}
+				if peer.Protocol != server.Tunnel.Protocol || peer.Encryption != expectedEncryption || peer.Decryption != "" || peer.KeyPEM != "" || peer.CertPEM != "" || peer.Reality.PrivateKey != "" {
 					t.Fatal("public crypto defaults or redaction incorrect")
 				}
 				if transport == "hysteria2" && peer.Hysteria2.Password != "shared-password" {

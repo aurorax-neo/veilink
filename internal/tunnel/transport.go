@@ -13,6 +13,9 @@ var xhttpPath = regexp.MustCompile(`^/[A-Za-z0-9/_-]*$`)
 
 // checkTransportSecurity allows empty client settings to inherit their gateway.
 func checkTransportSecurity(local model.LocalTLS) error {
+	if err := checkProtocol(local); err != nil {
+		return err
+	}
 	switch local.TransportSecurity {
 	case "", "tls", "plain":
 	default:
@@ -28,8 +31,11 @@ func checkTransportSecurity(local model.LocalTLS) error {
 		if len(x.Path) > 256 || !xhttpPath.MatchString(x.Path) || strings.Contains(x.Path, "//") || !strings.HasSuffix(x.Path, "/") || (x.Path != "/" && path.Clean(x.Path)+"/" != x.Path) {
 			return errors.New("xhttp path must be canonical, begin and end with /, and contain only letters, digits, /, _ or - (maximum 256 bytes)")
 		}
-		if local.Reality.Enabled() || local.Hysteria2.Enabled() || (local.Flow != "" && local.Flow != "none") {
-			return errors.New("xhttp cannot be combined with REALITY, Hysteria2 or Vision")
+		if local.Flow != "" && local.Flow != "none" {
+			return errors.New("xhttp cannot be combined with Vision")
+		}
+		if local.Reality.Enabled() && x.TLS {
+			return errors.New("xhttp with REALITY must disable xhttp TLS")
 		}
 	}
 	return nil

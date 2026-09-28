@@ -217,6 +217,7 @@ func TestCLIEndToEnd(t *testing.T) {
 	command(t, root, nil, "go", "run", "./tools/devcert", "-out", certs)
 	controlPort, tunnelPort, publicPort := freePort(t), freePort(t), freePort(t)
 	masterFlags := []string{"-database", filepath.Join(dir, "master.db"), "-deployment-key", filepath.Join(dir, "master.key"), "-listen-addr", fmt.Sprintf("127.0.0.1:%d", controlPort), "-scheme=https", "-cert-file", filepath.Join(certs, "cert.pem"), "-key-file", filepath.Join(certs, "key.pem")}
+	masterFlags = append(masterFlags, "-embedded-server-enabled=false")
 	master := launch(t, bin, "master", masterFlags...)
 	jar, _ := cookiejar.New(nil)
 	pool := x509.NewCertPool()

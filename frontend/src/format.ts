@@ -127,7 +127,7 @@ export function validatePEM(value: string, kind: 'cert' | 'key' | 'ca'): string 
   return null
 }
 
-export function validateNode(input: { name: string; role: string; address: string; port: string; listen: string; listenPort?: string; transport: string; security: string; cert: string; key: string; ca: string }): string | null {
+export function validateNode(input: { name: string; role: string; address: string; port: string; listen: string; listenPort?: string; protocol?: string; transport: string; security: string; cert: string; key: string; ca: string }): string | null {
   const name = input.name.trim()
   if (!name || name.length > 128) return '节点名称需要 1 到 128 个字符。'
   if (input.role !== 'server' && input.role !== 'client') return '角色只能是公网网关或内网节点。'
@@ -138,7 +138,11 @@ export function validateNode(input: { name: string; role: string; address: strin
   if (input.role === 'client') return null
   if (input.listen.trim() && !looksLikeIP(input.listen.trim())) return '隧道监听地址必须是 IP，例如 0.0.0.0、127.0.0.1 或 ::。'
   if (portNumber(input.listenPort || '') === null) return '本地监听端口要在 1 到 65535 之间。'
-  const tls = input.transport === 'hysteria2' || input.security === 'tls'
+  const protocol = input.protocol || (input.transport === 'hysteria2' ? 'hysteria2' : 'vless')
+  const tls = protocol === 'hysteria2' || input.transport === 'hysteria2' || input.security === 'tls'
+  if (protocol === 'hysteria2' && (input.transport !== 'quic' && input.transport !== 'hysteria2' || input.security !== 'tls')) return 'Hysteria2 只能使用 QUIC 和 TLS。'
+  if (protocol === 'hysteria2' && input.transport === 'xhttp') return 'Hysteria2 不支持 XHTTP。'
+  if (protocol === 'hysteria2' && input.security === 'reality') return 'Hysteria2 不支持 REALITY。'
   if (tls) {
     if (!input.cert.trim() || !input.key.trim()) return 'TLS / Hysteria2 需要完整的证书和私钥 PEM。'
     for (const kind of ['cert', 'key'] as const) {

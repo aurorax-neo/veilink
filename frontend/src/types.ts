@@ -22,6 +22,7 @@ export interface ConnectEndpoint {
 }
 
 export interface TunnelConfig {
+  protocol?: 'vless' | 'hysteria2' | ''
   transport_security?: 'tls' | 'plain' | ''
   cert_pem?: string
   key_pem?: string

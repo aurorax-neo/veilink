@@ -103,6 +103,12 @@ func TestJoinCommandAuthenticationRotationAndRevocation(t *testing.T) {
 		}
 		return r
 	}
+	body = `{"master_url":"https://panel.example:8443"}`
+	defaultTTL := generate()
+	if delta := defaultTTL.Expires - time.Now().Unix(); delta < 999999995 || delta > 1000000000 {
+		t.Fatal("omitted join TTL must match frp-panel lifetime")
+	}
+	body = `{"master_url":"https://panel.example:8443","ttl_seconds":60}`
 	old := generate()
 	fresh := generate()
 	if _, err = s.Enroll(n.ID, old.Token); err == nil {
@@ -142,8 +148,9 @@ func TestJoinCommandAuthenticationRotationAndRevocation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = s.Enroll(n.ID, fresh.Token); err == nil {
-		t.Fatal("reused token accepted")
+	credentialAgain, err := s.Enroll(n.ID, fresh.Token)
+	if err != nil || credentialAgain != credential {
+		t.Fatal("active join token was not reusable")
 	}
 	if w = call("DELETE", "/api/nodes/"+n.ID+"/enroll", ""); w.Code != 200 {
 		t.Fatal(w.Code)
@@ -151,7 +158,7 @@ func TestJoinCommandAuthenticationRotationAndRevocation(t *testing.T) {
 	if _, err = s.Snapshot(n.ID, credential); err != nil {
 		t.Fatal("token revoke revoked active node", err)
 	}
-	for _, bad := range []string{`{"master_url":"https://host","ttl_seconds":86401}`, `{"master_url":"https://host;id"}`, `{"master_url":"http://host"}`, `{"master_url":"https://host","ttl_seconds":-1}`} {
+	for _, bad := range []string{`{"master_url":"https://host","ttl_seconds":1000000001}`, `{"master_url":"https://host;id"}`, `{"master_url":"http://host"}`, `{"master_url":"https://host","ttl_seconds":-1}`} {
 		if w = call("POST", path, bad); w.Code != 400 {
 			t.Fatal("accepted invalid join", w.Code)
 		}

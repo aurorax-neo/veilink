@@ -190,7 +190,7 @@ func (s *service) maintainApplication(b model.Binding, gateway model.Node, peer 
 		return
 	}
 	for s.ctx.Err() == nil {
-		conn, err := s.dialGateway(gateway, peer)
+		conn, err := s.dialProtocol(gateway, peer, b, applicationPort)
 		if err != nil {
 			if !sleep(s.ctx, 200*time.Millisecond) {
 				return
@@ -205,15 +205,6 @@ func (s *service) maintainApplication(b model.Binding, gateway model.Node, peer 
 			return
 		}
 		_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
-		if peer.outbound != nil {
-			conn, err = peer.outbound.Handshake(conn)
-		}
-		if err == nil {
-			err = writeVLESS(conn, id, b.Domain, applicationPort, peer.flow)
-		}
-		if err == nil {
-			err = readVLESSResponse(conn)
-		}
 		if err == nil {
 			err = writeAll(conn, applicationMagic)
 		}

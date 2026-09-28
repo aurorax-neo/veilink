@@ -6,6 +6,7 @@ require (
 	github.com/apernet/quic-go v0.61.1-0.20260806010916-184d081eef3e
 	github.com/metacubex/sing v0.5.8
 	github.com/metacubex/sing-mux v0.3.10
+	github.com/quic-go/qpack v0.6.0
 	github.com/refraction-networking/utls v1.8.3-0.20260301010127-aa6edf4b11af
 	github.com/xtls/reality v0.0.0-20260908062103-8cdf7bf9c7f0
 	github.com/xtls/xray-core v1.260327.1-0.20260920225103-d562d8947d31

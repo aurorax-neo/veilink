@@ -313,6 +313,14 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			result, err = a.store.SaveNode(n)
 		case r.Method == "DELETE" && len(p) == 2:
 			err = a.store.RemoveNode(id, true)
+		case r.Method == "POST" && len(p) == 3 && p[2] == "refresh":
+			var in struct{}
+			if !decode(w, r, &in) {
+				return
+			}
+			var connected bool
+			connected, err = a.store.RequestRefresh(id)
+			result = map[string]bool{"connected": connected}
 		case r.Method == "POST" && len(p) == 3 && p[2] == "revoke":
 			err = a.store.RemoveNode(id, false)
 		case r.Method == "POST" && len(p) == 3 && p[2] == "join":

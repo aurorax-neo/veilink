@@ -12,6 +12,9 @@ import (
 	"time"
 )
 
+// defaultJoinTTL matches frp-panel's quick-join token lifetime in seconds.
+const defaultJoinTTL int64 = 1_000_000_000
+
 // shellQuote keeps all generated values data, never executable shell syntax.
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
 
@@ -49,10 +52,10 @@ func (a *API) joinCommand(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	if in.TTL == 0 {
-		in.TTL = 3600
+		in.TTL = defaultJoinTTL
 	}
 	address, serverName, err := joinAddress(in.MasterURL)
-	if err != nil || in.TTL < 1 || in.TTL > 86400 {
+	if err != nil || in.TTL < 1 || in.TTL > defaultJoinTTL {
 		failure(w, 400)
 		return
 	}
@@ -99,6 +102,6 @@ func (a *API) joinCommand(w http.ResponseWriter, r *http.Request, id string) {
 	} {
 		command.WriteString(" " + v.flag + " " + shellQuote(v.value))
 	}
-	warning := "命令包含一次性接入令牌，可能出现在 shell 历史和 Docker inspect 的容器参数中；请勿分享或记录日志。接入成功后保留 /data 状态并重建不带令牌的容器，删除原容器前妥善保护主机访问。私有 Master CA 时，请将证书放入 " + config + "/ca.pem，并在角色子命令后添加 -control-ca /config/ca.pem；不要关闭 TLS 验证。"
+	warning := "命令包含可重复使用的接入令牌，可能出现在 shell 历史和 Docker inspect 的容器参数中；请勿分享或记录日志。不再需要注册时请撤销令牌。接入成功后保留 /data 状态并重建不带令牌的容器，删除原容器前妥善保护主机访问。私有 Master CA 时，请将证书放入 " + config + "/ca.pem，并在角色子命令后添加 -control-ca /config/ca.pem；不要关闭 TLS 验证。"
 	output(w, 200, map[string]any{"prepare": prepare, "command": command.String(), "token": token, "expires_at": time.Now().Unix() + in.TTL, "warning": warning})
 }

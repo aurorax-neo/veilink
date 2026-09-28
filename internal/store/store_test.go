@@ -48,8 +48,9 @@ func TestPersistenceIsolationRevocation(t *testing.T) {
 		if e != nil {
 			t.Fatal(e)
 		}
-		if _, e = s.Enroll(n.ID, token); !errors.Is(e, ErrAuth) {
-			t.Fatal("enrollment reused")
+		second, e := s.Enroll(n.ID, token)
+		if e != nil || second != creds[n.ID] {
+			t.Fatal("enrollment token was not reusable")
 		}
 	}
 	expired, e := s.EnrollToken(other.ID, time.Hour)

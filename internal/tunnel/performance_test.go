@@ -18,7 +18,7 @@ import (
 	"veilink/internal/model"
 )
 
-// All 77 finite supported transport/flow/encryption choices. Padding lengths,
+// All 65 finite legal supported transport/flow/encryption choices. Padding lengths,
 // ticket lifetimes and arbitrary keys are not separate throughput dimensions.
 // 0rtt/1rtt is the configured policy; the measurement excludes handshakes and
 // does not claim that a fresh connection resumed a ticket.
@@ -40,6 +40,9 @@ func performanceCases() []perfCase {
 			}
 			if transport != "plain" {
 				out = append(out, perfCase{name: base, transport: transport, vision: vision})
+			}
+			if transport == "HY2" {
+				continue
 			}
 			for _, mode := range []string{"native", "xorpub", "random"} {
 				for _, key := range []string{"x25519", "mlkem"} {

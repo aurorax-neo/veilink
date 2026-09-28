@@ -14,6 +14,18 @@ HY2 默认使用 Xray `standard` BBR：Client/Server 均在认证成功后、业
 
 分发源码、二进制、镜像或前端产物时，须保留适用的第三方版权、许可和 NOTICE，并按 GPL/MPL 等适用条款提供对应源码与获取说明；本段不表示发布物已经完成合规审计。直接依赖许可核查、REALITY 标准 MPL Exhibit B 的说明及分发义务见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)，不构成法律意见或保证。
 
+## GitHub Actions 发布
+
+正式发布由 `.github/workflows/release.yml` 管理。将严格 SemVer tag（例如 `v0.1.0`）推送到 GitHub 后，workflow 会先执行 Go、race、integration、前端测试和生产构建；全部通过后构建并推送同一个多架构统一镜像，并创建 GitHub Release。发布镜像标签为 `ghcr.io/<owner>/<repo>:0.1.0`、`0.1`、`0` 和 `latest`，不生成角色镜像或角色发布包。
+
+```sh
+git tag -a v0.1.0 -m 'Release v0.1.0'
+git push origin main
+git push origin v0.1.0
+```
+
+workflow 使用 `VERSION=v0.1.0`、触发提交 SHA 和仓库 URL 注入统一镜像，并启用 BuildKit provenance 与 SBOM。GHCR 包和 GitHub Release 需要仓库 Actions 具备相应的 `packages: write` 与 `contents: write` 权限。
+
 ## 手动开发构建（GitHub Actions）
 
 工作流：`.github/workflows/development-artifacts.yml`。仅支持 `workflow_dispatch`，不响应 push、PR 或 tag；默认只检查和构建，不创建 Release、不上传镜像、不部署。它需先经另行授权推送到远端并存在于默认分支，才能在 **Actions → Development artifacts → Run workflow** 选择目标分支运行。本次本地开发不执行该推送或远端运行。
@@ -37,6 +49,7 @@ gh workflow run development-artifacts.yml --ref master -f push_dev_image=true
 | 统一开发二进制包 | macOS amd64 / arm64 | `veilink-darwin-{amd64,arm64}.tar.gz` |
 | 统一开发二进制包 | Windows amd64 / arm64 | `veilink-windows-{amd64,arm64}.tar.gz` |
 | 单名多架构镜像 | linux/amd64 + linux/arm64 | `ghcr.io/<owner>/<repo>:dev-<run-id>-<attempt>` |
+
 
 每个二进制包包含一个 `veilink`（Windows 为 `veilink.exe`）、`html/`、许可证与 NOTICE、README 和注明源码提交的 `BUILD.txt`；通过 `master|server|client` 子命令选择角色，没有角色包矩阵。Master 可用 `-html-dir` 指定随包 Web 资源。Actions 的 `package-<os>-<arch>` 下载项包含归档及其 `SHA256SUMS`，保留 14 天；共享 Web 中间产物保留 7 天。交叉编译不代表各系统原生运行验证；这些包用于开发检查，**不是宿主机生产部署指南**，生产仍使用下文 Docker Run。
 
@@ -94,7 +107,7 @@ docker run -itd \
 mkdir -p /opt/docker/veilink-master/config /opt/docker/veilink-master/data && chown -R 65532:65532 /opt/docker/veilink-master/config /opt/docker/veilink-master/data && chmod 700 /opt/docker/veilink-master/config /opt/docker/veilink-master/data
 ```
 
-**关键参数：** `/config` 是预留的只读目录，默认 HTTP 无需证书；`/data` 保存 SQLite、deployment key、内置节点状态。Web、REST API 和 gRPC 共用 Master 的 `8443` 监听器，HTTP 模式支持 gRPC h2c。上例仅监听本机，适合同主机 nginx；可信内网直连时显式改为内网地址，并限制来源。内置 Server 默认显示名为 `default`；已有节点身份和自定义名保持不变，可用 `-embedded-server-name` 指定首次名称。`-embedded-server-address/-port/-server-name` 初始化默认客户端接入候选；首次创建时本地隧道监听端口也初始化为该 port，之后可在 Web 分别修改。动态映射端口直接监听宿主机。HTTP 模式的内置节点不配置 `-control-server-name` 或 `-control-ca`。无需内置网关时改为 `-embedded-server-enabled=false`。已有数据库保留历史设置；切回 HTTP 时应显式传入 `-scheme http -control-server-name= -control-ca=`，而不是删库。
+**关键参数：** `/config` 是预留的只读目录，默认 HTTP 无需证书；`/data` 保存 SQLite、deployment key、内置节点状态。Web、REST API 和 gRPC 共用 Master 的 `8443` 监听器，HTTP 模式支持 gRPC h2c。上例仅监听本机，适合同主机 nginx；可信内网直连时显式改为内网地址，并限制来源。Master 默认自动初始化并启动一个显示名为 `default` 的内置 Server；已有节点身份和自定义名保持不变，可用 `-embedded-server-name` 指定首次名称。需要关闭时显式传入 `-embedded-server-enabled=false`。`-embedded-server-address/-port/-server-name` 初始化默认客户端接入候选；首次创建时本地隧道监听端口也初始化为该 port，之后可在 Web 分别修改。动态映射端口直接监听宿主机。HTTP 模式的内置节点不配置 `-control-server-name` 或 `-control-ca`。已有数据库保留历史设置；切回 HTTP 时应显式传入 `-scheme http -control-server-name= -control-ca=`，而不是删库。
 
 ### nginx 终止 HTTPS，Veilink 保持 HTTP
 
@@ -194,7 +207,7 @@ docker exec -i veilink-master /usr/local/bin/veilink reset-admin-password -passw
 
 ### 独立 Server
 
-先在 Web 创建 Server 节点并配置可访问地址及隧道参数，再获取节点 ID 与一次性接入令牌。Server 监听的隧道与 TCP/UDP 映射端口可能动态变化，因此只用 Host 网络。
+先在 Web 创建 Server 节点并配置可访问地址及隧道参数，再获取节点 ID 与接入令牌。Server 监听的隧道与 TCP/UDP 映射端口可能动态变化，因此只用 Host 网络。
 
 **Docker Run 命令**（示例连接上方 nginx 的 HTTPS 入口，替换节点 ID、令牌与域名）：
 
@@ -207,7 +220,7 @@ docker run -itd \
   veilink:latest server \
   -master-addr panel.example.com:443 \
   -control-server-name panel.example.com \
-  -node-id '<Server 节点 ID>' -enroll-token '<一次性令牌>' \
+  -node-id '<Server 节点 ID>' -enroll-token '<接入令牌>' \
   -state-dir /data/state
 ```
 
@@ -219,11 +232,11 @@ mkdir -p /opt/docker/veilink-server/config /opt/docker/veilink-server/data && ch
 
 **关键参数：** `-control-server-name` 开启并验证到 Master 的 HTTPS，`-master-addr` 是 `host:port`；只有 Master 使用私有 CA 时，才将 CA 放在 `config/master-ca.pem`，并在角色子命令后的 flags 中添加 `-control-ca /config/master-ca.pem`。`/data/state` 保留已获取的节点凭据与最后成功快照；后续重建容器无需再次提供 `-enroll-token`。令牌在启动命令、Shell 历史和 `docker inspect` 中可见；首次接入成功后，**保留 `/data`，删除原容器并以不含令牌的命令重建**。绝不把服务端隧道私钥或证书路径放在节点启动参数中。
 
-若节点通过可信内网直接连接 HTTP Master，将 `-master-addr` 改为可达的内网 `host:8443`，省略 `-control-server-name` 与 `-control-ca`，使用明文 gRPC/h2c。不要把 HTTP 直接暴露到不可信网络。当前 Web“快捷接入”仅接受 HTTPS 管理地址（可填 nginx 入口）；HTTP 直连使用此处的手工 flags，一次性令牌可通过已认证且携带 CSRF token 的 `POST /api/nodes/{id}/enroll` 获取（JSON：`{"ttl_seconds":3600}`）。这一命令生成器限制不影响 HTTP 首次注册、登录和管理 API。
+若节点通过可信内网直接连接 HTTP Master，将 `-master-addr` 改为可达的内网 `host:8443`，省略 `-control-server-name` 与 `-control-ca`，使用明文 gRPC/h2c。不要把 HTTP 直接暴露到不可信网络。当前 Web“快捷接入”仅接受 HTTPS 管理地址（可填 nginx 入口）；HTTP 直连使用此处的手工 flags，接入令牌可通过已认证且携带 CSRF token 的 `POST /api/nodes/{id}/enroll` 获取（JSON：`{"ttl_seconds":3600}`，手工 API 可选 1–86400 秒）。这一命令生成器限制不影响 HTTP 首次注册、登录和管理 API。
 
 ### Client
 
-先在 Web 创建 Client 节点，选择 Server/Client 创建映射，并获取 ID 与一次性接入令牌。Client 只发起出站连接，无需发布端口，因此使用默认 Bridge 网络。
+先在 Web 创建 Client 节点，选择 Server/Client 创建映射，并获取 ID 与接入令牌。Client 只发起出站连接，无需发布端口，因此使用默认 Bridge 网络。
 
 **Docker Run 命令**（示例连接上方 nginx 的 HTTPS 入口，替换节点 ID、令牌与域名；可信内网 HTTP 直连按 Server 章节调整）：
 
@@ -236,7 +249,7 @@ docker run -itd \
   veilink:latest client \
   -master-addr panel.example.com:443 \
   -control-server-name panel.example.com \
-  -node-id '<Client 节点 ID>' -enroll-token '<一次性令牌>' \
+  -node-id '<Client 节点 ID>' -enroll-token '<接入令牌>' \
   -state-dir /data/state
 ```
 
@@ -252,10 +265,14 @@ mkdir -p /opt/docker/veilink-client/config /opt/docker/veilink-client/data && ch
 
 - **仅通过角色 flags 配置运行参数**：不接受 YAML 配置文件、`-config` 或 `VEILINK_CONFIG`；Master 的持久化设置优先级是首次默认值 → SQLite 已存设置 → 显式传入的 flags。`-database`、`-deployment-key` 是 Master 存储位置，数据库与 key 必须一起备份。容器默认绝对路径为 `/data/veilink.db`、`/data/veilink.key` 与 `/data/state`，不会在源码目录创建 `.local`。管理员仅通过首次 Web 注册创建，不接受初始化环境变量。
 - **所有隧道参数均从 Web 管理**：仅编辑 Server 私有 `tunnel`，保存时由管理中心自动派生并保存只读 `client_tunnel`；没有独立的下发模板编辑入口，节点写入 API 不接受 `client_tunnel`。创建/关联映射后，授权快照只把派生的公共参数/共享认证发给 Client，不包含 Server 私钥；服务端配置修改后同步重新派生。客户端详情可只读查看期望配置，实际应用状态以节点修订为准。Client 不允许用启动参数或本地文件覆写。Master 身份证书来自只读 `/config`，与隧道 TLS/Hysteria2 的 Web PEM 不同。映射直接选择 Server、Client 与 Pool（1–32）。
+- **配置修订按节点隔离**：服务端隧道配置修改后，仅该服务端与它绑定的客户端更新期望修订；映射变更仅更新旧、新映射两端，无关服务端和客户端保持原修订。内部全局序号只用于生成单调递增的标识，因此节点修订可以跳号；重复保存相同配置不增加节点修订。Master 通过已认证 gRPC 长连接立即通知相关节点，节点成功应用并保存快照后立即上报，不再等待下一次定时心跳。失败保留最后成功快照，不虚报已应用。
+- **手动更新状态**：服务端、客户端（含内置节点）的「更新状态」调用 `POST /api/nodes/{id}/refresh`（空 JSON 对象，需要 Cookie 会话、同源与 CSRF 校验）。已连接时请求节点立即同步待应用配置并上报，已应用的相同配置不强制重启；未连接时明确提示，重连自动拉取最新配置。此操作不增加配置修订、不伪造在线或目标可达性；结果以节点实际回报为准。
 - **客户端连接地址与监听分离**：Server 私有 `tunnel.listen_host/listen_port` 是本地绑定的监听 IP/端口；`connect_endpoints` 的 `host/port`（Web 标签为「主机/域名」「端口」）是 Client 拨号使用的可达主机与端口，可与本地绑定不同（例如端口转发或 CDN 域名）。TLS/Hysteria2/XHTTP HTTPS 按连接地址的域名或 IP 校验证书，REALITY 使用自身伪装域名配置；不再提供节点或候选的独立 SNI 字段。保留多个具名候选与启用状态，Client 按列表顺序失败切换，不再提供优先级或 direct/nat/cdn 分类。旧 `server_name`、`priority`、`kind` 字段及旧数据库 schema 明确报错，不自动迁移或删库；已有数据须先备份，任何清除须另行明确授权。证书生成 API 使用 `host` 指定证书名称。Client 永不接收或覆盖本地监听字段。TCP/REALITY/Hysteria2 仍要求原始 TCP 或 UDP/QUIC 的 L4 透传；**XHTTP packet-up 可通过 HTTP/HTTPS 路径透传 CDN，允许边缘终止 TLS**，具体前提与限制见下节。
-- **Hysteria2 安全边界**：Hysteria2 基于 QUIC/UDP 且使用 TLS；当前上游和本实现不支持 REALITY，配置会被拒绝。
-- **XHTTP 安全边界**：Web 传输选择 XHTTP，对应 JSON `tunnel.xhttp`；仅支持 `packet-up`、HTTP/1.1。`xhttp.tls` 控制 Client 到连接地址的 HTTPS，`transport_security` 控制 Server 源站监听 TLS/plain，互相独立。任一配置为 HTTP 时必须启用 VLESS Encryption；不支持 REALITY、Hysteria2、Vision 混用。Client 模板仍由 Server 配置自动派生，映射/mux/XUDP 授权逻辑不变；不宣称 Xray 线协议互通或任意公网 CDN 兼容。
-- **认证**：管理员使用密码会话、CSRF；节点一次性接入令牌最长 24 小时，凭据有效期 30 天。内置 Server 身份持久且不可通过外部令牌接管。Web 的“快捷接入”生成统一镜像加角色子命令的 Docker Run 命令和挂载准备步骤；令牌可能暴露于 Shell 历史及 Docker inspect，关闭弹窗会从页面内存移除。
+- **协议选择**：`tunnel.protocol` 明确为 `vless` 或 `hysteria2`，Web 保存时总是写入。空值按已有 `hysteria2.password` 选择 HY2，否则选择 VLESS；显式协议不再由其它字段推断。派生模板与授权快照保留该值。未知值、VLESS 携带 HY2 参数以及 HY2 携带 VLESS Encryption（含 `none`）、REALITY、XHTTP 或 Vision 均拒绝，不静默删字段或迁移数据库。
+- **Hysteria2 实现状态（未完成全量生产验收）**：HY2 已分离为 QUIC + TLS 的独立入口，不经过 VLESS Encryption 或 VLESS 请求头。配置中的服务器密码仅用于启用/校验 HY2；标准 HTTP/3 `/auth` 使用授权 Binding UUID 作为每绑定凭据，服务端再要求 TCP 请求目标匹配同一 Binding 的反向域名及会话端口，已覆盖跨绑定凭据复用、跨绑定目标和错误凭据拒绝。后续反向控制、应用、mux 与 XUDP 仍是 Veilink 会话，不承诺 Xray 反向代理或原生 HY2 datagram 互通。旧 HY2+VLESS 配置明确拒绝，不自动迁移。全量 WAN/NAT、恢复、监控和供应链验收仍未完成。
+- **XHTTP 安全边界**：Web 传输选择 XHTTP，对应 JSON `tunnel.xhttp`；仅支持 `packet-up`、HTTP/1.1。普通 XHTTP 中 `xhttp.tls` 控制 Client 到连接地址的 HTTPS，`transport_security` 控制 Server 源站监听 TLS/plain，互相独立；任一配置为 HTTP 时必须启用 VLESS Encryption。按 Xray 的分层语义，XHTTP 可与 REALITY 组合为 TCP → REALITY → XHTTP：此时 `xhttp.tls` 必须为 false，由 REALITY 提供外层安全，不能走 CDN 的边缘 TLS 终止路径。仍不支持 Hysteria2、Vision 或其它 XHTTP 模式；不宣称 Xray 线协议互通或任意公网 CDN 兼容。Client 模板仍由 Server 配置自动派生，映射/mux/XUDP 授权逻辑不变。
+- **认证**：管理员使用密码会话、CSRF；快捷接入令牌按 frp-panel 的 `expiresIn=1000000000` 秒语义生成，在有效期内可重复使用，撤销或过期后失效；凭据有效期 30 天。内置 Server 身份持久且不可通过外部接入、删除或吊销替换。令牌可能暴露于 Shell 历史及 Docker inspect，关闭弹窗会从页面内存移除。
+  接入令牌仅授权对应节点，可重复获取同一份尚未过期的节点凭据，不延长凭据期限；重新生成令牌使旧令牌失效但不改变有效节点凭据。撤销接入令牌不吊销已接入凭据；需要禁用节点时请吊销节点。节点凭据用 deployment key 加密保存在现有私密状态中，不下发给其他节点。旧版本只有 hash 的有效凭据无法还原，重复接入明确报错且不替换该凭据；保留原节点 `/data/state` 继续使用，凭据过期后可用有效接入令牌重新注册。已经被旧版消费掉的令牌不能恢复，需重新生成；不自动迁移或删除数据。
 - **TCP mux 可选**：Web「映射 → 新建/编辑 → TCP mux」对应映射 JSON 字段 `mux`，默认 `false`（省略也是关闭），不是节点或全局设置。关闭时每条 TCP 流使用独立认证反向连接；开启时多条 TCP 流共享 mux 会话。同一 Server/Client 的不同映射可独立选择。Pool（1–32）控制该节点对的共享会话或独立连接预备数量，取启用映射的最大值，不限制业务并发。保存开关或类型后授权快照触发相关节点重建，现有连接会断开；以已应用修订确认生效。控制连接仍保留，UDP 始终使用 XUDP/共享帧通道，不受 TCP mux 开关影响。
 - **mux 类型**：Web 使用与其他字段同风格的单一下拉框，选项为「关闭 / smux / yamux / h2mux」，新建默认关闭，不使用 checkbox 或 radio。Mapping API 保留布尔 `mux` 和字符串 `mux_type`；选择协议时发送 `mux=true` 与明确类型，关闭时发送 `mux=false` 并清空类型。API 开启 mux 但省略/留空类型仍采用 `smux`，未知非空类型拒绝，不静默回退。切换 UDP 立即关闭 mux、清空类型并禁用下拉；切回 TCP 仍保持关闭，API 拒绝 UDP + mux=true。不提供额外 padding 或流数配置。反向隧道仍是 Veilink 协议，使用这些 mux 类型不代表兼容 mihomo 节点直连，也不宣称 Xray 通用互通。
 - **mux 实现边界**：smux/yamux 使用 sing-mux 客户端与服务端；h2mux 使用标准 HTTP/2 CONNECT 发起端及 sing-mux 编解码/服务端，以避开当前依赖的空 Header 兼容问题。每条真实 mux 流内另有 Veilink 有界 payload/FIN 记录，保留 TCP 半关闭语义；该记录不承担多路复用。连接池按节点绑定及 mux 类型隔离，每池最多 64 条活动/等待流，超过上限拒绝新流；Pool 不等于该并发上限。h2mux 单流 deadline API 不受支持，关闭和取消由上下文、受跟踪连接及目标 socket 驱动。旧 `private-session` 类型即使在关闭状态也明确拒绝。
@@ -272,6 +289,7 @@ Server `tunnel` JSON 示例（`decryption` 占位值须替换为 Web 生成的�
 
 ```json
 {
+  "protocol": "vless",
   "listen_host": "127.0.0.1",
   "listen_port": 8444,
   "transport_security": "plain",
@@ -283,7 +301,7 @@ Server `tunnel` JSON 示例（`decryption` 占位值须替换为 Web 生成的�
 - `xhttp.tls` 控制 Client → 连接地址：true 为 HTTPS，false 为 HTTP。`transport_security` 独立控制源站监听：tls 需要 Web 保存 `cert_pem/key_pem`；plain 为 HTTP，不能带源站证书/私钥。允许 HTTPS CDN → HTTP 回源，**不要求 TLS 原样透传**；直连时两端协议必须匹配。
 - 任一配置为 HTTP 时强制 VLESS Encryption；HTTPS 双段也建议启用，避免 TLS 终止者读取业务明文。HTTP-only 会暴露会话 URL 和流量元数据，且可能被篡改/阻断；Encryption 不替代 HTTPS。
 - `ca_pem` 用于 **Client 信任连接地址**，留空使用系统根。公共 CDN 通常留空；源站自签 CA 不等于 CDN 边缘 CA。源站 HTTPS 证书由 CDN 校验，边缘证书由 Client 校验，不提供跳过验证选项。证书续期由各自 TLS 终止组件管理。
-- 路径以 `/` 开头和结尾，最大 256 字节，只含 ASCII 字母、数字、`/`、`_`、`-`；重复 `/`、点路径、转义、查询串拒绝。仅支持 HTTP/1.1 `packet-up`，不接受 auto/stream-up/stream-one、downloadSettings、XMUX、padding、自定义 headers 等未实现选项；不支持与 REALITY/Hysteria2/Vision 混用。
+- 路径以 `/` 开头和结尾，最大 256 字节，只含 ASCII 字母、数字、`/`、`_`、`-`；重复 `/`、点路径、转义、查询串拒绝。仅支持私有 HTTP/1.1 `packet-up`，不接受 auto/stream-up/stream-one、downloadSettings、XMUX、padding、自定义 headers 等未实现选项；可叠加 REALITY（关闭 XHTTP TLS），不能与 Hysteria2/Vision 混用，不宣称 Xray SplitHTTP 线协议互通。
 - 业务 TCP off/smux/yamux/h2mux 和 UDP XUDP 仍受原授权限制；此处 HTTP/1.1 不限制内层业务 h2mux。Client 不接收私钥、源站监听或 decryption，不支持本地覆盖。
 
 ### CDN / 反代条件

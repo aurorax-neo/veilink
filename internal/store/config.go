@@ -14,7 +14,7 @@ import (
 	"veilink/internal/tunnel"
 )
 
-// RevokeEnrollToken invalidates only the pending enrollment, not an active credential.
+// RevokeEnrollToken invalidates enrollment reuse, not an active node credential.
 func (s *Store) RevokeEnrollToken(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/apernet/quic-go"
 	"github.com/apernet/quic-go/quicvarint"
+	"github.com/quic-go/qpack"
 
 	"veilink/internal/model"
 )
@@ -73,6 +75,7 @@ func (s *service) listenHysteria() error {
 		return err
 	}
 	s.quic = ln
+	s.packets = append(s.packets, udp)
 	go s.acceptHysteria(ln)
 	return nil
 }
@@ -89,14 +92,18 @@ func (s *service) acceptHysteria(ln *quic.Listener) {
 
 func (s *service) serveHysteria(conn *quic.Conn) {
 	defer conn.CloseWithError(0, "")
+	stopCancel := context.AfterFunc(s.ctx, func() { _ = conn.CloseWithError(0, "") })
+	defer stopCancel()
 	go discardUni(s.ctx, conn)
 	_ = writeControl(conn)
 	authed := false
+	var authenticated model.Binding
 	for {
 		stream, err := conn.AcceptStream(s.ctx)
 		if err != nil {
 			return
 		}
+		_ = stream.SetDeadline(time.Now().Add(15 * time.Second))
 		kind, err := readVarint(stream)
 		if err != nil {
 			_ = stream.Close()
@@ -104,11 +111,12 @@ func (s *service) serveHysteria(conn *quic.Conn) {
 		}
 		switch kind {
 		case 0x1:
-			ok, err := s.hysteriaAuth(stream)
+			binding, ok, err := s.hysteriaAuth(stream)
 			_ = stream.Close()
 			if err != nil || !ok {
 				return
 			}
+			authenticated = binding
 			if !authed {
 				enableHysteriaBBR(conn)
 			}
@@ -118,7 +126,18 @@ func (s *service) serveHysteria(conn *quic.Conn) {
 				_ = stream.Close()
 				return
 			}
-			if err = readTCPRequest(stream); err != nil {
+			target, requestErr := readTCPRequest(stream)
+			host, portText, splitErr := net.SplitHostPort(target)
+			port, portErr := strconv.ParseUint(portText, 10, 16)
+			var binding model.Binding
+			known := false
+			for _, candidate := range s.byUser {
+				if candidate.ID == authenticated.ID && candidate.Domain == host {
+					binding, known = candidate, true
+					break
+				}
+			}
+			if requestErr != nil || splitErr != nil || portErr != nil || !known || (port != 0 && port != applicationPort && port != singMuxPort) {
 				_ = stream.Close()
 				return
 			}
@@ -131,7 +150,9 @@ func (s *service) serveHysteria(conn *quic.Conn) {
 				_ = wrapped.Close()
 				return
 			}
-			s.authenticate(wrapped)
+			defer s.untrack(wrapped)
+			id, _ := parseUUID(binding.UUID)
+			s.serveAuthorized(wrapped, id, binding, uint16(port))
 			return
 		default:
 			_ = stream.Close()
@@ -140,27 +161,38 @@ func (s *service) serveHysteria(conn *quic.Conn) {
 	}
 }
 
-func (s *service) hysteriaAuth(stream *quic.Stream) (bool, error) {
+func (s *service) hysteriaAuth(stream *quic.Stream) (model.Binding, bool, error) {
 	n, err := readVarint(stream)
 	if err != nil {
-		return false, err
+		return model.Binding{}, false, err
 	}
 	payload, err := readLimited(stream, int(n), 8192)
 	if err != nil {
-		return false, err
+		return model.Binding{}, false, err
 	}
 	fields := decodeQPACK(payload)
-	ok := fields[":path"] == "/auth" && fields[":method"] == "POST" && subtle.ConstantTimeCompare([]byte(fields["hysteria-auth"]), []byte(s.local.Hysteria2.Password)) == 1
+	ok := fields != nil && fields[":authority"] == "hysteria" && fields[":scheme"] == "https" && fields[":path"] == "/auth" && fields[":method"] == "POST"
+	var binding model.Binding
+	if ok {
+		for _, candidate := range s.byUser {
+			if subtle.ConstantTimeCompare([]byte(fields["hysteria-auth"]), []byte(candidate.UUID)) == 1 {
+				binding = candidate
+				break
+			}
+		}
+		ok = binding.ID != ""
+	}
 	status := "404"
 	headers := [][2]string{{":status", status}}
 	if ok {
 		headers = [][2]string{{":status", "233"}, {"hysteria-udp", "false"}, {"hysteria-cc-rx", "auto"}, {"hysteria-padding", paddingString()}}
 	}
 	_, err = stream.Write(http3Headers(encodeFields(headers)))
-	return ok, err
+	return binding, ok, err
+
 }
 
-func dialHysteria(ctx context.Context, addr, serverName string, local model.LocalTLS) (net.Conn, error) {
+func dialHysteriaSession(ctx context.Context, addr, serverName string, local model.LocalTLS, credential, target string) (net.Conn, error) {
 	pool, err := roots(local.CAPEM)
 	if err != nil {
 		return nil, err
@@ -184,6 +216,8 @@ func dialHysteria(ctx context.Context, addr, serverName string, local model.Loca
 		_ = conn.CloseWithError(0, "")
 		_ = udp.Close()
 	}
+	stopCancel := context.AfterFunc(dialCtx, cleanup)
+	defer stopCancel()
 	go discardUni(ctx, conn)
 	if err = writeControl(conn); err != nil {
 		cleanup()
@@ -194,7 +228,8 @@ func dialHysteria(ctx context.Context, addr, serverName string, local model.Loca
 		cleanup()
 		return nil, err
 	}
-	fields := encodeFields([][2]string{{":method", "POST"}, {":scheme", "https"}, {":path", "/auth"}, {":authority", "hysteria"}, {"hysteria-auth", local.Hysteria2.Password}, {"hysteria-cc-rx", "0"}, {"hysteria-padding", paddingString()}})
+	_ = auth.SetDeadline(time.Now().Add(10 * time.Second))
+	fields := encodeFields([][2]string{{":method", "POST"}, {":scheme", "https"}, {":path", "/auth"}, {":authority", "hysteria"}, {"hysteria-auth", credential}, {"hysteria-cc-rx", "0"}, {"hysteria-padding", paddingString()}})
 	if _, err = auth.Write(http3Headers(fields)); err != nil {
 		cleanup()
 		return nil, err
@@ -210,13 +245,16 @@ func dialHysteria(ctx context.Context, addr, serverName string, local model.Loca
 		cleanup()
 		return nil, err
 	}
-	if err = writeTCPRequest(stream, addr); err != nil || readTCPResponse(stream) != nil {
-		if err == nil {
-			err = errors.New("Hysteria2 tunnel was rejected")
-		}
+	_ = stream.SetDeadline(time.Now().Add(10 * time.Second))
+	err = writeTCPRequest(stream, target)
+	if err == nil {
+		err = readTCPResponse(stream)
+	}
+	if err != nil {
 		cleanup()
 		return nil, err
 	}
+	_ = stream.SetDeadline(time.Time{})
 	graceful := func() {
 		go finishQUIC(ctx, conn.Context(), hysteriaQUIC.MaxIdleTimeout, cleanup)
 	}
@@ -307,20 +345,21 @@ func writeTCPRequest(w io.Writer, addr string) error {
 	return err
 }
 
-func readTCPRequest(r io.Reader) error {
+func readTCPRequest(r io.Reader) (string, error) {
 	n, err := readVarint(r)
 	if err != nil {
-		return err
+		return "", err
 	}
-	if _, err = readLimited(r, int(n), 512); err != nil {
-		return err
+	addr, err := readLimited(r, int(n), 512)
+	if err != nil {
+		return "", err
 	}
 	n, err = readVarint(r)
 	if err != nil {
-		return err
+		return "", err
 	}
 	_, err = readLimited(r, int(n), 4096)
-	return err
+	return string(addr), err
 }
 
 func writeTCPResponse(w io.Writer) error {
@@ -387,83 +426,31 @@ func http3Headers(fields []byte) []byte {
 }
 
 func encodeFields(headers [][2]string) []byte {
-	out := []byte{0, 0}
+	var out bytes.Buffer
+	encoder := qpack.NewEncoder(&out)
 	for _, h := range headers {
-		switch h[0] + " " + h[1] {
-		case ":method POST":
-			out = append(out, 0xC0|20)
-			continue
-		case ":scheme https":
-			out = append(out, 0xC0|23)
-			continue
-		}
-		out = append(out, qpackLiteral(h[0], h[1])...)
+		_ = encoder.WriteField(qpack.HeaderField{Name: h[0], Value: h[1]})
 	}
-	return out
-}
-
-func qpackLiteral(name, value string) []byte {
-	out := []byte{0x20 | byte(len(name))}
-	out = append(out, name...)
-	out = append(out, byte(len(value)))
-	return append(out, value...)
+	_ = encoder.Close()
+	return out.Bytes()
 }
 
 func decodeQPACK(b []byte) map[string]string {
 	out := map[string]string{}
-	if len(b) < 2 {
-		return out
-	}
-	b = b[2:]
-	for len(b) > 0 {
-		switch {
-		case b[0]&0xC0 == 0xC0:
-			out[staticName(int(b[0]&0x3f))] = staticValue(int(b[0] & 0x3f))
-			b = b[1:]
-		case b[0]&0xE0 == 0x20:
-			nameLen := int(b[0] & 0x1f)
-			b = b[1:]
-			if nameLen > len(b) {
-				return out
-			}
-			name := string(b[:nameLen])
-			b = b[nameLen:]
-			if len(b) == 0 {
-				return out
-			}
-			valueLen := int(b[0])
-			b = b[1:]
-			if valueLen > len(b) {
-				return out
-			}
-			out[strings.ToLower(name)] = string(b[:valueLen])
-			b = b[valueLen:]
-		default:
+	next := qpack.NewDecoder().Decode(b)
+	for {
+		h, err := next()
+		if err == io.EOF {
 			return out
 		}
-	}
-	return out
-}
-
-func staticName(i int) string {
-	switch i {
-	case 20:
-		return ":method"
-	case 23:
-		return ":scheme"
-	default:
-		return ""
-	}
-}
-
-func staticValue(i int) string {
-	switch i {
-	case 20:
-		return "POST"
-	case 23:
-		return "https"
-	default:
-		return ""
+		if err != nil || len(out) >= 32 {
+			return nil
+		}
+		name := strings.ToLower(h.Name)
+		if _, duplicate := out[name]; duplicate {
+			return nil
+		}
+		out[name] = h.Value
 	}
 }
 

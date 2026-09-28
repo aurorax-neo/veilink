@@ -76,10 +76,12 @@ defineExpose({ open, close })
         </div>
         <button type="button" class="icon-btn" aria-label="关闭" :disabled="busy" @click="close">×</button>
       </header>
-      <fieldset class="modal-body" :disabled="busy">
-        <slot />
-      </fieldset>
-      <p v-if="error" class="error" role="alert">{{ error }}</p>
+      <div class="modal-body">
+        <fieldset class="modal-fields" :disabled="busy">
+          <slot />
+        </fieldset>
+        <p v-if="error" class="error" role="alert">{{ error }}</p>
+      </div>
       <footer class="modal-foot">
         <button type="button" class="btn" :disabled="busy" @click="close">{{ hideSave ? '关闭' : cancelLabel }}</button>
         <button v-if="!hideSave" class="btn" :class="danger ? 'danger' : 'primary'" type="submit" :disabled="busy || disabled">

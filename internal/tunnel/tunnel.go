@@ -76,7 +76,7 @@ type policy struct {
 }
 
 // Build validates a snapshot and returns its deny-by-default routing policy.
-// Snapshots cannot select protocols, disable certificate checks, or set paths.
+// Only the validated server-owned protocol/template selects the data plane.
 func Build(s model.Snapshot, local model.LocalTLS) ([]byte, error) {
 	s = orderedSnapshot(s)
 	if err := validate(s, local); err != nil {
@@ -94,8 +94,15 @@ func Build(s model.Snapshot, local model.LocalTLS) ([]byte, error) {
 				Domain: []string{"full:" + b.Domain}, Network: "tcp", Port: "0", OutboundTag: "portal-" + b.ID,
 			})
 		} else {
+			protocol := "vless"
+			for _, gateway := range s.Nodes {
+				if gateway.ID == b.ServerID {
+					protocol = gateway.Tunnel.EffectiveProtocol()
+					break
+				}
+			}
 			doc.Outbounds = append(doc.Outbounds, outbound{
-				Protocol: "vless", Tag: "tunnel-" + b.ID, AllowInsecure: &falseValue, Mux: &muxSetting{Enabled: bindingMux(s.Mappings, b.ID)},
+				Protocol: protocol, Tag: "tunnel-" + b.ID, AllowInsecure: &falseValue, Mux: &muxSetting{Enabled: bindingMux(s.Mappings, b.ID)},
 			})
 			doc.Routing.Rules = append(doc.Routing.Rules, rule{
 				InboundTag: []string{"bridge-" + b.ID}, Domain: []string{"full:" + b.Domain},
@@ -295,6 +302,9 @@ func newClientGateway(local model.LocalTLS, gateway model.Node) (*clientGateway,
 	}
 	flow, _ := normalizeFlow(config.Flow)
 	peer := &clientGateway{local: config, flow: flow}
+	if config.EffectiveProtocol() == "hysteria2" {
+		return peer, nil
+	}
 	spec, err := parseEncryption(config.Encryption)
 	if err == nil && spec != nil {
 		peer.outbound, err = spec.newClient()
@@ -465,7 +475,7 @@ func (s *service) stop() {
 
 func (s *service) listenServer() error {
 	if len(s.snapshot.Bindings) > 0 {
-		if s.local.Hysteria2.Enabled() {
+		if s.local.EffectiveProtocol() == "hysteria2" {
 			if err := s.listenHysteria(); err != nil {
 				return err
 			}
@@ -491,6 +501,9 @@ func (s *service) listenServer() error {
 				return err
 			}
 			s.listeners = append(s.listeners, ln)
+			if s.reality != nil && s.local.XHTTP.Enabled() {
+				ln = reality.NewListener(ln, s.reality)
+			}
 			if s.local.XHTTP.Enabled() {
 				s.serveXHTTP(ln)
 			} else {
@@ -584,25 +597,7 @@ func (s *service) authenticate(conn net.Conn) {
 	if err = writeVLESSResponse(conn); err != nil {
 		return
 	}
-	if port == singMuxPort {
-		s.acceptSingMux(conn, id, binding)
-		return
-	}
-	if port == applicationPort {
-		s.acceptApplication(conn, id, binding)
-		return
-	}
-	if s.flow != "" {
-		conn = newVision(conn, id)
-	}
-	_ = conn.SetDeadline(time.Time{})
-	sess := newSession(conn)
-	s.addSession(binding.ID, sess)
-	owned := conn
-	conn = nil
-	sess.readLoop(nil)
-	s.removeSession(binding.ID, sess)
-	s.untrack(owned)
+	s.serveAuthorized(conn, id, binding, port)
 }
 
 func (s *service) openPublic(conn net.Conn, m model.Mapping) {
@@ -623,25 +618,7 @@ func (s *service) maintain(b model.Binding, gateway model.Node, peer *clientGate
 		if s.ctx.Err() != nil {
 			return
 		}
-		conn, err := s.dialGateway(gateway, peer)
-		if err == nil {
-			_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
-			if peer.outbound != nil {
-				var wrapped net.Conn
-				wrapped, err = peer.outbound.Handshake(conn)
-				if err != nil {
-					_ = conn.Close()
-					conn = nil
-				} else {
-					conn = wrapped
-				}
-			}
-		}
-		if err == nil {
-			if err = writeVLESS(conn, user, b.Domain, 0, peer.flow); err == nil {
-				err = readVLESSResponse(conn)
-			}
-		}
+		conn, err := s.dialProtocol(gateway, peer, b, 0)
 		if err == nil && peer.flow != "" {
 			vc := newVision(conn, user)
 			if err = vc.camouflage(); err != nil {
@@ -654,7 +631,6 @@ func (s *service) maintain(b model.Binding, gateway model.Node, peer *clientGate
 		if err == nil {
 			_ = conn.SetDeadline(time.Time{})
 		}
-
 		if err != nil {
 			if conn != nil {
 				_ = conn.Close()

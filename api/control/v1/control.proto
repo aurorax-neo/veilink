@@ -10,8 +10,11 @@ import "google/protobuf/struct.proto";
 // error:string (presence indicates failure; content never persisted).
 // software_version:string, software_commit:string: optional authenticated node
 // reports, each <=128 ASCII label characters; management-only, not snapshots.
-// Events server: revision:number. Client sends heartbeat at least every 15s,
-// pulls on every new revision and retries failed applications of same revision.
+// Events server: revision:number is scoped to the authenticated node, not the
+// database-wide sequence. Configuration changes are pushed immediately; optional
+// refresh:true requests an immediate heartbeat (also used for manual refresh).
+// Client sends heartbeat at least every 15s, pulls new revisions and retries
+// failed applications without claiming success. Successful Apply reports promptly.
 // Numeric revisions are limited to protobuf Struct exact integers (<2^53).
 service Control {
  rpc Enroll(google.protobuf.Struct) returns (google.protobuf.Struct);

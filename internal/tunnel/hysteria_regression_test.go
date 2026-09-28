@@ -15,10 +15,12 @@ func TestHysteriaRejectsCredentialsAndCancellation(t *testing.T) {
 	server, _ := fixtures(t, echoServer(t))
 	local := tlsFiles(t)
 	local.Hysteria2.Password = "correct-password"
+	local.Protocol = "hysteria2"
 	local.ListenPort = freeUDPPort(t)
 	server.Node.Tunnel = local
 	run(t, server, model.LocalTLS{})
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(local.ListenPort))
+	binding := server.Bindings[0]
 	for _, name := range []string{"password", "server-name", "cancelled"} {
 		t.Run(name, func(t *testing.T) {
 			client := local
@@ -33,7 +35,11 @@ func TestHysteriaRejectsCredentialsAndCancellation(t *testing.T) {
 			case "cancelled":
 				cancel()
 			}
-			conn, err := dialHysteria(ctx, addr, sni, client)
+			credential := binding.UUID
+			if name == "password" {
+				credential = "wrong-password"
+			}
+			conn, err := dialHysteriaSession(ctx, addr, sni, client, credential, net.JoinHostPort(binding.Domain, "0"))
 			if conn != nil {
 				conn.Close()
 			}

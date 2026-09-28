@@ -53,6 +53,9 @@ func checkVLESS(role string, local model.LocalTLS) error {
 	if err := checkTransportSecurity(local); err != nil {
 		return err
 	}
+	if local.EffectiveProtocol() == "hysteria2" {
+		return nil
+	}
 	if role == "server" {
 		if err := requireTransportSecurity(local); err != nil {
 			return err
@@ -66,7 +69,7 @@ func checkVLESS(role string, local model.LocalTLS) error {
 			return errors.New("plain transport_security requires VLESS encryption")
 		}
 	}
-	if local.XHTTP.Enabled() && !local.XHTTP.TLS && ((role == "server" && !decryptionEnabled(local.Decryption)) || (role == "client" && !decryptionEnabled(local.Encryption))) {
+	if local.XHTTP.Enabled() && !local.XHTTP.TLS && !local.Reality.Enabled() && ((role == "server" && !decryptionEnabled(local.Decryption)) || (role == "client" && !decryptionEnabled(local.Encryption))) {
 		return errors.New("xhttp HTTP dial candidates require VLESS encryption")
 	}
 	flow, err := normalizeFlow(local.Flow)
@@ -108,6 +111,9 @@ func (s *service) prepareCrypto() error {
 	}
 	if err := checkVLESS(s.snapshot.Node.Role, s.local); err != nil {
 		return err
+	}
+	if s.local.EffectiveProtocol() == "hysteria2" {
+		return nil
 	}
 	flow, err := normalizeFlow(s.local.Flow)
 	if err != nil {
@@ -222,8 +228,8 @@ func ValidateClientTemplate(result model.LocalTLS) error {
 	return nil
 }
 
-// PublicPeerTunnel returns a validated, public-only gateway view. Hysteria2's
-// shared password is deliberately omitted; authorized snapshots need it separately.
+// PublicPeerTunnel returns a validated, public-only gateway view. The server's
+// HY2 configuration password is omitted; authorized snapshots carry Binding UUIDs.
 func PublicPeerTunnel(server model.LocalTLS, node model.Node) (model.LocalTLS, error) {
 	peer, err := DeriveClientTunnel(model.LocalTLS{}, server, node)
 	peer.CertPEM, peer.KeyPEM = "", ""

@@ -32,7 +32,7 @@ docker build --build-arg HTTP_PROXY= --build-arg HTTPS_PROXY= \
 
 同一镜像分别运行三个临时容器，均使用 UID/GID 65532、`-itd --restart unless-stopped --name ... -e TZ=Asia/Shanghai` 和临时 `/data` tmpfs（不触碰用户数据）：
 
-- Master：Host 网络，`master -listen-addr 127.0.0.1:19843 -scheme http -html-dir /usr/local/html -embedded-server-enabled=false`；running/healthy，`/api/setup` 返回 `registration_required:true`，根路径返回 HTML。
+- Master：Host 网络，`master -listen-addr 127.0.0.1:19843 -scheme http -html-dir /usr/local/html`；默认自动初始化并启动 `default` 内置 Server，running/healthy，`/api/setup` 返回 `registration_required:true`，根路径返回 HTML。需要关闭内置 Server 时显式追加 `-embedded-server-enabled=false`。
 - Server：Host 网络，`server` 子命令和测试节点接入 flags；running/healthy。
 - Client：默认 Bridge 网络，`client` 子命令和测试节点接入 flags；running/healthy。
 

@@ -321,11 +321,17 @@ func (c *xhttpClientConn) Close() error {
 	return c.xhttpStream.Close()
 }
 func dialXHTTP(ctx context.Context, addr, serverName string, local model.LocalTLS) (net.Conn, error) {
+	return dialXHTTPWithDialer(ctx, addr, serverName, local, func(ctx context.Context) (net.Conn, error) {
+		return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", addr)
+	})
+}
+
+func dialXHTTPWithDialer(ctx context.Context, addr, serverName string, local model.LocalTLS, dial func(context.Context) (net.Conn, error)) (net.Conn, error) {
 	pool, err := roots(local.CAPEM)
 	if err != nil {
 		return nil, err
 	}
-	tr := &http.Transport{Proxy: nil, DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+	tr := &http.Transport{Proxy: nil, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) { return dial(ctx) },
 		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool, ServerName: serverName, NextProtos: []string{"http/1.1"}},
 		TLSNextProto:    map[string]func(string, *tls.Conn) http.RoundTripper{}, ForceAttemptHTTP2: false,
 		MaxConnsPerHost: 2, MaxIdleConnsPerHost: 2, IdleConnTimeout: 30 * time.Second, TLSHandshakeTimeout: xhttpTimeout, ResponseHeaderTimeout: xhttpTimeout, MaxResponseHeaderBytes: 8 << 10, DisableCompression: true}
@@ -336,11 +342,11 @@ func dialXHTTP(ctx context.Context, addr, serverName string, local model.LocalTL
 	if _, err = rand.Read(id[:]); err != nil {
 		return fail(err)
 	}
-	scheme := "http"
+	base := "http://" + addr
 	if local.XHTTP.TLS {
-		scheme = "https"
+		base = "https://" + addr
 	}
-	url := scheme + "://" + addr + local.XHTTP.Path + hex.EncodeToString(id[:])
+	url := base + local.XHTTP.Path + hex.EncodeToString(id[:])
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return fail(err)
