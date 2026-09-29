@@ -100,7 +100,7 @@ func (a *API) joinCommand(w http.ResponseWriter, r *http.Request, id string) {
 		command.WriteString(" --net host")
 	}
 	command.WriteString(" -v " + shellQuote(config+":/config:ro") + " -v " + shellQuote(data+":/data") + " -e TZ=Asia/Shanghai")
-	command.WriteString(" veilink:latest " + role)
+	command.WriteString(" ghcr.io/aurorax-neo/veilink:latest " + role)
 	for _, v := range []struct{ flag, value string }{
 		{"-master-addr", address}, {"-node-id", id},
 		{"-enroll-token", token}, {"-state-dir", "/data/state"},

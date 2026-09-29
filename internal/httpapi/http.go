@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -164,6 +165,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			output(w, 201, map[string]bool{"ok": true})
+			slog.Info("console account registered")
 			return
 		}
 		version, valid := a.store.LoginVersion(in.Username, in.Password)
@@ -186,6 +188,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		a.sessions[auth.Hash(token)] = s
 		a.mu.Unlock()
+		slog.Info("console login succeeded")
 		a.cookie(w, token, 43200)
 		output(w, 200, map[string]string{"csrf": s.csrf})
 		return
@@ -220,6 +223,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		delete(a.sessions, auth.Hash(c.Value))
 		a.mu.Unlock()
 		a.cookie(w, "", -1)
+		slog.Info("console logout")
 		output(w, 200, map[string]bool{"ok": true})
 		return
 	}
@@ -258,6 +262,12 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			} else {
 				result = []logring.Entry{}
 			}
+		} else {
+			matched = false
+		}
+	case "traffic":
+		if r.Method == http.MethodGet && len(p) == 1 {
+			result, err = a.store.TrafficRows()
 		} else {
 			matched = false
 		}
@@ -380,6 +390,15 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		failure(w, 400)
 		return
+	}
+	if r.Method != http.MethodGet {
+		switch p[0] {
+		case "nodes", "mappings":
+			if p[0] == "nodes" && len(p) == 3 && p[2] == "enroll" {
+				break
+			}
+			slog.Info("management operation completed", "resource", p[0], "method", r.Method, "id", id)
+		}
 	}
 	if result == nil {
 		result = map[string]bool{"ok": true}

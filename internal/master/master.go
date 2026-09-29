@@ -112,7 +112,7 @@ func Run(ctx context.Context, c config.Config) error {
 	if c.EmbeddedServer.Enabled {
 		go func() {
 			defer close(embeddedDone)
-			if err := runEmbeddedServer(ctx, c, s); err != nil && ctx.Err() == nil {
+			if err := runEmbeddedServer(ctx, c, s, ring); err != nil && ctx.Err() == nil {
 				slog.Error("embedded server failed", "error", err)
 				errc <- err
 			}

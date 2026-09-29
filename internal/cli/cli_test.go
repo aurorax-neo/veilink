@@ -19,6 +19,18 @@ func TestRemovedConfigFlagAndRoleFlags(t *testing.T) {
 	}
 }
 
+func TestMissingRoleBeforeFlagsExplainsDockerCommand(t *testing.T) {
+	for _, args := range [][]string{
+		{"-database", "/data/veilink.db", "-scheme", "http"},
+		{"-listen-addr", "127.0.0.1:2545"},
+	} {
+		err := Run(context.Background(), args, &bytes.Buffer{})
+		if err == nil || !strings.Contains(err.Error(), "missing role") || !strings.Contains(err.Error(), "veilink master -database") {
+			t.Fatalf("missing role not explained for %v: %v", args, err)
+		}
+	}
+}
+
 func TestResetAdminCommands(t *testing.T) {
 	dir := t.TempDir()
 	db, key := filepath.Join(dir, "db"), filepath.Join(dir, "key")

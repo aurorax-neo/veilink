@@ -46,7 +46,6 @@ function effectiveSources(node: Node) {
   return node.revoked ? [] : desk.nodes.filter(n => n.role === 'server' && !n.revoked && ids.has(n.id))
 }
 function tunnelLabel(node: Node) {
-  if (props.role === 'client') return effectiveSources(node).length ? '服务端统一下发' : '未关联服务端'
   const t = node.tunnel
   const protocol = t?.protocol || (t?.hysteria2?.password ? 'hysteria2' : 'vless')
   const enc = protocol === 'vless' ? t?.decryption : ''
@@ -112,13 +111,13 @@ async function run() {
     </div>
     <EmptyState v-if="!rows.length" title="暂无节点" text="新建节点或调整搜索。" />
     <div v-else class="panel table-scroll" tabindex="0" role="region" :aria-label="`${label}列表`">
-      <table class="nodes-table">
-        <thead><tr><th scope="col">名称 / 软件版本</th><th scope="col">状态</th><th scope="col">本地监听 / 客户端连接地址</th><th scope="col">隧道</th><th scope="col">映射</th><th scope="col">配置是否最新</th><th scope="col">操作</th></tr></thead>
+      <table class="nodes-table" :class="{ 'nodes-table-client': role === 'client' }">
+        <thead><tr><th scope="col">名称 / 软件版本</th><th scope="col">状态</th><th v-if="role === 'server'" scope="col">本地监听 / 客户端连接地址</th><th v-if="role === 'server'" scope="col">隧道</th><th scope="col">映射</th><th scope="col">配置是否最新</th><th scope="col">操作</th></tr></thead>
         <tbody><tr v-for="node in rows" :key="node.id" :class="{ selected: selectedId === node.id }">
           <td><button type="button" class="text-btn" :aria-expanded="selectedId === node.id" @click="selectedId = selectedId === node.id ? '' : node.id">{{ node.name }}</button><small class="node-id" :title="node.id">{{ node.id }}</small><small v-if="node.embedded">内置节点</small><small class="software-version" :title="node.software_version || '等待节点上报运行版本'">软件：{{ node.software_version || '未上报' }}</small></td>
           <td><div class="node-presence"><Badge :text="presence(node, now).text" :tone="presence(node, now).tone" /><button type="button" class="icon-btn refresh-node" :disabled="node.revoked || refreshing.has(node.id)" @click="refreshNode(node)" :class="{ spinning: refreshing.has(node.id) }" :title="'已请求节点立即同步并上报，结果以节点上报为准'" :aria-label="'已请求节点立即同步并上报，结果以节点上报为准'"><span aria-hidden="true">↻</span></button></div><small class="last-seen">最后在线：{{ seenText(node.last_seen, now) }}</small></td>
-          <td><template v-if="role === 'server'"><small>监听：{{ localListen(node) }} · {{ node.tunnel?.protocol === 'hysteria2' || node.tunnel?.hysteria2?.password ? 'UDP' : 'TCP' }}</small><small v-for="item in connectList(node)" :key="item.id">{{ item.name }} · {{ endpoint(item.host, item.port) }}</small></template><template v-else>—</template></td>
-          <td>{{ tunnelLabel(node) }}</td><td>{{ mappings(node.id).length }}</td>
+          <td v-if="role === 'server'"><small>监听：{{ localListen(node) }} · {{ node.tunnel?.protocol === 'hysteria2' || node.tunnel?.hysteria2?.password ? 'UDP' : 'TCP' }}</small><small v-for="item in connectList(node)" :key="item.id">{{ item.name }} · {{ endpoint(item.host, item.port) }}</small></td>
+          <td v-if="role === 'server'">{{ tunnelLabel(node) }}</td><td>{{ mappings(node.id).length }}</td>
           <td><div class="revision-status" role="group" :title="revisionDescription(node)" :aria-label="revisionDescription(node)"><Badge :text="revisionLabel(node)" :tone="revisionState(node).tone" /></div></td>
           <td><div class="actions"><button type="button" class="btn small" :disabled="node.revoked" @click="editor?.open(node)">编辑</button><button v-if="role === 'client'" type="button" class="btn small" :disabled="node.revoked || !effectiveSources(node).length" @click="openConfig(node)">查看配置</button><button v-if="!node.embedded" type="button" class="btn small" :disabled="node.revoked" @click="onboarding?.open(node)">快捷接入</button><button v-if="!node.embedded" type="button" class="btn small danger" @click="ask(node, 'delete')">删除</button></div></td>
         </tr></tbody>

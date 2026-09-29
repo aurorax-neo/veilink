@@ -145,12 +145,15 @@ type Runtime struct {
 	document  []byte
 	revision  int64
 	highWater int64
+	traffic   *Traffic
 	closed    bool
 }
 
 func New(local model.LocalTLS) *Runtime {
-	return &Runtime{local: local, revision: -1, highWater: -1}
+	return &Runtime{local: local, revision: -1, highWater: -1, traffic: &Traffic{}}
 }
+
+func (r *Runtime) Traffic() *Traffic { return r.traffic }
 
 // Apply prevalidates before touching listeners. A failed start restores the
 // last running configuration when one exists.
@@ -185,10 +188,10 @@ func (r *Runtime) Apply(s model.Snapshot) error {
 		r.instance = nil
 		r.revision = -1
 	}
-	instance, err := start(s, effective)
+	instance, err := start(s, effective, r.traffic)
 	if err != nil {
 		if r.good != nil {
-			restored, rollbackErr := start(*r.good, r.goodLocal)
+			restored, rollbackErr := start(*r.good, r.goodLocal, r.traffic)
 			if rollbackErr != nil {
 				return fmt.Errorf("start failed: %w; rollback failed: %v", err, rollbackErr)
 			}
@@ -201,6 +204,7 @@ func (r *Runtime) Apply(s model.Snapshot) error {
 		}
 		return fmt.Errorf("start tunnel: %w", err)
 	}
+	r.traffic.setActive(s.Mappings, s.Node.Role == "server")
 	r.instance = instance
 	saved := cloneSnapshot(s)
 	r.good = &saved
@@ -353,6 +357,7 @@ type service struct {
 	allowed            map[string]map[string]bool
 	listeners          []net.Listener
 	packets            []net.PacketConn
+	traffic            *Traffic
 	mu                 sync.Mutex
 	sessions           map[string][]*session
 	conns              map[net.Conn]struct{}
@@ -369,7 +374,7 @@ type service struct {
 	singPools          map[string]*singPool
 }
 
-func start(s model.Snapshot, local model.LocalTLS) (*service, error) {
+func start(s model.Snapshot, local model.LocalTLS, traffic ...*Traffic) (*service, error) {
 	if err := validate(s, local); err != nil {
 		return nil, err
 	}
@@ -381,6 +386,9 @@ func start(s model.Snapshot, local model.LocalTLS) (*service, error) {
 		applications:       map[string][]*applicationSlot{},
 		applicationChanged: make(chan struct{}), applicationWaiting: map[string]int{},
 		singPools: map[string]*singPool{},
+	}
+	if len(traffic) > 0 {
+		svc.traffic = traffic[0]
 	}
 	var err error
 	defer func() {
@@ -607,11 +615,12 @@ func (s *service) authenticate(conn net.Conn) {
 
 func (s *service) openPublic(conn net.Conn, m model.Mapping) {
 	defer s.untrack(conn)
+	public := &countedConn{Conn: conn, traffic: s.traffic, id: m.ID}
 	if !m.Mux {
-		s.openApplication(conn, m)
+		s.openApplication(public, m)
 		return
 	}
-	s.openSingMux(conn, m)
+	s.openSingMux(public, m)
 }
 
 func (s *service) maintain(b model.Binding, gateway model.Node, peer *clientGateway) {

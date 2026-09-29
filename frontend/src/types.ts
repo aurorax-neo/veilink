@@ -72,6 +72,13 @@ export interface Mapping {
   network?: string
   enabled: boolean
 }
+export interface TrafficRow {
+  mapping_id: string
+  up_bytes: number
+  down_bytes: number
+  reported_at: string | null
+  has_transfer: boolean
+}
 
 export interface Audit {
   at: number

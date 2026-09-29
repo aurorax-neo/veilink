@@ -78,13 +78,13 @@ func TestMasterHealthcheckFallbackAndFailure(t *testing.T) {
 	}
 	dir := t.TempDir()
 	args := []string{"veilink", "master", "-database", filepath.Join(dir, "missing.db")}
-	runHealthcheck(t, body, dir, args, "http://127.0.0.1:8443/healthz", false, true)
+	runHealthcheck(t, body, dir, args, "http://127.0.0.1:2545/healthz", false, true)
 	// A reachable but wrong endpoint must never make a probe healthy.
 	runHealthcheck(t, body, dir, args, "http://127.0.0.1:9999/healthz", false, false)
 	if err := os.WriteFile(filepath.Join(dir, "missing.db"), []byte("corrupt"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	runHealthcheck(t, body, dir, args, "http://127.0.0.1:8443/healthz", false, false)
+	runHealthcheck(t, body, dir, args, "http://127.0.0.1:2545/healthz", false, false)
 }
 
 // Substitute only the procfs path in a private copy; production always reads PID 1.

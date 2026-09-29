@@ -7,7 +7,7 @@ import (
 
 func TestDefaultsAndFlags(t *testing.T) {
 	c := Defaults()
-	if !c.EmbeddedServer.Enabled || c.Database != "/data/veilink.db" || c.DeploymentKey != "/data/veilink.key" || c.StateDir != "/data/state" || c.ListenAddr != "127.0.0.1:8443" || c.Scheme != "http" {
+	if !c.EmbeddedServer.Enabled || c.Database != "/data/veilink.db" || c.DeploymentKey != "/data/veilink.key" || c.StateDir != "/data/state" || c.ListenAddr != "127.0.0.1:2545" || c.Scheme != "http" {
 		t.Fatalf("defaults: %+v", c)
 	}
 	t.Setenv("VEILINK_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
@@ -15,7 +15,7 @@ func TestDefaultsAndFlags(t *testing.T) {
 	t.Setenv("VEILINK_LISTEN_ADDR", "0.0.0.0:65536")
 	t.Setenv("VEILINK_ENROLL_TOKEN", "ignored")
 	c, err := ParseFlags("master", nil)
-	if err != nil || c.Scheme != "http" || c.ListenAddr != "127.0.0.1:8443" {
+	if err != nil || c.Scheme != "http" || c.ListenAddr != "127.0.0.1:2545" {
 		t.Fatal(c, err)
 	}
 	c, err = ParseFlags("master", []string{"-listen-addr", "127.0.0.1:9443", "-control-server-name", "panel.example.com", "-control-ca", "/config/master-ca.pem", "-embedded-server-enabled", "-embedded-server-port", "9999", "-embedded-server-name", "gateway", "-embedded-server-address", "127.0.0.1", "-embedded-server-state-dir", "/tmp/gateway"})

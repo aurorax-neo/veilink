@@ -17,37 +17,48 @@ const desk = reactive<Desk>({
   nodes: [],
   mappings: [],
   audit: [],
+  traffic: [],
+  trafficLoaded: false,
+  trafficError: '',
   loading: false,
   loaded: false,
   error: '',
   notice: '',
   noticeBad: false,
-  async reload() {
+  async reload(options?: { silent?: boolean }) {
+    if (options?.silent && desk.loading) return
     const ticket = ++generation
-    desk.loading = true
+    if (!options?.silent) desk.loading = true
     try {
-      const [nodes, mappings, audit] = await Promise.all([
-        api<Node[] | null>('/nodes'),
+      const nodes = await api<Node[] | null>('/nodes')
+      if (ticket !== generation) return
+      if (nodes !== null && !Array.isArray(nodes)) throw new ApiError('API 数据格式不正确。', 200)
+      if (options?.silent) {
+        desk.nodes = nodes || []
+        if (page.value === 'proxies') await loadTraffic(ticket)
+        return
+      }
+      const [mappings, audit] = await Promise.all([
         api<Mapping[] | null>('/mappings'),
         api<Audit[] | null>('/audit'),
       ])
       if (ticket !== generation) return
-      if (![nodes, mappings, audit].every((item) => item === null || Array.isArray(item))) {
-        throw new ApiError('API 数据格式不正确。', 200)
-      }
+      if (![mappings, audit].every((item) => item === null || Array.isArray(item))) throw new ApiError('API 数据格式不正确。', 200)
       desk.nodes = nodes || []
       desk.mappings = mappings || []
       desk.audit = audit || []
+      await loadTraffic(ticket)
+      if (ticket !== generation) return
       desk.loaded = true
       desk.error = ''
     } catch (reason) {
-      if (ticket !== generation) return
+      if (ticket !== generation || options?.silent) return
       const message = reason instanceof Error ? reason.message : '请求失败'
       desk.error = message
       desk.notify(message, true)
       throw reason
     } finally {
-      if (ticket === generation) desk.loading = false
+      if (ticket === generation && !options?.silent) desk.loading = false
     }
   },
   notify(text: string, bad = false) {
@@ -55,6 +66,19 @@ const desk = reactive<Desk>({
     desk.noticeBad = bad
   },
 })
+async function loadTraffic(ticket: number) {
+  try {
+    const rows = await api<import('./types').TrafficRow[] | null>('/traffic')
+    if (ticket !== generation) return
+    if (rows !== null && !Array.isArray(rows)) throw new Error('流量数据格式不正确')
+    desk.traffic = rows || []
+    desk.trafficLoaded = true
+    desk.trafficError = ''
+  } catch (reason) {
+    if (ticket !== generation) return
+    desk.trafficError = reason instanceof Error ? reason.message : '流量读取失败'
+  }
+}
 
 function resetDesk() {
   generation += 1
@@ -62,6 +86,9 @@ function resetDesk() {
   desk.mappings = []
   desk.audit = []
   desk.loaded = false
+  desk.traffic = []
+  desk.trafficLoaded = false
+  desk.trafficError = ''
   desk.loading = false
   desk.error = ''
   desk.notice = ''
@@ -95,12 +122,12 @@ async function enter(session: { csrf?: string }, name = '') {
   }
 }
 
-async function loadSetup() {
+async function loadSetup(restoreSession = false) {
   phase.value = 'boot'
   try {
     const setup = await api<{ registration_required: boolean }>('/setup')
     if (typeof setup.registration_required !== 'boolean') throw new Error('初始化状态无效')
-    phase.value = setup.registration_required ? 'register' : 'login'
+    phase.value = setup.registration_required ? 'register' : restoreSession ? 'boot' : 'login'
   } catch (reason) {
     phase.value = 'setup-error'
     loginError.value = reason instanceof Error ? reason.message : '无法确认初始化状态'
@@ -146,6 +173,19 @@ watch(page, (next) => {
   desk.noticeBad = false
 })
 
+let liveTimer: ReturnType<typeof setInterval> | undefined
+let liveBusy = false
+async function refreshLive() {
+  if (phase.value !== 'app' || document.visibilityState === 'hidden' || desk.loading || liveBusy) return
+  liveBusy = true
+  try {
+    await desk.reload({ silent: true })
+  } finally {
+    liveBusy = false
+  }
+}
+
+function onVisible() { if (document.visibilityState === 'visible') void refreshLive() }
 onMounted(async () => {
   setUnauthorized((path) => {
     if (path === '/session') return
@@ -157,8 +197,10 @@ onMounted(async () => {
     document.title = 'Veilink · 穿透控制台'
   })
   window.addEventListener('hashchange', onHash)
-  await loadSetup()
-  if (phase.value !== 'login') return
+  window.addEventListener('visibilitychange', onVisible)
+  liveTimer = window.setInterval(() => { void refreshLive() }, 5000)
+  await loadSetup(true)
+  if (phase.value !== 'boot') return
   try {
     await enter(await api<{ csrf?: string }>('/session'))
   } catch (reason) {
@@ -169,13 +211,17 @@ onMounted(async () => {
   }
 })
 
-onUnmounted(() => window.removeEventListener('hashchange', onHash))
+onUnmounted(() => {
+  window.removeEventListener('hashchange', onHash)
+  window.removeEventListener('visibilitychange', onVisible)
+  if (liveTimer) window.clearInterval(liveTimer)
+})
 </script>
 
 <template>
   <a class="skip" :href="phase === 'app' ? '#main' : '#login-main'">跳转到主内容</a>
   <p v-if="phase === 'boot'" class="boot">正在确认会话…</p>
-  <div v-else-if="phase === 'setup-error'" class="boot" role="alert">{{ loginError }} <button class="btn" @click="loadSetup">重试</button></div>
+  <div v-else-if="phase === 'setup-error'" class="boot" role="alert">{{ loginError }} <button class="btn" @click="loadSetup()">重试</button></div>
   <LoginView v-else-if="phase === 'login' || phase === 'register'" :key="phase" :register="phase === 'register'" :error="loginError" :busy="loginBusy" @submit="submitLogin" />
   <ConsoleView v-else :page="page" :account="account" @navigate="navigate" @logout="logout" />
 </template>

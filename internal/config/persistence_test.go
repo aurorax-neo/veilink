@@ -84,7 +84,7 @@ func TestMasterPersistenceRejectsInvalidUpdate(t *testing.T) {
 	}
 	delete(c.explicit, "listen_addr")
 	c, err := PersistMaster(c)
-	if err != nil || c.ListenAddr != "127.0.0.1:8443" {
+	if err != nil || c.ListenAddr != "127.0.0.1:2545" {
 		t.Fatal("invalid update replaced saved config")
 	}
 }

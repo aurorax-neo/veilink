@@ -2,8 +2,10 @@ package node
 
 import (
 	"context"
+	crand "crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"google.golang.org/grpc"
@@ -89,13 +91,20 @@ func tlsConfig(c config.Config) (*tls.Config, error) {
 	return tc, nil
 }
 func Run(ctx context.Context, c config.Config, role string) error {
+	return RunWithLogger(ctx, c, role, nil)
+}
+
+// RunWithLogger keeps the embedded node from replacing the Master's process-wide logger.
+func RunWithLogger(ctx context.Context, c config.Config, role string, logger *slog.Logger) error {
 	if e := c.Validate(role); e != nil {
 		return e
 	}
-
-	ring := logring.New(200)
-	slog.SetDefault(slog.New(logring.NewHandler(ring, "node", slog.NewTextHandler(os.Stderr, nil))))
-
+	var ring *logring.Ring
+	if logger == nil {
+		ring = logring.New(1000)
+		logger = slog.New(logring.NewHandler(ring, "node", slog.NewTextHandler(os.Stderr, nil)))
+	}
+	logger.Info("node starting", "role", role, "node_id", c.NodeID)
 	tc, e := tlsConfig(c)
 	if e != nil {
 		return e
@@ -123,6 +132,13 @@ func Run(ctx context.Context, c config.Config, role string) error {
 	runCtx, stopRuntime := context.WithCancel(ctx)
 	defer func() { stopRuntime(); closeRuntime(runtime) }()
 	state := newSyncState(runCtx, runtime)
+	if role == "server" {
+		var epoch [16]byte
+		if _, err := crand.Read(epoch[:]); err != nil {
+			return err
+		}
+		state.traffic, state.trafficEpoch = runtime.Traffic(), hex.EncodeToString(epoch[:])
+	}
 	if st.Snapshot != nil {
 		if st.Snapshot.Node.ID != c.NodeID || st.Snapshot.Node.Role != role {
 			return errors.New("cached node identity mismatch")
@@ -161,12 +177,13 @@ func Run(ctx context.Context, c config.Config, role string) error {
 				if e = save(path, st); e != nil {
 					return errors.New("cannot persist node credential")
 				}
+				logger.Info("node enrolled; credential saved", "role", role, "node_id", c.NodeID)
 			}
 		} else {
 			e = nil
 		}
 		if e == nil {
-			e = cycle(ctx, client, c, role, &st, state, path, ring, defaultCycleTiming)
+			e = cycle(ctx, client, c, role, &st, state, path, ring, defaultCycleTiming, logger)
 		}
 		if rejected(e) {
 			stopRuntime()
@@ -182,7 +199,8 @@ func Run(ctx context.Context, c config.Config, role string) error {
 			backoff = time.Second
 			continue
 		}
-		slog.Warn("control connection unavailable; retaining last successful configuration", "err", e)
+		state.connected.Store(false)
+		logger.Warn("control connection unavailable; retaining last successful configuration", "role", role, "err", e)
 		delay := backoff + time.Duration(rand.Int64N(int64(backoff/2)+1))
 		select {
 		case <-ctx.Done():
@@ -215,12 +233,16 @@ type applyResult struct {
 // One worker survives stream rotations. It never touches credentials or disk,
 // and no second Apply is started while the first is outstanding.
 type syncState struct {
-	ctx      context.Context
-	jobs     chan model.Snapshot
-	results  chan applyResult
-	busy     bool // control-loop owned
-	revision atomic.Int64
-	failed   atomic.Bool
+	ctx          context.Context
+	jobs         chan model.Snapshot
+	results      chan applyResult
+	busy         bool // control-loop owned
+	revision     atomic.Int64
+	failed       atomic.Bool
+	connected    atomic.Bool
+	traffic      *tunnel.Traffic
+	trafficEpoch string
+	trafficSeq   atomic.Uint64
 }
 
 func newSyncState(ctx context.Context, runtime runtimeDriver) *syncState {
@@ -350,6 +372,29 @@ func heartbeat(ctx context.Context, client pb.ControlClient, id, credential stri
 		if err != nil {
 			return err
 		}
+		if state.traffic != nil {
+			totals := state.traffic.Snapshot()
+			if len(totals) <= 128 {
+				entries := make(map[string]any, len(totals))
+				for mappingID, v := range totals {
+					entries[mappingID] = map[string]any{"up": v.Up, "down": v.Down}
+				}
+				traffic, buildErr := structpb.NewStruct(entries)
+				if buildErr != nil {
+					return buildErr
+				}
+				in.Fields["traffic"] = structpb.NewStructValue(traffic)
+				in.Fields["traffic_epoch"] = structpb.NewStringValue(state.trafficEpoch)
+				in.Fields["traffic_seq"] = structpb.NewNumberValue(float64(state.trafficSeq.Add(1)))
+				logs := in.Fields["logs"].GetListValue()
+				for proto.Size(in) > 64<<10 && len(logs.Values) > 0 {
+					logs.Values = logs.Values[:len(logs.Values)-1]
+				}
+				if proto.Size(in) > 64<<10 {
+					return errors.New("traffic report exceeds RPC size limit")
+				}
+			}
+		}
 		if err = stream.Send(in); err != nil {
 			select {
 			case out := <-received:
@@ -404,7 +449,11 @@ func heartbeat(ctx context.Context, client pb.ControlClient, id, credential stri
 
 // Heartbeats never call Runtime.Revision (which locks behind Apply). Disk state
 // and scheduling belong exclusively to this loop; the apply worker is serialized.
-func cycle(ctx context.Context, client pb.ControlClient, c config.Config, role string, st *diskState, state *syncState, path string, ring *logring.Ring, timing cycleTiming) (err error) {
+func cycle(ctx context.Context, client pb.ControlClient, c config.Config, role string, st *diskState, state *syncState, path string, ring *logring.Ring, timing cycleTiming, loggers ...*slog.Logger) (err error) {
+	logger := slog.Default()
+	if len(loggers) > 0 && loggers[0] != nil {
+		logger = loggers[0]
+	}
 	streamCtx, cancel := context.WithTimeout(ctx, timing.lifetime)
 	deadline, _ := streamCtx.Deadline()
 	defer cancel()
@@ -445,15 +494,19 @@ func cycle(ctx context.Context, client pb.ControlClient, c config.Config, role s
 			return nil
 		case result := <-state.results:
 			state.busy = false
+			previous, wasFailed := state.revision.Load(), state.failed.Load()
 			state.revision.Store(result.revision)
 			state.failed.Store(result.err != nil)
 			if result.err != nil {
-				slog.Warn("runtime configuration apply failed", "revision", result.snapshot.Revision, "err", result.err)
+				logger.Warn("runtime configuration apply failed", "role", role, "revision", result.snapshot.Revision, "err", result.err)
 			} else if streamCtx.Err() == nil && state.ctx.Err() == nil {
 				st.Snapshot = &result.snapshot
 				if err := save(path, *st); err != nil {
 					state.failed.Store(true)
 					return errors.New("cannot persist runtime cache")
+				}
+				if previous != result.revision || wasFailed {
+					logger.Info("runtime configuration applied", "role", role, "revision", result.snapshot.Revision)
 				}
 				select {
 				case report <- struct{}{}:
@@ -492,6 +545,9 @@ func cycle(ctx context.Context, client pb.ControlClient, c config.Config, role s
 			}
 			if streamCtx.Err() != nil {
 				return nil
+			}
+			if !state.connected.Swap(true) {
+				logger.Info("control connection established", "role", role, "node_id", c.NodeID)
 			}
 			state.restore(snap)
 		}

@@ -1,6 +1,12 @@
 package logring
 
-import "testing"
+import (
+	"context"
+	"io"
+	"log/slog"
+	"strings"
+	"testing"
+)
 
 func TestRingBasic(t *testing.T) {
 	r := New(5)
@@ -44,5 +50,26 @@ func TestRingDrain(t *testing.T) {
 	}
 	if drainedAgain := r.Drain(); drainedAgain != nil {
 		t.Fatalf("expected nil after drain, got %v", drainedAgain)
+	}
+}
+
+func TestNodeHandlerSourceAndRedactedDiagnostics(t *testing.T) {
+	ring := New(10)
+	logger := slog.New(NewNodeHandler(ring, "server-1", slog.NewTextHandler(io.Discard, nil)))
+	logger.InfoContext(context.Background(), "runtime configuration applied", "role", "server", "revision", 7, "credential", "private-credential", "token", "private-token")
+	entries := ring.Query("node", "server-1", "INFO", 10)
+	if len(entries) != 1 || !strings.Contains(entries[0].Message, "revision=7") || !strings.Contains(entries[0].Message, "role=server") {
+		t.Fatalf("missing node diagnostic: %+v", entries)
+	}
+	if strings.Contains(entries[0].Message, "private-") || len(ring.Query("master", "", "", 10)) != 0 {
+		t.Fatalf("secret leaked or wrong source: %+v", entries)
+	}
+	master := slog.New(NewHandler(ring, "master", slog.NewTextHandler(io.Discard, nil)))
+	master.Info("master started", "addr", "127.0.0.1:2545")
+	if got := ring.Query("master", "", "", 10); len(got) != 1 || !strings.Contains(got[0].Message, "addr=127.0.0.1:2545") {
+		t.Fatalf("master log missing or wrongly attributed: %+v", got)
+	}
+	if got := ring.Query("node", "server-1", "", 10); len(got) != 1 {
+		t.Fatalf("embedded node log duplicated or lost: %+v", got)
 	}
 }

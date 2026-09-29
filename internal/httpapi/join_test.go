@@ -126,7 +126,7 @@ func TestJoinCommandAuthenticationRotationAndRevocation(t *testing.T) {
 	}
 	expected := "docker run -itd --restart unless-stopped --name " + shellQuote(app) +
 		" -v " + shellQuote(config+":/config:ro") + " -v " + shellQuote(data+":/data") + " -e TZ=Asia/Shanghai" +
-		" veilink:latest client -master-addr " + shellQuote("panel.example:8443") + " -node-id " + shellQuote(n.ID) +
+		" ghcr.io/aurorax-neo/veilink:latest client -master-addr " + shellQuote("panel.example:8443") + " -node-id " + shellQuote(n.ID) +
 		" -enroll-token " + shellQuote(fresh.Token) + " -state-dir '/data/state' -control-server-name 'panel.example'"
 	if fresh.Command != expected || strings.Contains(fresh.Command, "--net") || strings.Contains(fresh.Command, " -p ") {
 		t.Fatal("client Docker policy violated", fresh.Command)
@@ -189,7 +189,7 @@ func TestJoinCommandAuthenticationRotationAndRevocation(t *testing.T) {
 	serverRoot := "/opt/docker/" + serverApp
 	serverExpected := "docker run -itd --restart unless-stopped --name " + shellQuote(serverApp) + " --net host" +
 		" -v " + shellQuote(serverRoot+"/config:/config:ro") + " -v " + shellQuote(serverRoot+"/data:/data") + " -e TZ=Asia/Shanghai" +
-		" veilink:latest server -master-addr 'panel.example:8443' -node-id " + shellQuote(server.ID) +
+		" ghcr.io/aurorax-neo/veilink:latest server -master-addr 'panel.example:8443' -node-id " + shellQuote(server.ID) +
 		" -enroll-token " + shellQuote(serverJoin.Token) + " -state-dir '/data/state' -control-server-name 'panel.example'"
 	if serverJoin.Command != serverExpected || strings.Contains(serverJoin.Command, " -p ") {
 		t.Fatal("server Docker network policy violated", serverJoin.Command)

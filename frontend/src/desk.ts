@@ -1,16 +1,19 @@
 import type { InjectionKey } from 'vue'
-import type { Audit, Mapping, Node, PageId } from './types'
+import type { Audit, Mapping, Node, PageId, TrafficRow } from './types'
 
 export interface Desk {
   nodes: Node[]
   mappings: Mapping[]
   audit: Audit[]
+  traffic: TrafficRow[]
+  trafficLoaded: boolean
+  trafficError: string
   loading: boolean
   loaded: boolean
   error: string
   notice: string
   noticeBad: boolean
-  reload: () => Promise<void>
+  reload: (options?: { silent?: boolean }) => Promise<void>
   notify: (text: string, bad?: boolean) => void
 }
 

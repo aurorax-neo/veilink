@@ -34,7 +34,7 @@ if [ -z "$listen" ] || [ -z "$scheme" ]; then
     fi
   fi
 fi
-listen=${listen:-127.0.0.1:8443}
+listen=${listen:-127.0.0.1:2545}
 scheme=${scheme:-http}
 port=${listen##*:}
 host=${listen%:*}

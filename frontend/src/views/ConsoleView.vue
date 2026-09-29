@@ -58,7 +58,6 @@ async function refresh() {
             <div class="build-details">
               <p>管理中心：{{ software?.version || '未知' }}</p>
               <p>构建提交：<code>{{ software?.commit || '未知' }}</code></p>
-              <p class="help">统一镜像随附 Web；节点运行版本以节点上报为准。配置修订 rN 不代表软件升级。</p>
               <button v-if="versionError" type="button" class="btn small" @click="loadVersion">重试</button>
             </div>
           </details>

@@ -5,7 +5,9 @@ package logring
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 )
@@ -98,6 +100,7 @@ func (r *Ring) Query(source, nodeID, level string, limit int) []Entry {
 	}
 	return out
 }
+
 // Drain returns and removes all entries accumulated so far in oldest-first order.
 func (r *Ring) Drain() []Entry {
 	r.mu.Lock()
@@ -127,12 +130,19 @@ func (r *Ring) Drain() []Entry {
 type handler struct {
 	ring   *Ring
 	source string
+	nodeID string
 	next   slog.Handler
 }
 
 // NewHandler creates a dual-write slog handler.
 func NewHandler(r *Ring, source string, next slog.Handler) slog.Handler {
 	return &handler{ring: r, source: source, next: next}
+}
+
+// NewNodeHandler records an embedded node in the shared Master ring without
+// replacing the process-wide logger or forwarding its entries twice.
+func NewNodeHandler(r *Ring, nodeID string, next slog.Handler) slog.Handler {
+	return &handler{ring: r, source: "node", nodeID: nodeID, next: next}
 }
 
 func (h *handler) Enabled(_ context.Context, level slog.Level) bool {
@@ -149,21 +159,39 @@ func (h *handler) Handle(_ context.Context, rec slog.Record) error {
 	case rec.Level < slog.LevelInfo:
 		lvl = "DEBUG"
 	}
-	h.ring.Append(Entry{
-		At:      rec.Time.Unix(),
-		Level:   lvl,
-		Message: rec.Message,
-		Source:  h.source,
+	// Only include known non-secret diagnostic fields in the web log.
+	message := rec.Message
+	var details []string
+	rec.Attrs(func(a slog.Attr) bool {
+		switch a.Key {
+		case "role", "revision", "resource", "method", "id", "node_id", "addr", "scheme", "port", "attempt":
+			value := fmt.Sprint(a.Value.Any())
+			value = strings.Map(func(c rune) rune {
+				if c < 32 || c == 127 {
+					return ' '
+				}
+				return c
+			}, value)
+			if len(value) > 128 {
+				value = value[:128]
+			}
+			details = append(details, a.Key+"="+value)
+		}
+		return true
 	})
+	if len(details) > 0 {
+		message += " (" + strings.Join(details, ", ") + ")"
+	}
+	h.ring.Append(Entry{At: rec.Time.Unix(), Level: lvl, Message: message, Source: h.source, NodeID: h.nodeID})
 	return h.next.Handle(context.Background(), rec)
 }
 
 func (h *handler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return &handler{ring: h.ring, source: h.source, next: h.next.WithAttrs(attrs)}
+	return &handler{ring: h.ring, source: h.source, nodeID: h.nodeID, next: h.next.WithAttrs(attrs)}
 }
 
 func (h *handler) WithGroup(name string) slog.Handler {
-	return &handler{ring: h.ring, source: h.source, next: h.next.WithGroup(name)}
+	return &handler{ring: h.ring, source: h.source, nodeID: h.nodeID, next: h.next.WithGroup(name)}
 }
 
 // NodeRing stores per-node log entries in SQLite and an in-memory cache.

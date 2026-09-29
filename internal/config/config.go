@@ -39,7 +39,7 @@ type Config struct {
 }
 
 func Defaults() Config {
-	return Config{Database: "/data/veilink.db", DeploymentKey: "/data/veilink.key", ListenAddr: "127.0.0.1:8443", Scheme: "http", StateDir: "/data/state", EmbeddedServer: EmbeddedServerConfig{Enabled: true}, explicit: make(map[string]bool)}
+	return Config{Database: "/data/veilink.db", DeploymentKey: "/data/veilink.key", ListenAddr: "127.0.0.1:2545", Scheme: "http", StateDir: "/data/state", EmbeddedServer: EmbeddedServerConfig{Enabled: true}, explicit: make(map[string]bool)}
 }
 
 // ParseFlags accepts only flags belonging to the requested role. Visited flags,

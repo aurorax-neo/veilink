@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"veilink/internal/config"
+	"veilink/internal/logring"
 	"veilink/internal/model"
 	"veilink/internal/node"
 	"veilink/internal/store"
@@ -75,13 +76,13 @@ func embeddedConfig(c config.Config, n model.Node) config.Config {
 	}
 }
 
-func runEmbeddedServer(ctx context.Context, c config.Config, s *store.Store) error {
+func runEmbeddedServer(ctx context.Context, c config.Config, s *store.Store, rings ...*logring.Ring) error {
 	n, err := embeddedNode(c, s)
 	if err != nil {
 		return err
 	}
 	return superviseEmbedded(ctx, func() error {
-		return runEmbeddedAttempt(ctx, c, s, n)
+		return runEmbeddedAttempt(ctx, c, s, n, rings...)
 	}, time.Second)
 }
 
@@ -119,7 +120,7 @@ func superviseEmbedded(ctx context.Context, run func() error, delay time.Duratio
 	}
 }
 
-func runEmbeddedAttempt(ctx context.Context, c config.Config, s *store.Store, n model.Node) error {
+func runEmbeddedAttempt(ctx context.Context, c config.Config, s *store.Store, n model.Node, rings ...*logring.Ring) error {
 	// Never re-register here: missing/revoked/corrupt identities must fail closed,
 	// not create a replacement node or adopt a different embedded identity.
 	nodes, err := s.Nodes()
@@ -183,6 +184,10 @@ func runEmbeddedAttempt(ctx context.Context, c config.Config, s *store.Store, n 
 		}
 		srvConfig.EnrollToken = token
 		defer s.RevokeEnrollToken(n.ID)
+	}
+	if len(rings) > 0 && rings[0] != nil {
+		logger := slog.New(logring.NewNodeHandler(rings[0], n.ID, slog.NewTextHandler(os.Stderr, nil)))
+		return node.RunWithLogger(ctx, srvConfig, "server", logger)
 	}
 	return node.Run(ctx, srvConfig, "server")
 }

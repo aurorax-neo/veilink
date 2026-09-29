@@ -120,6 +120,9 @@ func RunWithInput(ctx context.Context, args []string, in io.Reader, out io.Write
 		fmt.Fprintln(out, "Administrator credential updated; previous sessions revoked.")
 		return nil
 	}
+	if strings.HasPrefix(args[0], "-") {
+		return errors.New("missing role: put master, server or client before role flags (example: veilink master -database /data/veilink.db)")
+	}
 	if args[0] != "master" && args[0] != "server" && args[0] != "client" {
 		return errors.New("unknown command")
 	}

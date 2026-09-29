@@ -153,10 +153,8 @@ test('labels and read-only effective configuration use authoritative mapped serv
   assert.equal(s.tunnelLabel({ tunnel: { protocol: 'hysteria2', hysteria2: { password: 'demo' } } }), 'Hysteria2 / QUIC + TLS')
   const c = setupTable('client')
   const client = { id: 'client' }
-  assert.equal(c.tunnelLabel(client), '未关联服务端')
   c.desk.nodes.push({ id: 'server', role: 'server', client_tunnel: { ca_pem: cert } }, { id: 'revoked', role: 'server', revoked: true })
   c.desk.mappings.push({ client_id: 'client', server_id: 'server' }, { client_id: 'client', server_id: 'server' }, { client_id: 'client', server_id: 'revoked' }, { client_id: 'other', server_id: 'server' })
-  assert.equal(c.tunnelLabel(client), '服务端统一下发')
   assert.equal(c.effectiveSources(client).length, 1)
   assert.equal(c.effectiveSources(client)[0].client_tunnel.ca_pem, cert)
   assert.equal(c.effectiveSources({ ...client, revoked: true }).length, 0)
@@ -172,6 +170,15 @@ test('labels and read-only effective configuration use authoritative mapped serv
   assert.doesNotMatch(tableSource.slice(tableSource.indexOf('<section v-if="selected"'), tableSource.indexOf('<Modal ref="configModal"')), /JSON.stringify\(source\.client_tunnel/)
 
 })
+test('client list omits server-only address and tunnel columns', () => {
+  assert.match(tableSource, /<table class="nodes-table" :class="\{ 'nodes-table-client': role === 'client' \}"/)
+  assert.match(tableSource, /<th v-if="role === 'server'" scope="col">本地监听 \/ 客户端连接地址<\/th><th v-if="role === 'server'" scope="col">隧道<\/th>/)
+  assert.match(tableSource, /<td v-if="role === 'server'">{{ tunnelLabel\(node\) }}<\/td><td>{{ mappings\(node.id\).length }}<\/td>/)
+  assert.doesNotMatch(tableSource, /服务端统一下发|<template v-else>—<\/template>/)
+  assert.match(tableSource, /<button v-if="role === 'client'"[^>]*>查看配置<\/button>/)
+  assert.match(source('../src/styles.css'), /\.nodes-table-client \{ min-width: 780px; \}/)
+})
+
 const ca = cert.replace('ZGVtbw==', 'Y3VzdG9t')
 const tlsNode = () => ({ id: 'server', name: 'Server', address: 'example.com', port: 443, connect_endpoints: [{ id: 'primary', name: '首选地址', host: 'example.com', port: 443, enabled: true }], tunnel: { listen_port: 8444, transport_security: 'tls', cert_pem: cert, key_pem: key, ca_pem: cert }, client_tunnel: { transport_security: 'tls', ca_pem: ca } })
 const realityNode = () => ({ id: 'reality', name: 'Reality', address: 'example.com', port: 443, connect_endpoints: [{ id: 'primary', name: '首选地址', host: 'example.com', port: 443, enabled: true }], tunnel: { listen_port: 8444, reality: { private_key: 'private', short_ids: 'aa,bb', server_names: 'example.com', dest: 'example.com:443' } }, client_tunnel: { reality: { public_key: 'public', short_id: 'bb', fingerprint: 'firefox', server_names: 'example.com', max_time_diff: '1m' } } })
@@ -337,7 +344,7 @@ test('onboarding displays role-specific flag commands and accepts HTTP only for 
   const context = vm.createContext({
     exports: {}, computed, ref, URL, location: { origin: 'https://master.example.com' },
     window: { setInterval: () => 1, clearInterval: () => {} }, onUnmounted: () => {}, defineExpose: () => {},
-    api: async (...args) => { requests.push(args); return { prepare: "mkdir -p '/opt/docker/veilink-client-demo/config' '/opt/docker/veilink-client-demo/data' && chown -R 65532:65532 '/opt/docker/veilink-client-demo/config' '/opt/docker/veilink-client-demo/data' && chmod 700 '/opt/docker/veilink-client-demo/config' '/opt/docker/veilink-client-demo/data'", command: "docker run -itd --restart unless-stopped --name 'veilink-client-demo' -v '/opt/docker/veilink-client-demo/config:/config:ro' -v '/opt/docker/veilink-client-demo/data:/data' -e TZ=Asia/Shanghai veilink:latest client -master-addr 'master.example.com:443' -node-id 'remote/id' -enroll-token 'token' -state-dir '/data/state' -control-server-name 'master.example.com'", token: 'token', expires_at: 2000000000, warning: '私有 Master CA 时，在角色子命令后添加 -control-ca /config/ca.pem。' } },
+    api: async (...args) => { requests.push(args); return { prepare: "mkdir -p '/opt/docker/veilink-client-demo/config' '/opt/docker/veilink-client-demo/data' && chown -R 65532:65532 '/opt/docker/veilink-client-demo/config' '/opt/docker/veilink-client-demo/data' && chmod 700 '/opt/docker/veilink-client-demo/config' '/opt/docker/veilink-client-demo/data'", command: "docker run -itd --restart unless-stopped --name 'veilink-client-demo' -v '/opt/docker/veilink-client-demo/config:/config:ro' -v '/opt/docker/veilink-client-demo/data:/data' -e TZ=Asia/Shanghai ghcr.io/aurorax-neo/veilink:latest client -master-addr 'master.example.com:443' -node-id 'remote/id' -enroll-token 'token' -state-dir '/data/state' -control-server-name 'master.example.com'", token: 'token', expires_at: 2000000000, warning: '私有 Master CA 时，在角色子命令后添加 -control-ca /config/ca.pem。' } },
   })
   vm.runInContext(transpile(onboardingScript + '\nglobalThis.onboarding = { open, generate, revoke, node, modal, result, masterURL };'), context)
   const e = context.onboarding
@@ -359,10 +366,10 @@ test('onboarding displays role-specific flag commands and accepts HTTP only for 
   assert.doesNotMatch(source('../src/components/NodeOnboarding.vue'), /ttl_seconds|join-ttl|有效期（秒）/)
   assert.match(source('../src/components/NodeOnboarding.vue'), /不影响已接入节点的有效凭据/)
   assert.equal(e.result.value.token, 'token')
-  assert.equal(e.result.value.command, "docker run -itd --restart unless-stopped --name 'veilink-client-demo' -v '/opt/docker/veilink-client-demo/config:/config:ro' -v '/opt/docker/veilink-client-demo/data:/data' -e TZ=Asia/Shanghai veilink:latest client -master-addr 'master.example.com:443' -node-id 'remote/id' -enroll-token 'token' -state-dir '/data/state' -control-server-name 'master.example.com'")
+  assert.equal(e.result.value.command, "docker run -itd --restart unless-stopped --name 'veilink-client-demo' -v '/opt/docker/veilink-client-demo/config:/config:ro' -v '/opt/docker/veilink-client-demo/data:/data' -e TZ=Asia/Shanghai ghcr.io/aurorax-neo/veilink:latest client -master-addr 'master.example.com:443' -node-id 'remote/id' -enroll-token 'token' -state-dir '/data/state' -control-server-name 'master.example.com'")
   assert.match(e.result.value.prepare, /chown -R 65532:65532/)
   assert.match(e.result.value.warning, /-control-ca \/config\/ca.pem/)
-  assert.match(source('../src/components/NodeOnboarding.vue'), /统一 veilink:latest 镜像.*server 或 client 子命令/)
+  assert.match(source('../src/components/NodeOnboarding.vue'), /统一镜像 ghcr.io\/aurorax-neo\/veilink:latest.*server 或 client 子命令/)
   assert.match(source('../src/components/NodeOnboarding.vue'), /id="join-prepare"[^>]+:value="result.prepare"/)
   e.masterURL.value = 'http://192.168.1.10:8443'
   await e.generate()

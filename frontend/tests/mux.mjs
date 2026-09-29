@@ -10,7 +10,7 @@ const script = source.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].r
 test('mapping mux select defaults off, round-trips every option and clears for UDP', async () => {
   const requests = []
   const desk = { nodes: [{ id: 's', role: 'server' }, { id: 'c', role: 'client' }], mappings: [], reload: async () => {}, notify: () => {} }
-  const context = vm.createContext({ exports: {}, computed, reactive, ref, watch, inject: () => desk, deskKey: {}, validateMapping: () => '', api: async (...args) => requests.push(args) })
+  const context = vm.createContext({ exports: {}, computed, reactive, ref, watch, inject: () => desk, deskKey: {}, validateMapping: () => '', api: async (...args) => requests.push(args), onMounted: () => {}, onUnmounted: () => {} })
   vm.runInContext(ts.transpileModule(script + '\nglobalThis.editor = { open, draft, muxType, save, fields };', { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText, context)
   const e = context.editor
   e.open()

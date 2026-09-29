@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { computed, inject, reactive, ref, watch } from 'vue'
+import { computed, inject, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { api } from '../api'
 import { deskKey } from '../desk'
-import { endpoint, nodeName, validateMapping } from '../format'
-import type { Mapping } from '../types'
+import { endpoint, heartbeatOnline, nodeName, validateMapping } from '../format'
+import type { Mapping, TrafficRow } from '../types'
 import Badge from '../components/Badge.vue'
 import EmptyState from '../components/EmptyState.vue'
 import Modal from '../components/Modal.vue'
@@ -15,6 +15,10 @@ const editor = ref<InstanceType<typeof Modal> | null>(null)
 const confirm = ref<InstanceType<typeof Modal> | null>(null)
 const pending = ref<Mapping | null>(null)
 const action = ref<'toggle' | 'delete'>('toggle')
+const now = ref(Date.now())
+let clock: ReturnType<typeof setInterval> | undefined
+onMounted(() => { clock = setInterval(() => { now.value = Date.now() }, 1000) })
+onUnmounted(() => { if (clock) clearInterval(clock) })
 const draft = reactive({ id: '', name: '', serverId: '', clientId: '', connectEndpointId: '', pool: 1, listenHost: '0.0.0.0', listenPort: '', targetHost: '', targetPort: '', network: 'tcp', enabled: true })
 const defaultMuxType = 'smux'
 const muxType = ref('')
@@ -34,6 +38,22 @@ function connectionLabel(mapping: Mapping) {
   if (!mapping.connect_endpoint_id) return '自动按服务端地址顺序切换'
   const candidate = connectionOptions(mapping.server_id).find(item => item.id === mapping.connect_endpoint_id)
   return candidate ? `${candidate.name} · ${endpoint(candidate.host, candidate.port)}` : '连接地址不可用，请重新选择'
+}
+function tunnelState(mapping: Mapping): { text: string; tone: '' | 'good' | 'warn' } {
+  if (!mapping.enabled) return { text: '已停用', tone: '' }
+  const server = desk.nodes.find(node => node.id === mapping.server_id)
+  const client = desk.nodes.find(node => node.id === mapping.client_id)
+  if (!server || !client || server.revoked || client.revoked) return { text: '节点不可用', tone: 'warn' }
+  if (!heartbeatOnline(server, now.value) || !heartbeatOnline(client, now.value)) return { text: '节点未连接', tone: 'warn' }
+  if ([server, client].some(node => node.error || !node.desired_revision || node.applied_revision !== node.desired_revision)) return { text: '配置未就绪', tone: 'warn' }
+  return { text: '待业务验证', tone: '' }
+}
+function traffic(mapping: Mapping): TrafficRow | undefined { return desk.traffic.find(row => row.mapping_id === mapping.id) }
+function bytes(n: number): string {
+  if (!Number.isSafeInteger(n) || n < 0) return '—'
+  if (n < 1024) return `${n} B`
+  const unit = Math.min(Math.floor(Math.log(n) / Math.log(1024)), 4)
+  return `${(n / 1024 ** unit).toFixed(1)} ${['B', 'KiB', 'MiB', 'GiB', 'TiB'][unit]}`
 }
 const rows = computed(() => desk.mappings.filter(m => (filter.value === 'all' || m.enabled === (filter.value === 'on')) && [m.name, m.listen_host, m.target_host, nodeName(desk.nodes, m.server_id), nodeName(desk.nodes, m.client_id)].join(' ').toLowerCase().includes(query.value.trim().toLowerCase())))
 function fields(m: Mapping) {
@@ -82,15 +102,18 @@ async function run() {
       <input v-model="query" type="search" aria-label="搜索映射" placeholder="搜索名称、节点或地址" />
       <button type="button" class="btn primary" @click="open()">新建映射</button>
     </div>
+    <p class="help">流量为服务端本次进程已上报的公网侧载荷字节（上行：进入监听；下行：返回公网），不含协议开销；重启后重新计数，不代表目标可达。隧道状态依据节点心跳和配置，需单独验证业务。</p>
+    <p v-if="desk.trafficError" class="error" role="alert">流量读取失败：{{ desk.trafficError }}；可点击刷新重试。</p>
     <EmptyState v-if="!rows.length" title="暂无映射" text="新建映射或调整筛选。" />
     <div v-else class="panel table-scroll" tabindex="0" role="region" aria-label="映射列表">
       <table>
-        <thead><tr><th scope="col">名称</th><th scope="col">服务端 → 客户端</th><th scope="col">路径</th><th scope="col">Pool</th><th scope="col">状态</th><th scope="col">操作</th></tr></thead>
+        <thead><tr><th scope="col">名称</th><th scope="col">服务端 → 客户端</th><th scope="col">路径</th><th scope="col">Pool</th><th scope="col">隧道状态</th><th scope="col">流量（上行 / 下行）</th><th scope="col">操作</th></tr></thead>
         <tbody><tr v-for="mapping in rows" :key="mapping.id">
           <td><strong>{{ mapping.name }}</strong><Badge :text="(mapping.network || 'tcp').toUpperCase()" /></td>
           <td>{{ nodeName(desk.nodes, mapping.server_id) }}<small>→ {{ nodeName(desk.nodes, mapping.client_id) }}</small><small>隧道入口：{{ connectionLabel(mapping) }}</small></td>
           <td><code>{{ endpoint(mapping.listen_host, mapping.listen_port) }}</code><small>→ <code>{{ endpoint(mapping.target_host, mapping.target_port) }}</code></small></td>
-          <td>{{ mapping.pool || 1 }}<small>{{ mapping.network === 'udp' ? 'XUDP' : mapping.mux ? (mapping.mux_type || 'smux') : 'mux 关闭' }}</small></td><td><Badge :text="mapping.enabled ? '启用' : '停用'" :tone="mapping.enabled ? 'good' : ''" /></td>
+          <td>{{ mapping.pool || 1 }}<small>{{ mapping.network === 'udp' ? 'XUDP' : mapping.mux ? (mapping.mux_type || 'smux') : 'mux 关闭' }}</small></td><td><Badge :text="tunnelState(mapping).text" :tone="tunnelState(mapping).tone" :title="'基于节点心跳和已应用配置；不代表映射目标可达'" /></td>
+          <td><template v-if="desk.trafficError">读取失败</template><template v-else-if="!desk.trafficLoaded">加载中…</template><template v-else-if="!mapping.enabled">—</template><template v-else-if="traffic(mapping)?.reported_at">{{ bytes(traffic(mapping)!.up_bytes) }} / {{ bytes(traffic(mapping)!.down_bytes) }}<small :title="traffic(mapping)!.reported_at || ''">服务端本次进程 · {{ new Date(traffic(mapping)!.reported_at!).toLocaleString('zh-CN') }} 上报</small></template><template v-else>尚无流量上报</template></td>
           <td><div class="actions"><button type="button" class="btn small" @click="open(mapping)">编辑</button><button type="button" class="btn small" @click="ask(mapping, 'toggle')">{{ mapping.enabled ? '停用' : '启用' }}</button><button type="button" class="btn small danger" @click="ask(mapping, 'delete')">删除</button></div></td>
         </tr></tbody>
       </table>

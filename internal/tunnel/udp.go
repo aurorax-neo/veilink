@@ -32,6 +32,8 @@ type xudpConn struct {
 	buf       []byte
 	fresh     bool
 	seen      time.Time
+	traffic   *Traffic
+	mappingID string
 }
 
 func newClientUDP(conn *net.UDPConn, host string, port int) *xudpConn {
@@ -56,7 +58,7 @@ func (c *xudpConn) push(p []byte) bool {
 	case c.queue <- append([]byte(nil), p...):
 		return true
 	default:
-		return true
+		return false
 	}
 }
 
@@ -136,7 +138,9 @@ func (c *xudpConn) Write(p []byte) (int, error) {
 	c.seen = time.Now()
 	c.mu.Unlock()
 	if c.peer != nil {
-		_, err = c.back.WriteToUDP(payload, c.peer)
+		n, writeErr := c.back.WriteToUDP(payload, c.peer)
+		c.traffic.add(c.mappingID, 0, n)
+		err = writeErr
 	} else {
 		_, err = c.udp.Write(payload)
 	}
@@ -203,6 +207,13 @@ func (c *xudpConn) SetWriteDeadline(t time.Time) error {
 func (s *service) serveUDP(pc *net.UDPConn, m model.Mapping) {
 	peers := map[string]*xudpConn{}
 	var mu sync.Mutex
+	defer func() {
+		mu.Lock()
+		for _, peer := range peers {
+			_ = peer.Close()
+		}
+		mu.Unlock()
+	}()
 	buf := make([]byte, 64<<10)
 	for {
 		n, addr, err := pc.ReadFromUDP(buf)
@@ -222,6 +233,7 @@ func (s *service) serveUDP(pc *net.UDPConn, m model.Mapping) {
 		}
 		if peer == nil {
 			peer = newGatewayUDP(pc, addr, m.TargetHost, m.TargetPort)
+			peer.traffic, peer.mappingID = s.traffic, m.ID
 			if !s.openUDP(peer, m) {
 				_ = peer.Close()
 				mu.Unlock()
@@ -239,7 +251,9 @@ func (s *service) serveUDP(pc *net.UDPConn, m model.Mapping) {
 		}
 		link := peer
 		mu.Unlock()
-		link.push(buf[:n])
+		if link.push(buf[:n]) {
+			s.traffic.add(m.ID, n, 0)
+		}
 	}
 }
 

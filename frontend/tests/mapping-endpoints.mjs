@@ -20,12 +20,13 @@ function setup() {
     { id: 'other', name: 'Other', role: 'server', connect_endpoints: [candidate('c')] },
     { id: 'client', name: 'Client', role: 'client' },
   ], mappings: [], reload: async () => {}, notify: () => {} })
-  const context = vm.createContext({ exports: {}, computed, reactive, ref, watch, ...format.exports, inject: () => desk, deskKey: {}, api: async (...args) => requests.push(args) })
-  vm.runInContext(transpile(script + '\nglobalThis.editor = { open, draft, save, fields, connections, missingConnection, connectionLabel, ask, run };'), context)
+  let tick = () => {}, unmount = () => {}
+  const context = vm.createContext({ exports: {}, computed, reactive, ref, watch, ...format.exports, inject: () => desk, deskKey: {}, api: async (...args) => requests.push(args), onMounted: cb => { tick = cb }, onUnmounted: cb => { unmount = cb }, setInterval: cb => { tick = cb; return 7 }, clearInterval: () => {} })
+  vm.runInContext(transpile(script + '\nglobalThis.editor = { open, draft, save, fields, connections, missingConnection, connectionLabel, tunnelState, now, ask, run };'), context)
   const editor = context.editor
   editor.open()
   Object.assign(editor.draft, { name: 'Map', listenPort: '18080', targetPort: '80' })
-  return { ...editor, desk, requests }
+  return { ...editor, desk, requests, tick: () => tick(), unmount: () => unmount() }
 }
 
 test('mapping defaults to first enabled endpoint, saves and restores explicit and automatic selection', async () => {
@@ -112,4 +113,30 @@ test('changed Vue templates compile with no malformed or duplicate editor blocks
     assert.doesNotMatch(text, /^CUT |^PUT /m)
   }
   assert.equal((read('../src/components/NodesTable.vue').match(/<NodeEditor /g) || []).length, 1)
+})
+
+test('tunnel state distinguishes disabled, offline and applied nodes without claiming reachability', () => {
+  const e = setup()
+  const mapping = { id: 'm', server_id: 's', client_id: 'client', enabled: true }
+  assert.equal(e.tunnelState({ ...mapping, enabled: false }).text, '已停用')
+  assert.equal(e.tunnelState(mapping).text, '节点未连接')
+  for (const node of [e.desk.nodes[0], e.desk.nodes[2]]) Object.assign(node, { last_seen: Math.floor(Date.now()/1000), desired_revision: 2, applied_revision: 2 })
+  assert.equal(e.tunnelState(mapping).text, '待业务验证')
+  e.desk.nodes[2].applied_revision = 1
+  assert.equal(e.tunnelState(mapping).text, '配置未就绪')
+  e.desk.nodes[2].revoked = true
+  assert.equal(e.tunnelState(mapping).text, '节点不可用')
+  assert.match(view, /隧道状态/)
+  assert.match(view, /不代表映射目标可达/)
+})
+
+test('mapping heartbeat status expires on local clock without new API data', () => {
+ const e = setup()
+ const stamp = Math.floor(Date.now()/1000)
+ for (const node of [e.desk.nodes[0],e.desk.nodes[2]]) Object.assign(node,{last_seen:stamp,desired_revision:1,applied_revision:1,error:'',revoked:false})
+ const mapping={enabled:true,server_id:'s',client_id:'client'}
+ assert.equal(e.tunnelState(mapping).text,'待业务验证')
+ e.now.value=(stamp+91)*1000
+ assert.equal(e.tunnelState(mapping).text,'节点未连接')
+ e.unmount()
 })

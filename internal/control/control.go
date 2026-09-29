@@ -9,6 +9,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
 	"io"
+	"math"
 	"time"
 	pb "veilink/api/control/v1"
 	"veilink/internal/logring"
@@ -60,6 +61,47 @@ func (s *Service) Pull(ctx context.Context, m *structpb.Struct) (*structpb.Struc
 		return nil, rpcError(e)
 	}
 	return Envelope(snap)
+}
+
+// trafficPayload rejects malformed or oversized structpb values before touching state.
+func trafficPayload(m *structpb.Struct) (string, uint64, map[string]store.TrafficBytes, error) {
+	fields := m.GetFields()
+	epoch, ok := fields["traffic_epoch"].GetKind().(*structpb.Value_StringValue)
+	if !ok {
+		return "", 0, nil, store.ErrInvalid
+	}
+	seqValue, ok := fields["traffic_seq"].GetKind().(*structpb.Value_NumberValue)
+	if !ok || seqValue.NumberValue < 1 || seqValue.NumberValue > 9007199254740991 || math.Trunc(seqValue.NumberValue) != seqValue.NumberValue {
+		return "", 0, nil, store.ErrInvalid
+	}
+	v, ok := fields["traffic"].GetKind().(*structpb.Value_StructValue)
+	if !ok || len(v.StructValue.GetFields()) > 128 {
+		return "", 0, nil, store.ErrInvalid
+	}
+	out := make(map[string]store.TrafficBytes, len(v.StructValue.GetFields()))
+	for id, entry := range v.StructValue.GetFields() {
+		if entry == nil {
+			return "", 0, nil, store.ErrInvalid
+		}
+		pair := entry.GetStructValue()
+		if pair == nil || len(pair.GetFields()) != 2 {
+			return "", 0, nil, store.ErrInvalid
+		}
+		get := func(k string) (uint64, bool) {
+			val, ok := pair.GetFields()[k].GetKind().(*structpb.Value_NumberValue)
+			if !ok || val.NumberValue < 0 || val.NumberValue > 9007199254740991 || math.Trunc(val.NumberValue) != val.NumberValue {
+				return 0, false
+			}
+			return uint64(val.NumberValue), true
+		}
+		up, a := get("up")
+		down, b := get("down")
+		if !a || !b {
+			return "", 0, nil, store.ErrInvalid
+		}
+		out[id] = store.TrafficBytes{Up: up, Down: down}
+	}
+	return epoch.StringValue, uint64(seqValue.NumberValue), out, nil
 }
 func (s *Service) Events(stream grpc.BidiStreamingServer[structpb.Struct, structpb.Struct]) error {
 	type result struct {
@@ -129,6 +171,18 @@ func (s *Service) Events(stream grpc.BidiStreamingServer[structpb.Struct, struct
 			})
 			if e != nil {
 				return rpcError(e)
+			}
+			if _, present := r.m.GetFields()["traffic"]; present {
+				epoch, seq, totals, parseErr := trafficPayload(r.m)
+				if parseErr != nil {
+					return rpcError(parseErr)
+				}
+				reportErr := s.Store.ReportTraffic(id, String(r.m, "credential"), epoch, seq, totals)
+				// A stale mapping may be removed while the node is applying the
+				// new snapshot. Do not block configuration sync on old telemetry.
+				if reportErr != nil && !errors.Is(reportErr, store.ErrInvalid) {
+					return rpcError(reportErr)
+				}
 			}
 			if updates == nil {
 				var unsubscribe func()

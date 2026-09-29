@@ -36,6 +36,7 @@ type Store struct {
 	key       []byte
 	software  map[string]SoftwareReport
 	listeners map[chan int64]string
+	traffic   map[string]trafficNode
 }
 
 func Open(path, keyPath string) (*Store, error) {
@@ -391,6 +392,15 @@ func (s *Store) mutate(action, id string, fn func(*state) error) error {
 	}
 	if e = tx.Commit(); e == nil {
 		s.notifyLocked(st.Revision, affected)
+		for mid, old := range before.Mappings {
+			newMapping, exists := st.Mappings[mid]
+			if !exists || !newMapping.Enabled || old.ServerID != newMapping.ServerID {
+				for nodeID, report := range s.traffic {
+					delete(report.totals, mid)
+					s.traffic[nodeID] = report
+				}
+			}
+		}
 	}
 	return e
 }
