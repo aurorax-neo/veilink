@@ -37,8 +37,8 @@ func TestUnifiedImageAndDockerRunOnly(t *testing.T) {
 			t.Errorf("obsolete bootstrap instruction %q", obsolete)
 		}
 	}
-	if !strings.Contains(readme, "docker build -t veilink:latest .") {
-		t.Error("missing unified image build")
+	if !strings.Contains(readme, "docker build -t ghcr.io/aurorax-neo/veilink:latest .") || !strings.Contains(readme, "docker pull ghcr.io/aurorax-neo/veilink:latest") {
+		t.Error("missing unified GHCR image pull/build")
 	}
 	blocks := strings.Split(readme, "```sh\n")[1:]
 	for _, role := range []string{"master", "server", "client"} {
@@ -48,7 +48,7 @@ func TestUnifiedImageAndDockerRunOnly(t *testing.T) {
 		var runs []string
 		for _, part := range blocks {
 			block := strings.SplitN(part, "\n```", 2)[0]
-			if strings.HasPrefix(block, "docker run -itd") && strings.Contains(block, "veilink:latest "+role+" ") {
+			if strings.HasPrefix(block, "docker run -itd") && strings.Contains(block, "ghcr.io/aurorax-neo/veilink:latest "+role+" ") {
 				runs = append(runs, block)
 			}
 		}

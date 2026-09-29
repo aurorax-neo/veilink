@@ -2,20 +2,21 @@
 
 Veilink 是原生 Go 私有反向隧道：Master 管理 Server、Client 和 TCP/UDP 映射。**生产只使用一个统一 Docker 镜像**，以 `master|server|client` 子命令选择角色；只有 Master 提供 Web。默认 Master 使用 HTTP，内置 HTTPS 可选；不承诺与 Xray 协议互通。
 
-[v0.2.0 Release](https://github.com/aurorax-neo/veilink/releases/tag/v0.2.0) 提供统一镜像 `ghcr.io/aurorax-neo/veilink:0.2.0`（linux/amd64、linux/arm64）。下文使用本机镜像别名 `veilink:latest`。**先做准备，再执行 Docker Run**；三种角色使用相同镜像。示例拓扑：nginx 与 Master 同机，外部 `https://vl.vekt.cc.cd:8843` → Master `http://127.0.0.1:2545`；内置 Server 首次默认监听 `8444`。首次注册前须限制面板访问来源。
+[v0.2.0 Release](https://github.com/aurorax-neo/veilink/releases/tag/v0.2.0) 提供统一镜像 `ghcr.io/aurorax-neo/veilink:latest`（linux/amd64、linux/arm64）；`latest` 是可变标签，生产如需锁定版本可使用 `:0.2.0`。**先做准备，再执行 Docker Run**；三种角色使用相同镜像。示例拓扑：nginx 与 Master 同机，外部 `https://panel.example.com:8843` → Master `http://127.0.0.1:2545`；内置 Server 首次默认监听 `8444`。替换示例域名、端口和证书路径，并在首次注册前限制面板访问来源。
 
 ## 1. 每台运行节点的主机：准备镜像
 
 ```sh
-docker pull ghcr.io/aurorax-neo/veilink:0.2.0
-docker tag ghcr.io/aurorax-neo/veilink:0.2.0 veilink:latest
+docker pull ghcr.io/aurorax-neo/veilink:latest
 ```
 
-`veilink:latest` 只是本地别名，不会自动升级。v0.2.0 的新安装默认监听 `127.0.0.1:2545`；已有 Master 若已存旧监听地址，仍须按下方命令显式指定 `-listen-addr 127.0.0.1:2545`。第三方镜像代理若提示 `DENIED: invalid token`，先检查代理的鉴权/镜像路径；不要把拉取失败误判成 Veilink 启动失败。也可以从当前源码构建同一个镜像（会覆盖这个本地别名）：
+如从当前源码在本机构建同一个统一镜像（仅生成本机标签，不会推送 GHCR），可在仓库根目录运行：
 
 ```sh
-docker build -t veilink:latest .
+docker build -t ghcr.io/aurorax-neo/veilink:latest .
 ```
+
+`latest` 不会自动更新已运行的容器；升级须先备份数据，再主动拉取镜像并重建容器。已有 Master 若已存旧监听地址，仍须按下方命令显式指定 `-listen-addr 127.0.0.1:2545`。第三方镜像代理若提示 `DENIED: invalid token`，先检查代理鉴权/镜像路径，不要把拉取失败误判成 Veilink 启动失败。
 
 ## 2. Master 主机：先准备目录，再启动
 
@@ -35,7 +36,7 @@ docker run -itd \
   -e TZ=Asia/Shanghai \
   -v /opt/docker/veilink-master/config:/config:ro \
   -v /opt/docker/veilink-master/data:/data \
-  veilink:latest master \
+  ghcr.io/aurorax-neo/veilink:latest master \
   -database /data/veilink.db -deployment-key /data/veilink.key \
   -state-dir /data/state -listen-addr 127.0.0.1:2545 \
   -scheme http -html-dir /usr/local/html \
@@ -54,25 +55,25 @@ curl -fsS http://127.0.0.1:2545/healthz
 
 ## 3. 同机 nginx：先配 HTTPS 与 gRPC，再接入远端节点
 
-示例放入 nginx 的 `http {}` 中；需要 **nginx ≥ 1.25.1**、SSL/HTTP2/gRPC 模块。与贴出的站点配置一致：外部域名 `vl.vekt.cc.cd`、HTTPS 端口 `8843`，后端 HTTP/h2c 端口 `2545`。`<实际证书目录>` 须替换为证书所在的**具体目录名**（例如实际目录 `*.vekt.cc.cd_vekt.cc.cd_EC384`），`ssl_certificate` 指令不能直接用 `*` 通配符匹配目录。nginx 若在独立 Bridge 容器，`127.0.0.1` 是 nginx 自己，回源地址须改成它能到达的受限地址。
+示例放入 nginx 的 `http {}` 中；需要 **nginx ≥ 1.25.1**、SSL/HTTP2/gRPC 模块。以下以 `panel.example.com:8843` 为外部地址、`127.0.0.1:2545` 为 Master HTTP/h2c 回源；替换域名和证书的**实际文件路径**，nginx 证书路径不能使用 `*` 匹配目录。nginx 若在独立 Bridge 容器，`127.0.0.1` 是 nginx 自己，须使用它能到达的受限回源地址。
 
 ```nginx
 server {
     listen 8843 ssl;
     listen [::]:8843 ssl;
     http2 on;
-    server_name vl.vekt.cc.cd;
-    ssl_certificate /etc/nginx/ssl/<实际证书目录>/fullchain.cer;
-    ssl_certificate_key /etc/nginx/ssl/<实际证书目录>/private.key;
+    server_name panel.example.com;
+    ssl_certificate /etc/nginx/ssl/panel.example.com/fullchain.cer;
+    ssl_certificate_key /etc/nginx/ssl/panel.example.com/private.key;
 
     if ($host != $server_name) {
         return 404;
     }
 
-    # 只转换本站 Origin；其它 Origin 原样传递，由 Master 拒绝跨站写入。
+    # 只转换本站的精确 Origin；其它 Origin 原样传递，由 Master 拒绝跨站写入。
     set $veilink_origin $http_origin;
-    if ($http_origin = "https://vl.vekt.cc.cd:8843") {
-        set $veilink_origin "http://vl.vekt.cc.cd:8843";
+    if ($http_origin = "https://panel.example.com:8843") {
+        set $veilink_origin "http://panel.example.com:8843";
     }
 
     location /veilink.control.v1.Control/ {
@@ -97,8 +98,8 @@ server {
 
 ```sh
 nginx -t && nginx -s reload
-curl -fsS https://vl.vekt.cc.cd:8843/api/setup
-openssl s_client -connect vl.vekt.cc.cd:8843 -servername vl.vekt.cc.cd -alpn h2 </dev/null 2>&1 | grep -i 'ALPN protocol'
+curl -fsS https://panel.example.com:8843/api/setup
+openssl s_client -connect panel.example.com:8843 -servername panel.example.com -alpn h2 </dev/null 2>&1 | grep -i 'ALPN protocol'
 ```
 
 预期 ALPN 为 `h2`。旧 nginx 不支持 `http2 on;` 时可使用 `listen 8843 ssl http2;`，但仍须有 HTTP/2 模块。**`tls: no application protocol` 是外部 HTTPS 入口未提供 h2，不是 CSRF 错误**；节点控制面必须使用 `grpc_pass`，不能换成普通 `proxy_pass`。本例 nginx 的监听端口就是外部访问端口 `8843`，所以回源 Host 使用 `$host:$server_port`；单独 `$host` 不含非标准端口，会导致同源 Origin 比对失败。若前置负载均衡/CDN 改写了外部端口，不要用 `$server_port` 猜测，应在两个 Host 指令中填写实际外部域名和端口。Web/API 使用同一外部域名及端口，本站 Origin 的精确转换也须与回源 Host 一致。登录/注册就 403 先检查 Origin/Host/端口；登录后操作 403 再检查 `veilink_session` Cookie、`X-CSRF-Token` 与 `Sec-Fetch-Site`。不关闭 CSRF、不信任客户端提供的转发头，也不把所有 Origin 改成本域。nginx 为会话 Cookie 加 `Secure`；Master 不依赖 `X-Forwarded-Proto` 放宽认证。
@@ -127,9 +128,9 @@ docker run -itd \
   -e TZ=Asia/Shanghai \
   -v /opt/docker/veilink-server/config:/config:ro \
   -v /opt/docker/veilink-server/data:/data \
-  veilink:latest server \
-  -master-addr vl.vekt.cc.cd:8843 \
-  -control-server-name vl.vekt.cc.cd \
+  ghcr.io/aurorax-neo/veilink:latest server \
+  -master-addr panel.example.com:8843 \
+  -control-server-name panel.example.com \
   -node-id '<Server 节点 ID>' -enroll-token '<接入令牌>' \
   -state-dir /data/state
 ```
@@ -150,14 +151,14 @@ docker run -itd \
   -e TZ=Asia/Shanghai \
   -v /opt/docker/veilink-client/config:/config:ro \
   -v /opt/docker/veilink-client/data:/data \
-  veilink:latest client \
-  -master-addr vl.vekt.cc.cd:8843 \
-  -control-server-name vl.vekt.cc.cd \
+  ghcr.io/aurorax-neo/veilink:latest client \
+  -master-addr panel.example.com:8843 \
+  -control-server-name panel.example.com \
   -node-id '<Client 节点 ID>' -enroll-token '<接入令牌>' \
   -state-dir /data/state
 ```
 
-两种节点均可在 Web「快捷接入」填写 `https://vl.vekt.cc.cd:8843` 生成同类 Docker 命令；**不要同时运行生成命令和手工命令创建重复容器**。私有 Master CA 才将 CA 放入只读 `/config` 并追加 `-control-ca /config/master-ca.pem`，保持证书校验。可信内网也可直接 HTTP/h2c：填写 `http://节点可达地址:2545`，或手工把 `-master-addr` 改成该地址并省略 `-control-server-name` 和 `-control-ca`；HTTP 传输会暴露凭据，不能跨不可信网络。Client 容器里的 `127.0.0.1` 不是宿主机，映射目标须从容器网络可达。
+两种节点均可在 Web「快捷接入」填写 `https://panel.example.com:8843` 生成同类 Docker 命令；**不要同时运行生成命令和手工命令创建重复容器**。私有 Master CA 才将 CA 放入只读 `/config` 并追加 `-control-ca /config/master-ca.pem`，保持证书校验。可信内网也可直接 HTTP/h2c：填写 `http://节点可达地址:2545`，或手工把 `-master-addr` 改成该地址并省略 `-control-server-name` 和 `-control-ca`；HTTP 传输会暴露凭据，不能跨不可信网络。Client 容器里的 `127.0.0.1` 不是宿主机，映射目标须从容器网络可达。
 
 接入令牌会出现在 shell 历史和 `docker inspect`。确认节点首次接入且 `/data/state` 已保存凭据后，**保留数据目录**，删除原节点容器并用不含 `-enroll-token` 的同参数命令重建，以清除 inspect 中的令牌；令牌也可在 Web 撤销。不要为了修复未上报或待应用删除数据库、key 或节点状态。如果节点显示「未上报」，检查节点容器日志、Master 地址、端口与 TLS/ALPN；「最新」只代表认证上报的期望配置已应用，不代表映射目标可达。节点状态列的刷新图标只发出请求，实际结果仍以节点上报为准。
 
