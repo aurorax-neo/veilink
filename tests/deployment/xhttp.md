@@ -2,22 +2,21 @@
 
 ## 实现与参考边界
 
-- 原生 HTTP/1.1 packet-up：随机会话 GET 下行、32 KiB 有序 POST 上行、私有空 POST `X-Veilink-EOF: 1` 半关闭。HTTPS 验证证书链与候选名称；支持 HTTP-only 与 HTTPS 终止后 HTTP 回源，不要求 L4/TLS 透传。
-- 行为参考 `ref/Xray-core/transport/internet/splithttp/{config.go,config.proto}` 及 `infra/conf/transport_internet.go`。参考 LICENSE 声明 MPL-2.0；独立实现，不复制参考代码或 AGPL 代码，不宣称 Xray 互通。
-- 地址语义对照 `ref/frp-panel/idl/common.proto` 的 `frps_url/frps_urls`：Client 拨号地址与 Server 监听分离、多个候选。本项目保留 JSON host/port 候选，不复制其 URL 配置或实现。
-- Server 唯一可编辑源配置，自动派生 Client 公共模板；API/SQLite/快照/状态均为 JSON。没有 YAML、本地 Client 覆盖、私钥下发、认证或 CSRF 放宽。
-- 仅支持 packet-up、HTTP/1.1；可按 Xray 分层方式使用 TCP → REALITY → XHTTP，但 REALITY 模式必须关闭 XHTTP 自身 TLS 且不能经过 CDN 边缘 TLS 终止。普通 XHTTP 可使用 HTTP/HTTPS 路径透传；CDN 必须路径透传、禁用缓存和响应缓冲、支持流式 GET 与 EOF 头，并将同一会话路由到同一源站。详细配置在 README。
+- 原生 HTTP/1.1、HTTP/2/h2c、HTTP/3 packet-up，以及 HTTP/2/HTTP/3 TLS stream-up/stream-one：GET 下行、POST/PUT 上行、私有 EOF/完成确认和取消回收均为 Veilink 双端原生行为，不宣称 Xray 对端互通。
+- Server 是唯一可编辑源配置，自动派生 Client 公共模板；API/SQLite/快照/状态均为 JSON。Client 不维护本地隧道覆盖，不下发 Server 私钥、REALITY 私钥或 VLESS decryption 材料。
+- `download_endpoint_id` 仅引用 Server 已启用的授权连接入口。packet-up/auto 的 GET/下行使用独立授权 transport，POST/PUT/上行继续使用主入口；显式主入口绑定会保留下行入口，主/下行 xmux 池按入口隔离。未知、禁用、流模式、任意 URL 或拨号器缺失均 fail closed。
+- REALITY 可作为 TCP 外层安全层；XHTTP 自身 TLS 必须关闭，不能经过 CDN 边缘 TLS 终止。`auto` 在 REALITY 下明确选择 packet-up，避免降级到未认证流模式；这不是完整参考实现或 Xray 兼容声明。
+- 普通 XHTTP 可使用 HTTP/HTTPS 路径透传；CDN 必须路径透传、禁用缓存和响应缓冲、支持流式 GET/EOF，并将同一会话路由到同一源站。以下均为本机或隔离 Docker 证据，不代表公网 CDN 或跨机 WAN 验收。
 
 ## 测试覆盖与执行
 
 以下均在本机临时资源上实际执行，不代表公网 CDN 或跨机 WAN 验收。
 
-- `internal/tunnel/protocol_matrix_test.go`：总计 **62 个组合**，其中新增 XHTTP **15 个**＝HTTPS / HTTPS+Encryption / HTTP+Encryption × TCP off/smux/yamux/h2mux、UDP off。每组 3 个并发 peer，TCP 每 peer 64 KiB 加 CloseWrite，UDP 每 peer 1 KiB，校验完整内容。
-- `internal/tunnel/xhttp_test.go`：**6 个顶层测试**；往返的 3 个子场景为 HTTP、HTTPS、本机 HTTPS 代理→HTTP；另含不可信证书拒绝、读 deadline/取消、写 deadline、8 个上传输入用例及重复 GET、128 会话上限（第 129 个拒绝）。不是所有恶意输入的穷举。
-- `internal/tunnel/xhttp_runtime_test.go`：**2 个子场景**，完整 VLESS Encryption 业务经 HTTP-only 代理或 HTTPS 终止代理→HTTP 源站，首候选不可达后切换、二进制回显和半关闭。
-- `internal/store/xhttp_test.go`：持久化重开、派生模板/私密字段隔离、映射与授权快照、候选顺序、JSON 往返、模板不可编辑；另有 **15 个非法配置子用例**，检查不推进修订。
-- `internal/httpapi/xhttp_test.go`：真实 JSON API 保存与派生、未登录/无 CSRF 拒绝、**4 个错误请求子用例**（未知字段、模式、类型、独立 client_tunnel）。
-- `frontend/tests/node-editor.mjs`：新增 **2 个行为测试**，覆盖 XHTTP 保存/恢复、HTTPS 与源站安全分离、HTTP 强制 Encryption、8 个非法路径、切回 TCP 清除 XHTTP；全部前端 **34/34** 通过，`npm run build` 通过。
+- `internal/tunnel/protocol_matrix_test.go`：覆盖 TCP/UDP、TCP mux、XHTTP 及授权协议组合；本轮全量 Go 测试通过。
+- `internal/tunnel/xhttp_test.go`、`xhttp_runtime_test.go`、`xhttp_auto_test.go`、`xhttp_downlink_test.go`：覆盖 HTTP/1.1、HTTP/2/h2c、HTTP/3、代理回源、缓冲并发、取消/EOF、REALITY auto、授权主/下行入口和 fail-closed。
+- `internal/store/xhttp_test.go`、`internal/httpapi/xhttp_test.go`：覆盖 XHTTP 持久化、Server 派生 Client 模板、快照隔离、下载入口合法性、未知/禁用入口拒绝和 API 保存。
+- `frontend/tests/node-editor.mjs`：覆盖 XHTTP 字段回填、分离下行入口筛选、模式切换清理和 Client 隔离；本轮前端全部 **93/93** 通过，`npm run typecheck` 与生产构建通过。
+- 本轮额外回归：`go test -race ./internal/tunnel ./internal/store ./internal/httpapi ./internal/control ./internal/node`、`go test -tags integration ./tests/integration`、`go vet ./...` 和 `git diff --check` 均通过。
 
 实际执行命令：
 
@@ -38,10 +37,11 @@ git diff --check
 ## 统一镜像本机检查
 
 - 实际构建：`veilink:xhttp-check`，镜像 ID 前缀 `6cd1a936e5a8`，VERSION=`dev-xhttp`、COMMIT=`working-tree`。构建来自含既有 CLI help 工作的工作区，**不是最终提交的精确源码身份证明**。
-- 执行 `tests/deployment/soak.py --image veilink:xhttp-check --duration 60`，实际 259.8 秒（包括故障恢复），2 次 rollout、12 次稳态业务探测。
-- master/server/client 三种角色均 healthy，均有静态资源，同一二进制 SHA256：`dccde6f647227b1d93b7a8acb58d3009fac6f26b6c60041147ca1a18bd150b7b`。测试容器/网络已清理，剩余容器为空。
-- 镜像脚本沿用既有业务传输做三角色通用回归，不冒充 xhttp/CDN 镜像端到端测试；xhttp 业务/CDN 类转发证据来自上述 Go runtime 测试。原始日志位于本次 session scratch 的 `xhttp-*.log` 与 `xhttp-image-check/result.json`，未将令牌/运行数据库提交。
-
+- 实际构建：`veilink:rc-20260930`，镜像 ID `sha256:c0a2a8e21c71fc66be72157bd499d696424371e276faac64c22b68f09c21ccaf`；镜像内统一二进制 SHA-256 `289fe7def69d290054902f5f02b3863e243e6648ef0c4a0ffd2b9ec9b1c186e4`。
+- 执行 `tests/deployment/soak.py --image veilink:rc-20260930 --duration 60`，实际约 184 秒（含故障恢复），2 次 rollout、12 次稳态业务采样；初始收敛、100 秒分区、配置漂移、恢复和三角色重启均通过。
+- master/server/client 三种角色均 healthy，统一二进制摘要一致；测试容器/网络已清理，`cleanup_remaining` 为空。结果：`$PI_SCRATCH_DIR/rc-soak/result.json`。
+- 执行 `tests/deployment/proxy_check.py --image veilink:rc-20260930`：TLS/CA、Cookie、Origin、CSRF、证书候选拒绝、证书热更新、h2c 心跳和重连均通过；结果：`$PI_SCRATCH_DIR/rc-proxy/result.json`。
+- 本地隔离证据不代表真实 WAN/NAT、生产 CDN、容量压测或 24–72 小时长期稳定性。
 ## 未做与保留项
 
 未 push、未远端部署、未公网 CDN 厂商验证、未多机长稳或容量压测；未新增浏览器截图验收。nginx 配置是说明示例，本次真实代理测试使用 Go httputil。CLI help 的 `internal/cli/cli.go`、`internal/config/config.go`、`internal/cli/help_test.go` 保持原工作区改动，不纳入 xhttp 提交；其它既有未跟踪文件同样保留。没有 hard reset。

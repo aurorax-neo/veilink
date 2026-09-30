@@ -2,7 +2,7 @@
 import { computed, inject, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { api } from '../api'
 import { deskKey } from '../desk'
-import { endpoint, heartbeatOnline, nodeName, validateMapping } from '../format'
+import { byNameAndId, endpoint, heartbeatOnline, nodeName, validateMapping } from '../format'
 import type { Mapping, TrafficRow } from '../types'
 import Badge from '../components/Badge.vue'
 import EmptyState from '../components/EmptyState.vue'
@@ -16,15 +16,43 @@ const confirm = ref<InstanceType<typeof Modal> | null>(null)
 const pending = ref<Mapping | null>(null)
 const action = ref<'toggle' | 'delete'>('toggle')
 const now = ref(Date.now())
+type EndpointStatus = { acknowledged: boolean; reason: string }
+type MappingStatus = { server: EndpointStatus; client: EndpointStatus }
+const statuses = ref<Record<string, MappingStatus>>({})
+const statusError = ref('')
+let statusGeneration = 0
+let active = false
 let clock: ReturnType<typeof setInterval> | undefined
-onMounted(() => { clock = setInterval(() => { now.value = Date.now() }, 1000) })
-onUnmounted(() => { if (clock) clearInterval(clock) })
+let statusClock: ReturnType<typeof setInterval> | undefined
+async function refreshStatus() {
+  const generation = ++statusGeneration
+  statuses.value = {} // Never display old acknowledgements while a new request is pending.
+  statusError.value = ''
+  try {
+    const result = await api<Record<string, MappingStatus>>('/mappings/status')
+    if (!active || generation !== statusGeneration) return
+    if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('状态格式无效')
+    statuses.value = result
+  } catch {
+    if (active && generation === statusGeneration) { statuses.value = {}; statusError.value = '映射状态读取失败，请稍后重试。' }
+  }
+}
+onMounted(() => {
+  active = true
+  clock = setInterval(() => { now.value = Date.now() }, 1000)
+  statusClock = setInterval(() => { void refreshStatus() }, 5000)
+  void refreshStatus()
+})
+onUnmounted(() => { active = false; ++statusGeneration; if (clock) clearInterval(clock); if (statusClock) clearInterval(statusClock) })
+watch(() => desk.mappings, () => { if (active) void refreshStatus() })
+watch(() => desk.loading, (loading, previous) => { if (active && previous && !loading) void refreshStatus() })
+
 const draft = reactive({ id: '', name: '', serverId: '', clientId: '', connectEndpointId: '', pool: 1, listenHost: '0.0.0.0', listenPort: '', targetHost: '', targetPort: '', network: 'tcp', enabled: true })
 const defaultMuxType = 'smux'
 const muxType = ref('')
 watch(() => draft.network, network => { if (network !== 'tcp') muxType.value = '' }, { flush: 'sync' })
-const servers = computed(() => desk.nodes.filter(n => n.role === 'server' && !n.revoked))
-const clients = computed(() => desk.nodes.filter(n => n.role === 'client' && !n.revoked))
+const servers = computed(() => desk.nodes.filter(n => n.role === 'server' && !n.revoked).sort(byNameAndId))
+const clients = computed(() => desk.nodes.filter(n => n.role === 'client' && !n.revoked).sort(byNameAndId))
 function connectionOptions(serverId: string) {
   const server = servers.value.find(node => node.id === serverId)
   if (!server) return []
@@ -45,8 +73,10 @@ function tunnelState(mapping: Mapping): { text: string; tone: '' | 'good' | 'war
   const client = desk.nodes.find(node => node.id === mapping.client_id)
   if (!server || !client || server.revoked || client.revoked) return { text: '节点不可用', tone: 'warn' }
   if (!heartbeatOnline(server, now.value) || !heartbeatOnline(client, now.value)) return { text: '节点未连接', tone: 'warn' }
-  if ([server, client].some(node => node.error || !node.desired_revision || node.applied_revision !== node.desired_revision)) return { text: '配置未就绪', tone: 'warn' }
-  return { text: '待业务验证', tone: '' }
+  const status = statuses.value[mapping.id]
+  if (status?.server?.reason === 'apply_failed' || status?.client?.reason === 'apply_failed') return { text: '配置应用失败', tone: 'warn' }
+  if (status?.server?.acknowledged !== true || status.server.reason !== 'acknowledged' || status?.client?.acknowledged !== true || status.client.reason !== 'acknowledged') return { text: '配置状态未知', tone: 'warn' }
+  return { text: '待业务验证', tone: '' } // Acknowledgement is not a target-service probe.
 }
 function traffic(mapping: Mapping): TrafficRow | undefined { return desk.traffic.find(row => row.mapping_id === mapping.id) }
 function bytes(n: number): string {
@@ -55,7 +85,7 @@ function bytes(n: number): string {
   const unit = Math.min(Math.floor(Math.log(n) / Math.log(1024)), 4)
   return `${(n / 1024 ** unit).toFixed(1)} ${['B', 'KiB', 'MiB', 'GiB', 'TiB'][unit]}`
 }
-const rows = computed(() => desk.mappings.filter(m => (filter.value === 'all' || m.enabled === (filter.value === 'on')) && [m.name, m.listen_host, m.target_host, nodeName(desk.nodes, m.server_id), nodeName(desk.nodes, m.client_id)].join(' ').toLowerCase().includes(query.value.trim().toLowerCase())))
+const rows = computed(() => desk.mappings.filter(m => (filter.value === 'all' || m.enabled === (filter.value === 'on')) && [m.name, m.listen_host, m.target_host, nodeName(desk.nodes, m.server_id), nodeName(desk.nodes, m.client_id)].join(' ').toLowerCase().includes(query.value.trim().toLowerCase())).sort(byNameAndId))
 function fields(m: Mapping) {
   return { id: m.id, name: m.name, serverId: m.server_id, clientId: m.client_id, connectEndpointId: m.connect_endpoint_id || '', pool: m.pool || 1, listenHost: m.listen_host, listenPort: String(m.listen_port), targetHost: m.target_host, targetPort: String(m.target_port), network: m.network || 'tcp', enabled: m.enabled }
 }
@@ -74,7 +104,7 @@ async function save() {
     connect_endpoint_id: draft.connectEndpointId,
     listen_host: draft.listenHost.trim(), listen_port: Number(draft.listenPort), target_host: draft.targetHost.trim(), target_port: Number(draft.targetPort), network: draft.network, enabled: draft.enabled,
   })
-  await desk.reload(); desk.notify('映射已保存。')
+  await desk.reload(); if (active) void refreshStatus(); desk.notify('映射已保存。')
   return true
 }
 function ask(mapping: Mapping, operation: 'toggle' | 'delete') { pending.value = mapping; action.value = operation; confirm.value?.open() }
@@ -88,7 +118,7 @@ async function run() {
     }
     await api(`/mappings/${encodeURIComponent(mapping.id)}`, 'PUT', { ...mapping, enabled: !mapping.enabled })
   } else await api(`/mappings/${encodeURIComponent(mapping.id)}`, 'DELETE')
-  await desk.reload(); desk.notify(action.value === 'delete' ? '映射已删除。' : '状态已更新。')
+  await desk.reload(); if (active) void refreshStatus(); desk.notify(action.value === 'delete' ? '映射已删除。' : '状态已更新。')
   return true
 }
 </script>
@@ -102,8 +132,9 @@ async function run() {
       <input v-model="query" type="search" aria-label="搜索映射" placeholder="搜索名称、节点或地址" />
       <button type="button" class="btn primary" @click="open()">新建映射</button>
     </div>
-    <p class="help">流量为服务端本次进程已上报的公网侧载荷字节（上行：进入监听；下行：返回公网），不含协议开销；重启后重新计数，不代表目标可达。隧道状态依据节点心跳和配置，需单独验证业务。</p>
+    <p class="help">映射按名称排序，同名按 ID 固定排序。隧道状态仅依据节点心跳和各映射两端的已应用确认；「待业务验证」不代表目标服务已连通，请从服务端监听地址发起实际业务请求验证。流量为服务端本次进程已上报的公网侧载荷字节（上行：进入监听；下行：返回公网），不含协议开销；重启后重新计数，流量出现也不代表业务健康。</p>
     <p v-if="desk.trafficError" class="error" role="alert">流量读取失败：{{ desk.trafficError }}；可点击刷新重试。</p>
+    <p v-if="statusError" class="error" role="alert">{{ statusError }}</p>
     <EmptyState v-if="!rows.length" title="暂无映射" text="新建映射或调整筛选。" />
     <div v-else class="panel table-scroll" tabindex="0" role="region" aria-label="映射列表">
       <table>
@@ -112,7 +143,7 @@ async function run() {
           <td><strong>{{ mapping.name }}</strong><Badge :text="(mapping.network || 'tcp').toUpperCase()" /></td>
           <td>{{ nodeName(desk.nodes, mapping.server_id) }}<small>→ {{ nodeName(desk.nodes, mapping.client_id) }}</small><small>隧道入口：{{ connectionLabel(mapping) }}</small></td>
           <td><code>{{ endpoint(mapping.listen_host, mapping.listen_port) }}</code><small>→ <code>{{ endpoint(mapping.target_host, mapping.target_port) }}</code></small></td>
-          <td>{{ mapping.pool || 1 }}<small>{{ mapping.network === 'udp' ? 'XUDP' : mapping.mux ? (mapping.mux_type || 'smux') : 'mux 关闭' }}</small></td><td><Badge :text="tunnelState(mapping).text" :tone="tunnelState(mapping).tone" :title="'基于节点心跳和已应用配置；不代表映射目标可达'" /></td>
+          <td>{{ mapping.pool || 1 }}<small>{{ mapping.network === 'udp' ? 'XUDP' : mapping.mux ? (mapping.mux_type || 'smux') : 'mux 关闭' }}</small></td><td><Badge :text="tunnelState(mapping).text" :tone="tunnelState(mapping).tone" :title="'只代表节点心跳及配置已应用；不代表隧道连接和映射目标可达'" /></td>
           <td><template v-if="desk.trafficError">读取失败</template><template v-else-if="!desk.trafficLoaded">加载中…</template><template v-else-if="!mapping.enabled">—</template><template v-else-if="traffic(mapping)?.reported_at">{{ bytes(traffic(mapping)!.up_bytes) }} / {{ bytes(traffic(mapping)!.down_bytes) }}<small :title="traffic(mapping)!.reported_at || ''">服务端本次进程 · {{ new Date(traffic(mapping)!.reported_at!).toLocaleString('zh-CN') }} 上报</small></template><template v-else>尚无流量上报</template></td>
           <td><div class="actions"><button type="button" class="btn small" @click="open(mapping)">编辑</button><button type="button" class="btn small" @click="ask(mapping, 'toggle')">{{ mapping.enabled ? '停用' : '启用' }}</button><button type="button" class="btn small danger" @click="ask(mapping, 'delete')">删除</button></div></td>
         </tr></tbody>

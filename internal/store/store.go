@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -31,12 +33,98 @@ type state struct {
 	Secrets  map[string][]byte
 }
 type Store struct {
-	mu        sync.Mutex
-	db        *sql.DB
-	key       []byte
-	software  map[string]SoftwareReport
-	listeners map[chan int64]string
-	traffic   map[string]trafficNode
+	mu          sync.Mutex
+	db          *sql.DB
+	key         []byte
+	software    map[string]SoftwareReport
+	listeners   map[chan int64]string
+	traffic     map[string]trafficNode
+	mappingAcks map[string]map[string]mappingAck
+}
+
+// MappingStatus represents in-process configuration acknowledgement, not reachability.
+type MappingStatus struct {
+	Server MappingEndpointStatus `json:"server"`
+	Client MappingEndpointStatus `json:"client"`
+}
+type MappingEndpointStatus struct {
+	Acknowledged bool   `json:"acknowledged"`
+	Reason       string `json:"reason"`
+}
+type mappingAck struct {
+	Policy string
+	Failed bool
+}
+
+// Include binding-wide effective session settings, but exclude administrative labels.
+func mappingPolicy(st state, m model.Mapping) string {
+	b := st.Bindings[m.BindingID]
+	b.UUID = ""
+	pool := 0
+	mux := map[string]bool{}
+	for _, other := range st.Mappings {
+		if other.BindingID != m.BindingID || !other.Enabled {
+			continue
+		}
+		if other.Pool > pool {
+			pool = other.Pool
+		}
+		if other.Mux {
+			mux[other.MuxType] = true
+		}
+	}
+	var types []string
+	for kind := range mux {
+		types = append(types, kind)
+	}
+	sort.Strings(types)
+	m.Name = ""
+	data, _ := json.Marshal(struct {
+		Mapping model.Mapping
+		Binding model.Binding
+		Server  model.Node
+		Client  model.Node
+		Pool    int
+		Mux     []string
+	}{m, b, nodeRuntimeConfig(st.Nodes[m.ServerID]), nodeRuntimeConfig(st.Nodes[m.ClientID]), pool, types})
+	return fmt.Sprintf("%x", sha256.Sum256(data))
+}
+
+// MappingStatuses never returns internal policy, credentials, or a target probe.
+func (s *Store) MappingStatuses() (map[string]MappingStatus, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, err := s.load()
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]MappingStatus, len(st.Mappings))
+	for id, m := range st.Mappings {
+		policy := mappingPolicy(st, m)
+		endpoint := func(nodeID string) MappingEndpointStatus {
+			status := MappingEndpointStatus{Reason: "unknown"}
+			if n, ok := st.Nodes[nodeID]; !ok || n.Revoked {
+				status.Reason = "node_unavailable"
+				return status
+			}
+			if !m.Enabled {
+				status.Reason = "disabled"
+				return status
+			}
+			ack, ok := s.mappingAcks[id][nodeID]
+			if !ok || ack.Policy != policy {
+				return status
+			}
+			if ack.Failed {
+				status.Reason = "apply_failed"
+				return status
+			}
+			status.Acknowledged, status.Reason = true, "acknowledged"
+			return status
+		}
+		out[id] = MappingStatus{Server: endpoint(m.ServerID), Client: endpoint(m.ClientID)}
+	}
+	return out, nil
 }
 
 func Open(path, keyPath string) (*Store, error) {
@@ -273,10 +361,27 @@ func cloneState(in state) state {
 	return out
 }
 
+// Display labels and heartbeat status never change the runtime configuration.
+func nodeRuntimeConfig(n model.Node) model.Node {
+	n.Name = ""
+	n.DesiredRevision, n.AppliedRevision, n.LastSeen, n.Error = 0, 0, 0, ""
+	n.ConnectEndpoints = append([]model.ConnectEndpoint(nil), n.ConnectEndpoints...)
+	for i := range n.ConnectEndpoints {
+		n.ConnectEndpoints[i].Name = ""
+	}
+	return n
+}
 func nodeConfigEqual(a, b model.Node) bool {
-	a.DesiredRevision, a.AppliedRevision, a.LastSeen, a.Error = 0, 0, 0, ""
-	b.DesiredRevision, b.AppliedRevision, b.LastSeen, b.Error = 0, 0, 0, ""
-	return reflect.DeepEqual(a, b)
+	return reflect.DeepEqual(nodeRuntimeConfig(a), nodeRuntimeConfig(b))
+}
+
+// A Client consumes the Server's public template and dial candidates, not its
+// private listener/certificate or administrative labels.
+func serverClientConfigEqual(a, b model.Node) bool {
+	a, b = nodeRuntimeConfig(a), nodeRuntimeConfig(b)
+	return a.Address == b.Address && a.Port == b.Port &&
+		reflect.DeepEqual(a.ConnectEndpoints, b.ConnectEndpoints) &&
+		reflect.DeepEqual(a.ClientTunnel, b.ClientTunnel)
 }
 
 func bindingPeers(st state, nodeID string) map[string]bool {
@@ -290,6 +395,12 @@ func bindingPeers(st state, nodeID string) map[string]bool {
 		}
 	}
 	return peers
+}
+
+// Mapping names are administrative labels, not tunnel policy.
+func mappingConfigEqual(a, b model.Mapping) bool {
+	a.Name, b.Name = "", ""
+	return reflect.DeepEqual(a, b)
 }
 
 func affectedNodes(before, after state) map[string]bool {
@@ -319,7 +430,7 @@ func affectedNodes(before, after state) map[string]bool {
 		}
 	}
 	for id, m := range before.Mappings {
-		if next, ok := after.Mappings[id]; !ok || !reflect.DeepEqual(m, next) {
+		if next, ok := after.Mappings[id]; !ok || !mappingConfigEqual(m, next) {
 			if b, ok := before.Bindings[m.BindingID]; ok {
 				affected[b.ServerID], affected[b.ClientID] = true, true
 			}
@@ -331,7 +442,7 @@ func affectedNodes(before, after state) map[string]bool {
 		}
 	}
 	for id, m := range after.Mappings {
-		if old, ok := before.Mappings[id]; !ok || !reflect.DeepEqual(old, m) {
+		if old, ok := before.Mappings[id]; !ok || !mappingConfigEqual(old, m) {
 			if b, ok := after.Bindings[m.BindingID]; ok {
 				affected[b.ServerID], affected[b.ClientID] = true, true
 			}
@@ -343,7 +454,7 @@ func affectedNodes(before, after state) map[string]bool {
 		if exists && nodeConfigEqual(old, next) {
 			continue
 		}
-		if old.Role == "server" || !exists || old.Revoked != next.Revoked {
+		if !exists || old.Revoked != next.Revoked || (old.Role == "server" && !serverClientConfigEqual(old, next)) {
 			for peer := range bindingPeers(before, id) {
 				affected[peer] = true
 			}
@@ -392,6 +503,21 @@ func (s *Store) mutate(action, id string, fn func(*state) error) error {
 	}
 	if e = tx.Commit(); e == nil {
 		s.notifyLocked(st.Revision, affected)
+		// A revision bump alone does not invalidate unrelated mappings. Drop only
+		// acknowledgements whose effective mapping or shared binding policy changed.
+		for mid, endpoints := range s.mappingAcks {
+			m, exists := st.Mappings[mid]
+			if !exists {
+				delete(s.mappingAcks, mid)
+				continue
+			}
+			policy := mappingPolicy(st, m)
+			for nodeID, ack := range endpoints {
+				if ack.Policy != policy || (nodeID != m.ServerID && nodeID != m.ClientID) {
+					delete(endpoints, nodeID)
+				}
+			}
+		}
 		for mid, old := range before.Mappings {
 			newMapping, exists := st.Mappings[mid]
 			if !exists || !newMapping.Enabled || old.ServerID != newMapping.ServerID {
@@ -536,6 +662,12 @@ func (s *Store) Nodes() ([]model.Node, error) {
 	for _, n := range st.Nodes {
 		out = append(out, n)
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].ID < out[j].ID
+	})
 	return out, e
 }
 func (s *Store) SaveNode(n model.Node) (model.Node, error) {
@@ -885,6 +1017,25 @@ func (s *Store) HeartbeatSoftware(id, credential string, applied int64, failed b
 			s.software = make(map[string]SoftwareReport)
 		}
 		s.software[id] = software
+		if s.mappingAcks == nil {
+			s.mappingAcks = make(map[string]map[string]mappingAck)
+		}
+		for mid, m := range st.Mappings {
+			if !m.Enabled || (id != m.ServerID && id != m.ClientID) {
+				continue
+			}
+			policy := mappingPolicy(st, m)
+			if s.mappingAcks[mid] == nil {
+				s.mappingAcks[mid] = make(map[string]mappingAck)
+			}
+			old := s.mappingAcks[mid][id]
+			if !failed && applied == n.DesiredRevision {
+				s.mappingAcks[mid][id] = mappingAck{Policy: policy}
+			} else if failed && old.Policy != policy {
+				// A failed apply never erases an earlier successful acknowledgement.
+				s.mappingAcks[mid][id] = mappingAck{Policy: policy, Failed: true}
+			}
+		}
 	}
 	return n.DesiredRevision, e
 }
@@ -901,11 +1052,20 @@ func (s *Store) Mappings() ([]model.Mapping, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st, e := s.load()
-	out := []model.Mapping{}
+	if e != nil {
+		return nil, e
+	}
+	out := make([]model.Mapping, 0, len(st.Mappings))
 	for _, m := range st.Mappings {
 		out = append(out, m)
 	}
-	return out, e
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out, nil
 }
 func host(h string) bool {
 	if net.ParseIP(h) != nil {

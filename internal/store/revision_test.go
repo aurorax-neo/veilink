@@ -161,6 +161,170 @@ func TestScopedRevisionsAndDerivedClients(t *testing.T) {
 	}
 }
 
+func TestMetadataAndPrivateListenerDoNotInvalidateUnrelatedNodes(t *testing.T) {
+	s, _, _ := testStore(t)
+	a := testNode(t, s, "server", "a")
+	b := testNode(t, s, "server", "b")
+	c := testNode(t, s, "client", "c")
+	d := testNode(t, s, "client", "d")
+	for _, pair := range []struct {
+		server, client string
+		port           int
+	}{{a.ID, c.ID, 18080}, {b.ID, d.ID, 18081}} {
+		if _, err := s.SaveMapping(testMapping(pair.server, pair.client, pair.port)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ids := []string{a.ID, b.ID, c.ID, d.ID}
+	creds := map[string]string{}
+	for _, id := range ids {
+		creds[id] = testCredential(t, s, id)
+	}
+	baseline, err := s.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids {
+		if _, err := s.Heartbeat(id, creds[id], baseline.Nodes[id].DesiredRevision, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	baseline, _ = s.load()
+	channels := map[string]<-chan int64{}
+	for _, id := range ids {
+		ch, stop := s.Subscribe(id)
+		channels[id] = ch
+		defer stop()
+	}
+	check := func(want ...string) {
+		t.Helper()
+		after, err := s.load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		changed := map[string]bool{}
+		for _, id := range want {
+			changed[id] = true
+		}
+		for _, id := range ids {
+			if (after.Nodes[id].DesiredRevision != baseline.Nodes[id].DesiredRevision) != changed[id] {
+				t.Fatalf("unexpected revision change %q: %t", id, changed[id])
+			}
+			select {
+			case <-channels[id]:
+				if !changed[id] {
+					t.Fatalf("unexpected push to %q", id)
+				}
+			default:
+				if changed[id] {
+					t.Fatalf("missing push to %q", id)
+				}
+			}
+		}
+		baseline = after
+	}
+	a.Name = "renamed-server"
+	a.ConnectEndpoints = append([]model.ConnectEndpoint(nil), a.ConnectEndpoints...)
+	a.ConnectEndpoints[0].Name = "renamed-endpoint"
+	if _, err := s.SaveNode(a); err != nil {
+		t.Fatal(err)
+	}
+	check()
+	stored, _ := s.load()
+	if stored.Nodes[a.ID].Name != a.Name || stored.Nodes[a.ID].ConnectEndpoints[0].Name != a.ConnectEndpoints[0].Name {
+		t.Fatal("metadata lost")
+	}
+	c.Name = "renamed-client"
+	if _, err := s.SaveNode(c); err != nil {
+		t.Fatal(err)
+	}
+	check()
+	a.Tunnel.ListenHost = "127.0.0.1"
+	if _, err := s.SaveNode(a); err != nil {
+		t.Fatal(err)
+	}
+	check(a.ID)
+	a.ClientTunnel = nil
+	a.Tunnel.Flow = "xtls-rprx-vision"
+	if _, err := s.SaveNode(a); err != nil {
+		t.Fatal(err)
+	}
+	check(a.ID, c.ID)
+	if got, err := s.Snapshot(c.ID, creds[c.ID]); err != nil || got.Revision != baseline.Nodes[c.ID].DesiredRevision {
+		t.Fatalf("client snapshot: %v", err)
+	}
+}
+
+func TestMappingRenameDoesNotInvalidateRuntime(t *testing.T) {
+	s, _, _ := testStore(t)
+	a := testNode(t, s, "server", "a")
+	b := testNode(t, s, "server", "b")
+	c := testNode(t, s, "client", "c")
+	d := testNode(t, s, "client", "d")
+	first, err := s.SaveMapping(testMapping(a.ID, c.ID, 18080))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SaveMapping(testMapping(b.ID, d.ID, 18081)); err != nil {
+		t.Fatal(err)
+	}
+	ids := []string{a.ID, b.ID, c.ID, d.ID}
+	creds := map[string]string{}
+	for _, id := range ids {
+		creds[id] = testCredential(t, s, id)
+	}
+	before, err := s.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	channels := map[string]<-chan int64{}
+	for _, id := range ids {
+		ch, stop := s.Subscribe(id)
+		channels[id] = ch
+		defer stop()
+	}
+	first.Name = "renamed"
+	first.BindingID = ""
+	if _, err := s.SaveMapping(first); err != nil {
+		t.Fatal(err)
+	}
+	after, err := s.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids {
+		if !reflect.DeepEqual(before.Nodes[id], after.Nodes[id]) {
+			t.Fatalf("rename changed node state %q", id)
+		}
+		select {
+		case <-channels[id]:
+			t.Fatalf("rename notified %q", id)
+		default:
+		}
+		snap, err := s.Snapshot(id, creds[id])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if snap.Revision != before.Nodes[id].DesiredRevision {
+			t.Fatalf("rename revised %q", id)
+		}
+	}
+	first.Pool = 2
+	if _, err := s.SaveMapping(first); err != nil {
+		t.Fatal(err)
+	}
+	after, err = s.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids {
+		changed := id == a.ID || id == c.ID
+		if (before.Nodes[id].DesiredRevision != after.Nodes[id].DesiredRevision) != changed {
+			t.Fatalf("pool changed wrong node %q", id)
+		}
+	}
+}
+
 func TestRefreshTargetingAndConcurrentUnsubscribe(t *testing.T) {
 	s, _, _ := testStore(t)
 	a := testNode(t, s, "client", "a")

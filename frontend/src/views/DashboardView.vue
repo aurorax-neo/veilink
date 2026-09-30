@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, inject } from 'vue'
 import { deskKey, navigateKey } from '../desk'
-import { attentionReasons, heartbeatOnline, nodeName, presence, revisionState } from '../format'
+import { attentionReasons, byNameAndId, heartbeatOnline, nodeName, presence, revisionState } from '../format'
 import Badge from '../components/Badge.vue'
 import EmptyState from '../components/EmptyState.vue'
 
@@ -9,9 +9,9 @@ const desk = inject(deskKey)!
 const navigate = inject(navigateKey)!
 const onlineServers = computed(() => desk.nodes.filter(n => n.role === 'server' && heartbeatOnline(n)).length)
 const onlineClients = computed(() => desk.nodes.filter(n => n.role === 'client' && heartbeatOnline(n)).length)
-const attention = computed(() => desk.nodes.filter(n => attentionReasons(n).length))
-const servers = computed(() => desk.nodes.filter(n => n.role === 'server'))
-function clientsOf(id: string) { return [...new Set(desk.mappings.filter(m => m.server_id === id).map(m => nodeName(desk.nodes, m.client_id)))].join('、') || '—' }
+const attention = computed(() => desk.nodes.filter(n => attentionReasons(n).length).sort(byNameAndId))
+const servers = computed(() => desk.nodes.filter(n => n.role === 'server').sort(byNameAndId))
+function clientsOf(id: string) { return [...new Set(desk.mappings.filter(m => m.server_id === id).map(m => m.client_id))].sort((a, b) => byNameAndId({ id: a, name: nodeName(desk.nodes, a) }, { id: b, name: nodeName(desk.nodes, b) })).map(clientId => nodeName(desk.nodes, clientId)).join('、') || '—' }
 </script>
 
 <template>

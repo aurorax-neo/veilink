@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { inject, onMounted, onUnmounted, ref } from 'vue'
+import { computed, inject, onMounted, onUnmounted, ref } from 'vue'
 import { api } from '../api'
 import { deskKey } from '../desk'
-import { logLevelTone, nodeName } from '../format'
+import { byNameAndId, logLevelTone, nodeName } from '../format'
 import type { LogEntry } from '../types'
 import EmptyState from '../components/EmptyState.vue'
 import Badge from '../components/Badge.vue'
@@ -12,6 +12,7 @@ const source = ref<'all' | 'master' | 'node'>('all')
 const nodeId = ref('')
 const level = ref('')
 const logs = ref<LogEntry[]>([])
+const sortedNodes = computed(() => [...desk.nodes].sort(byNameAndId))
 const loading = ref(false)
 const error = ref('')
 let request = 0
@@ -67,7 +68,7 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
       </div>
       <select v-if="source === 'node'" v-model="nodeId" aria-label="节点" @change="fetchLogs()">
         <option value="">全部节点</option>
-        <option v-for="n in desk.nodes" :key="n.id" :value="n.id">{{ n.name }}</option>
+        <option v-for="n in sortedNodes" :key="n.id" :value="n.id">{{ n.name }}</option>
       </select>
       <div class="chips" role="group" aria-label="级别">
         <button type="button" :aria-pressed="level === ''" @click="level = ''; fetchLogs()">全部</button>

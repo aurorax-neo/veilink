@@ -129,6 +129,9 @@ func RunWithLogger(ctx context.Context, c config.Config, role string, logger *sl
 	}
 	// Only authenticated database snapshots configure the tunnel runtime.
 	runtime := tunnel.New(model.LocalTLS{})
+	if role == "client" {
+		runtime.SetDialLogger(logger)
+	}
 	runCtx, stopRuntime := context.WithCancel(ctx)
 	defer func() { stopRuntime(); closeRuntime(runtime) }()
 	state := newSyncState(runCtx, runtime)

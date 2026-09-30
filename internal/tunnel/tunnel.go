@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"reflect"
 	"sort"
@@ -146,11 +147,19 @@ type Runtime struct {
 	revision  int64
 	highWater int64
 	traffic   *Traffic
+	dialLog   *dialDiagnostics
 	closed    bool
 }
 
 func New(local model.LocalTLS) *Runtime {
 	return &Runtime{local: local, revision: -1, highWater: -1, traffic: &Traffic{}}
+}
+
+// SetDialLogger supplies a node-scoped logger before Apply starts the client.
+func (r *Runtime) SetDialLogger(logger *slog.Logger) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.dialLog = newDialDiagnostics(logger)
 }
 
 func (r *Runtime) Traffic() *Traffic { return r.traffic }
@@ -188,10 +197,18 @@ func (r *Runtime) Apply(s model.Snapshot) error {
 		r.instance = nil
 		r.revision = -1
 	}
-	instance, err := start(s, effective, r.traffic)
+	r.traffic.prepareActive(s.Mappings, s.Node.Role == "server")
+	instance, err := startWithDiagnostics(s, effective, r.dialLog, r.traffic)
 	if err != nil {
+		defer func() {
+			if r.good != nil {
+				r.traffic.setActive(r.good.Mappings, r.good.Node.Role == "server")
+			} else {
+				r.traffic.setActive(nil, false)
+			}
+		}()
 		if r.good != nil {
-			restored, rollbackErr := start(*r.good, r.goodLocal, r.traffic)
+			restored, rollbackErr := startWithDiagnostics(*r.good, r.goodLocal, r.dialLog, r.traffic)
 			if rollbackErr != nil {
 				return fmt.Errorf("start failed: %w; rollback failed: %v", err, rollbackErr)
 			}
@@ -254,18 +271,24 @@ func orderedSnapshot(s model.Snapshot) model.Snapshot {
 
 func sameConfiguration(a, b model.Snapshot) bool {
 	canonical := func(s model.Snapshot) model.Snapshot {
+		// Copy slices before clearing labels so callers retain their snapshots.
 		s = orderedSnapshot(s)
 		s.Revision = 0
-		// Administrative metadata on local and related nodes is not data-plane
-		// configuration. Keep mapping names: validation requires unique names.
 		clearStatus := func(n *model.Node) {
 			n.Name = ""
 			n.DesiredRevision, n.AppliedRevision, n.LastSeen = 0, 0, 0
 			n.Error = ""
+			n.ConnectEndpoints = append([]model.ConnectEndpoint(nil), n.ConnectEndpoints...)
+			for i := range n.ConnectEndpoints {
+				n.ConnectEndpoints[i].Name = ""
+			}
 		}
 		clearStatus(&s.Node)
 		for i := range s.Nodes {
 			clearStatus(&s.Nodes[i])
+		}
+		for i := range s.Mappings {
+			s.Mappings[i].Name = ""
 		}
 		return s
 	}
@@ -372,9 +395,14 @@ type service struct {
 	applicationWaiting map[string]int
 	applications       map[string][]*applicationSlot
 	singPools          map[string]*singPool
+	dialLog            *dialDiagnostics
 }
 
 func start(s model.Snapshot, local model.LocalTLS, traffic ...*Traffic) (*service, error) {
+	return startWithDiagnostics(s, local, nil, traffic...)
+}
+
+func startWithDiagnostics(s model.Snapshot, local model.LocalTLS, diagnostics *dialDiagnostics, traffic ...*Traffic) (*service, error) {
 	if err := validate(s, local); err != nil {
 		return nil, err
 	}
@@ -385,7 +413,7 @@ func start(s model.Snapshot, local model.LocalTLS, traffic ...*Traffic) (*servic
 		sessions: map[string][]*session{}, conns: map[net.Conn]struct{}{},
 		applications:       map[string][]*applicationSlot{},
 		applicationChanged: make(chan struct{}), applicationWaiting: map[string]int{},
-		singPools: map[string]*singPool{},
+		singPools: map[string]*singPool{}, dialLog: diagnostics,
 	}
 	if len(traffic) > 0 {
 		svc.traffic = traffic[0]
@@ -490,6 +518,10 @@ func (s *service) listenServer() error {
 	if len(s.snapshot.Bindings) > 0 {
 		if s.local.EffectiveProtocol() == "hysteria2" {
 			if err := s.listenHysteria(); err != nil {
+				return err
+			}
+		} else if s.local.XHTTP.Enabled() && s.local.XHTTP.HTTPVersion == "3" {
+			if err := s.listenXHTTP3(); err != nil {
 				return err
 			}
 		} else {

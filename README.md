@@ -112,6 +112,16 @@ Master **不会自动创建账号**；在可信网络或已限制来源的反代
 
 在 Web 中配置 Server 的隧道、接入候选和本地监听地址/端口；创建 Client，直接选择 Server/Client 建立映射（Pool 1–32）。客户端隧道模板由 Server 自动派生，**Client 不维护本地隧道配置**。映射可指定一个启用的连接入口；选择“自动”才按服务端启用地址顺序切换。NAT 的客户端连接端口可与 Server 本地监听端口不同。只看节点列表的「配置是否最新」状态和最后上报时间，不把 Master 健康或心跳当成业务目标可达性。
 
+映射列表按名称、同名按 ID 固定排序。「待业务验证」只说明节点近期上报且配置已应用，不是隧道连通或目标服务健康检查；应从 Server 监听地址发起符合业务协议的请求验证。通用 TCP 连通不等于应用认证成功，UDP 也无法用一次无负载探针判定可用。流量只统计 Server 公网侧实际载荷，当前进程重启重新计数，出现上行/下行也不能代替业务探针。
+
+XHTTP 参考请求路径、模式和流式行为，通信双方始终是 Veilink 节点，不以 Xray 对端互联为目标。Server 保存并派生配置给 Client。可选 `packet-up`（默认）、`stream-up`、`stream-one` 或受限 `auto`：非 REALITY auto 实际选择 packet-up；REALITY auto 在 Veilink 中明确选择 packet-up，避免降级到未认证流模式，不声称等同于完整参考实现。packet-up 使用分片上行、GET 流式下行；stream-up 使用同一会话 ID 的流式上行和 GET 下行；stream-one 使用单条双向请求。显式 HTTP/1.1 仅支持 packet-up；HTTP/2、HTTP/3 流模式仅支持直连 HTTPS 与 TLS 回源。h2c 仅限直连 HTTP、plain 回源并启用 VLESS Encryption 的 packet-up。任一段使用 HTTP 都须启用 VLESS Encryption；显式版本不降级，HTTP/3 须放行监听端口 UDP 并保持端到端 QUIC/TLS。上行默认 POST，可选 PUT，代理须放行并禁用请求缓冲。
+
+packet-up 默认固定 32768 字节分片、无额外发送间隔、逐片确认背压；可配置 1024–32768 字节随机分片及 0–1000 毫秒节奏。可选服务端缓冲窗口 1–32 和 Client 并发请求数 1–8（不超过窗口 + 1），服务端按序交付应用后才确认，不把入队当作消费成功。未配置时保留旧行为。上行数据默认在请求体；可选私有请求头或 Cookie 的 Base64URL 连续编码块，严格拒绝缺块、重复和混合位置。显式 xmux 按授权入口和完整配置隔离共享 H1/H2/H3 transport，并按并发、连接复用次数、请求次数、可复用时长和保活周期管理生命周期；未配置时保持独立 transport。stream-up 的上传响应立即发送填充，再按默认随机 20–80 秒或显式 1–300 秒周期继续发送，直到上传结束；填充不会进入业务下行，EOF 完成确认与取消保护保持有效。填充默认保留 Referer 查询与响应 X-Padding；启用混淆后可选查询、受限请求头或私有 Cookie，以及 repeat-x/tokenish 方法。请求头只接受 User-Agent、Accept-Language、X-Custom-*；Server 在创建会话前核对。填充与元数据键碰撞、保留头及非法组合均拒绝。`download_endpoint_id` 仅引用 Server 已启用的连接入口；GET/下行使用独立授权 transport，POST/PUT/上行继续使用主入口，主/下行入口和 xmux 池分别隔离，主入口、下行入口或授权拨号器失败均 fail closed。完整字段范围、模式限制及对应测试见 `tests/deployment/xhttp-capability-matrix.md`。不宣称通用 CDN 支持；半关闭及上传确认是 Veilink 私有扩展。
+
+可选的 XHTTP `host` 仅覆写业务请求的 HTTP Host，Server 在创建会话前严格核对；填写小写 DNS 名或 IPv4，不含端口。Client 仍按授权连接入口拨号并验证入口的 TLS 证书名称，不能靠 Host 覆写跳过证书校验。经反代时须保留该 Host；未配置时不额外限制原有 Host 行为。
+
+XHTTP 会话 ID 与 packet-up 序号默认位于路径，可选查询参数、受限请求头或私有 `x_` Cookie；Server 会拒绝重复/混合元数据。会话 ID 默认使用 UUID v4，自定义字符表和长度必须保留至少 128 位熵。Cookie 元数据仅属于独立业务入口，不能用作 Master Web 登录 Cookie。stream-one 不使用会话 ID，详见 `tests/deployment/xhttp-capability-matrix.md`。
+
 ## 5. 可选独立 Server：节点主机先准备，再运行
 
 如使用 Master 内置 Server，可跳过本节。先在 Web 创建 Server 并获取节点 ID、接入令牌；节点主机须已完成步骤 1。主机目录先准备：
@@ -196,6 +206,6 @@ docker exec -i veilink-master /usr/local/bin/veilink reset-admin-password -passw
 
 ## 边界与许可证
 
-只转发授权映射，不是开放代理。支持原生私有 VLESS、Hysteria2、TCP mux、XUDP 等；Server 证书/私钥由 Web 保存，不通过节点 flags 下发私钥。XHTTP `packet-up` 是业务通道，和上文 Master 的 gRPC/h2c **不是同一个反代路径**；业务 HTTP 回源须按安全模式启用 VLESS Encryption，不承诺通用 CDN/Xray 互通。旧字段与旧数据库 schema 不自动迁移或删除，处理已有用户数据前先备份并获得删除授权。真实多主机 WAN/NAT、24–72 小时长稳、生产 CA 生命周期和供应链签名仍须目标环境验收。历史实验记录在 `tests/`，不代表当前版本已完成生产认证。
+只转发授权映射，不是开放代理。支持原生私有 VLESS、Hysteria2、TCP mux、XUDP 等；Server 证书/私钥由 Web 保存，不通过节点 flags 下发私钥。XHTTP `packet-up`、`stream-up`、`stream-one` 是业务通道，和上文 Master 的 gRPC/h2c 不是同一个反代路径；业务 HTTP 回源须按安全模式启用 VLESS Encryption，HTTP/3 须 UDP 直连 HTTPS/TLS，不承诺通用 CDN/Xray 互通。旧字段与旧数据库 schema 不自动迁移或删除，处理已有用户数据前先备份并获得删除授权。真实多主机 WAN/NAT、24–72 小时长稳、生产 CA 生命周期和供应链签名仍须目标环境验收。历史实验记录在 `tests/`，不代表当前版本已完成生产认证。
 
 源码与文档适用 [GPL-3.0-or-later](LICENSE)；第三方组件的许可与分发声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。项目约束见 [AGENTS.md](AGENTS.md)。

@@ -9,7 +9,7 @@ const source = path => readFileSync(new URL(path, import.meta.url), 'utf8')
 const transpile = text => ts.transpileModule(text, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText
 const format = vm.createContext({ exports: {}, TextEncoder })
 vm.runInContext(transpile(source('../src/format.ts')), format)
-const { heartbeatOnline, revisionState, attentionReasons, nodeName, presence } = format.exports
+const { heartbeatOnline, revisionState, attentionReasons, nodeName, presence, byNameAndId } = format.exports
 
 test('heartbeat boundaries and failed revisions remain distinct', () => {
   const now = 1000_000
@@ -39,7 +39,7 @@ test('Dashboard metrics use actual node and mapping state', () => {
   })
   const vue = source('../src/views/DashboardView.vue')
   const script = vue.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import .*$/gm, '')
-  const context = vm.createContext({ exports: {}, computed, inject: key => key === 'desk' ? desk : () => {}, deskKey: 'desk', navigateKey: 'navigate', heartbeatOnline, attentionReasons, nodeName, presence, revisionState })
+  const context = vm.createContext({ exports: {}, computed, byNameAndId, inject: key => key === 'desk' ? desk : () => {}, deskKey: 'desk', navigateKey: 'navigate', heartbeatOnline, attentionReasons, nodeName, presence, revisionState })
   vm.runInContext(transpile(script + '\nglobalThis.metrics = { onlineServers, onlineClients, attention };'), context)
   assert.equal(context.metrics.onlineServers.value, 1)
   assert.equal(context.metrics.onlineClients.value, 1)

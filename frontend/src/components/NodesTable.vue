@@ -2,7 +2,7 @@
 import { computed, inject, onMounted, onUnmounted, ref } from 'vue'
 import { api } from '../api'
 import { deskKey } from '../desk'
-import { endpoint, needsAttention, presence, revisionState, seenText } from '../format'
+import { byNameAndId, endpoint, needsAttention, presence, revisionState, seenText } from '../format'
 import type { Node } from '../types'
 import Badge from './Badge.vue'
 import EmptyState from './EmptyState.vue'
@@ -38,12 +38,12 @@ const defaultName = computed(() => {
   while (used.has(String(number))) number++
   return String(number)
 })
-const rows = computed(() => desk.nodes.filter(n => n.role === props.role && [n.name, n.id, n.address, n.error].join(' ').toLowerCase().includes(query.value.trim().toLowerCase())).sort((a, b) => Number(needsAttention(b, now.value)) - Number(needsAttention(a, now.value)) || a.name.localeCompare(b.name, 'zh-CN')))
+const rows = computed(() => desk.nodes.filter(n => n.role === props.role && [n.name, n.id, n.address, n.error].join(' ').toLowerCase().includes(query.value.trim().toLowerCase())).sort((a, b) => Number(needsAttention(b, now.value)) - Number(needsAttention(a, now.value)) || byNameAndId(a, b)))
 const selected = computed(() => desk.nodes.find(n => n.id === selectedId.value))
 function mappings(id: string) { return desk.mappings.filter(m => props.role === 'server' ? m.server_id === id : m.client_id === id) }
 function effectiveSources(node: Node) {
   const ids = new Set(desk.mappings.filter(m => m.client_id === node.id).map(m => m.server_id))
-  return node.revoked ? [] : desk.nodes.filter(n => n.role === 'server' && !n.revoked && ids.has(n.id))
+  return node.revoked ? [] : desk.nodes.filter(n => n.role === 'server' && !n.revoked && ids.has(n.id)).sort(byNameAndId)
 }
 function tunnelLabel(node: Node) {
   const t = node.tunnel
@@ -51,7 +51,7 @@ function tunnelLabel(node: Node) {
   const enc = protocol === 'vless' ? t?.decryption : ''
   const additive = enc && enc !== 'none' ? ' + Encryption' : ''
   if (protocol === 'hysteria2') return 'Hysteria2 / QUIC + TLS'
-  if (t?.xhttp?.path) return `VLESS / XHTTP · packet-up · 连接 ${t.xhttp.tls ? 'HTTPS' : 'HTTP'} · 回源 ${t.transport_security === 'tls' ? 'HTTPS' : 'HTTP'}${additive}`
+  if (t?.xhttp?.path) return `VLESS / XHTTP · ${t.xhttp.mode || 'packet-up'} · 连接 ${t.xhttp.tls ? 'HTTPS' : 'HTTP'} · 回源 ${t.transport_security === 'tls' ? 'HTTPS' : 'HTTP'}${additive}`
   if (t?.reality && Object.values(t.reality).some(Boolean)) return `VLESS / TCP · REALITY${additive}`
   if (t?.transport_security === 'plain') return `VLESS / TCP · Encryption`
   if (t?.transport_security === 'tls') return `VLESS / TCP · TLS${additive}`

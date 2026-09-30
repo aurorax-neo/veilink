@@ -129,6 +129,15 @@ func clientTemplate(server model.Node) (*model.LocalTLS, error) {
 		}
 		return nil, nil
 	}
+	if server.Tunnel.XHTTP.DownloadEndpointID != "" {
+		mode := server.Tunnel.XHTTP.Mode
+		if mode != "" && mode != "packet-up" && mode != "auto" {
+			return nil, ErrInvalid
+		}
+		if !validEndpointSelection(server, server.Tunnel.XHTTP.DownloadEndpointID) {
+			return nil, ErrInvalid
+		}
+	}
 	if err := validateTunnel("server", server.Tunnel); err != nil {
 		return nil, err
 	}

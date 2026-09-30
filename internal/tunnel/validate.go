@@ -113,6 +113,18 @@ func validate(s model.Snapshot, local model.LocalTLS) error {
 				return bad("gateway " + n.ID + ": " + err.Error())
 			}
 		}
+		if s.Node.Role == "client" && local.XHTTP.DownloadEndpointID != "" {
+			found := false
+			for _, ep := range enabledEndpoints(n) {
+				if ep.ID == local.XHTTP.DownloadEndpointID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return bad("xhttp download endpoint is not an enabled authorized gateway endpoint")
+			}
+		}
 		bindings[b.ID] = b
 		domains[b.Domain] = true
 		users[strings.ToLower(b.UUID)] = true

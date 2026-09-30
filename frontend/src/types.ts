@@ -34,7 +34,7 @@ export interface TunnelConfig {
   encryption?: string
   reality?: RealityConfig
   hysteria2?: Hysteria2Config
-  xhttp?: { path: string; mode: 'packet-up'; tls: boolean }
+  xhttp?: { host?: string; path: string; download_endpoint_id?: string; mode: 'packet-up' | 'stream-up' | 'stream-one' | 'auto'; tls: boolean; headers?: Record<string, string>; http_version?: '1.1' | '2' | '3'; max_each_post_bytes?: number; post_bytes_max?: number; max_buffered_posts?: number; max_concurrent_posts?: number; uplink_data_placement?: 'body' | 'header' | 'cookie'; uplink_data_key?: string; uplink_chunk_size?: number; xmux?: { max_concurrency?: number; max_connections?: number; c_max_reuse_times?: number; h_max_request_times?: number; h_max_reusable_secs?: number; keep_alive_period?: number }; stream_up_server_secs?: number; stream_up_server_max_secs?: number; request_timeout_seconds?: number; padding_bytes?: number; padding_max_bytes?: number; padding_obfs_mode?: boolean; padding_placement?: 'query_in_header' | 'query' | 'header' | 'cookie'; padding_key?: string; padding_header?: string; padding_method?: 'repeat-x' | 'tokenish'; no_grpc_header?: boolean; no_sse_header?: boolean; server_max_header_bytes?: number; uplink_http_method?: 'POST' | 'PUT'; min_posts_interval_ms?: number; max_posts_interval_ms?: number; session_id_placement?: 'path' | 'query' | 'header' | 'cookie'; session_id_key?: string; seq_placement?: 'path' | 'query' | 'header' | 'cookie'; seq_key?: string; session_id_table?: string; session_id_length?: number }
 }
 
 export interface Node {

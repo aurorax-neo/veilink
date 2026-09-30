@@ -134,14 +134,19 @@ http {
             join = request('/api/nodes/' + n['id'] + '/join', {'master_url': 'https://panel.test', 'ttl_seconds': 3600})
             # Consume actual shortcut role flags, not a hand-constructed enrollment request.
             words = shlex.split(join['command'])
-            flags = words[words.index('veilink:latest') + 1:]
+            image_index = next((i for i, word in enumerate(words) if word.endswith('/veilink:latest') or word == 'veilink:latest'), None)
+            if image_index is None or image_index + 1 >= len(words):
+                raise RuntimeError('join command did not contain an image and role')
+            flags = words[image_index + 1:]
+            if flags[0] not in ('server', 'client'):
+                raise RuntimeError('join command role was malformed')
             command('docker', 'run', '-itd', '--name', names[role], '--network', network, '--network-alias', role,
                     '--restart', 'unless-stopped', '-e', 'TZ=Asia/Shanghai', '-v', str(certs / 'ca.pem') + ':/config/ca.pem:ro',
                     a.image, *flags, '-control-ca', '/config/ca.pem')
             created.append(names[role])
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
-            nodes = request('/api/nodes')
+            nodes = [n for n in request('/api/nodes') if n['role'] in ('server', 'client') and not n.get('embedded')]
             if len(nodes) == 2 and all(n['last_seen'] and n['desired_revision'] == n['applied_revision'] and not n['error'] for n in nodes):
                 break
             time.sleep(2)
@@ -149,7 +154,7 @@ http {
             raise RuntimeError('gRPC enrollment/heartbeat/application through nginx timed out')
         before = {n['id']: n['last_seen'] for n in nodes}
         time.sleep(12)
-        nodes = request('/api/nodes')
+        nodes = [n for n in request('/api/nodes') if n['role'] in ('server', 'client') and not n.get('embedded')]
         assert all(n['last_seen'] > before[n['id']] for n in nodes)
         # A broken candidate must fail validation without taking down active workers.
         original_cert = (certs / 'cert.pem').read_bytes()
@@ -164,12 +169,12 @@ http {
         assert 'serial=02' in command('openssl', 'x509', '-in', str(certs / 'cert.pem'), '-noout', '-serial').stdout.decode().lower()
         request('/api/nodes', {'name': 'blocked', 'role': 'client'}, expected=403, token=False)
         request('/api/nodes', {'name': 'blocked', 'role': 'client'}, expected=403, origin='https://evil.example')
-        before = {n['id']: n['last_seen'] for n in request('/api/nodes')}
+        before = {n['id']: n['last_seen'] for n in request('/api/nodes') if n['role'] in ('server', 'client') and not n.get('embedded')}
         for role in ('server', 'client'):
             command('docker', 'restart', names[role])
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
-            nodes = request('/api/nodes')
+            nodes = [n for n in request('/api/nodes') if n['role'] in ('server', 'client') and not n.get('embedded')]
             if len(nodes) == 2 and all(n['last_seen'] > before[n['id']] and
                                       n['desired_revision'] == n['applied_revision'] and not n['error'] for n in nodes):
                 break

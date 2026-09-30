@@ -15,6 +15,7 @@ export interface Desk {
   noticeBad: boolean
   reload: (options?: { silent?: boolean }) => Promise<void>
   notify: (text: string, bad?: boolean) => void
+  dismissNotice: () => void
 }
 
 export const deskKey: InjectionKey<Desk> = Symbol('desk')

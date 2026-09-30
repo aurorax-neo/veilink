@@ -57,6 +57,23 @@ func (t *Traffic) Snapshot() map[string]TrafficBytes {
 	return out
 }
 
+// prepareActive admits new listeners during Apply without deleting the last
+// successful counters; a failed Apply restores the previous active set.
+func (t *Traffic) prepareActive(mappings []model.Mapping, server bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.active == nil {
+		t.active = make(map[string]bool)
+	}
+	if server {
+		for _, m := range mappings {
+			if m.Enabled {
+				t.active[m.ID] = true
+			}
+		}
+	}
+}
+
 // setActive removes deleted/disabled mappings and excludes late old-Apply flows.
 func (t *Traffic) setActive(mappings []model.Mapping, server bool) {
 	t.mu.Lock()
@@ -95,6 +112,8 @@ func (c *countedConn) Write(p []byte) (int, error) {
 }
 
 func (c *countedConn) CloseWrite() error {
-	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok { return cw.CloseWrite() }
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
 	return c.Conn.Close()
 }

@@ -227,6 +227,12 @@ func TestEmbeddedLiveCredentialExpiry(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	// This independent test connection races with the embedded node heartbeat.
+	// Match the store's busy timeout instead of failing on a transient WAL writer.
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := db.Exec("UPDATE credentials SET expires=0 WHERE node=?", id); err != nil {
 		t.Fatal(err)
 	}

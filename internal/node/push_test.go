@@ -70,16 +70,19 @@ func TestPushApplyAndManualReportWithoutHeartbeatWait(t *testing.T) {
 		got, found, err := s.FindNodeByName(n.Name)
 		return err == nil && found && got.AppliedRevision > 0 && got.AppliedRevision == got.DesiredRevision
 	})
+	previousCalls := runtime.calls.Load()
+	previousRevision := runtime.Revision()
 	n.Name = "changed"
-	started := time.Now()
 	if _, err = s.SaveNode(n); err != nil {
 		t.Fatal(err)
 	}
 	wait(func() bool {
 		got, found, err := s.FindNodeByName(n.Name)
-		return err == nil && found && got.AppliedRevision == got.DesiredRevision && runtime.calls.Load() >= 2
+		return err == nil && found && got.AppliedRevision == previousRevision && got.DesiredRevision == previousRevision
 	})
-	t.Logf("save to applied report: %s", time.Since(started))
+	if runtime.calls.Load() != previousCalls {
+		t.Fatal("display name triggered runtime apply")
+	}
 	// Clear only test software metadata through an authenticated report, then
 	// request a new node report. It must arrive without waiting a minute.
 	rev := runtime.Revision()

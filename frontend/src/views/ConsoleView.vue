@@ -10,7 +10,7 @@ import LogsView from './LogsView.vue'
 import ProxiesView from './ProxiesView.vue'
 import ServersView from './ServersView.vue'
 
-defineProps<{ page: PageId; account: string }>()
+defineProps<{ page: PageId; account: string; noticeKey: number }>()
 const emit = defineEmits<{ navigate: [page: PageId]; logout: [] }>()
 const desk = inject(deskKey)!
 const nav: PageId[] = ['dashboard', 'servers', 'clients', 'proxies', 'logs', 'audit']
@@ -30,7 +30,7 @@ async function refresh() {
   <div class="shell">
     <aside class="side">
       <a class="brand" href="#/dashboard">
-        <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" /><path d="M7.5 8.5h4.4L16 20.2 20.1 8.5H24.5L17.4 24.5h-2.8L7.5 8.5z" /></svg>
+        <svg viewBox="0 0 32 32" aria-hidden="true"><defs><linearGradient id="brandGradient" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#9b7cff" /><stop offset="1" stop-color="#ed7bc0" /></linearGradient></defs><rect width="32" height="32" rx="8" /><path d="M7.5 8.5h4.4L16 20.2 20.1 8.5H24.5L17.4 24.5h-2.8L7.5 8.5z" /></svg>
         veilink
       </a>
       <p class="side-label">工作空间</p>
@@ -72,7 +72,13 @@ async function refresh() {
           </div>
           <button type="button" class="btn" :disabled="desk.loading" @click="refresh">{{ desk.loading ? '刷新中…' : '刷新' }}</button>
         </div>
-        <div class="notice-layer" aria-live="polite" aria-atomic="true"><div v-if="desk.notice" class="notice toast" :class="{ bad: desk.noticeBad }"><span>{{ desk.notice }}</span><button type="button" class="icon-btn" aria-label="关闭提示" @click="desk.notice = ''">×</button></div></div>
+        <div class="notice-layer" aria-live="polite" aria-atomic="true">
+          <div v-if="desk.notice" :key="noticeKey" class="notice toast" :class="{ bad: desk.noticeBad }" :role="desk.noticeBad ? 'alert' : undefined">
+            <span class="toast-mark" aria-hidden="true">{{ desk.noticeBad ? '!' : '✓' }}</span>
+            <span class="toast-text">{{ desk.notice }}</span>
+            <button type="button" class="icon-btn" aria-label="关闭提示" @click="desk.dismissNotice()">×</button>
+          </div>
+        </div>
         <DashboardView v-if="page === 'dashboard'" />
         <ServersView v-else-if="page === 'servers'" />
         <ClientsView v-else-if="page === 'clients'" />

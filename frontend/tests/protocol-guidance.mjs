@@ -18,6 +18,9 @@ test('node API errors give protocol guidance without exposing backend secrets', 
   for (const [path, method] of [['/nodes', 'POST'], ['/nodes/id', 'PUT']]) {
     await assert.rejects(context.exports.api(path, method, {}), error => {
       for (const protocol of ['TLS', 'plain', 'REALITY', 'Hysteria2', 'VLESS Encryption', 'Vision']) assert.ok(error.message.includes(protocol))
+      for (const mode of ['packet-up', 'stream-up', 'stream-one']) assert.ok(error.message.includes(mode))
+      assert.match(error.message, /流模式仅允许直连 HTTPS \+ TLS 回源的 HTTP\/2 或 HTTP\/3/)
+      assert.doesNotMatch(error.message, /仅支持 packet-up/)
       assert.doesNotMatch(error.message, /SECRET/)
       return error.status === 400
     })

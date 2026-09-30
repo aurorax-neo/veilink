@@ -121,15 +121,64 @@ type LocalTLS struct {
 	XHTTP             XHTTP     `json:"xhttp,omitempty"`
 }
 
-// XHTTP configures packet-up HTTP transport. TLS selects HTTPS at the Client
-// dial candidate; TransportSecurity independently selects the origin listener.
-type XHTTP struct {
-	Path string `json:"path"`
-	Mode string `json:"mode"`
-	TLS  bool   `json:"tls"`
+// XHTTP configures Veilink's native HTTP transport. TLS selects HTTPS at the
+// Client dial candidate; TransportSecurity independently selects the origin listener.
+// Unsupported reference settings are not accepted as no-op configuration.
+type XHTTPXmux struct {
+	MaxConcurrency   int `json:"max_concurrency,omitempty"`
+	MaxConnections   int `json:"max_connections,omitempty"`
+	CMaxReuseTimes   int `json:"c_max_reuse_times,omitempty"`
+	HMaxRequestTimes int `json:"h_max_request_times,omitempty"`
+	HMaxReusableSecs int `json:"h_max_reusable_secs,omitempty"`
+	KeepAlivePeriod  int `json:"keep_alive_period,omitempty"`
 }
 
-func (x XHTTP) Enabled() bool { return x.Path != "" || x.Mode != "" || x.TLS }
+type XHTTP struct {
+	Xmux                  XHTTPXmux    `json:"xmux,omitempty"`
+	Host                  string       `json:"host,omitempty"`    // HTTP Host only; TLS identity stays at the dial endpoint
+	Headers               XHTTPHeaders `json:"headers,omitempty"` // canonical bounded safe header object
+	Path                  string       `json:"path"`
+	Mode                  string       `json:"mode"`
+	TLS                   bool         `json:"tls"`
+	HTTPVersion           string       `json:"http_version,omitempty"`            // empty = existing HTTP negotiation; 3 = QUIC/HTTP3
+	MaxEachPostBytes      int          `json:"max_each_post_bytes,omitempty"`     // 0 = 32 KiB
+	PostBytesMax          int          `json:"post_bytes_max,omitempty"`          // 0 = fixed at MaxEachPostBytes
+	RequestTimeoutSeconds int          `json:"request_timeout_seconds,omitempty"` // 0 = 15 s
+	PaddingBytes          int          `json:"padding_bytes,omitempty"`           // 0 = 100; minimum or fixed length
+	PaddingMaxBytes       int          `json:"padding_max_bytes,omitempty"`       // 0 = fixed at PaddingBytes
+	PaddingObfsMode       bool         `json:"padding_obfs_mode,omitempty"`
+	PaddingPlacement      string       `json:"padding_placement,omitempty"`
+	PaddingKey            string       `json:"padding_key,omitempty"`
+	PaddingHeader         string       `json:"padding_header,omitempty"`
+	PaddingMethod         string       `json:"padding_method,omitempty"`
+	NoGRPCHeader          bool         `json:"no_grpc_header,omitempty"`            // streaming POST without application/grpc
+	NoSSEHeader           bool         `json:"no_sse_header,omitempty"`             // download without text/event-stream
+	ServerMaxHeaderBytes  int          `json:"server_max_header_bytes,omitempty"`   // 0 = 8 KiB; bounded to 8-32 KiB
+	UplinkHTTPMethod      string       `json:"uplink_http_method,omitempty"`        // empty = POST; PUT also permitted
+	MinPostsIntervalMs    int          `json:"min_posts_interval_ms,omitempty"`     // 0 = no pacing; packet-up only
+	MaxPostsIntervalMs    int          `json:"max_posts_interval_ms,omitempty"`     // 0 = fixed at min; packet-up only
+	MaxBufferedPosts      int          `json:"max_buffered_posts,omitempty"`        // 0 = legacy ordered backpressure; 1-32 buffered posts
+	MaxConcurrentPosts    int          `json:"max_concurrent_posts,omitempty"`      // 0 = one request; 1-8, bounded by buffering
+	StreamUpServerSecs    int          `json:"stream_up_server_secs,omitempty"`     // 0 = random 20-80 s; stream-up response padding
+	StreamUpServerMaxSecs int          `json:"stream_up_server_max_secs,omitempty"` // 0 = fixed at explicit minimum
+	DownloadEndpointID    string       `json:"download_endpoint_id,omitempty"`      // authorized Server endpoint for packet-up downlink
+	UplinkDataPlacement   string       `json:"uplink_data_placement,omitempty"`     // body (default), header or cookie
+	UplinkDataKey         string       `json:"uplink_data_key,omitempty"`           // private header/cookie base name
+	UplinkChunkSize       int          `json:"uplink_chunk_size,omitempty"`         // encoded block size, 64-8192
+	SessionIDPlacement    string       `json:"session_id_placement,omitempty"`
+	SessionIDKey          string       `json:"session_id_key,omitempty"`
+	SeqPlacement          string       `json:"seq_placement,omitempty"`
+	SeqKey                string       `json:"seq_key,omitempty"`
+	SessionIDTable        string       `json:"session_id_table,omitempty"`
+	SessionIDLength       int          `json:"session_id_length,omitempty"`
+}
+
+func (x XHTTP) Enabled() bool {
+	if x.MaxBufferedPosts != 0 || x.MaxConcurrentPosts != 0 || x.StreamUpServerSecs != 0 || x.StreamUpServerMaxSecs != 0 || x.DownloadEndpointID != "" || x.UplinkDataPlacement != "" || x.UplinkDataKey != "" || x.UplinkChunkSize != 0 || x.Xmux != (XHTTPXmux{}) {
+		return true
+	}
+	return x.Path != "" || x.Host != "" || x.Headers != "" || x.Mode != "" || x.TLS || x.HTTPVersion != "" || x.MaxEachPostBytes != 0 || x.PostBytesMax != 0 || x.RequestTimeoutSeconds != 0 || x.PaddingBytes != 0 || x.PaddingMaxBytes != 0 || x.PaddingObfsMode || x.PaddingPlacement != "" || x.PaddingKey != "" || x.PaddingHeader != "" || x.PaddingMethod != "" || x.NoGRPCHeader || x.NoSSEHeader || x.ServerMaxHeaderBytes != 0 || x.UplinkHTTPMethod != "" || x.MinPostsIntervalMs != 0 || x.MaxPostsIntervalMs != 0 || x.SessionIDPlacement != "" || x.SessionIDKey != "" || x.SeqPlacement != "" || x.SeqKey != "" || x.SessionIDTable != "" || x.SessionIDLength != 0 || x.DownloadEndpointID != "" || x.UplinkDataPlacement != "" || x.UplinkDataKey != "" || x.UplinkChunkSize != 0 || x.Xmux != (XHTTPXmux{})
+}
 
 // Reality is optional camouflage for the data plane. Private keys stay on the
 // server; the master never distributes them. An empty value keeps certificate TLS.

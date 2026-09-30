@@ -11,7 +11,16 @@ const loginError = ref('')
 const loginBusy = ref(false)
 const account = ref('')
 const page = ref<PageId>(pageFromHash())
+// A new key remounts the live region when identical messages are sent again.
+const noticeKey = ref(0)
 let generation = 0
+let noticeTimer: ReturnType<typeof setTimeout> | undefined
+function dismissNotice() {
+  if (noticeTimer) clearTimeout(noticeTimer)
+  noticeTimer = undefined
+  desk.notice = ''
+  desk.noticeBad = false
+}
 
 const desk = reactive<Desk>({
   nodes: [],
@@ -62,9 +71,14 @@ const desk = reactive<Desk>({
     }
   },
   notify(text: string, bad = false) {
-    desk.notice = text
+    dismissNotice()
+    if (!text) return
+    noticeKey.value += 1
     desk.noticeBad = bad
+    desk.notice = text
+    noticeTimer = window.setTimeout(dismissNotice, bad ? 8000 : 4000)
   },
+  dismissNotice,
 })
 async function loadTraffic(ticket: number) {
   try {
@@ -91,8 +105,7 @@ function resetDesk() {
   desk.trafficError = ''
   desk.loading = false
   desk.error = ''
-  desk.notice = ''
-  desk.noticeBad = false
+  dismissNotice()
 }
 
 function navigate(next: PageId) {
@@ -169,8 +182,7 @@ async function logout() {
 
 watch(page, (next) => {
   if (phase.value === 'app') document.title = `Veilink · ${pages[next].title}`
-  desk.notice = ''
-  desk.noticeBad = false
+  dismissNotice()
 })
 
 let liveTimer: ReturnType<typeof setInterval> | undefined
@@ -215,6 +227,7 @@ onUnmounted(() => {
   window.removeEventListener('hashchange', onHash)
   window.removeEventListener('visibilitychange', onVisible)
   if (liveTimer) window.clearInterval(liveTimer)
+  dismissNotice()
 })
 </script>
 
@@ -223,5 +236,5 @@ onUnmounted(() => {
   <p v-if="phase === 'boot'" class="boot">正在确认会话…</p>
   <div v-else-if="phase === 'setup-error'" class="boot" role="alert">{{ loginError }} <button class="btn" @click="loadSetup()">重试</button></div>
   <LoginView v-else-if="phase === 'login' || phase === 'register'" :key="phase" :register="phase === 'register'" :error="loginError" :busy="loginBusy" @submit="submitLogin" />
-  <ConsoleView v-else :page="page" :account="account" @navigate="navigate" @logout="logout" />
+  <ConsoleView v-else :page="page" :account="account" :notice-key="noticeKey" @navigate="navigate" @logout="logout" />
 </template>

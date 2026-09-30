@@ -359,9 +359,16 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			matched = false
 		}
 	case "mappings":
+		if len(p) == 2 && id == "status" && (r.Method != http.MethodGet || r.URL.RawQuery != "") {
+			failure(w, http.StatusNotFound)
+			return
+		}
 		switch {
 		case r.Method == "GET" && len(p) == 1:
 			result, err = a.store.Mappings()
+		case r.Method == http.MethodGet && len(p) == 2 && id == "status":
+			result, err = a.store.MappingStatuses()
+
 		case (r.Method == "POST" && len(p) == 1) || (r.Method == "PUT" && len(p) == 2):
 			var m model.Mapping
 			if !decode(w, r, &m) {

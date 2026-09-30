@@ -86,8 +86,11 @@ def main():
             time.sleep(2)
         raise RuntimeError(label + ' timed out: ' + last)
 
+    def external_nodes():
+        return [n for n in api('/nodes') if n['role'] in ('server', 'client') and not n.get('embedded')]
+
     def converged():
-        ns = api('/nodes')
+        ns = external_nodes()
         return len(ns) == 2 and all(n['desired_revision'] > 0 and n['desired_revision'] == n['applied_revision']
                                    and not n['error'] and 0 <= time.time() - n['last_seen'] < 30 for n in ns)
 
@@ -146,17 +149,17 @@ def main():
         wait('partition_recovered', converged)
         wait('partition_business_recovered', probe)
         for role in ('client', 'server', 'master'):
-            previous = {n['id']: n['last_seen'] for n in api('/nodes')}
+            previous = {n['id']: n['last_seen'] for n in external_nodes()}
             command('docker', 'restart', names[role])
             event('process_restart', role=role)
             if role == 'master':
                 wait('master_relogin', lambda: (login() or True))
-            wait(role + '_new_heartbeat', lambda: all(n['last_seen'] > previous[n['id']] for n in api('/nodes')))
+            wait(role + '_new_heartbeat', lambda: all(n['last_seen'] > previous[n['id']] for n in external_nodes()))
             wait(role + '_restart_converged', converged)
             wait(role + '_restart_business', probe)
         end = time.monotonic() + args.duration
         cycles = samples = 0
-        last_seen = {n['id']: n['last_seen'] for n in api('/nodes')}
+        last_seen = {n['id']: n['last_seen'] for n in external_nodes()}
         while time.monotonic() < end:
             mode = ('', 'smux', 'yamux', 'h2mux')[cycles % 4]
             mapping.update(mux=bool(mode), mux_type=mode, pool=1 + cycles % 2)
@@ -166,12 +169,12 @@ def main():
             for _ in range(6):
                 if not probe():
                     raise RuntimeError('steady-state business request failed')
-                ns = api('/nodes')
+                ns = external_nodes()
                 if any(n['error'] or time.time() - n['last_seen'] >= 45 for n in ns):
                     raise RuntimeError('heartbeat/error during steady state')
                 samples += 1
                 time.sleep(5)
-            ns = api('/nodes')
+            ns = external_nodes()
             if any(n['last_seen'] <= last_seen[n['id']] for n in ns):
                 raise RuntimeError('heartbeat failed to advance')
             last_seen = {n['id']: n['last_seen'] for n in ns}

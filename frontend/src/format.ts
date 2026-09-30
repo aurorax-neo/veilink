@@ -22,6 +22,11 @@ export function nodeName(nodes: Node[], id: string): string {
   return nodes.find((n) => n.id === id)?.name || id
 }
 
+// Stable even when the API returns map-backed rows in a different order.
+export function byNameAndId<T extends { name: string; id: string }>(a: T, b: T): number {
+  return (a.name || '').localeCompare(b.name || '', 'zh-CN') || a.id.localeCompare(b.id)
+}
+
 export function heartbeatOnline(node: Node, now = Date.now()): boolean {
   return !node.revoked && node.last_seen > 0 && now / 1000 >= node.last_seen && now / 1000 - node.last_seen < 90
 }

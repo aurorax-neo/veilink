@@ -22,9 +22,10 @@ function setup() {
   ], mappings: [], reload: async () => {}, notify: () => {} })
   let tick = () => {}, unmount = () => {}
   const context = vm.createContext({ exports: {}, computed, reactive, ref, watch, ...format.exports, inject: () => desk, deskKey: {}, api: async (...args) => requests.push(args), onMounted: cb => { tick = cb }, onUnmounted: cb => { unmount = cb }, setInterval: cb => { tick = cb; return 7 }, clearInterval: () => {} })
-  vm.runInContext(transpile(script + '\nglobalThis.editor = { open, draft, save, fields, connections, missingConnection, connectionLabel, tunnelState, now, ask, run };'), context)
+  vm.runInContext(transpile(script + '\nglobalThis.editor = { open, draft, save, fields, connections, missingConnection, connectionLabel, tunnelState, statuses, now, ask, run };'), context)
   const editor = context.editor
   editor.open()
+  editor.draft.serverId = 's'
   Object.assign(editor.draft, { name: 'Map', listenPort: '18080', targetPort: '80' })
   return { ...editor, desk, requests, tick: () => tick(), unmount: () => unmount() }
 }
@@ -46,6 +47,7 @@ test('mapping defaults to first enabled endpoint, saves and restores explicit an
     assert.match(e.connectionLabel(body), id ? /b.example.com:443/ : /自动/)
   }
   e.open()
+  e.draft.serverId = 's'
   assert.equal(e.draft.connectEndpointId, 'a')
 })
 
@@ -97,9 +99,9 @@ test('floating notifications occupy no layout space and expose dismissal and liv
   const css = read('../src/styles.css')
   assert.doesNotMatch(consoleView + css, /notice-slot/)
   assert.match(css, /\.notice-layer\s*\{[^}]*position: fixed/)
-  assert.match(css, /\.notice-layer\s*\{[^}]*calc\(100vw - 32px\)/)
+  assert.match(css, /\.notice-layer\s*\{[^}]*calc\(100vw - 24px\)/)
   assert.match(consoleView, /class="notice-layer" aria-live="polite" aria-atomic="true"/)
-  assert.match(consoleView, /aria-label="关闭提示" @click="desk.notice = ''"/)
+  assert.match(consoleView, /aria-label="关闭提示" @click="desk.dismissNotice\(\)"/)
 })
 
 test('changed Vue templates compile with no malformed or duplicate editor blocks', () => {
@@ -121,13 +123,16 @@ test('tunnel state distinguishes disabled, offline and applied nodes without cla
   assert.equal(e.tunnelState({ ...mapping, enabled: false }).text, '已停用')
   assert.equal(e.tunnelState(mapping).text, '节点未连接')
   for (const node of [e.desk.nodes[0], e.desk.nodes[2]]) Object.assign(node, { last_seen: Math.floor(Date.now()/1000), desired_revision: 2, applied_revision: 2 })
+  assert.equal(e.tunnelState(mapping).text, '配置状态未知')
+  e.statuses.value = { m: { server: { acknowledged: true, reason: 'acknowledged' }, client: { acknowledged: true, reason: 'acknowledged' } } }
   assert.equal(e.tunnelState(mapping).text, '待业务验证')
   e.desk.nodes[2].applied_revision = 1
-  assert.equal(e.tunnelState(mapping).text, '配置未就绪')
+  assert.equal(e.tunnelState(mapping).text, '待业务验证')
   e.desk.nodes[2].revoked = true
   assert.equal(e.tunnelState(mapping).text, '节点不可用')
   assert.match(view, /隧道状态/)
-  assert.match(view, /不代表映射目标可达/)
+  assert.match(view, /不代表隧道连接和映射目标可达/)
+  assert.match(view, /映射按名称排序，同名按 ID 固定排序/)
 })
 
 test('mapping heartbeat status expires on local clock without new API data', () => {
@@ -135,6 +140,8 @@ test('mapping heartbeat status expires on local clock without new API data', () 
  const stamp = Math.floor(Date.now()/1000)
  for (const node of [e.desk.nodes[0],e.desk.nodes[2]]) Object.assign(node,{last_seen:stamp,desired_revision:1,applied_revision:1,error:'',revoked:false})
  const mapping={enabled:true,server_id:'s',client_id:'client'}
+ assert.equal(e.tunnelState(mapping).text,'配置状态未知')
+ e.statuses.value={ [mapping.id]: {server:{acknowledged:true,reason:'acknowledged'},client:{acknowledged:true,reason:'acknowledged'}} }
  assert.equal(e.tunnelState(mapping).text,'待业务验证')
  e.now.value=(stamp+91)*1000
  assert.equal(e.tunnelState(mapping).text,'节点未连接')

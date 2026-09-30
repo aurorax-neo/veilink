@@ -156,9 +156,10 @@ func bindingGateway(gateway model.Node, b model.Binding) (model.Node, error) {
 	if b.ConnectEndpointID == "" {
 		return gateway, nil
 	}
+	allEndpoints := enabledEndpoints(gateway)
 	endpoints := gateway.ConnectEndpoints
 	if len(endpoints) == 0 {
-		endpoints = enabledEndpoints(gateway)
+		endpoints = allEndpoints
 	}
 	var selected model.ConnectEndpoint
 	matches := 0
@@ -172,6 +173,14 @@ func bindingGateway(gateway model.Node, b model.Binding) (model.Node, error) {
 		return model.Node{}, errors.New("binding connect endpoint is missing, disabled or invalid")
 	}
 	gateway.ConnectEndpoints = []model.ConnectEndpoint{selected}
+	if gateway.Tunnel.XHTTP.DownloadEndpointID != "" {
+		for _, ep := range allEndpoints {
+			if ep.ID == gateway.Tunnel.XHTTP.DownloadEndpointID && ep.ID != selected.ID {
+				gateway.ConnectEndpoints = append(gateway.ConnectEndpoints, ep)
+				break
+			}
+		}
+	}
 	return gateway, nil
 }
 
@@ -180,8 +189,22 @@ func (s *service) dialGateway(gateway model.Node, peer *clientGateway) (net.Conn
 	if err := checkVLESS("client", local); err != nil {
 		return nil, err
 	}
+	endpoints := enabledEndpoints(gateway)
+	var downEndpoint *model.ConnectEndpoint
+	if local.XHTTP.Enabled() && local.XHTTP.DownloadEndpointID != "" {
+		for i := range endpoints {
+			if endpoints[i].ID == local.XHTTP.DownloadEndpointID {
+				selected := endpoints[i]
+				downEndpoint = &selected
+				break
+			}
+		}
+		if downEndpoint == nil {
+			return nil, errors.New("xhttp download endpoint is missing, disabled or invalid")
+		}
+	}
 	var last error
-	for _, endpoint := range enabledEndpoints(gateway) {
+	for _, endpoint := range endpoints {
 		addr := net.JoinHostPort(endpoint.Host, strconv.Itoa(endpoint.Port))
 		serverName := endpoint.Host
 		if local.XHTTP.Enabled() {
@@ -191,7 +214,22 @@ func (s *service) dialGateway(gateway model.Node, peer *clientGateway) (net.Conn
 			if local.Reality.Enabled() {
 				dial = func(ctx context.Context) (net.Conn, error) { return dialReality(ctx, addr, serverName, local.Reality) }
 			}
-			if conn, err := dialXHTTPWithDialer(s.ctx, addr, serverName, local, dial); err == nil {
+			var downDial func(context.Context) (net.Conn, error)
+			downAddr := ""
+			if downEndpoint != nil {
+				downAddr = net.JoinHostPort(downEndpoint.Host, strconv.Itoa(downEndpoint.Port))
+				downServerName := downEndpoint.Host
+				if local.Reality.Enabled() {
+					downDial = func(ctx context.Context) (net.Conn, error) {
+						return dialReality(ctx, downAddr, downServerName, local.Reality)
+					}
+				} else {
+					downDial = func(ctx context.Context) (net.Conn, error) {
+						return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", downAddr)
+					}
+				}
+			}
+			if conn, err := dialXHTTPWithDownDialer(s.ctx, addr, serverName, local, dial, downDial, downAddr); err == nil {
 				return conn, nil
 			} else {
 				last = err

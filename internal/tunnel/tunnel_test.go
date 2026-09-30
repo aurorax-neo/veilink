@@ -139,12 +139,15 @@ func exchange(port int, payload []byte, half bool) error {
 	got := make([]byte, len(payload))
 	_, err = io.ReadFull(c, got)
 	if err != nil {
-		return err
+		return fmt.Errorf("read response: %w", err)
 	}
 	if !bytes.Equal(payload, got) {
 		return fmt.Errorf("payload mismatch")
 	}
-	return <-result
+	if err := <-result; err != nil {
+		return fmt.Errorf("write request/half-close: %w", err)
+	}
+	return nil
 }
 func awaitEcho(t *testing.T, port int) {
 	t.Helper()
