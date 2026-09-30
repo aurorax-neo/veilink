@@ -30,7 +30,7 @@ async function refresh() {
   <div class="shell">
     <aside class="side">
       <a class="brand" href="#/dashboard">
-        <svg viewBox="0 0 32 32" aria-hidden="true"><defs><linearGradient id="brandGradient" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#9b7cff" /><stop offset="1" stop-color="#ed7bc0" /></linearGradient></defs><rect width="32" height="32" rx="8" /><path d="M7.5 8.5h4.4L16 20.2 20.1 8.5H24.5L17.4 24.5h-2.8L7.5 8.5z" /></svg>
+        <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" /><path d="M7.5 8.5h4.4L16 20.2 20.1 8.5H24.5L17.4 24.5h-2.8L7.5 8.5z" /></svg>
         veilink
       </a>
       <p class="side-label">工作空间</p>
