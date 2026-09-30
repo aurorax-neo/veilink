@@ -67,16 +67,25 @@ function connectionLabel(mapping: Mapping) {
   const candidate = connectionOptions(mapping.server_id).find(item => item.id === mapping.connect_endpoint_id)
   return candidate ? `${candidate.name} · ${endpoint(candidate.host, candidate.port)}` : '连接地址不可用，请重新选择'
 }
-function tunnelState(mapping: Mapping): { text: string; tone: '' | 'good' | 'warn' } {
+function endpointState(label: string, status?: { acknowledged: boolean; reason: string }) {
+  if (status?.reason === 'apply_failed') return `${label}应用失败`
+  if (status?.reason === 'node_unavailable') return `${label}不可用`
+  if (status?.acknowledged === true && status.reason === 'acknowledged') return `${label}已应用`
+  return `等待${label}确认`
+}
+function tunnelState(mapping: Mapping): { text: string; tone: '' | 'good' | 'warn' | 'bad' } {
   if (!mapping.enabled) return { text: '已停用', tone: '' }
   const server = desk.nodes.find(node => node.id === mapping.server_id)
   const client = desk.nodes.find(node => node.id === mapping.client_id)
   if (!server || !client || server.revoked || client.revoked) return { text: '节点不可用', tone: 'warn' }
-  if (!heartbeatOnline(server, now.value) || !heartbeatOnline(client, now.value)) return { text: '节点未连接', tone: 'warn' }
+  const serverOnline = heartbeatOnline(server, now.value)
+  const clientOnline = heartbeatOnline(client, now.value)
+  if (!serverOnline || !clientOnline) return { text: !serverOnline && !clientOnline ? '两端离线' : !serverOnline ? '服务端离线' : '客户端离线', tone: 'warn' }
   const status = statuses.value[mapping.id]
-  if (status?.server?.reason === 'apply_failed' || status?.client?.reason === 'apply_failed') return { text: '配置应用失败', tone: 'warn' }
-  if (status?.server?.acknowledged !== true || status.server.reason !== 'acknowledged' || status?.client?.acknowledged !== true || status.client.reason !== 'acknowledged') return { text: '配置状态未知', tone: 'warn' }
-  return { text: '待业务验证', tone: '' } // Acknowledgement is not a target-service probe.
+  const parts = [endpointState('服务端', status?.server), endpointState('客户端', status?.client)]
+  if (parts.every(part => part.endsWith('已应用'))) return { text: '两端已应用', tone: 'good' }
+  const tone = parts.some(part => part.endsWith('应用失败')) ? 'bad' : 'warn'
+  return { text: parts.join(' · '), tone }
 }
 function traffic(mapping: Mapping): TrafficRow | undefined { return desk.traffic.find(row => row.mapping_id === mapping.id) }
 function bytes(n: number): string {
@@ -132,7 +141,7 @@ async function run() {
       <input v-model="query" type="search" aria-label="搜索映射" placeholder="搜索名称、节点或地址" />
       <button type="button" class="btn primary" @click="open()">新建映射</button>
     </div>
-    <p class="help">映射按名称排序，同名按 ID 固定排序。隧道状态仅依据节点心跳和各映射两端的已应用确认；「待业务验证」不代表目标服务已连通，请从服务端监听地址发起实际业务请求验证。流量为服务端本次进程已上报的公网侧载荷字节（上行：进入监听；下行：返回公网），不含协议开销；重启后重新计数，流量出现也不代表业务健康。</p>
+    <p class="help">隧道状态分别显示服务端和客户端对当前映射配置的确认结果，不是目标服务探针。两端已应用只说明配置已应用。</p>
     <p v-if="desk.trafficError" class="error" role="alert">流量读取失败：{{ desk.trafficError }}；可点击刷新重试。</p>
     <p v-if="statusError" class="error" role="alert">{{ statusError }}</p>
     <EmptyState v-if="!rows.length" title="暂无映射" text="新建映射或调整筛选。" />
@@ -144,7 +153,7 @@ async function run() {
           <td>{{ nodeName(desk.nodes, mapping.server_id) }}<small>→ {{ nodeName(desk.nodes, mapping.client_id) }}</small><small>隧道入口：{{ connectionLabel(mapping) }}</small></td>
           <td><code>{{ endpoint(mapping.listen_host, mapping.listen_port) }}</code><small>→ <code>{{ endpoint(mapping.target_host, mapping.target_port) }}</code></small></td>
           <td>{{ mapping.pool || 1 }}<small>{{ mapping.network === 'udp' ? 'XUDP' : mapping.mux ? (mapping.mux_type || 'smux') : 'mux 关闭' }}</small></td>
-          <td><Badge :text="tunnelState(mapping).text" :tone="tunnelState(mapping).tone" :title="'只代表节点心跳及配置已应用；不代表隧道连接和映射目标可达'" /><small v-if="tunnelState(mapping).text === '节点未连接'" class="mapping-state-hint">节点未连接，重连后自动同步</small></td>
+          <td><Badge :text="tunnelState(mapping).text" :tone="tunnelState(mapping).tone" title="配置确认状态，不代表目标服务可达" /></td>
           <td><template v-if="desk.trafficError">读取失败</template><template v-else-if="!desk.trafficLoaded">加载中…</template><template v-else-if="!mapping.enabled">—</template><template v-else-if="traffic(mapping)?.reported_at">{{ bytes(traffic(mapping)!.up_bytes) }} / {{ bytes(traffic(mapping)!.down_bytes) }}<small :title="traffic(mapping)!.reported_at || ''">服务端本次进程 · {{ new Date(traffic(mapping)!.reported_at!).toLocaleString('zh-CN') }} 上报</small></template><template v-else>尚无流量上报</template></td>
           <td><div class="actions"><button type="button" class="btn small" @click="open(mapping)">编辑</button><button type="button" class="btn small" @click="ask(mapping, 'toggle')">{{ mapping.enabled ? '停用' : '启用' }}</button><button type="button" class="btn small danger" @click="ask(mapping, 'delete')">删除</button></div></td>
         </tr></tbody>

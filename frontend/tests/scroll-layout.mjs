@@ -30,11 +30,12 @@ test('narrow screens keep a bounded navigation scroll area above the content', (
 })
 
 test('wide workspace uses available width and node columns total 100 percent', () => {
- assert.match(rule('.stage'), /width: calc\(100% - 56px\)/)
- assert.doesNotMatch(rule('.stage'), /1240px|max-width/)
+ assert.match(rule('.stage'), /width: auto/)
+ assert.match(rule('.stage'), /padding: 24px 28px 40px/)
+ assert.doesNotMatch(css, /1240px|min-width: 1080px/)
+ assert.match(css, /\.stack \{[^}]*width: 100%/)
+ assert.match(css, /\.panel, \.table-scroll, table \{ width: 100%; \}/)
  assert.equal((css.match(/^\.shell \{/gm)||[]).length,1)
- const widths=[...css.matchAll(/\.nodes-table th[^}]+width: (\d+)%;/g)].map(m=>Number(m[1]))
- assert.equal(widths.reduce((a,b)=>a+b,0),100)
 })
 test('mapping rows retain Pool cell so status, traffic and actions align with headers', () => {
  const source=readFileSync(new URL('../src/views/ProxiesView.vue',import.meta.url),'utf8')

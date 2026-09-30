@@ -27,16 +27,16 @@ const ok={a:{server:{acknowledged:true,reason:'acknowledged'},client:{acknowledg
 
 test('mapping status requires both endpoint acknowledgements, not node global revision or reachability',async()=>{
  const e=setup()
- assert.equal(e.tunnelState(mapping).text,'配置状态未知')
+ assert.equal(e.tunnelState(mapping).text,'等待服务端确认 · 等待客户端确认')
  e.mount(); assert.equal(e.timers.find(t=>t.delay===5000)?.delay,5000)
  e.responses.shift().resolve(ok); await flush()
- assert.equal(e.tunnelState(mapping).text,'待业务验证')
+ assert.equal(e.tunnelState(mapping).text,'两端已应用')
  e.desk.nodes[0].error='unrelated change failed';e.desk.nodes[0].desired_revision=3;e.desk.nodes[0].applied_revision=2
- assert.equal(e.tunnelState(mapping).text,'待业务验证')
+ assert.equal(e.tunnelState(mapping).text,'两端已应用')
  e.timers.find(t=>t.delay===5000).cb()
- assert.equal(e.tunnelState(mapping).text,'配置状态未知')
+ assert.equal(e.tunnelState(mapping).text,'等待服务端确认 · 等待客户端确认')
  e.responses.shift().resolve({a:{server:{acknowledged:false,reason:'apply_failed'},client:ok.a.client}});await flush()
- assert.equal(e.tunnelState(mapping).text,'配置应用失败')
+ assert.equal(e.tunnelState(mapping).text,'服务端应用失败 · 客户端已应用')
  e.unmount()
 })
 
@@ -45,26 +45,38 @@ test('failed, malformed, stale and late responses fail closed',async()=>{
  const stale=e.responses.shift()
  e.refreshStatus();e.responses.shift().resolve(ok);await flush()
  stale.resolve({a:{server:{acknowledged:false,reason:'unknown'},client:ok.a.client}});await flush()
- assert.equal(e.tunnelState(mapping).text,'待业务验证')
+ assert.equal(e.tunnelState(mapping).text,'两端已应用')
  e.refreshStatus();e.responses.shift().reject(new Error('offline'));await flush()
- assert.equal(e.tunnelState(mapping).text,'配置状态未知');assert.match(e.statusError.value,/失败/)
+ assert.equal(e.tunnelState(mapping).text,'等待服务端确认 · 等待客户端确认');assert.match(e.statusError.value,/失败/)
  e.refreshStatus();e.responses.shift().resolve(null);await flush()
- assert.equal(e.tunnelState(mapping).text,'配置状态未知')
+ assert.equal(e.tunnelState(mapping).text,'等待服务端确认 · 等待客户端确认')
  e.refreshStatus();const late=e.responses.shift();e.unmount();late.resolve(ok);await flush()
- assert.equal(e.tunnelState(mapping).text,'配置状态未知')
- assert.match(source,/不代表隧道连接和映射目标可达/)
+ assert.equal(e.tunnelState(mapping).text,'等待服务端确认 · 等待客户端确认')
+ assert.match(source,/两端已应用只说明配置已应用/)
+ assert.match(source,/不是目标服务探针/)
 })
 
 test('desk reload clears prior status and requests fresh per-mapping acknowledgement',async()=>{
  const e=setup();e.mount()
  e.responses.shift().resolve(ok);await flush()
- assert.equal(e.tunnelState(mapping).text,'待业务验证')
+ assert.equal(e.tunnelState(mapping).text,'两端已应用')
  e.desk.loading=true;await flush()
  e.desk.mappings=[{...mapping}]
  e.desk.loading=false;await flush()
- assert.equal(e.tunnelState(mapping).text,'配置状态未知')
+ assert.equal(e.tunnelState(mapping).text,'等待服务端确认 · 等待客户端确认')
  assert.ok(e.responses.length>0)
  e.responses.at(-1).resolve(ok);await flush()
- assert.equal(e.tunnelState(mapping).text,'待业务验证')
+ assert.equal(e.tunnelState(mapping).text,'两端已应用')
+ e.unmount()
+})
+
+test('one side waiting stays visible beside the acknowledged side',async()=>{
+ const e=setup();e.mount()
+ e.responses.shift().resolve({a:{server:{acknowledged:true,reason:'acknowledged'},client:{acknowledged:false,reason:'unknown'}}});await flush()
+ assert.equal(e.tunnelState(mapping).text,'服务端已应用 · 等待客户端确认')
+ e.desk.nodes[1].last_seen=stamp-120
+ assert.equal(e.tunnelState(mapping).text,'客户端离线')
+ e.desk.nodes[0].last_seen=stamp-120
+ assert.equal(e.tunnelState(mapping).text,'两端离线')
  e.unmount()
 })

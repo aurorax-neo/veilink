@@ -237,7 +237,7 @@ test('client list omits server-only address and tunnel columns', () => {
   assert.match(tableSource, /<td v-if="role === 'server'">{{ tunnelLabel\(node\) }}<\/td><td>{{ mappings\(node.id\).length }}<\/td>/)
   assert.doesNotMatch(tableSource, /服务端统一下发|<template v-else>—<\/template>/)
   assert.match(tableSource, /<button v-if="role === 'client'"[^>]*>查看配置<\/button>/)
-  assert.match(source('../src/styles.css'), /\.nodes-table-client \{ min-width: 780px; \}/)
+  assert.equal(source('../src/styles.css').includes('.nodes-table, .nodes-table-client { width: 100%; min-width: 760px; }'), true)
 })
 
 const ca = cert.replace('ZGVtbw==', 'Y3VzdG9t')

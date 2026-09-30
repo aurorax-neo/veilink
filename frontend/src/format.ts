@@ -61,9 +61,10 @@ export function needsAttention(node: Node, now = Date.now()): boolean {
   return attentionReasons(node, now).length > 0
 }
 
-export function seenText(unix: number, now = Date.now()): string {
+export function seenText(unix: number, now = Date.now(), relative = true): string {
   if (!unix) return '尚未上报'
   const abs = new Date(unix * 1000).toLocaleString('zh-CN', { hour12: false })
+  if (!relative) return abs
   const delta = Math.round(now / 1000 - unix)
   if (delta < -5) return `${abs}（比本机时钟晚 ${-delta} 秒）`
   if (delta < 90) return `${abs}（${Math.max(delta, 0)} 秒前）`

@@ -28,7 +28,7 @@ function setup(response = { connected: true }, reload = async () => {}, role = '
     setInterval: callback => { tick = callback; return 7 }, clearInterval: id => { cleared = id },
     api: async (...args) => { calls.push(structuredClone(args)); return typeof response === 'function' ? response(...args) : response },
   })
-  vm.runInContext(transpile(script + '\nglobalThis.state = { refreshNode, refreshing, refreshFeedback, revisionLabel, revisionDescription, saved, now };'), context)
+  vm.runInContext(transpile(script + '\nglobalThis.state = { refreshNode, refreshing, refreshFeedback, pendingRefresh, revisionLabel, revisionDescription, saved, now };'), context)
   return { ...context.state, desk, calls, notices, nodeReloads, tick: () => tick?.(), unmount: () => unmount?.(), get cleared() { return cleared }, get reloads() { return reloads } }
 }
 const node = { id: 'node/id', name: 'node', revoked: false, desired_revision: 4, applied_revision: 4, last_seen: 1000, error: '' }
@@ -128,4 +128,31 @@ test('revision status preserves applied/pending/failed distinctions', () => {
 test('saving still reloads full data without claiming configuration applied', async () => {
   const s = setup(); await s.saved()
   assert.equal(s.reloads, 1); assert.match(s.notices[0].text, /已保存.*等待节点上报/)
+})
+test('row updates when a later poll sees a new report and times out without one', async () => {
+  const target = { ...node }
+  let reads = 0
+  const s = setup({ connected: true }, async () => {
+    reads++
+    if (reads >= 2) s.desk.nodes[0].last_seen = 1001
+  })
+  s.desk.nodes.push(target)
+  await s.refreshNode(target)
+  assert.match(s.refreshFeedback.value[node.id].text, /已请求上报/)
+  assert.equal(s.pendingRefresh.value[node.id].seen, 1000)
+  await s.tick()
+  assert.equal(s.desk.nodes[0].last_seen, 1001)
+  assert.equal(s.refreshFeedback.value[node.id], undefined)
+  assert.equal(s.pendingRefresh.value[node.id], undefined)
+
+  const quiet = setup({ connected: true })
+  quiet.desk.nodes.push({ ...node, id: 'quiet' })
+  await quiet.refreshNode(quiet.desk.nodes[0])
+  quiet.pendingRefresh.value.quiet.until = Date.now() - 1
+  await quiet.tick()
+  assert.equal(quiet.refreshFeedback.value.quiet.text, '节点尚未上报新状态')
+  assert.equal(quiet.pendingRefresh.value.quiet, undefined)
+  assert.match(table, /seenText\(node\.last_seen, now, false\)/)
+  assert.match(table, /seenText\(selected\.last_seen, now, false\)/)
+  assert.doesNotMatch(table, /秒前/)
 })

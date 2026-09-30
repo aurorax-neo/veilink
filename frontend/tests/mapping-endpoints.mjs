@@ -121,18 +121,20 @@ test('tunnel state distinguishes disabled, offline and applied nodes without cla
   const e = setup()
   const mapping = { id: 'm', server_id: 's', client_id: 'client', enabled: true }
   assert.equal(e.tunnelState({ ...mapping, enabled: false }).text, '已停用')
-  assert.equal(e.tunnelState(mapping).text, '节点未连接')
+  assert.equal(e.tunnelState(mapping).text, '两端离线')
   for (const node of [e.desk.nodes[0], e.desk.nodes[2]]) Object.assign(node, { last_seen: Math.floor(Date.now()/1000), desired_revision: 2, applied_revision: 2 })
-  assert.equal(e.tunnelState(mapping).text, '配置状态未知')
+  assert.equal(e.tunnelState(mapping).text, '等待服务端确认 · 等待客户端确认')
   e.statuses.value = { m: { server: { acknowledged: true, reason: 'acknowledged' }, client: { acknowledged: true, reason: 'acknowledged' } } }
-  assert.equal(e.tunnelState(mapping).text, '待业务验证')
+  assert.equal(e.tunnelState(mapping).text, '两端已应用')
   e.desk.nodes[2].applied_revision = 1
-  assert.equal(e.tunnelState(mapping).text, '待业务验证')
+  assert.equal(e.tunnelState(mapping).text, '两端已应用')
   e.desk.nodes[2].revoked = true
   assert.equal(e.tunnelState(mapping).text, '节点不可用')
   assert.match(view, /隧道状态/)
-  assert.match(view, /不代表隧道连接和映射目标可达/)
-  assert.match(view, /映射按名称排序，同名按 ID 固定排序/)
+  assert.match(view, /两端已应用只说明配置已应用/)
+  assert.match(view, /不是目标服务探针/)
+  assert.equal(view.includes('.sort(byNameAndId)'), true)
+  assert.doesNotMatch(view, /配置状态未知|待业务验证/)
 })
 
 test('mapping heartbeat status expires on local clock without new API data', () => {
@@ -140,10 +142,12 @@ test('mapping heartbeat status expires on local clock without new API data', () 
  const stamp = Math.floor(Date.now()/1000)
  for (const node of [e.desk.nodes[0],e.desk.nodes[2]]) Object.assign(node,{last_seen:stamp,desired_revision:1,applied_revision:1,error:'',revoked:false})
  const mapping={enabled:true,server_id:'s',client_id:'client'}
- assert.equal(e.tunnelState(mapping).text,'配置状态未知')
+ assert.equal(e.tunnelState(mapping).text,'等待服务端确认 · 等待客户端确认')
  e.statuses.value={ [mapping.id]: {server:{acknowledged:true,reason:'acknowledged'},client:{acknowledged:true,reason:'acknowledged'}} }
- assert.equal(e.tunnelState(mapping).text,'待业务验证')
+ assert.equal(e.tunnelState(mapping).text,'两端已应用')
  e.now.value=(stamp+91)*1000
- assert.equal(e.tunnelState(mapping).text,'节点未连接')
+ assert.equal(e.tunnelState(mapping).text,'两端离线')
+ e.desk.nodes[0].last_seen=stamp+91
+ assert.equal(e.tunnelState(mapping).text,'客户端离线')
  e.unmount()
 })
