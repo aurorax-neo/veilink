@@ -1,0 +1,139 @@
+{
+  "before-HY2.log": [
+    "performance_test.go:315: PERF protocol=HY2 network=tcp pool=1 round=1 bytes=536870912 seconds=3.968753 MiBps=129.008 p50_us=77.792 p95_us=91.708 switches=0/0",
+    "performance_test.go:315: PERF protocol=HY2 network=udp pool=1 round=1 bytes=19660800 seconds=0.390971 MiBps=47.958 p50_us=87.541 p95_us=96.208 switches=0/0",
+    "performance_test.go:315: PERF protocol=HY2 network=tcp pool=1 round=2 bytes=536870912 seconds=4.062788 MiBps=126.022 p50_us=76.917 p95_us=86.250 switches=0/0",
+    "performance_test.go:315: PERF protocol=HY2 network=udp pool=1 round=2 bytes=19660800 seconds=0.387923 MiBps=48.334 p50_us=86.875 p95_us=94.250 switches=0/0",
+    "performance_test.go:315: PERF protocol=HY2 network=tcp pool=1 round=3 bytes=536870912 seconds=3.974605 MiBps=128.818 p50_us=80.542 p95_us=92.333 switches=0/0",
+    "performance_test.go:315: PERF protocol=HY2 network=udp pool=1 round=3 bytes=19660800 seconds=0.392537 MiBps=47.766 p50_us=87.334 p95_us=97.875 switches=0/0"
+  ],
+  "before-TLS-Vision.log": [
+    "performance_test.go:315: PERF protocol=TLS-Vision network=tcp pool=1 round=1 bytes=536870912 seconds=0.590959 MiBps=866.388 p50_us=42.042 p95_us=49.667 switches=1/1",
+    "performance_test.go:315: PERF protocol=TLS-Vision network=udp pool=1 round=1 bytes=19660800 seconds=0.290919 MiBps=64.451 p50_us=63.083 p95_us=75.708 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS-Vision network=tcp pool=1 round=2 bytes=536870912 seconds=0.586333 MiBps=873.224 p50_us=42.666 p95_us=49.167 switches=1/1",
+    "performance_test.go:315: PERF protocol=TLS-Vision network=udp pool=1 round=2 bytes=19660800 seconds=0.286051 MiBps=65.548 p50_us=64.875 p95_us=76.292 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS-Vision network=tcp pool=1 round=3 bytes=536870912 seconds=0.581311 MiBps=880.767 p50_us=19.375 p95_us=26.166 switches=1/1",
+    "performance_test.go:315: PERF protocol=TLS-Vision network=udp pool=1 round=3 bytes=19660800 seconds=0.291826 MiBps=64.251 p50_us=68.250 p95_us=86.708 switches=0/0"
+  ],
+  "before-TLS.log": [
+    "performance_test.go:315: PERF protocol=TLS network=tcp pool=1 round=1 bytes=536870912 seconds=0.809546 MiBps=632.453 p50_us=50.125 p95_us=77.167 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS network=udp pool=1 round=1 bytes=19660800 seconds=0.288010 MiBps=65.102 p50_us=67.083 p95_us=85.875 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS network=tcp pool=1 round=2 bytes=536870912 seconds=0.735402 MiBps=696.218 p50_us=50.834 p95_us=73.458 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS network=udp pool=1 round=2 bytes=19660800 seconds=0.284119 MiBps=65.994 p50_us=67.167 p95_us=80.667 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS network=tcp pool=1 round=3 bytes=536870912 seconds=0.757601 MiBps=675.818 p50_us=51.417 p95_us=77.000 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS network=udp pool=1 round=3 bytes=19660800 seconds=0.287826 MiBps=65.143 p50_us=65.417 p95_us=77.833 switches=0/0"
+  ],
+  "buffers-HY2.log": [
+    "performance_test.go:315: PERF protocol=HY2 network=tcp pool=1 round=1 bytes=536870912 seconds=3.868404 MiBps=132.354 p50_us=79.334 p95_us=86.917 switches=0/0",
+    "performance_test.go:315: PERF protocol=HY2 network=udp pool=1 round=1 bytes=19660800 seconds=0.376155 MiBps=49.847 p50_us=85.125 p95_us=96.000 switches=0/0",
+    "performance_test.go:315: PERF protocol=HY2 network=tcp pool=1 round=2 bytes=536870912 seconds=3.871626 MiBps=132.244 p50_us=79.292 p95_us=88.333 switches=0/0",
+    "performance_test.go:315: PERF protocol=HY2 network=udp pool=1 round=2 bytes=19660800 seconds=0.377748 MiBps=49.636 p50_us=85.542 p95_us=94.375 switches=0/0",
+    "performance_test.go:315: PERF protocol=HY2 network=tcp pool=1 round=3 bytes=536870912 seconds=3.895340 MiBps=131.439 p50_us=77.416 p95_us=85.709 switches=0/0",
+    "performance_test.go:315: PERF protocol=HY2 network=udp pool=1 round=3 bytes=19660800 seconds=0.379546 MiBps=49.401 p50_us=85.083 p95_us=92.750 switches=0/0"
+  ],
+  "buffers-TLS.log": [
+    "performance_test.go:315: PERF protocol=TLS network=tcp pool=1 round=1 bytes=536870912 seconds=0.617040 MiBps=829.767 p50_us=48.958 p95_us=59.541 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS network=udp pool=1 round=1 bytes=19660800 seconds=0.241683 MiBps=77.581 p50_us=61.833 p95_us=70.792 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS network=tcp pool=1 round=2 bytes=536870912 seconds=0.584617 MiBps=875.787 p50_us=45.458 p95_us=65.583 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS network=udp pool=1 round=2 bytes=19660800 seconds=0.241153 MiBps=77.751 p50_us=61.541 p95_us=68.209 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS network=tcp pool=1 round=3 bytes=536870912 seconds=0.588328 MiBps=870.263 p50_us=53.666 p95_us=62.833 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS network=udp pool=1 round=3 bytes=19660800 seconds=0.242498 MiBps=77.320 p50_us=61.917 p95_us=71.458 switches=0/0"
+  ],
+  "control.log": [
+    "performance_control_test.go:98: CONTROL variant=raw round=1 MiBps=143.555 p50_us=36.959 p95_us=41.583",
+    "performance_control_test.go:98: CONTROL variant=raw round=2 MiBps=144.050 p50_us=36.333 p95_us=40.209",
+    "performance_control_test.go:98: CONTROL variant=raw round=3 MiBps=140.850 p50_us=36.708 p95_us=41.375",
+    "performance_control_test.go:98: CONTROL variant=inner-TLS round=1 MiBps=144.459 p50_us=37.459 p95_us=42.042",
+    "performance_control_test.go:98: CONTROL variant=inner-TLS round=2 MiBps=140.556 p50_us=38.500 p95_us=45.208",
+    "performance_control_test.go:98: CONTROL variant=inner-TLS round=3 MiBps=141.143 p50_us=38.250 p95_us=43.208",
+    "performance_control_test.go:98: CONTROL variant=inner-TLS-large-window round=1 MiBps=140.540 p50_us=37.667 p95_us=45.166",
+    "performance_control_test.go:98: CONTROL variant=inner-TLS-large-window round=2 MiBps=131.030 p50_us=38.208 p95_us=43.583",
+    "performance_control_test.go:98: CONTROL variant=inner-TLS-large-window round=3 MiBps=143.112 p50_us=38.750 p95_us=43.209"
+  ],
+  "final-HY2.log": [
+    "performance_test.go:315: PERF protocol=HY2 network=tcp pool=1 round=1 bytes=536870912 seconds=3.795169 MiBps=134.908 p50_us=77.625 p95_us=85.375 switches=0/0",
+    "performance_test.go:315: PERF protocol=HY2 network=udp pool=1 round=1 bytes=19660800 seconds=0.377494 MiBps=49.670 p50_us=86.708 p95_us=96.166 switches=0/0",
+    "performance_test.go:315: PERF protocol=HY2 network=tcp pool=1 round=2 bytes=536870912 seconds=3.748331 MiBps=136.594 p50_us=76.875 p95_us=84.542 switches=0/0",
+    "performance_test.go:315: PERF protocol=HY2 network=udp pool=1 round=2 bytes=19660800 seconds=0.374391 MiBps=50.081 p50_us=80.375 p95_us=89.583 switches=0/0",
+    "performance_test.go:315: PERF protocol=HY2 network=tcp pool=1 round=3 bytes=536870912 seconds=3.797842 MiBps=134.813 p50_us=75.958 p95_us=88.541 switches=0/0",
+    "performance_test.go:315: PERF protocol=HY2 network=udp pool=1 round=3 bytes=19660800 seconds=0.374503 MiBps=50.066 p50_us=85.792 p95_us=93.666 switches=0/0"
+  ],
+  "final-TLS-Vision.log": [
+    "performance_test.go:315: PERF protocol=TLS-Vision network=tcp pool=1 round=1 bytes=536870912 seconds=0.598071 MiBps=856.085 p50_us=38.000 p95_us=47.958 switches=1/1",
+    "performance_test.go:315: PERF protocol=TLS-Vision network=udp pool=1 round=1 bytes=19660800 seconds=0.238192 MiBps=78.718 p50_us=62.250 p95_us=70.125 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS-Vision network=tcp pool=1 round=2 bytes=536870912 seconds=0.582306 MiBps=879.263 p50_us=44.750 p95_us=50.375 switches=1/1",
+    "performance_test.go:315: PERF protocol=TLS-Vision network=udp pool=1 round=2 bytes=19660800 seconds=0.236547 MiBps=79.265 p50_us=63.917 p95_us=72.083 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS-Vision network=tcp pool=1 round=3 bytes=536870912 seconds=0.597989 MiBps=856.204 p50_us=40.750 p95_us=50.792 switches=1/1",
+    "performance_test.go:315: PERF protocol=TLS-Vision network=udp pool=1 round=3 bytes=19660800 seconds=0.235014 MiBps=79.782 p50_us=61.500 p95_us=69.583 switches=0/0"
+  ],
+  "final-TLS.log": [
+    "performance_test.go:315: PERF protocol=TLS network=tcp pool=1 round=1 bytes=536870912 seconds=0.525707 MiBps=973.926 p50_us=48.375 p95_us=56.042 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS network=udp pool=1 round=1 bytes=19660800 seconds=0.225102 MiBps=83.296 p50_us=61.583 p95_us=69.375 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS network=tcp pool=1 round=2 bytes=536870912 seconds=0.502769 MiBps=1018.360 p50_us=47.708 p95_us=55.833 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS network=udp pool=1 round=2 bytes=19660800 seconds=0.227451 MiBps=82.435 p50_us=60.750 p95_us=74.000 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS network=tcp pool=1 round=3 bytes=536870912 seconds=0.512113 MiBps=999.780 p50_us=52.417 p95_us=59.167 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS network=udp pool=1 round=3 bytes=19660800 seconds=0.233136 MiBps=80.425 p50_us=60.875 p95_us=68.459 switches=0/0"
+  ],
+  "hy2-buffered.log": [
+    "performance_test.go:315: PERF protocol=HY2 network=tcp pool=1 round=1 bytes=536870912 seconds=3.781032 MiBps=135.413 p50_us=77.833 p95_us=85.750 switches=0/0",
+    "performance_test.go:315: PERF protocol=HY2 network=udp pool=1 round=1 bytes=19660800 seconds=0.373063 MiBps=50.260 p50_us=86.208 p95_us=98.208 switches=0/0",
+    "performance_test.go:315: PERF protocol=HY2 network=tcp pool=1 round=2 bytes=536870912 seconds=3.730309 MiBps=137.254 p50_us=73.667 p95_us=88.208 switches=0/0",
+    "performance_test.go:315: PERF protocol=HY2 network=udp pool=1 round=2 bytes=19660800 seconds=0.377227 MiBps=49.705 p50_us=84.875 p95_us=92.250 switches=0/0",
+    "performance_test.go:315: PERF protocol=HY2 network=tcp pool=1 round=3 bytes=536870912 seconds=3.773064 MiBps=135.699 p50_us=78.792 p95_us=91.917 switches=0/0",
+    "performance_test.go:315: PERF protocol=HY2 network=udp pool=1 round=3 bytes=19660800 seconds=0.376031 MiBps=49.863 p50_us=84.792 p95_us=93.709 switches=0/0"
+  ],
+  "hy2-p4.log": [
+    "performance_test.go:315: PERF protocol=HY2 network=tcp pool=1 round=1 bytes=1073741824 seconds=6.042858 MiBps=169.456 p50_us=81.417 p95_us=88.833 switches=0/0"
+  ],
+  "hy2-procs2.log": [
+    "performance_test.go:315: PERF protocol=HY2 network=tcp pool=1 round=1 bytes=536870912 seconds=3.652368 MiBps=140.183 p50_us=75.125 p95_us=84.083 switches=0/0",
+    "performance_test.go:315: PERF protocol=HY2 network=tcp pool=1 round=2 bytes=536870912 seconds=3.664907 MiBps=139.703 p50_us=76.084 p95_us=83.584 switches=0/0",
+    "performance_test.go:315: PERF protocol=HY2 network=tcp pool=1 round=3 bytes=536870912 seconds=3.703512 MiBps=138.247 p50_us=77.916 p95_us=86.250 switches=0/0"
+  ],
+  "hy2-procs4.log": [
+    "performance_test.go:315: PERF protocol=HY2 network=tcp pool=1 round=1 bytes=536870912 seconds=2.952401 MiBps=173.418 p50_us=79.041 p95_us=85.541 switches=0/0",
+    "performance_test.go:315: PERF protocol=HY2 network=tcp pool=1 round=2 bytes=536870912 seconds=2.952439 MiBps=173.416 p50_us=76.666 p95_us=84.917 switches=0/0",
+    "performance_test.go:315: PERF protocol=HY2 network=tcp pool=1 round=3 bytes=536870912 seconds=2.930185 MiBps=174.733 p50_us=76.291 p95_us=83.875 switches=0/0"
+  ],
+  "ordinary-TLS.log": [
+    "performance_test.go:315: PERF protocol=TLS network=tcp pool=1 round=1 bytes=536870912 seconds=0.524767 MiBps=975.670 p50_us=49.250 p95_us=55.709 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS network=udp pool=1 round=1 bytes=19660800 seconds=0.225719 MiBps=83.068 p50_us=63.250 p95_us=71.292 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS network=tcp pool=1 round=2 bytes=536870912 seconds=0.530244 MiBps=965.593 p50_us=48.166 p95_us=64.333 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS network=udp pool=1 round=2 bytes=19660800 seconds=0.231911 MiBps=80.850 p50_us=61.583 p95_us=71.792 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS network=tcp pool=1 round=3 bytes=536870912 seconds=0.523653 MiBps=977.746 p50_us=48.000 p95_us=58.209 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS network=udp pool=1 round=3 bytes=19660800 seconds=0.234071 MiBps=80.104 p50_us=60.208 p95_us=71.583 switches=0/0"
+  ],
+  "streams.log": [
+    "performance_streams_test.go:117: STREAMS count=1 round=1 MiBps=154.316",
+    "performance_streams_test.go:117: STREAMS count=1 round=2 MiBps=152.840",
+    "performance_streams_test.go:117: STREAMS count=1 round=3 MiBps=153.969",
+    "performance_streams_test.go:117: STREAMS count=4 round=1 MiBps=148.794",
+    "performance_streams_test.go:117: STREAMS count=4 round=2 MiBps=147.542",
+    "performance_streams_test.go:117: STREAMS count=4 round=3 MiBps=147.681"
+  ],
+  "tls-buffer.log": [
+    "performance_test.go:315: PERF protocol=TLS network=tcp pool=1 round=1 bytes=536870912 seconds=0.693591 MiBps=738.187 p50_us=49.583 p95_us=64.875 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS network=tcp pool=1 round=2 bytes=536870912 seconds=0.665546 MiBps=769.293 p50_us=48.583 p95_us=60.750 switches=0/0",
+    "performance_test.go:315: PERF protocol=TLS network=tcp pool=1 round=3 bytes=536870912 seconds=0.671209 MiBps=762.803 p50_us=42.375 p95_us=62.041 switches=0/0"
+  ],
+  "xray-tls-results.log": [
+    "round=1 bytes=536870912 seconds=0.480624 MiBps=1065.281 p50_us=47.000 p95_us=59.500 TLS=304",
+    "round=2 bytes=536870912 seconds=0.488144 MiBps=1048.870 p50_us=49.584 p95_us=58.375 TLS=304",
+    "round=3 bytes=536870912 seconds=0.495503 MiBps=1033.294 p50_us=49.250 p95_us=56.208 TLS=304"
+  ],
+  "xray-hy2-results.log": [
+    "round=1 bytes=536870912 seconds=5.049244 MiBps=101.401 p50_us=78.334 p95_us=90.083 TLS=304",
+    "round=2 bytes=536870912 seconds=5.260527 MiBps=97.329 p50_us=76.333 p95_us=90.958 TLS=304",
+    "round=3 bytes=536870912 seconds=5.262426 MiBps=97.294 p50_us=74.083 p95_us=84.083 TLS=304"
+  ],
+  "xray-vision-results.log": [
+    "round=1 bytes=536870912 seconds=0.521624 MiBps=981.550 p50_us=47.959 p95_us=57.375 TLS=304",
+    "round=2 bytes=536870912 seconds=1.081251 MiBps=473.526 p50_us=47.417 p95_us=55.791 TLS=304",
+    "round=3 bytes=536870912 seconds=1.118015 MiBps=457.955 p50_us=47.333 p95_us=56.916 TLS=304"
+  ],
+  "xray-vision-recheck.log": [
+    "round=1 bytes=536870912 seconds=0.540774 MiBps=946.791 p50_us=46.708 p95_us=53.333 TLS=304",
+    "round=2 bytes=536870912 seconds=1.122743 MiBps=456.026 p50_us=46.708 p95_us=56.583 TLS=304",
+    "round=3 bytes=536870912 seconds=0.539793 MiBps=948.511 p50_us=48.542 p95_us=55.875 TLS=304"
+  ]
+}

@@ -1,26 +1,89 @@
 # Veilink
 
-Veilink 是原生 Go 私有反向隧道：Master 管理 Server、Client 和 TCP/UDP 映射。**生产只使用一个统一 Docker 镜像**，以 `master|server|client` 子命令选择角色；只有 Master 提供 Web。默认 Master 使用 HTTP，内置 HTTPS 可选；不承诺与 Xray 协议互通。
+用 Web 管理的私有反向隧道系统，将 Server 的 TCP/UDP 入口转发到 Client 可访问的目标服务。
 
-[v0.2.0 Release](https://github.com/aurorax-neo/veilink/releases/tag/v0.2.0) 提供统一镜像 `ghcr.io/aurorax-neo/veilink:latest`（linux/amd64、linux/arm64）；`latest` 是可变标签，生产如需锁定版本可使用 `:0.2.0`。**先做准备，再执行 Docker Run**；三种角色使用相同镜像。示例拓扑：nginx 与 Master 同机，外部 `https://panel.example.com:8843` → Master `http://127.0.0.1:2545`；内置 Server 首次默认监听 `8444`。替换示例域名、端口和证书路径，并在首次注册前限制面板访问来源。
+Veilink 使用 Go 实现节点与隧道，Vue 3 提供管理界面。**一个 Docker 镜像，三种运行角色**，不需要额外安装代理内核。
 
-## 1. 每台运行节点的主机：准备镜像
+[发布版本](https://github.com/aurorax-neo/veilink/releases) · [问题反馈](https://github.com/aurorax-neo/veilink/issues) · [许可证](LICENSE)
+
+## 目录
+
+- [功能与架构](#功能与架构)
+- [部署准备](#部署准备)
+- [启动 Master](#启动-master)
+- [配置管理入口](#配置管理入口)
+- [首次注册与配置映射](#首次注册与配置映射)
+- [接入独立 Server](#接入独立-server)
+- [接入 Client](#接入-client)
+- [协议与配置参考](#协议与配置参考)
+- [日常运维](#日常运维)
+- [故障排查](#故障排查)
+- [开发与验证](#开发与验证)
+- [许可证与第三方组件](#许可证与第三方组件)
+
+## 功能与架构
+
+- **集中管理**：在 Web 中管理节点、连接入口、映射和配置修订。
+- **反向连接**：Client 主动连接 Server，将业务转发到授权目标，无需为 Client 开放入站端口。
+- **TCP/UDP 映射**：映射直接选择 Server 和 Client，连接池大小 Pool 为 `1–32`。
+- **多种传输**：支持私有 VLESS、Hysteria2、TCP mux、XUDP 和 XHTTP，具体组合见[协议参考](#协议与配置参考)。
+- **统一部署**：同一镜像包含二进制与 Web 静态资源，用 `master`、`server`、`client` 子命令选择角色。
+
+| 角色 | 职责 | 容器网络 |
+| --- | --- | --- |
+| Master | 提供 Web/API、管理授权配置，可运行内置 Server | Host |
+| Server | 提供隧道接入和业务映射监听 | Host |
+| Client | 主动建立反向隧道，访问授权目标 | 默认 Bridge |
+
+```text
+控制面：浏览器 ── Web/API ── Master ←── gRPC ── Server / Client
+
+业务面：访问者 ── Server 映射入口 ══ 反向隧道 ══ Client ── 目标服务
+                                  ↑
+                         隧道连接由 Client 发起
+```
+
+只有 Master 提供 Web。Master 内置 Server 与独立 Server 职责相同，可先使用内置节点，再按需增加独立节点。
+
+> Veilink 是双端私有隧道，不是开放代理，也不承诺与 Xray、mihomo 或原生 Hysteria2 对端互通。项目不嵌入 Xray 代理内核；第三方源码依赖及其许可单独列在[第三方声明](THIRD_PARTY_NOTICES.md)。
+
+## 部署准备
+
+### 镜像与版本
+
+在每台节点主机准备 Docker 和统一镜像。以下命令以 Linux Docker Engine 为部署环境：
 
 ```sh
 docker pull ghcr.io/aurorax-neo/veilink:latest
 ```
 
-如从当前源码在本机构建同一个统一镜像（仅生成本机标签，不会推送 GHCR），可在仓库根目录运行：
+发布镜像面向 `linux/amd64` 和 `linux/arm64`。`latest` 是可变标签，不会自动更新运行中的容器；生产环境可按[发布说明](https://github.com/aurorax-neo/veilink/releases)选择具体版本标签，例如 `:0.2.0`。当前源码的功能不一定已包含在旧版本镜像中。
+
+从仓库根目录构建当前源码时，仍只构建一个镜像；此命令不会推送 GHCR：
 
 ```sh
 docker build -t ghcr.io/aurorax-neo/veilink:latest .
 ```
 
-`latest` 不会自动更新已运行的容器；升级须先备份数据，再主动拉取镜像并重建容器。已有 Master 若已存旧监听地址，仍须按下方命令显式指定 `-listen-addr 127.0.0.1:2545`。第三方镜像代理若提示 `DENIED: invalid token`，先检查代理鉴权/镜像路径，不要把拉取失败误判成 Veilink 启动失败。
+### 目录与网络
 
-## 2. Master 主机：先准备目录，再启动
+- 容器以 UID/GID `65532:65532` 运行，持久化数据挂载到 `/data`，宿主机目录统一放在 `/opt/docker/<app_name>/`。
+- Master、Server 使用 Host 网络承载动态入站端口，**不要添加 `-p`**；Client 使用默认 Bridge。
+- `/config` 只读挂载 Master 身份证书或控制面 CA。隧道证书和私钥通过 Web 保存为 PEM，不放入节点启动参数。
+- 以下目录准备命令需要相应的宿主机权限。已有数据库、key 和状态目录不得删除或覆盖，先备份。
 
-首次创建目录时执行；**已有数据不删除、不覆盖**，数据库与 deployment key 应一起备份。容器使用 UID/GID `65532:65532`：
+| 端口示例 | 用途 | 放行范围 |
+| --- | --- | --- |
+| `127.0.0.1:2545/TCP` | Master 默认 HTTP/h2c | 默认仅本机 |
+| `8843/TCP` | 本文 nginx 外部 HTTPS 示例 | 管理员和节点来源 |
+| `8444` | 内置 Server 首次默认隧道监听 | 按传输放行 TCP 或 UDP |
+| Web 中设置的映射端口 | 业务访问入口 | 实际业务访问来源 |
+
+首次注册前必须限制管理入口来源。HTTPS 加密不能防止管理员被抢注。
+
+## 启动 Master
+
+### 1. 准备目录
 
 ```sh
 mkdir -p /opt/docker/veilink-master/config /opt/docker/veilink-master/data
@@ -28,7 +91,9 @@ chown 65532:65532 /opt/docker/veilink-master/config /opt/docker/veilink-master/d
 chmod 700 /opt/docker/veilink-master/config /opt/docker/veilink-master/data
 ```
 
-启动 Master（默认 HTTP，无需 Master 证书）：
+### 2. 启动容器
+
+默认 HTTP 不需要证书：
 
 ```sh
 docker run -itd \
@@ -43,19 +108,29 @@ docker run -itd \
   -embedded-server-enabled=true
 ```
 
-**镜像名后必须先写 `master`，再写 `-database` 等 flags**；少写角色会启动失败。`-embedded-server-address`、`-embedded-server-port` 通常不必设置，内置 Server 首次默认名 `default`、监听端口 `8444`；`-embedded-server-server-name` 不是合法 flag。已有内置节点的自定义设置不会被默认值覆盖；如果已存监听端口与新的 Master 端口冲突，选择另一个 Master 端口启动，再到 Web 调整内置节点，不要删库。`-embedded-server-enabled=false` 可显式关闭内置节点。
+镜像名后必须先写 `master`，再写 flags。内置 Server 首次默认显示名为 `default`，端口为 `8444`；已有稳定身份和自定义名称保持不变。无需内置节点时，将 `-embedded-server-enabled` 改为 `false`。
+
+Master 会保留 SQLite 已存设置：显式 flags 覆盖已存值，缺省 flags 不清空旧设置。已有 HTTPS 配置切回 HTTP 时，除 `-scheme http` 外还应显式清空 `-control-server-name= -control-ca=`，不要删库。
+
+### 3. 确认启动
 
 ```sh
 docker ps -a --filter name=veilink-master
-docker logs veilink-master
+docker logs --tail=200 veilink-master
 curl -fsS http://127.0.0.1:2545/healthz
 ```
 
-`docker run -itd` 返回容器 ID 不代表启动成功。**新部署的 Master 默认监听** `127.0.0.1:2545`；上例仍显式指定该地址，以便已有数据库保存了旧监听地址时也切换至 2545。它仅同机可达，远端节点必须走下一步的 HTTPS 反代，或者改成受访问控制的可信内网监听。Host 网络不要加 `-p`。Master 会保留 SQLite 已存设置；显式 flags 覆盖已存值，缺省 flags 不会清空旧设置。若从已存 HTTPS 切回 HTTP，另加 `-control-server-name= -control-ca=`，不要删除数据库。
+返回容器 ID 不代表启动成功。默认监听只同机可达；远程浏览器和节点需使用下一节的 HTTPS 入口，或受访问控制的可信内网地址。
 
-## 3. 同机 nginx：先配 HTTPS 与 gRPC，再接入远端节点
+## 配置管理入口
 
-示例放入 nginx 的 `http {}` 中；需要 **nginx ≥ 1.25.1**、SSL/HTTP2/gRPC 模块。以下以 `panel.example.com:8843` 为外部地址、`127.0.0.1:2545` 为 Master HTTP/h2c 回源；替换域名和证书的**实际文件路径**，nginx 证书路径不能使用 `*` 匹配目录。nginx 若在独立 Bridge 容器，`127.0.0.1` 是 nginx 自己，须使用它能到达的受限回源地址。
+选择一种方式即可，不要求首次注册必须使用 HTTPS。
+
+### 方式一：nginx 终止 HTTPS
+
+适合跨不可信网络访问。示例拓扑为同机 nginx `https://panel.example.com:8843` → Master `http://127.0.0.1:2545`。
+
+下面的 `server` 段放入 nginx 的 `http {}` 中，需要 nginx ≥ 1.25.1 及 SSL、HTTP/2、gRPC 模块。替换域名和实际证书路径；证书文件路径不能用 `*`。首次开放入口前，用防火墙或反代访问控制限制来源。
 
 ```nginx
 server {
@@ -70,9 +145,9 @@ server {
         return 404;
     }
 
-    # 只转换本站的精确 Origin；其它 Origin 原样传递，由 Master 拒绝跨站写入。
+    # 只转换本站的精确 Origin，其它 Origin 原样交给 Master 校验。
     set $veilink_origin $http_origin;
-    if ($http_origin = "https://$http_host" ) {
+    if ($http_origin = "https://$http_host") {
         set $veilink_origin "http://$http_host";
     }
 
@@ -99,38 +174,76 @@ server {
 ```sh
 nginx -t && nginx -s reload
 curl -fsS https://panel.example.com:8843/api/setup
-openssl s_client -connect panel.example.com:8843 -servername panel.example.com -alpn h2 </dev/null 2>&1 | grep -i 'ALPN protocol'
+openssl s_client -connect panel.example.com:8843 \
+  -servername panel.example.com -alpn h2 </dev/null 2>&1 \
+  | grep -i 'ALPN protocol'
 ```
 
-预期 ALPN 为 `h2`。旧 nginx 不支持 `http2 on;` 时可使用 `listen 8843 ssl http2;`，但仍须有 HTTP/2 模块。**`tls: no application protocol` 是外部 HTTPS 入口未提供 h2，不是 CSRF 错误**；节点控制面必须使用 `grpc_pass`，不能换成普通 `proxy_pass`。本例 nginx 的监听端口就是外部访问端口 `8843`，所以回源 Host 使用 `$host:$server_port`；单独 `$host` 不含非标准端口，会导致同源 Origin 比对失败。若前置负载均衡/CDN 改写了外部端口，不要用 `$server_port` 猜测，应在两个 Host 指令中填写实际外部域名和端口。Web/API 使用同一外部域名及端口，本站 Origin 的精确转换也须与回源 Host 一致。登录/注册就 403 先检查 Origin/Host/端口；登录后操作 403 再检查 `veilink_session` Cookie、`X-CSRF-Token` 与 `Sec-Fetch-Site`。不关闭 CSRF、不信任客户端提供的转发头，也不把所有 Origin 改成本域。nginx 为会话 Cookie 加 `Secure`；Master 不依赖 `X-Forwarded-Proto` 放宽认证。
+预期 ALPN 为 `h2`。部署时注意：
 
-反代只处理管理 Web/API/gRPC；隧道 TCP/TLS/REALITY 和 HY2 UDP/QUIC 业务端口仍按所选传输直达或 L4 透传。证书续期先验证新证书，再 `nginx -t && nginx -s reload`；不要把 HTTP 管理入口直接暴露不可信网络。若不使用 nginx，也可给 Master 配只读证书并使用 `-scheme https -cert-file /config/cert.pem -key-file /config/key.pem`；内置 Server 验证 Master 身份时根据证书配置 `-control-server-name`，私有 CA 再设置 `-control-ca`。
+- Web/API 用 `proxy_pass`，节点 gRPC 用 `grpc_pass`，两者不能互换。
+- nginx 如果运行在独立 Bridge 容器，`127.0.0.1` 是 nginx 自己，必须换成能到达的受限回源地址。
+- 本例监听端口就是外部端口，所以 Host 使用 `$host:$server_port`。前置代理若改写端口，两处 Host 应填写真实外部域名和端口，并与 Origin 转换一致。
+- 不关闭 CSRF，不把所有 Origin 改成本域，不盲目信任客户端转发头。nginx 为会话 Cookie 添加 Secure；Master 不靠 `X-Forwarded-Proto` 放宽认证。
+- 此反代仅处理管理面和控制面；业务隧道端口需按传输直达或 L4 透传。它不是 XHTTP 业务反代配置。
 
-## 4. 限制访问后完成首次注册、配置节点与映射
+### 方式二：可信内网直接 HTTP
 
-Master **不会自动创建账号**；在可信网络或已限制来源的反代入口打开 Web 完成首次注册。`GET /api/setup` 显示是否需要注册，`POST /api/register` 只允许无账号时创建唯一账号。TLS 本身不能防止抢注；不要开放未注册的管理页面给不可信来源。
+将 Master 的 `-listen-addr` 改为节点可达的可信内网地址，例如 `192.168.10.2:2545`，并限制来源。Web「快捷接入」填写 `http://192.168.10.2:2545`。
 
-在 Web 中配置 Server 的隧道、接入候选和本地监听地址/端口；创建 Client，直接选择 Server/Client 建立映射（Pool 1–32）。客户端隧道模板由 Server 自动派生，**Client 不维护本地隧道配置**。映射可指定一个启用的连接入口；选择“自动”才按服务端启用地址顺序切换。NAT 的客户端连接端口可与 Server 本地监听端口不同。只看节点列表的「配置是否最新」状态和最后上报时间，不把 Master 健康或心跳当成业务目标可达性。
+手工节点命令使用 `-master-addr 192.168.10.2:2545`，省略 `-control-server-name` 与 `-control-ca`。HTTP/h2c 会明文传输凭据，不适合跨不可信网络。
 
-映射列表按名称、同名按 ID 固定排序。「待业务验证」只说明节点近期上报且配置已应用，不是隧道连通或目标服务健康检查；应从 Server 监听地址发起符合业务协议的请求验证。通用 TCP 连通不等于应用认证成功，UDP 也无法用一次无负载探针判定可用。流量只统计 Server 公网侧实际载荷，当前进程重启重新计数，出现上行/下行也不能代替业务探针。
+### 方式三：Master 内置 HTTPS
 
-XHTTP 参考请求路径、模式和流式行为，通信双方始终是 Veilink 节点，不以 Xray 对端互联为目标。Server 保存并派生配置给 Client。可选 `packet-up`（默认）、`stream-up`、`stream-one` 或受限 `auto`：非 REALITY auto 实际选择 packet-up；REALITY auto 在 Veilink 中明确选择 packet-up，避免降级到未认证流模式，不声称等同于完整参考实现。packet-up 使用分片上行、GET 流式下行；stream-up 使用同一会话 ID 的流式上行和 GET 下行；stream-one 使用单条双向请求。显式 HTTP/1.1 仅支持 packet-up；HTTP/2、HTTP/3 流模式仅支持直连 HTTPS 与 TLS 回源。h2c 仅限直连 HTTP、plain 回源并启用 VLESS Encryption 的 packet-up。任一段使用 HTTP 都须启用 VLESS Encryption；显式版本不降级，HTTP/3 须放行监听端口 UDP 并保持端到端 QUIC/TLS。上行默认 POST，可选 PUT，代理须放行并禁用请求缓冲。
+将证书与私钥放入已挂载的只读 `/config`，确保 UID `65532` 可读取；在 Master 启动命令中替换或补充以下参数：
 
-packet-up 默认固定 32768 字节分片、无额外发送间隔、逐片确认背压；可配置 1024–32768 字节随机分片及 0–1000 毫秒节奏。可选服务端缓冲窗口 1–32 和 Client 并发请求数 1–8（不超过窗口 + 1），服务端按序交付应用后才确认，不把入队当作消费成功。未配置时保留旧行为。上行数据默认在请求体；可选私有请求头或 Cookie 的 Base64URL 连续编码块，严格拒绝缺块、重复和混合位置。显式 xmux 按授权入口和完整配置隔离共享 H1/H2/H3 transport，并按并发、连接复用次数、请求次数、可复用时长和保活周期管理生命周期；未配置时保持独立 transport。stream-up 的上传响应立即发送填充，再按默认随机 20–80 秒或显式 1–300 秒周期继续发送，直到上传结束；填充不会进入业务下行，EOF 完成确认与取消保护保持有效。填充默认保留 Referer 查询与响应 X-Padding；启用混淆后可选查询、受限请求头或私有 Cookie，以及 repeat-x/tokenish 方法。请求头只接受 User-Agent、Accept-Language、X-Custom-*；Server 在创建会话前核对。填充与元数据键碰撞、保留头及非法组合均拒绝。`download_endpoint_id` 仅引用 Server 已启用的连接入口；GET/下行使用独立授权 transport，POST/PUT/上行继续使用主入口，主/下行入口和 xmux 池分别隔离，主入口、下行入口或授权拨号器失败均 fail closed。完整字段范围、模式限制及对应测试见 `tests/deployment/xhttp-capability-matrix.md`。不宣称通用 CDN 支持；半关闭及上传确认是 Veilink 私有扩展。
+```text
+-listen-addr 0.0.0.0:2545
+-scheme https
+-cert-file /config/cert.pem
+-key-file /config/key.pem
+-control-server-name panel.example.com
+```
 
-可选的 XHTTP `host` 仅覆写业务请求的 HTTP Host，Server 在创建会话前严格核对；填写小写 DNS 名或 IPv4，不含端口。Client 仍按授权连接入口拨号并验证入口的 TLS 证书名称，不能靠 Host 覆写跳过证书校验。经反代时须保留该 Host；未配置时不额外限制原有 Host 行为。
+限制该监听地址的访问来源。内置 Server 也会验证 Master 证书；私有 CA 额外设置 `-control-ca /config/master-ca.pem`。外部 Server、Client 同样配置控制面证书名称和 CA。
 
-XHTTP 会话 ID 与 packet-up 序号默认位于路径，可选查询参数、受限请求头或私有 `x_` Cookie；Server 会拒绝重复/混合元数据。会话 ID 默认使用 UUID v4，自定义字符表和长度必须保留至少 128 位熵。Cookie 元数据仅属于独立业务入口，不能用作 Master Web 登录 Cookie。stream-one 不使用会话 ID，详见 `tests/deployment/xhttp-capability-matrix.md`。
+证书由实际终止 TLS 的组件管理。nginx 证书续期后先检查新证书，再执行 `nginx -t && nginx -s reload`。
 
-## 5. 可选独立 Server：节点主机先准备，再运行
+## 首次注册与配置映射
 
-如使用 Master 内置 Server，可跳过本节。先在 Web 创建 Server 并获取节点 ID、接入令牌；节点主机须已完成步骤 1。主机目录先准备：
+1. **注册管理员**：从可信或已限制来源的入口打开 Web。Master 不自动创建账号；`GET /api/setup` 返回是否需要注册，`POST /api/register` 仅允许无管理员时原子创建唯一账号。
+2. **配置 Server**：使用内置 `default` 或创建独立 Server。在 Web 保存隧道、连接入口和本地监听配置；客户端模板由 Server 配置自动派生。
+3. **创建 Client**：获取节点 ID 和接入令牌，按下文或 Web「快捷接入」生成的命令启动。生成命令和手工命令二选一。
+4. **创建映射**：选择 Server、Client、TCP/UDP、Server 监听地址与端口、Client 可达的目标地址与端口，以及 Pool（`1–32`）。没有独立的公开绑定管理。
+5. **选择连接入口**：固定入口只用所选启用入口；“自动”按启用入口顺序尝试。NAT 对外连接端口可以与 Server 本地隧道监听端口不同。
+6. **验证业务**：等待节点应用配置，从 Server 映射监听地址发起符合目标协议的实际请求。
+
+例如，Client 能访问 `192.168.10.20:8080` 的 HTTP 服务时，可建立 TCP 映射到 Server 的空闲业务端口。验证该映射应发送 HTTP 请求，而不是只确认 TCP 握手成功。目标必须从 Client 容器网络可达；容器内的 `127.0.0.1` 不是宿主机。
+
+### 如何理解状态
+
+| 信号 | 能说明什么 | 不能说明什么 |
+| --- | --- | --- |
+| Master `/healthz` | 管理进程健康接口可响应 | 隧道或目标服务可用 |
+| Server/Client Docker `healthy` | PID 1 存活 | 节点已认证或配置已应用 |
+| 节点上报时间 | 控制面近期收到上报 | 目标服务可达 |
+| 配置“最新” | 节点已应用期望修订 | 业务请求必然成功 |
+| 映射“待业务验证” | 节点近期上报且配置已应用 | 已完成业务探针 |
+| 上行/下行流量 | Server 公网侧有实际载荷 | 应用认证和请求成功 |
+
+期望修订与已应用修订分开记录；Apply 失败不会报成功，旧修订或相同修订对应不同配置会被拒绝，节点保留最后成功快照。刷新按钮只是请求节点刷新，以实际上报为准。流量计数在进程重启后重新开始。
+
+## 接入独立 Server
+
+使用内置 Server 可跳过。先在 Web 创建 Server，获取节点 ID 和接入令牌；在 Server 主机准备镜像与目录：
 
 ```sh
 mkdir -p /opt/docker/veilink-server/config /opt/docker/veilink-server/data
 chown 65532:65532 /opt/docker/veilink-server/config /opt/docker/veilink-server/data
 chmod 700 /opt/docker/veilink-server/config /opt/docker/veilink-server/data
 ```
+
+以下连接到前述 nginx HTTPS 入口：
 
 ```sh
 docker run -itd \
@@ -145,15 +258,17 @@ docker run -itd \
   -state-dir /data/state
 ```
 
-## 6. Client：节点主机先准备，再运行
+## 接入 Client
 
-先在 Web 创建 Client、建立映射并获取节点 ID、接入令牌；节点主机须已完成步骤 1。Client 只出站，保持默认 Bridge，**不加 `--net host` 或 `-p`**：
+先在 Web 创建 Client，获取节点 ID 和接入令牌；在 Client 主机准备镜像与目录：
 
 ```sh
 mkdir -p /opt/docker/veilink-client/config /opt/docker/veilink-client/data
 chown 65532:65532 /opt/docker/veilink-client/config /opt/docker/veilink-client/data
 chmod 700 /opt/docker/veilink-client/config /opt/docker/veilink-client/data
 ```
+
+Client 保持默认 Bridge，不添加 `--net host` 或 `-p`：
 
 ```sh
 docker run -itd \
@@ -168,13 +283,64 @@ docker run -itd \
   -state-dir /data/state
 ```
 
-两种节点均可在 Web「快捷接入」填写 `https://panel.example.com:8843` 生成同类 Docker 命令；**不要同时运行生成命令和手工命令创建重复容器**。私有 Master CA 才将 CA 放入只读 `/config` 并追加 `-control-ca /config/master-ca.pem`，保持证书校验。可信内网也可直接 HTTP/h2c：填写 `http://节点可达地址:2545`，或手工把 `-master-addr` 改成该地址并省略 `-control-server-name` 和 `-control-ca`；HTTP 传输会暴露凭据，不能跨不可信网络。Client 容器里的 `127.0.0.1` 不是宿主机，映射目标须从容器网络可达。
+两种节点若连接私有 CA 签发的 Master，将 CA 放到只读 `/config`，追加 `-control-ca /config/master-ca.pem`。该参数只影响 Master 控制面信任，不影响业务隧道证书。
 
-接入令牌会出现在 shell 历史和 `docker inspect`。确认节点首次接入且 `/data/state` 已保存凭据后，**保留数据目录**，删除原节点容器并用不含 `-enroll-token` 的同参数命令重建，以清除 inspect 中的令牌；令牌也可在 Web 撤销。不要为了修复未上报或待应用删除数据库、key 或节点状态。如果节点显示「未上报」，检查节点容器日志、Master 地址、端口与 TLS/ALPN；「最新」只代表认证上报的期望配置已应用，不代表映射目标可达。节点状态列的刷新图标只发出请求，实际结果仍以节点上报为准。
+### 首次接入后的令牌清理
 
-## 7. 运维：备份、恢复、账号
+令牌在有效期内可重复使用，撤销或过期后失效；它可能留在 shell 历史和 `docker inspect` 中。
 
-停机备份 Master 的 `/data`（数据库、deployment key、内置节点 state 必须成套保存）；从**源码仓库目录**调用工具，备份目标必须为新目录：
+确认首次接入成功且 `/data/state` 已保存凭据后，停止并删除原节点容器，**保留数据目录**，用去掉 `-enroll-token` 的相同命令重建，再撤销不再需要的令牌。撤销令牌不会清除 inspect 或历史中的文本残留，不要公开完整启动命令。
+
+## 协议与配置参考
+
+### 配置归属
+
+| 设置 | 配置位置 |
+| --- | --- |
+| Master 监听、数据库、deployment key、内置 HTTPS | Master 角色 flags；部分设置持久化于 SQLite |
+| 节点 Master 地址、ID、首次令牌、状态目录、控制面 TLS 信任 | Server/Client 角色 flags |
+| 隧道协议、证书 PEM、密钥、入口和映射 | Master Web |
+| Client 公共隧道模板 | 从 Server 私有配置自动派生，Client 不本地覆盖 |
+
+不接受 YAML 配置文件、`-config` 或 `VEILINK_CONFIG`。Server 证书私钥、REALITY 私钥和 VLESS decryption 材料不会进入 Client 快照。
+
+### 传输组合
+
+| 传输 | 安全要求与边界 |
+| --- | --- |
+| VLESS TCP + TLS | 校验证书及名称；可选 Encryption、Vision |
+| VLESS TCP + REALITY | 公私钥、Short ID、Server Name 匹配；可选 Encryption、Vision |
+| VLESS TCP + plain | 必须启用 Encryption；禁止 Vision |
+| Hysteria2 | 独立 UDP/QUIC + TLS；需要证书、私钥和密码；不叠加 VLESS Encryption、REALITY、XHTTP、Vision |
+| XHTTP | Veilink 双端业务通道；HTTP 版本与模式须符合下表和能力矩阵 |
+
+TCP 映射可选择关闭 mux 或使用 `smux`、`yamux`、`h2mux`；UDP 业务使用授权 XUDP，不启用 TCP mux，也不代表原生 Hysteria2 datagram 互通。
+
+Vision 只用于 TCP + TLS/REALITY。只有独立已认证连接上的内层 TLS 1.3 满足结构和记录边界条件才可能直拷；mux、控制和 UDP 不裸传，Encryption 或无法安全识别的流保留加密回退。不宣称内核零拷贝。
+
+### XHTTP
+
+| 模式 | 行为 |
+| --- | --- |
+| `packet-up`（默认） | 分片上行，GET 流式下行 |
+| `stream-up` | 同会话流式上行与 GET 下行 |
+| `stream-one` | 单条双向请求，不使用会话 ID |
+| `auto` | 当前在非 REALITY 和 REALITY 下均选择 `packet-up`，不是完整参考实现的自动协商 |
+
+- 显式 HTTP/1.1 仅支持 `packet-up`。HTTP/2、HTTP/3 流模式仅支持直连 HTTPS 与 TLS 回源。
+- h2c 仅限直连 HTTP、plain 回源且启用 VLESS Encryption 的 `packet-up`；显式版本不降级。普通 HTTP 链路或回源段必须启用 Encryption；REALITY 外层保护的 XHTTP 按独立安全组合校验。
+- HTTP/3 需要 UDP 直连和端到端 QUIC/TLS。上行默认 POST，可选 PUT，前置代理须放行并禁用请求缓冲。不承诺通用 CDN 支持。
+- `host` 仅覆写业务 HTTP Host，限小写 DNS 名或 IPv4、无端口；不改变授权拨号地址或证书校验名称。反代须保留 Host。
+- 默认分片为 32768 字节、无额外间隔、逐片确认背压。随机分片、并发缓冲、padding、xmux、元数据位置和独立下行入口等高级参数见[XHTTP 能力边界](tests/deployment/xhttp-capability-matrix.md)，避免在两处重复维护字段范围。
+- 半关闭与上传确认是 Veilink 私有扩展；业务 Cookie 元数据不是 Master 的登录 Cookie。
+
+## 日常运维
+
+### 备份
+
+从源码仓库根目录执行 [备份工具](tools/backup-master.sh)，需要宿主机 Python 3，以及读取源目录、保留数字 UID/GID 的权限。该工具只支持离线备份，目标必须是**尚不存在的新目录**，父目录须存在。
+
+Master 数据库、deployment key 和内置节点状态须成套保存：
 
 ```sh
 docker stop veilink-master
@@ -185,27 +351,138 @@ tools/backup-master.sh backup master \
 docker start veilink-master
 ```
 
-恢复前先验证备份 `manifest.json`，并恢复到**新的空目录**，不要覆盖生产目录：
+检查工具退出状态与 `backup complete` 输出；失败的目录不可作为有效备份。备份含凭据，限制读取权限并加密存放。修改过数据库文件名或将状态放到 `/data` 外时，先确认工具要求与完整备份范围，不能直接套用默认示例。
+
+独立节点同样先停机，在对应节点主机执行：
+
+```sh
+docker stop veilink-server
+mkdir -p /opt/docker/veilink-server/backups
+tools/backup-master.sh backup node \
+  /opt/docker/veilink-server/data \
+  /opt/docker/veilink-server/backups/$(date +%Y%m%d-%H%M%S)
+docker start veilink-server
+```
+
+Client 备份将路径及容器名中的 `veilink-server` 替换为 `veilink-client`。
+
+### 恢复
+
+工具会校验 `manifest.json` 与备份文件内容。恢复到尚不存在的新目录，**不要覆盖生产目录**；将示例时间戳替换为实际备份目录名：
 
 ```sh
 tools/backup-master.sh restore master \
-  /opt/docker/veilink-master/backups/<timestamp> \
+  /opt/docker/veilink-master/backups/20260930-120000 \
   /opt/docker/veilink-master/recovery-data
 ```
 
-先在隔离环境验证登录、节点身份、心跳和业务探针，再切换正式实例；禁止旧、新 Master 同时提供写服务。备份包含凭据，须限制读取权限并加密存放。独立节点数据可用 `tools/backup-master.sh backup node <节点data目录> <新备份目录>` 备份。
+先在隔离环境验证登录、节点身份、上报和业务探针，再切换正式挂载。保留原数据副本，禁止旧、新 Master 同时提供写服务。旧 schema 不自动迁移或删库，任何数据删除都须先备份并得到明确授权。
 
-仅重置**已有**账号（不会创建管理员；成功后旧会话失效）：
+### 管理员维护
+
+仅修改已有唯一管理员，不创建数据库、key 或用户；成功后旧会话即时失效。
+
+改名只改用户名，密码 hash 不变，同名请求会被拒绝：
 
 ```sh
 docker exec -i veilink-master /usr/local/bin/veilink reset-admin-username -username new-admin
+```
+
+改密保留用户名。先用安全方式准备权限 `0600`、包含 12–72 字节新密码的文件，再从 stdin 读取；不要在 shell 命令中直接写密码：
+
+```sh
 docker exec -i veilink-master /usr/local/bin/veilink reset-admin-password -password-stdin < /opt/docker/veilink-master/config/admin-password.txt
 ```
 
-改名不改密码；改密须从权限 `0600` 的文件经 stdin 读取 12–72 字节密码，不要把密码放在命令参数或日志里。无管理员时只能通过受限访问的 Web 首次注册。
+使用自定义数据库或 key 路径时，两种命令均需补充对应的 `-database`、`-deployment-key`。改名命令拒绝密码 flags；改密命令拒绝 `-username`。密码更新并验证登录后，妥善清理临时密码文件。无管理员时只能通过受限 Web 首次注册。
 
-## 边界与许可证
+### 升级与回滚
 
-只转发授权映射，不是开放代理。支持原生私有 VLESS、Hysteria2、TCP mux、XUDP 等；Server 证书/私钥由 Web 保存，不通过节点 flags 下发私钥。XHTTP `packet-up`、`stream-up`、`stream-one` 是业务通道，和上文 Master 的 gRPC/h2c 不是同一个反代路径；业务 HTTP 回源须按安全模式启用 VLESS Encryption，HTTP/3 须 UDP 直连 HTTPS/TLS，不承诺通用 CDN/Xray 互通。旧字段与旧数据库 schema 不自动迁移或删除，处理已有用户数据前先备份并获得删除授权。真实多主机 WAN/NAT、24–72 小时长稳、生产 CA 生命周期和供应链签名仍须目标环境验收。历史实验记录在 `tests/`，不代表当前版本已完成生产认证。
+1. 记录当前镜像版本和运行参数，敏感令牌不要写入公开日志。
+2. 停机备份 Master 数据和独立节点状态，确认备份有效。
+3. 拉取目标版本镜像，保留数据挂载，以原有角色和 flags 重建容器。
+4. 检查日志、健康接口、节点应用状态及实际业务请求。
+5. 回滚前备份当前状态，确认旧版本兼容性；不兼容时用匹配旧版本的成套备份在新目录验证，不直接覆盖数据库。
 
-源码与文档适用 [GPL-3.0-or-later](LICENSE)；第三方组件的许可与分发声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。项目约束见 [AGENTS.md](AGENTS.md)。
+## 故障排查
+
+按“容器 → 控制面 → 配置应用 → 业务目标”的顺序检查，不以删库或关闭校验代替排障。
+
+| 现象 | 优先检查 |
+| --- | --- |
+| 镜像拉取 `DENIED: invalid token` | GHCR 或镜像代理的鉴权、路径；这不是 Veilink 启动错误 |
+| 容器返回 ID 后退出 | `docker ps -a` 和容器日志；角色是否写在 flags 前、目录权限、端口占用 |
+| 内置 Server 与 Master 端口冲突 | 用另一个 Master 端口启动，再到 Web 调整内置节点；不要删库 |
+| `flag provided but not defined` | 使用当前角色 `--help`；没有 `-embedded-server-server-name` 或 `-config` |
+| 远端无法访问 `127.0.0.1:2545` | 该地址仅本机可达；使用反代或受限内网监听 |
+| `tls: no application protocol` | 外部 HTTPS 是否协商 ALPN `h2`、nginx HTTP/2 模块和 `grpc_pass` |
+| 注册/登录直接 403 | Host、Origin 和非标准外部端口是否匹配 |
+| 登录后写操作 403 | 会话 Cookie、`X-CSRF-Token`、`Sec-Fetch-Site`；不要关闭 CSRF |
+| 节点未上报 | 节点日志、Master 地址、证书名称/CA、端口、节点 ID、令牌和状态目录 |
+| 配置待应用或应用失败 | 对比期望/已应用修订，查看节点错误；刷新请求不是成功确认 |
+| 配置已应用但业务失败 | Server 业务端口、Client 容器目标可达性、TCP/UDP 协议、防火墙/NAT、目标认证 |
+
+常用诊断命令（按角色选择已存在的容器）：
+
+```sh
+docker logs --tail=200 veilink-master
+docker logs --tail=200 veilink-server
+docker logs --tail=200 veilink-client
+docker exec veilink-master /usr/local/bin/veilink version
+docker exec veilink-master /usr/local/bin/veilink master --help
+```
+
+反馈问题时提供版本、角色、传输方式、脱敏配置、复现步骤与相关日志。不要附上接入令牌、会话 Cookie、私钥或数据库。
+
+## 开发与验证
+
+### 项目结构
+
+| 路径 | 内容 |
+| --- | --- |
+| `cmd/veilink`、`internal/cli`、`internal/config` | 统一命令入口与角色参数 |
+| `internal/master`、`internal/control`、`internal/node` | 管理服务、控制面与节点配置应用 |
+| `internal/store`、`internal/httpapi` | 配置持久化与 Web API |
+| `internal/tunnel` | 隧道、复用与数据传输 |
+| `frontend` | 唯一 Web 界面，Vue 3 + TypeScript + Vite |
+| `tests/integration`、`tests/deployment` | 集成与部署测试 |
+| `tests/web` | 历史 Web 验收记录和截图 |
+| `tools` | 离线备份及节点验证工具 |
+
+Go 版本以 [go.mod](go.mod) 为准，当前为 `1.27.0`；前端发布构建使用 Node.js 22 和 npm 锁文件。前端 `npm run build` 输出到仓库根目录 `html/`，统一镜像将其放入 `/usr/local/html`，仅 Master 加载。
+
+### 检查命令
+
+以下是维护者验收命令，不代表本次文档更新已执行这些检查：
+
+```sh
+go test ./...
+go vet ./...
+go test -race ./internal/store ./internal/control ./internal/httpapi ./internal/master ./internal/node ./internal/tunnel ./tests/deployment
+go test -tags=integration ./tests/integration -count=1
+(
+  cd frontend &&
+  npm ci &&
+  node --test tests/*.mjs &&
+  npm run typecheck &&
+  npm run build
+)
+git diff --check
+```
+
+此外需构建一次统一镜像，分别检查 Master、Server、Client 的镜像内容、启动和健康状态；节点 `healthy` 只表示进程存活，业务验收仍需授权节点和实际目标请求。不要提交生成的 `bin/`、`html/`、密钥、数据库或部署 env 文件。
+
+### 能力与验证材料
+
+- [协议矩阵](tests/deployment/protocol-matrix.md)：组合、授权和往返覆盖范围。
+- [XHTTP 能力边界](tests/deployment/xhttp-capability-matrix.md)：字段、模式与限制。
+- [XHTTP 验证记录](tests/deployment/xhttp.md)：对应阶段的执行证据。
+- [统一镜像验收记录](tests/web/unified-image-acceptance.md)：历史镜像与三角色验证。
+
+`tests/` 下的执行结果只对应记录中的版本和环境，不是当前版本的生产认证。真实多主机 WAN/NAT、24–72 小时长稳、生产 CA 生命周期和供应链签名仍需目标环境验收。开发约束集中在 [AGENTS.md](AGENTS.md)。
+
+## 许可证与第三方组件
+
+Veilink 原创代码和文档（另有声明者除外）采用 [GPL-3.0-or-later](LICENSE)，授权声明见 [NOTICE](NOTICE)。
+
+第三方组件保留各自许可。依赖版本、MPL-2.0 覆盖文件、上游来源、对应源码获取及分发义务见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

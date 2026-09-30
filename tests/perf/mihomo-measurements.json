@@ -1,0 +1,18 @@
+{
+  "environment": {"date": "2026-09-25", "os": "darwin/arm64", "cpu": "Apple M4", "cpus": 10, "go": "go1.27.0", "gomaxprocs_default": 10, "serial_non_race": true},
+  "references": {"mihomo_branch": "Alpha", "mihomo_commit": "f103639c808d93a2c34cae56757b458862871b22", "xray_commit": "d562d8947d3175db86b4fa849742433a9876cb63", "xray_version": "26.9.9"},
+  "method": {"unit": "MiB/s, echo payload counted once", "tcp_bytes": 536870912, "tcp_block_bytes": 65536, "tcp_warmup_blocks": 16, "tcp_inner_tls": "1.3", "udp_payload_bytes": 1200, "udp_batch": 16, "udp_count": 16384, "udp_warmup_count": 256, "udp_retransmission": false, "rtt_samples": 200},
+  "mihomo_config": {"up": "0", "down": "0", "cwnd": 32, "bbr-profile": "standard", "ignore-client-bandwidth": true, "brutal": false, "udp-mtu_default": 1197, "stream_receive_initial_max_bytes": 8388608, "connection_receive_initial_max_bytes": 20971520, "outer_tls_trust": "SHA256 certificate pin", "extra_mux": false},
+  "groups": [
+    {"name": "mihomo-standard", "tcp": [101.494, 101.981, 97.100], "udp": [29.084, 28.802, 28.814], "tcp_median": 101.494, "udp_median": 28.814},
+    {"name": "mihomo-cwnd128", "tcp": [105.426, 103.053, 99.636], "udp": [28.853, 30.014, 30.281], "tcp_median": 103.053, "udp_median": 30.014},
+    {"name": "mihomo-windows", "stream_initial_max_bytes": [16777216, 33554432], "connection_initial_max_bytes": [33554432, 67108864], "tcp": [102.469, 102.529, 100.296], "udp": [29.380, 29.059, 29.261], "tcp_median": 102.469, "udp_median": 29.261},
+    {"name": "mihomo-p4", "gomaxprocs_all_three_processes": 4, "tcp": [105.010, 101.235, 102.668], "udp": [29.043, 28.849, 30.311], "tcp_median": 102.668, "udp_median": 29.043},
+    {"name": "veilink-current-pool1", "tcp": [132.892, 130.398, 133.356], "udp": [48.823, 48.194, 49.761], "tcp_median": 132.892, "udp_median": 48.823},
+    {"name": "xray-standard", "tcp": [107.035, 99.944, 97.225], "tcp_median": 99.944, "udp": [], "udp_median": null, "udp_failures": ["initial attempt: first warmup batch received 14/16 then 5s timeout", "independent process restart: first warmup batch received 14/16 then 5s timeout"]},
+    {"name": "mihomo-mtu1400", "udp-mtu": 1400, "tcp": [103.913, 100.579, 111.818], "udp": [38.302, 39.132, 39.179], "tcp_median": 103.913, "udp_median": 39.132},
+    {"name": "mihomo-standard-recheck", "tcp": [102.672, 97.086, 101.404], "udp": [28.753, 30.154, 30.506], "tcp_median": 101.404, "udp_median": 30.154}
+  ],
+  "setup_failures_excluded": ["initial dependency download timed out; command-scoped GOPROXY=https://goproxy.cn retry succeeded", "mihomo certificate outside per-process home rejected", "outbound certificate field requires client key, not a CA trust file", "custom CA did not take effect for outbound in this startup; used explicit SHA256 pin instead", "VEILINK_PERF_CASE=hy2 matched zero cases; reran uppercase HY2 and required six PERF records"],
+  "limitations": ["loopback only; no controlled loss or Linux measurement", "UDP is finite-window goodput, not line rate", "Veilink UDP uses reliable XUDP/mux stream; references use native DATAGRAM", "mihomo and Xray use separate client/server processes, Veilink fixture is in-process", "no new multi-stream or profile experiment in this round", "no production change; overall HY2 target remains unmet"]
+}
