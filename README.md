@@ -72,8 +72,8 @@ server {
 
     # 只转换本站的精确 Origin；其它 Origin 原样传递，由 Master 拒绝跨站写入。
     set $veilink_origin $http_origin;
-    if ($http_origin = "https://panel.example.com:8843") {
-        set $veilink_origin "http://panel.example.com:8843";
+    if ($http_origin = "https://$http_host" ) {
+        set $veilink_origin "http://$http_host";
     }
 
     location /veilink.control.v1.Control/ {
