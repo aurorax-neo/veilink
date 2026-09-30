@@ -34,6 +34,16 @@ const desk = reactive<Desk>({
   error: '',
   notice: '',
   noticeBad: false,
+  async reloadNodes(id: string) {
+    const ticket = generation
+    const previous = desk.nodes.find(node => node.id === id)
+    const nodes = await api<Node[] | null>('/nodes')
+    if (ticket !== generation || phase.value !== 'app' || !previous || desk.nodes.find(node => node.id === id) !== previous) return
+    if (!Array.isArray(nodes)) throw new ApiError('节点数据格式不正确。', 200)
+    const updated = nodes.find(node => node.id === id)
+    if (!updated) throw new ApiError('节点已不存在，请刷新列表。', 404)
+    desk.nodes = desk.nodes.map(node => node.id === id ? updated : node)
+  },
   async reload(options?: { silent?: boolean }) {
     if (options?.silent && desk.loading) return
     const ticket = ++generation

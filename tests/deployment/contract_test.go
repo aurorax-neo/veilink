@@ -93,12 +93,12 @@ func TestUnifiedImageContents(t *testing.T) {
 		t.Fatal(err)
 	}
 	file := string(body)
-	for _, required := range []string{"FROM golang:1.27-alpine3.23 AS build", "FROM node:22-alpine3.23 AS ui", "FROM alpine:3.23", "org.opencontainers.image.version", "org.opencontainers.image.revision", "org.opencontainers.image.source"} {
+	for _, required := range []string{"FROM --platform=$BUILDPLATFORM golang:1.27-alpine3.23 AS build", "FROM --platform=$BUILDPLATFORM node:22-alpine3.23 AS ui", "\nFROM alpine:3.23\n", "ARG TARGETOS\n", "ARG TARGETARCH\n", "CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build", "org.opencontainers.image.version", "org.opencontainers.image.revision", "org.opencontainers.image.source"} {
 		if !strings.Contains(file, required) {
 			t.Errorf("image build provenance missing %q", required)
 		}
 	}
-	for _, floating := range []string{"FROM golang:alpine", "FROM node:alpine"} {
+	for _, floating := range []string{"golang:alpine", "node:alpine"} {
 		if strings.Contains(file, floating) {
 			t.Errorf("floating build base remains %q", floating)
 		}
@@ -110,6 +110,12 @@ func TestUnifiedImageContents(t *testing.T) {
 	}
 	if strings.Count("\n"+file, "\nFROM ") != 3 || strings.Count(file, "ENTRYPOINT ") != 1 || strings.Count(file, "HEALTHCHECK ") != 1 {
 		t.Error("expected two build stages and one runtime product")
+	}
+	// Target and release metadata must not invalidate the shared dependency layer.
+	for _, arg := range []string{"ARG TARGETOS\n", "ARG TARGETARCH\n", "ARG VERSION=dev\n", "ARG COMMIT=unknown\n"} {
+		if strings.Index(file, arg) < strings.Index(file, "RUN go mod download\n") {
+			t.Errorf("%q must follow dependency download", arg)
+		}
 	}
 	for _, role := range []string{"master", "server", "client"} {
 		if strings.Contains(strings.ToLower(file), " as "+role+"\n") {

@@ -116,3 +116,35 @@ test('session restoration stays on boot screen until confirmed, never flashes lo
  await firstRun.mount()
  assert.equal(firstRun.phase.value,'register')
 })
+
+test('node-only read merges the target and never toggles global loading or reads unrelated APIs', async () => {
+ const calls=[]
+ const app=setup(async path=>{calls.push(path); return [{id:'a',last_seen:20},{id:'b',last_seen:999}]})
+ app.phase.value='app';app.desk.nodes=[{id:'a',last_seen:1},{id:'b',last_seen:2}]
+ app.desk.mappings=[{id:'mapping'}]
+ await app.desk.reloadNodes('a')
+ assert.deepEqual(calls,['/nodes']);assert.equal(app.desk.loading,false)
+ assert.equal(app.desk.nodes[0].last_seen,20);assert.equal(app.desk.nodes[1].last_seen,2)
+ assert.equal(app.desk.mappings[0].id,'mapping')
+})
+test('late node reads cannot overwrite logout, polling or a global refresh', async () => {
+ for(const mode of ['logout','poll','global']) {
+  let finish, first=true
+  const app=setup(path=>{if(first){first=false;return new Promise(resolve=>{finish=resolve})}return Promise.resolve(path==='/nodes'?[{id:'a',last_seen:50}]:[])})
+  app.phase.value='app';app.desk.nodes=[{id:'a',last_seen:1}]
+  const pending=app.desk.reloadNodes('a')
+  if(mode==='logout'){app.phase.value='login';app.resetDesk()}
+  else await app.desk.reload(mode==='poll'?{silent:true}:undefined)
+  finish([{id:'a',last_seen:2}]);await pending
+  assert.equal(app.desk.nodes[0]?.last_seen,mode==='logout'?undefined:50)
+  assert.equal(app.desk.loading,false)
+ }
+})
+test('malformed or missing target reads fail without overwriting nodes', async () => {
+ for(const response of [null,{},[]]){
+  const app=setup(async()=>response)
+  app.phase.value='app';app.desk.nodes=[{id:'a',last_seen:1}]
+  await assert.rejects(app.desk.reloadNodes('a'))
+  assert.equal(app.desk.nodes[0].last_seen,1);assert.equal(app.desk.loading,false)
+ }
+})

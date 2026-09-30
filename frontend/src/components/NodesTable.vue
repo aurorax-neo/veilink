@@ -23,12 +23,15 @@ const configNode = ref<Node | null>(null)
 const action = ref<'revoke' | 'delete'>('delete')
 const label = computed(() => props.role === 'server' ? '服务端' : '客户端')
 const refreshing = ref(new Set<string>())
+const refreshFeedback = ref<Record<string, { text: string; bad: boolean }>>({})
+let active = true
 const now = ref(Date.now())
 let clockTimer: ReturnType<typeof setInterval> | undefined
 onMounted(() => {
   clockTimer = setInterval(() => { now.value = Date.now() }, 1000)
 })
 onUnmounted(() => {
+  active = false
   if (clockTimer) clearInterval(clockTimer)
   clockTimer = undefined
 })
@@ -79,14 +82,21 @@ function setRefreshing(id: string, busy: boolean) {
   refreshing.value = next
 }
 async function refreshNode(node: Node) {
-  if (node.revoked || refreshing.value.has(node.id)) return
+  if (!active || node.revoked || refreshing.value.has(node.id)) return
   setRefreshing(node.id, true)
+  delete refreshFeedback.value[node.id]
   try {
     const result = await api<{ connected: boolean }>(`/nodes/${encodeURIComponent(node.id)}/refresh`, 'POST', {})
-    if (!result.connected) desk.notify('节点未连接，重连后自动同步')
-    await desk.reload()
+    if (!active) return
+    if (!result || typeof result.connected !== 'boolean') throw new Error('刷新响应无效，请重试。')
+    await desk.reloadNodes(node.id)
+    if (!active) return
+    refreshFeedback.value[node.id] = {
+      text: result.connected ? '已请求上报，等待节点反馈' : '推送通道未连接，重连后自动同步',
+      bad: false,
+    }
   } catch (error) {
-    desk.notify(error instanceof Error ? error.message : '请求节点更新状态失败，请稍后重试。', true)
+    if (active) refreshFeedback.value[node.id] = { text: error instanceof Error ? error.message : '请求节点更新状态失败，请稍后重试。', bad: true }
   } finally {
     setRefreshing(node.id, false)
   }
@@ -115,7 +125,7 @@ async function run() {
         <thead><tr><th scope="col">名称 / 软件版本</th><th scope="col">状态</th><th v-if="role === 'server'" scope="col">本地监听 / 客户端连接地址</th><th v-if="role === 'server'" scope="col">隧道</th><th scope="col">映射</th><th scope="col">配置是否最新</th><th scope="col">操作</th></tr></thead>
         <tbody><tr v-for="node in rows" :key="node.id" :class="{ selected: selectedId === node.id }">
           <td><button type="button" class="text-btn" :aria-expanded="selectedId === node.id" @click="selectedId = selectedId === node.id ? '' : node.id">{{ node.name }}</button><small class="node-id" :title="node.id">{{ node.id }}</small><small v-if="node.embedded">内置节点</small><small class="software-version" :title="node.software_version || '等待节点上报运行版本'">软件：{{ node.software_version || '未上报' }}</small></td>
-          <td><div class="node-presence"><Badge :text="presence(node, now).text" :tone="presence(node, now).tone" /><button type="button" class="icon-btn refresh-node" :disabled="node.revoked || refreshing.has(node.id)" @click="refreshNode(node)" :class="{ spinning: refreshing.has(node.id) }" :title="'已请求节点立即同步并上报，结果以节点上报为准'" :aria-label="'已请求节点立即同步并上报，结果以节点上报为准'"><span aria-hidden="true">↻</span></button></div><small class="last-seen">最后在线：{{ seenText(node.last_seen, now) }}</small></td>
+          <td><div class="node-presence"><Badge :text="presence(node, now).text" :tone="presence(node, now).tone" /><button type="button" class="icon-btn refresh-node" :disabled="node.revoked || refreshing.has(node.id)" @click="refreshNode(node)" :class="{ spinning: refreshing.has(node.id) }" :aria-busy="refreshing.has(node.id)" title="请求节点刷新状态" :aria-label="`刷新节点 ${node.name}`"><span aria-hidden="true">↻</span></button></div><small class="last-seen">最后在线：{{ seenText(node.last_seen, now) }}</small><span v-if="refreshFeedback[node.id]" class="node-refresh-feedback" :class="{ bad: refreshFeedback[node.id]!.bad }" role="status">{{ refreshFeedback[node.id]!.text }}</span></td>
           <td v-if="role === 'server'"><small>监听：{{ localListen(node) }} · {{ node.tunnel?.protocol === 'hysteria2' || node.tunnel?.hysteria2?.password ? 'UDP' : 'TCP' }}</small><small v-for="item in connectList(node)" :key="item.id">{{ item.name }} · {{ endpoint(item.host, item.port) }}</small></td>
           <td v-if="role === 'server'">{{ tunnelLabel(node) }}</td><td>{{ mappings(node.id).length }}</td>
           <td><div class="revision-status" role="group" :title="revisionDescription(node)" :aria-label="revisionDescription(node)"><Badge :text="revisionLabel(node)" :tone="revisionState(node).tone" /></div></td>

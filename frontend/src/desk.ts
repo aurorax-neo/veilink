@@ -13,6 +13,7 @@ export interface Desk {
   error: string
   notice: string
   noticeBad: boolean
+  reloadNodes: (id: string) => Promise<void>
   reload: (options?: { silent?: boolean }) => Promise<void>
   notify: (text: string, bad?: boolean) => void
   dismissNotice: () => void

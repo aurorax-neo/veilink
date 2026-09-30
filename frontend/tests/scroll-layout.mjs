@@ -28,3 +28,17 @@ test('narrow screens keep a bounded navigation scroll area above the content', (
   // Login and boot are not inside .shell; keep natural page scrolling there.
   assert.match(app, /<LoginView v-else-if=/)
 })
+
+test('wide workspace uses available width and node columns total 100 percent', () => {
+ assert.match(rule('.stage'), /width: calc\(100% - 56px\)/)
+ assert.doesNotMatch(rule('.stage'), /1240px|max-width/)
+ assert.equal((css.match(/^\.shell \{/gm)||[]).length,1)
+ const widths=[...css.matchAll(/\.nodes-table th[^}]+width: (\d+)%;/g)].map(m=>Number(m[1]))
+ assert.equal(widths.reduce((a,b)=>a+b,0),100)
+})
+test('mapping rows retain Pool cell so status, traffic and actions align with headers', () => {
+ const source=readFileSync(new URL('../src/views/ProxiesView.vue',import.meta.url),'utf8')
+ assert.match(source, /<td>\{\{ mapping.pool \|\| 1 \}\}/)
+ const row=source.match(/<tbody><tr v-for="mapping in rows"[\s\S]*?<\/tr>/)[0]
+ assert.equal((row.match(/<td[ >]/g)||[]).length,7)
+})

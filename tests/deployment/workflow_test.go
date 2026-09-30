@@ -62,3 +62,38 @@ func TestDockerSoftwareIdentity(t *testing.T) {
 		}
 	}
 }
+
+func TestReleaseWorkflowContract(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join(projectRoot(t), ".github/workflows/release.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(body)
+	for _, required := range []string{
+		"actions/checkout@v7.0.1", "actions/setup-go@v7.0.0", "actions/setup-node@v7.0.0",
+		"docker/setup-qemu-action@v4.4.0", "docker/setup-buildx-action@v4.4.1",
+		"docker/login-action@v4.6.0", "docker/metadata-action@v6.2.0", "docker/build-push-action@v7.4.0",
+		"go test ./... -count=1", "go vet ./...",
+		"go test -race ./internal/store ./internal/control ./internal/httpapi ./internal/master",
+		"go test -tags=integration ./tests/integration -count=1",
+		"npm ci", "node --test tests/*.mjs", "npm run typecheck", "npm run build", "git diff --check",
+		"needs: checks", "needs: [checks, image]", "platforms: linux/amd64,linux/arm64",
+		"cache-from: type=gha", "cache-to: type=gha,mode=max", "provenance: mode=max", "sbom: true",
+		"push: true", "--verify-tag", "persist-credentials: false",
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Errorf("missing release workflow contract %q", required)
+		}
+	}
+	if strings.Count(workflow, "runs-on: ubuntu-24.04") != 3 {
+		t.Error("all three release jobs must pin Ubuntu 24.04")
+	}
+	if strings.Count(workflow, "uses: docker/build-push-action@") != 1 {
+		t.Error("release must publish one unified multi-platform image")
+	}
+	for _, forbidden := range []string{"ubuntu-latest", "continue-on-error:", "target:", "role:", "matrix:"} {
+		if strings.Contains(workflow, forbidden) {
+			t.Errorf("forbidden release workflow behavior %q", forbidden)
+		}
+	}
+}

@@ -2,18 +2,21 @@ ARG NPM_REGISTRY=https://registry.npmmirror.com
 ARG GOPROXY=https://goproxy.cn,direct
 ARG APK_MIRROR=https://mirrors.ustc.edu.cn/alpine
 
-FROM golang:1.27-alpine3.23 AS build
+# Compile on the builder host; only the runtime stage needs target emulation.
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine3.23 AS build
 WORKDIR /src
 ARG GOPROXY
-ARG VERSION=dev
-ARG COMMIT=unknown
 ENV GOPROXY=${GOPROXY}
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X veilink/internal/buildinfo.Version=${VERSION} -X veilink/internal/buildinfo.Commit=${COMMIT}" -o /out/veilink ./cmd/veilink
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=dev
+ARG COMMIT=unknown
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w -X veilink/internal/buildinfo.Version=${VERSION} -X veilink/internal/buildinfo.Commit=${COMMIT}" -o /out/veilink ./cmd/veilink
 
-FROM node:22-alpine3.23 AS ui
+FROM --platform=$BUILDPLATFORM node:22-alpine3.23 AS ui
 WORKDIR /src/frontend
 ARG NPM_REGISTRY
 RUN npm config set registry ${NPM_REGISTRY}
