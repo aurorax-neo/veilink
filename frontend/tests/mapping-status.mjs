@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import vm from 'node:vm'
 import ts from 'typescript'
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, reactive, ref, watch, watchEffect } from 'vue'
 
 const read = path => readFileSync(new URL(path, import.meta.url), 'utf8')
 const source = read('../src/views/ProxiesView.vue')
@@ -18,25 +18,25 @@ function setup() {
  let mount,unmount
  const timers=[]
  const responses=[]
- const context=vm.createContext({exports:{},computed,reactive,ref,watch,...format.exports,inject:()=>desk,deskKey:{},api:()=>new Promise((resolve,reject)=>responses.push({resolve,reject})),onMounted:cb=>{mount=cb},onUnmounted:cb=>{unmount=cb},setInterval:(cb,delay)=>{timers.push({cb,delay});return timers.length},clearInterval:()=>{}})
+ const context=vm.createContext({exports:{},computed,reactive,ref,watch,watchEffect,...format.exports,inject:()=>desk,deskKey:{},api:()=>new Promise((resolve,reject)=>responses.push({resolve,reject})),onMounted:cb=>{mount=cb},onUnmounted:cb=>{unmount=cb},setInterval:(cb,delay)=>{timers.push({cb,delay});return timers.length},clearInterval:()=>{}})
  vm.runInContext(transpile(script+'\nglobalThis.view={tunnelState,refreshStatus,statuses,statusError};'),context)
  return { desk,timers,responses,mount:()=>mount(),unmount:()=>unmount(),...context.view }
 }
 const flush=()=>new Promise(resolve=>setImmediate(resolve))
-const ok={a:{server:{acknowledged:true,reason:'acknowledged'},client:{acknowledged:true,reason:'acknowledged'}}}
+const ok={a:{server:{acknowledged:true,reason:'acknowledged',linked:true},client:{acknowledged:true,reason:'acknowledged',linked:true}}}
 
-test('mapping status requires both endpoint acknowledgements, not node global revision or reachability',async()=>{
+test('tunnel state uses live sessions, not configuration acknowledgement',async()=>{
  const e=setup()
- assert.equal(e.tunnelState(mapping).text,'等待服务端确认 · 等待客户端确认')
+ assert.equal(e.tunnelState(mapping).text,'未连接')
  e.mount(); assert.equal(e.timers.find(t=>t.delay===5000)?.delay,5000)
  e.responses.shift().resolve(ok); await flush()
- assert.equal(e.tunnelState(mapping).text,'两端已应用')
+ assert.equal(e.tunnelState(mapping).text,'已连接')
  e.desk.nodes[0].error='unrelated change failed';e.desk.nodes[0].desired_revision=3;e.desk.nodes[0].applied_revision=2
- assert.equal(e.tunnelState(mapping).text,'两端已应用')
+ assert.equal(e.tunnelState(mapping).text,'已连接')
  e.timers.find(t=>t.delay===5000).cb()
- assert.equal(e.tunnelState(mapping).text,'等待服务端确认 · 等待客户端确认')
- e.responses.shift().resolve({a:{server:{acknowledged:false,reason:'apply_failed'},client:ok.a.client}});await flush()
- assert.equal(e.tunnelState(mapping).text,'服务端应用失败 · 客户端已应用')
+ assert.equal(e.tunnelState(mapping).text,'已连接')
+ e.responses.shift().resolve({a:{server:{acknowledged:true,reason:'acknowledged',linked:false},client:{acknowledged:true,reason:'acknowledged',linked:true}}});await flush()
+ assert.equal(e.tunnelState(mapping).text,'服务端未连接')
  e.unmount()
 })
 
@@ -45,35 +45,35 @@ test('failed, malformed, stale and late responses fail closed',async()=>{
  const stale=e.responses.shift()
  e.refreshStatus();e.responses.shift().resolve(ok);await flush()
  stale.resolve({a:{server:{acknowledged:false,reason:'unknown'},client:ok.a.client}});await flush()
- assert.equal(e.tunnelState(mapping).text,'两端已应用')
+ assert.equal(e.tunnelState(mapping).text,'已连接')
  e.refreshStatus();e.responses.shift().reject(new Error('offline'));await flush()
- assert.equal(e.tunnelState(mapping).text,'等待服务端确认 · 等待客户端确认');assert.match(e.statusError.value,/失败/)
+ assert.equal(e.tunnelState(mapping).text,'未连接');assert.match(e.statusError.value,/失败/)
  e.refreshStatus();e.responses.shift().resolve(null);await flush()
- assert.equal(e.tunnelState(mapping).text,'等待服务端确认 · 等待客户端确认')
+ assert.equal(e.tunnelState(mapping).text,'未连接')
  e.refreshStatus();const late=e.responses.shift();e.unmount();late.resolve(ok);await flush()
- assert.equal(e.tunnelState(mapping).text,'等待服务端确认 · 等待客户端确认')
- assert.match(source,/两端已应用只说明配置已应用/)
- assert.match(source,/不是目标服务探针/)
+ assert.equal(e.tunnelState(mapping).text,'未连接')
+ assert.match(source,/已连接/)
+ assert.doesNotMatch(source,/两端已应用|配置确认/)
 })
 
 test('desk reload clears prior status and requests fresh per-mapping acknowledgement',async()=>{
  const e=setup();e.mount()
  e.responses.shift().resolve(ok);await flush()
- assert.equal(e.tunnelState(mapping).text,'两端已应用')
+ assert.equal(e.tunnelState(mapping).text,'已连接')
  e.desk.loading=true;await flush()
  e.desk.mappings=[{...mapping}]
  e.desk.loading=false;await flush()
- assert.equal(e.tunnelState(mapping).text,'等待服务端确认 · 等待客户端确认')
+ assert.equal(e.tunnelState(mapping).text,'已连接')
  assert.ok(e.responses.length>0)
  e.responses.at(-1).resolve(ok);await flush()
- assert.equal(e.tunnelState(mapping).text,'两端已应用')
+ assert.equal(e.tunnelState(mapping).text,'已连接')
  e.unmount()
 })
 
 test('one side waiting stays visible beside the acknowledged side',async()=>{
  const e=setup();e.mount()
- e.responses.shift().resolve({a:{server:{acknowledged:true,reason:'acknowledged'},client:{acknowledged:false,reason:'unknown'}}});await flush()
- assert.equal(e.tunnelState(mapping).text,'服务端已应用 · 等待客户端确认')
+ e.responses.shift().resolve({a:{server:{acknowledged:true,reason:'acknowledged',linked:true},client:{acknowledged:false,reason:'unknown',linked:false}}});await flush()
+ assert.equal(e.tunnelState(mapping).text,'客户端未连接')
  e.desk.nodes[1].last_seen=stamp-120
  assert.equal(e.tunnelState(mapping).text,'客户端离线')
  e.desk.nodes[0].last_seen=stamp-120

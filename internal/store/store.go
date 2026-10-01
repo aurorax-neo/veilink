@@ -40,6 +40,7 @@ type Store struct {
 	listeners   map[chan int64]string
 	traffic     map[string]trafficNode
 	mappingAcks map[string]map[string]mappingAck
+	links       map[string]map[string]struct{}
 }
 
 // MappingStatus represents in-process configuration acknowledgement, not reachability.
@@ -50,6 +51,7 @@ type MappingStatus struct {
 type MappingEndpointStatus struct {
 	Acknowledged bool   `json:"acknowledged"`
 	Reason       string `json:"reason"`
+	Linked       bool   `json:"linked"`
 }
 type mappingAck struct {
 	Policy string
@@ -103,7 +105,13 @@ func (s *Store) MappingStatuses() (map[string]MappingStatus, error) {
 		policy := mappingPolicy(st, m)
 		endpoint := func(nodeID string) MappingEndpointStatus {
 			status := MappingEndpointStatus{Reason: "unknown"}
-			if n, ok := st.Nodes[nodeID]; !ok || n.Revoked {
+			n, ok := st.Nodes[nodeID]
+			if ok && !n.Revoked && !n.Disabled && n.LastSeen > 0 && time.Now().Unix()-n.LastSeen < 90 {
+				if _, up := s.links[nodeID][m.BindingID]; up {
+					status.Linked = true
+				}
+			}
+			if !ok || n.Revoked {
 				status.Reason = "node_unavailable"
 				return status
 			}
@@ -125,6 +133,41 @@ func (s *Store) MappingStatuses() (map[string]MappingStatus, error) {
 		out[id] = MappingStatus{Server: endpoint(m.ServerID), Client: endpoint(m.ClientID)}
 	}
 	return out, nil
+}
+
+// ReportLinks replaces one node's live tunnel bindings. Unknown IDs are ignored.
+// An empty report means that node currently has no authenticated tunnel session.
+func (s *Store) ReportLinks(id, credential string, bindings []string) error {
+	if len(bindings) > 64 {
+		return ErrInvalid
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, err := s.load()
+	if err != nil {
+		return err
+	}
+	if !s.authorized(st, id, credential) {
+		return ErrAuth
+	}
+	allowed := map[string]bool{}
+	for _, b := range st.Bindings {
+		if b.ServerID == id || b.ClientID == id {
+			allowed[b.ID] = true
+		}
+	}
+	next := map[string]struct{}{}
+	for _, bindingID := range bindings {
+		if bindingID == "" || len(bindingID) > 80 || !allowed[bindingID] {
+			continue
+		}
+		next[bindingID] = struct{}{}
+	}
+	if s.links == nil {
+		s.links = map[string]map[string]struct{}{}
+	}
+	s.links[id] = next
+	return nil
 }
 
 func Open(path, keyPath string) (*Store, error) {
@@ -454,7 +497,7 @@ func affectedNodes(before, after state) map[string]bool {
 		if exists && nodeConfigEqual(old, next) {
 			continue
 		}
-		if !exists || old.Revoked != next.Revoked || (old.Role == "server" && !serverClientConfigEqual(old, next)) {
+		if !exists || old.Revoked != next.Revoked || old.Disabled != next.Disabled || (old.Role == "server" && !serverClientConfigEqual(old, next)) {
 			for peer := range bindingPeers(before, id) {
 				affected[peer] = true
 			}
@@ -784,6 +827,7 @@ func (s *Store) saveNode(n model.Node, embedded bool) (model.Node, error) {
 			n.LastSeen = old.LastSeen
 			n.Error = old.Error
 			n.Embedded = old.Embedded || embedded
+			n.Disabled = old.Disabled
 		}
 		if n.Role == "server" {
 			if n.Tunnel.Reality.PrivateKey != "" {
@@ -804,6 +848,20 @@ func (s *Store) saveNode(n model.Node, embedded bool) (model.Node, error) {
 		return validate(st)
 	})
 	return n, e
+}
+
+// SetNodeDisabled stops or resumes a node without revoking its credential.
+// A disabled server is removed from client snapshots, so clients do not dial it.
+func (s *Store) SetNodeDisabled(id string, disabled bool) error {
+	return s.mutate("node.disable", id, func(st *state) error {
+		n, ok := st.Nodes[id]
+		if !ok || n.Revoked {
+			return ErrInvalid
+		}
+		n.Disabled = disabled
+		st.Nodes[id] = n
+		return nil
+	})
 }
 func (s *Store) RemoveNode(id string, remove bool) error {
 	return s.mutate("node.revoke", id, func(st *state) error {
@@ -940,11 +998,14 @@ func (s *Store) Snapshot(id, credential string) (model.Snapshot, error) {
 		currentNode.Tunnel = model.LocalTLS{}
 	}
 	out := model.Snapshot{Revision: currentNode.DesiredRevision, Node: currentNode, Nodes: []model.Node{}, Bindings: []model.Binding{}, Mappings: []model.Mapping{}}
+	if currentNode.Disabled {
+		return out, nil
+	}
 	peers := map[string]bool{}
 	for bid, b := range st.Bindings {
 		a, aok := st.Nodes[b.ServerID]
 		c, cok := st.Nodes[b.ClientID]
-		if !aok || !cok || a.Revoked || c.Revoked || (b.ServerID != id && b.ClientID != id) {
+		if !aok || !cok || a.Revoked || c.Revoked || a.Disabled || c.Disabled || (b.ServerID != id && b.ClientID != id) {
 			continue
 		}
 		if !validEndpointSelection(a, b.ConnectEndpointID) {

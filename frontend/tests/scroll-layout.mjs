@@ -36,6 +36,9 @@ test('wide workspace uses available width and node columns total 100 percent', (
  assert.match(css, /\.stack \{[^}]*width: 100%/)
  assert.match(css, /\.panel, \.table-scroll, table \{ width: 100%; \}/)
  assert.equal((css.match(/^\.shell \{/gm)||[]).length,1)
+ assert.match(css, /\.fit \{ display: inline-grid/)
+ assert.doesNotMatch(css, /text-overflow:\s*ellipsis/)
+ assert.doesNotMatch(readFileSync(new URL('../src/views/ConsoleView.vue', import.meta.url), 'utf8'), /min-width:\s*[\d.]+rem/)
 })
 test('mapping rows retain Pool cell so status, traffic and actions align with headers', () => {
  const source=readFileSync(new URL('../src/views/ProxiesView.vue',import.meta.url),'utf8')

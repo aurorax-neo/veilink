@@ -50,6 +50,7 @@ export interface Node {
   software_version?: string
   software_commit?: string
   revoked: boolean
+  disabled?: boolean
   desired_revision: number
   applied_revision: number
   last_seen: number

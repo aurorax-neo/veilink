@@ -3,14 +3,14 @@ import { readFileSync } from 'node:fs'
 import vm from 'node:vm'
 import { test } from 'node:test'
 import ts from 'typescript'
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, reactive, ref, watch, watchEffect } from 'vue'
 
 const source = readFileSync(new URL('../src/views/ProxiesView.vue', import.meta.url), 'utf8')
 const script = source.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import .*$/gm, '')
 test('mapping mux select defaults off, round-trips every option and clears for UDP', async () => {
   const requests = []
   const desk = { nodes: [{ id: 's', role: 'server' }, { id: 'c', role: 'client' }], mappings: [], reload: async () => {}, notify: () => {} }
-  const context = vm.createContext({ exports: {}, computed, reactive, ref, watch, byNameAndId: (a, b) => (a.name || '').localeCompare(b.name || '') || a.id.localeCompare(b.id), inject: () => desk, deskKey: {}, validateMapping: () => '', api: async (...args) => requests.push(args), onMounted: () => {}, onUnmounted: () => {} })
+  const context = vm.createContext({ exports: {}, computed, reactive, ref, watch, watchEffect, byNameAndId: (a, b) => (a.name || '').localeCompare(b.name || '') || a.id.localeCompare(b.id), inject: () => desk, deskKey: {}, validateMapping: () => '', api: async (...args) => requests.push(args), onMounted: () => {}, onUnmounted: () => {} })
   vm.runInContext(ts.transpileModule(script + '\nglobalThis.editor = { open, draft, muxType, save, fields };', { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText, context)
   const e = context.editor
   e.open()

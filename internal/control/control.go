@@ -172,6 +172,9 @@ func (s *Service) Events(stream grpc.BidiStreamingServer[structpb.Struct, struct
 			if e != nil {
 				return rpcError(e)
 			}
+			if e = reportLinks(s.Store, id, String(r.m, "credential"), r.m); e != nil {
+				return rpcError(e)
+			}
 			if _, present := r.m.GetFields()["traffic"]; present {
 				epoch, seq, totals, parseErr := trafficPayload(r.m)
 				if parseErr != nil {
@@ -231,4 +234,24 @@ func (s *Service) Events(stream grpc.BidiStreamingServer[structpb.Struct, struct
 			timer.Reset(45 * time.Second)
 		}
 	}
+}
+
+func reportLinks(st *store.Store, id, credential string, message *structpb.Struct) error {
+	raw, ok := message.GetFields()["links"]
+	if !ok {
+		return st.ReportLinks(id, credential, nil)
+	}
+	list := raw.GetListValue()
+	if list == nil || len(list.GetValues()) > 64 {
+		return store.ErrInvalid
+	}
+	bindings := make([]string, 0, len(list.GetValues()))
+	for _, item := range list.GetValues() {
+		value, ok := item.GetKind().(*structpb.Value_StringValue)
+		if !ok {
+			return store.ErrInvalid
+		}
+		bindings = append(bindings, value.StringValue)
+	}
+	return st.ReportLinks(id, credential, bindings)
 }

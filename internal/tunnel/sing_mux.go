@@ -191,9 +191,16 @@ func (s *service) openSingMux(conn net.Conn, m model.Mapping) {
 
 func (s *service) maintainSingMux(b model.Binding, gateway model.Node, peer *clientGateway, kind string) {
 	id, _ := parseUUID(b.UUID)
+	attempt := 1
 	for s.ctx.Err() == nil {
+		if s.dialLog != nil {
+			s.dialLog.noteAttempt(b.ID, attempt)
+		}
+		started := time.Now()
 		s.runSingMux(b, gateway, peer, kind, id)
-		if !sleep(s.ctx, 200*time.Millisecond) {
+		var ok bool
+		attempt, ok = s.afterShort(b, gateway, started, attempt)
+		if !ok {
 			return
 		}
 	}

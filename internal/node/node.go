@@ -129,12 +129,11 @@ func RunWithLogger(ctx context.Context, c config.Config, role string, logger *sl
 	}
 	// Only authenticated database snapshots configure the tunnel runtime.
 	runtime := tunnel.New(model.LocalTLS{})
-	if role == "client" {
-		runtime.SetDialLogger(logger)
-	}
+	runtime.SetDialLogger(logger)
 	runCtx, stopRuntime := context.WithCancel(ctx)
 	defer func() { stopRuntime(); closeRuntime(runtime) }()
 	state := newSyncState(runCtx, runtime)
+	state.linkIDs = runtime.LinkedBindings
 	if role == "server" {
 		var epoch [16]byte
 		if _, err := crand.Read(epoch[:]); err != nil {
@@ -246,6 +245,7 @@ type syncState struct {
 	traffic      *tunnel.Traffic
 	trafficEpoch string
 	trafficSeq   atomic.Uint64
+	linkIDs      func() []string
 }
 
 func newSyncState(ctx context.Context, runtime runtimeDriver) *syncState {
@@ -374,6 +374,14 @@ func heartbeat(ctx context.Context, client pb.ControlClient, id, credential stri
 		in, err := heartbeatEnvelope(id, credential, state.revision.Load(), state.failed.Load(), ring)
 		if err != nil {
 			return err
+		}
+		if state.linkIDs != nil {
+			ids := state.linkIDs()
+			values := make([]*structpb.Value, 0, len(ids))
+			for _, bindingID := range ids {
+				values = append(values, structpb.NewStringValue(bindingID))
+			}
+			in.Fields["links"] = structpb.NewListValue(&structpb.ListValue{Values: values})
 		}
 		if state.traffic != nil {
 			totals := state.traffic.Snapshot()

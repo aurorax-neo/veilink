@@ -164,6 +164,30 @@ func (r *Runtime) SetDialLogger(logger *slog.Logger) {
 
 func (r *Runtime) Traffic() *Traffic { return r.traffic }
 
+// LinkedBindings reports bindings with a live authenticated session.
+// It is the tunnel link itself, not a probe of the mapping target.
+func (r *Runtime) LinkedBindings() []string {
+	r.mu.Lock()
+	svc := r.instance
+	r.mu.Unlock()
+	if svc == nil {
+		return nil
+	}
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+	ids := make([]string, 0, len(svc.sessions))
+	for id, list := range svc.sessions {
+		for _, sess := range list {
+			if sess.alive() {
+				ids = append(ids, id)
+				break
+			}
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
 // Apply prevalidates before touching listeners. A failed start restores the
 // last running configuration when one exists.
 func (r *Runtime) Apply(s model.Snapshot) error {
@@ -577,6 +601,9 @@ func (s *service) listenServer() error {
 		s.listeners = append(s.listeners, ln)
 		go s.acceptMapping(ln, m)
 	}
+	if s.dialLog != nil && s.dialLog.logger != nil && len(s.snapshot.Bindings) > 0 {
+		s.dialLog.logger.Info("server tunnel listening", "role", "server", "id", s.snapshot.Node.ID, "addr", listenHost(s.local.ListenHost), "port", s.local.ListenPort)
+	}
 	return nil
 }
 
@@ -632,11 +659,13 @@ func (s *service) authenticate(conn net.Conn) {
 	}
 	id, host, port, flow, err := readVLESS(conn)
 	if err != nil {
+		s.noteServer("peer_closed")
 		return
 	}
 	got, flowErr := normalizeFlow(flow)
 	binding, ok := s.byUser[hex.EncodeToString(id[:])]
 	if flowErr != nil || got != s.flow || !ok || (port != 0 && port != applicationPort && port != singMuxPort) || !strings.EqualFold(host, binding.Domain) {
+		s.noteServer("authentication")
 		return
 	}
 	if err = writeVLESSResponse(conn); err != nil {
@@ -660,10 +689,15 @@ func (s *service) maintain(b model.Binding, gateway model.Node, peer *clientGate
 	if err != nil {
 		return
 	}
+	attempt := 1
 	for {
 		if s.ctx.Err() != nil {
 			return
 		}
+		if s.dialLog != nil {
+			s.dialLog.noteAttempt(b.ID, attempt)
+		}
+		started := time.Now()
 		conn, err := s.dialProtocol(gateway, peer, b, 0)
 		if err == nil && peer.flow != "" {
 			vc := newVision(conn, user)
@@ -681,11 +715,14 @@ func (s *service) maintain(b model.Binding, gateway model.Node, peer *clientGate
 			if conn != nil {
 				_ = conn.Close()
 			}
-			if !sleep(s.ctx, 200*time.Millisecond) {
+			var ok bool
+			attempt, ok = s.afterShort(b, gateway, started, attempt)
+			if !ok {
 				return
 			}
 			continue
 		}
+		attempt = 1
 		if !s.track(conn) {
 			_ = conn.Close()
 			return
@@ -714,10 +751,33 @@ func (s *service) maintain(b model.Binding, gateway model.Node, peer *clientGate
 		})
 		s.removeSession(b.ID, sess)
 		s.untrack(conn)
-		if !sleep(s.ctx, 200*time.Millisecond) {
+		var ok bool
+		attempt, ok = s.afterShort(b, gateway, started, attempt)
+		if !ok {
 			return
 		}
 	}
+}
+
+func (s *service) noteServer(reason string) {
+	if s.dialLog == nil {
+		return
+	}
+	s.dialLog.warnLimited("server-"+reason, "server tunnel handshake failed ("+reason+")", "role", "server", "id", s.snapshot.Node.ID, "reason", reason)
+}
+
+func (s *service) afterShort(b model.Binding, gateway model.Node, started time.Time, attempt int) (int, bool) {
+	if time.Since(started) >= 5*time.Second {
+		attempt = 1
+	}
+	if attempt >= 3 && s.dialLog != nil {
+		s.dialLog.warnLimited(b.ID+"-backoff", "client tunnel backing off after repeated short connections", "role", "client", "id", b.ID, "node_id", gateway.ID, "attempt", attempt)
+	}
+	ok := retryWait(s.ctx, attempt)
+	if attempt < 5 {
+		attempt++
+	}
+	return attempt, ok
 }
 
 func roots(caPEM string) (*x509.CertPool, error) {

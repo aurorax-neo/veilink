@@ -333,6 +333,14 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			result = map[string]bool{"connected": connected}
 		case r.Method == "POST" && len(p) == 3 && p[2] == "revoke":
 			err = a.store.RemoveNode(id, false)
+		case r.Method == "POST" && len(p) == 3 && p[2] == "disabled":
+			var in struct {
+				Disabled bool `json:"disabled"`
+			}
+			if !decode(w, r, &in) {
+				return
+			}
+			err = a.store.SetNodeDisabled(id, in.Disabled)
 		case r.Method == "POST" && len(p) == 3 && p[2] == "join":
 			a.joinCommand(w, r, id)
 			return

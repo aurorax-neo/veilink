@@ -189,14 +189,22 @@ func (s *service) maintainApplication(b model.Binding, gateway model.Node, peer 
 	if err != nil {
 		return
 	}
+	attempt := 1
 	for s.ctx.Err() == nil {
+		if s.dialLog != nil {
+			s.dialLog.noteAttempt(b.ID, attempt)
+		}
+		started := time.Now()
 		conn, err := s.dialProtocol(gateway, peer, b, applicationPort)
 		if err != nil {
-			if !sleep(s.ctx, 200*time.Millisecond) {
+			var ok bool
+			attempt, ok = s.afterShort(b, gateway, started, attempt)
+			if !ok {
 				return
 			}
 			continue
 		}
+		attempt = 1
 		// Track before Encryption/VLESS/idle reads so cancellation interrupts all
 		// authenticated and unauthenticated stages, including consumed slots.
 		tracked := conn
@@ -235,7 +243,9 @@ func (s *service) maintainApplication(b model.Binding, gateway model.Node, peer 
 		}
 		tracked.Close()
 		s.untrack(tracked)
-		if !sleep(s.ctx, 200*time.Millisecond) {
+		var ok bool
+		attempt, ok = s.afterShort(b, gateway, started, attempt)
+		if !ok {
 			return
 		}
 	}

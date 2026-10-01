@@ -31,6 +31,7 @@ type Node struct {
 	Port             int               `json:"port"`
 	ConnectEndpoints []ConnectEndpoint `json:"connect_endpoints,omitempty"`
 	Revoked          bool              `json:"revoked"`
+	Disabled         bool              `json:"disabled,omitempty"` // administrative stop; absent means enabled
 	DesiredRevision  int64             `json:"desired_revision"`
 	AppliedRevision  int64             `json:"applied_revision"`
 	LastSeen         int64             `json:"last_seen"`

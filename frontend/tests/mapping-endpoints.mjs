@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import vm from 'node:vm'
 import { test } from 'node:test'
 import ts from 'typescript'
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, reactive, ref, watch, watchEffect } from 'vue'
 import { parse, compileScript, compileTemplate } from '@vue/compiler-sfc'
 
 const read = path => readFileSync(new URL(path, import.meta.url), 'utf8')
@@ -21,7 +21,7 @@ function setup() {
     { id: 'client', name: 'Client', role: 'client' },
   ], mappings: [], reload: async () => {}, notify: () => {} })
   let tick = () => {}, unmount = () => {}
-  const context = vm.createContext({ exports: {}, computed, reactive, ref, watch, ...format.exports, inject: () => desk, deskKey: {}, api: async (...args) => requests.push(args), onMounted: cb => { tick = cb }, onUnmounted: cb => { unmount = cb }, setInterval: cb => { tick = cb; return 7 }, clearInterval: () => {} })
+  const context = vm.createContext({ exports: {}, computed, reactive, ref, watch, watchEffect, ...format.exports, inject: () => desk, deskKey: {}, api: async (...args) => requests.push(args), onMounted: cb => { tick = cb }, onUnmounted: cb => { unmount = cb }, setInterval: cb => { tick = cb; return 7 }, clearInterval: () => {} })
   vm.runInContext(transpile(script + '\nglobalThis.editor = { open, draft, save, fields, connections, missingConnection, connectionLabel, tunnelState, statuses, now, ask, run };'), context)
   const editor = context.editor
   editor.open()
@@ -123,16 +123,16 @@ test('tunnel state distinguishes disabled, offline and applied nodes without cla
   assert.equal(e.tunnelState({ ...mapping, enabled: false }).text, '已停用')
   assert.equal(e.tunnelState(mapping).text, '两端离线')
   for (const node of [e.desk.nodes[0], e.desk.nodes[2]]) Object.assign(node, { last_seen: Math.floor(Date.now()/1000), desired_revision: 2, applied_revision: 2 })
-  assert.equal(e.tunnelState(mapping).text, '等待服务端确认 · 等待客户端确认')
-  e.statuses.value = { m: { server: { acknowledged: true, reason: 'acknowledged' }, client: { acknowledged: true, reason: 'acknowledged' } } }
-  assert.equal(e.tunnelState(mapping).text, '两端已应用')
+  assert.equal(e.tunnelState(mapping).text, '未连接')
+  e.statuses.value = { m: { server: { acknowledged: true, reason: 'acknowledged', linked: true }, client: { acknowledged: true, reason: 'acknowledged', linked: true } } }
+  assert.equal(e.tunnelState(mapping).text, '已连接')
   e.desk.nodes[2].applied_revision = 1
-  assert.equal(e.tunnelState(mapping).text, '两端已应用')
+  assert.equal(e.tunnelState(mapping).text, '已连接')
   e.desk.nodes[2].revoked = true
   assert.equal(e.tunnelState(mapping).text, '节点不可用')
   assert.match(view, /隧道状态/)
-  assert.match(view, /两端已应用只说明配置已应用/)
-  assert.match(view, /不是目标服务探针/)
+  assert.match(view, /已连接/)
+  assert.doesNotMatch(view, /两端已应用|不是目标服务探针/)
   assert.equal(view.includes('.sort(byNameAndId)'), true)
   assert.doesNotMatch(view, /配置状态未知|待业务验证/)
 })
@@ -142,9 +142,9 @@ test('mapping heartbeat status expires on local clock without new API data', () 
  const stamp = Math.floor(Date.now()/1000)
  for (const node of [e.desk.nodes[0],e.desk.nodes[2]]) Object.assign(node,{last_seen:stamp,desired_revision:1,applied_revision:1,error:'',revoked:false})
  const mapping={enabled:true,server_id:'s',client_id:'client'}
- assert.equal(e.tunnelState(mapping).text,'等待服务端确认 · 等待客户端确认')
- e.statuses.value={ [mapping.id]: {server:{acknowledged:true,reason:'acknowledged'},client:{acknowledged:true,reason:'acknowledged'}} }
- assert.equal(e.tunnelState(mapping).text,'两端已应用')
+ assert.equal(e.tunnelState(mapping).text,'未连接')
+ e.statuses.value={ [mapping.id]: {server:{acknowledged:true,reason:'acknowledged',linked:true},client:{acknowledged:true,reason:'acknowledged',linked:true}} }
+ assert.equal(e.tunnelState(mapping).text,'已连接')
  e.now.value=(stamp+91)*1000
  assert.equal(e.tunnelState(mapping).text,'两端离线')
  e.desk.nodes[0].last_seen=stamp+91

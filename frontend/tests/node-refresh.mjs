@@ -148,6 +148,8 @@ test('row updates when a later poll sees a new report and times out without one'
   const quiet = setup({ connected: true })
   quiet.desk.nodes.push({ ...node, id: 'quiet' })
   await quiet.refreshNode(quiet.desk.nodes[0])
+  await quiet.tick()
+  assert.match(quiet.refreshFeedback.value.quiet.text, /已请求上报/)
   quiet.pendingRefresh.value.quiet.until = Date.now() - 1
   await quiet.tick()
   assert.equal(quiet.refreshFeedback.value.quiet.text, '节点尚未上报新状态')

@@ -54,7 +54,7 @@ async function refresh() {
         <p>管理中心 <span>/ {{ pages[page].title }}</span></p>
         <div class="top-actions">
           <details class="build-version">
-            <summary :title="software?.version">软件 {{ software?.version || (versionError ? '未获取' : '加载中…') }}</summary>
+             <summary :title="software?.version"><span class="fit"><span class="fit-sizer" aria-hidden="true">软件 加载中…</span><span class="fit-sizer" aria-hidden="true">软件 未获取</span><span class="fit-sizer" aria-hidden="true">软件 {{ software?.version || '加载中…' }}</span><span class="fit-value">软件 {{ software?.version || (versionError ? '未获取' : '加载中…') }}</span></span></summary>
             <div class="build-details">
               <p>管理中心：{{ software?.version || '未知' }}</p>
               <p>构建提交：<code>{{ software?.commit || '未知' }}</code></p>
@@ -70,7 +70,7 @@ async function refresh() {
           <div>
             <h1>{{ pages[page].title }}</h1>
           </div>
-          <button type="button" class="btn" :disabled="desk.loading" @click="refresh">{{ desk.loading ? '刷新中…' : '刷新' }}</button>
+           <button type="button" class="btn fit" :disabled="desk.loading" @click="refresh"><span class="fit-sizer" aria-hidden="true">刷新中…</span><span class="fit-sizer" aria-hidden="true">刷新</span><span class="fit-value">{{ desk.loading ? '刷新中…' : '刷新' }}</span></button>
         </div>
         <div class="notice-layer" aria-live="polite" aria-atomic="true">
           <div v-if="desk.notice" :key="noticeKey" class="notice toast" :class="{ bad: desk.noticeBad }" :role="desk.noticeBad ? 'alert' : undefined">

@@ -164,7 +164,7 @@ func (h *handler) Handle(_ context.Context, rec slog.Record) error {
 	var details []string
 	rec.Attrs(func(a slog.Attr) bool {
 		switch a.Key {
-		case "role", "revision", "resource", "method", "id", "node_id", "addr", "scheme", "port", "attempt":
+		case "role", "revision", "resource", "method", "id", "node_id", "addr", "scheme", "port", "attempt", "reason":
 			value := fmt.Sprint(a.Value.Any())
 			value = strings.Map(func(c rune) rune {
 				if c < 32 || c == 127 {

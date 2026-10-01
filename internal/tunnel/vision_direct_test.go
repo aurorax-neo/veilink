@@ -76,7 +76,7 @@ func TestVisionApplicationRuntime(t *testing.T) {
 	}{
 		{"tls13", tls.VersionTLS13, false, false}, {"tls12", tls.VersionTLS12, false, false},
 		{"plain", 0, false, false}, {"encryption-fallback", tls.VersionTLS13, true, false},
-		{"reality-tls13", tls.VersionTLS13, false, true},
+		{"reality-tls13", tls.VersionTLS13, false, true}, {"reality-encryption", tls.VersionTLS13, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			files := tlsFiles(t)
@@ -101,8 +101,9 @@ func TestVisionApplicationRuntime(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				serverLocal = model.LocalTLS{Flow: flowVision, Reality: model.Reality{Dest: camouflage(t, files.CertPEM, files.KeyPEM), PrivateKey: priv, ShortIDs: "0123456789abcdef", ServerNames: "gateway.test"}}
-				clientLocal = model.LocalTLS{Flow: flowVision, Reality: model.Reality{PublicKey: pub, ShortID: "0123456789abcdef", ServerNames: "gateway.test"}}
+				dec, enc := serverLocal.Decryption, clientLocal.Encryption
+				serverLocal = model.LocalTLS{Flow: flowVision, Decryption: dec, Reality: model.Reality{Dest: camouflage(t, files.CertPEM, files.KeyPEM), PrivateKey: priv, ShortIDs: "0123456789abcdef", ServerNames: "gateway.test", Fingerprint: "chrome"}}
+				clientLocal = model.LocalTLS{Flow: flowVision, Encryption: enc, Reality: model.Reality{PublicKey: pub, ShortID: "0123456789abcdef", ServerNames: "gateway.test", Fingerprint: "chrome"}}
 			}
 			sr := run(t, server, serverLocal)
 			cr := run(t, client, clientLocal)

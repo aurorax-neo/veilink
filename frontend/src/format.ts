@@ -33,6 +33,7 @@ export function heartbeatOnline(node: Node, now = Date.now()): boolean {
 
 export function presence(node: Node, now = Date.now()): { text: string; tone: Tone } {
   if (node.revoked) return { text: '已吊销', tone: 'bad' }
+  if (node.disabled) return { text: '已停用', tone: '' }
   if (heartbeatOnline(node, now)) return { text: '近期在线', tone: 'good' }
   if (!node.last_seen) return { text: '尚未连接', tone: '' }
   if (now / 1000 < node.last_seen) return { text: '时钟超前', tone: 'warn' }
@@ -63,7 +64,7 @@ export function needsAttention(node: Node, now = Date.now()): boolean {
 
 export function seenText(unix: number, now = Date.now(), relative = true): string {
   if (!unix) return '尚未上报'
-  const abs = new Date(unix * 1000).toLocaleString('zh-CN', { hour12: false })
+  const abs = new Date(unix * 1000).toLocaleString('zh-CN', { hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
   if (!relative) return abs
   const delta = Math.round(now / 1000 - unix)
   if (delta < -5) return `${abs}（比本机时钟晚 ${-delta} 秒）`

@@ -76,8 +76,8 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
         <button type="button" :aria-pressed="level === 'WARN'" @click="level = 'WARN'; fetchLogs()">WARN</button>
         <button type="button" :aria-pressed="level === 'ERROR'" @click="level = 'ERROR'; fetchLogs()">ERROR</button>
       </div>
-      <button type="button" class="btn small" :class="{ primary: autoRefresh }" @click="toggleAutoRefresh">{{ autoRefresh ? '停止自动刷新' : '自动刷新' }}</button>
-      <button type="button" class="btn small" :disabled="loading" @click="fetchLogs">{{ loading ? '刷新中…' : '刷新' }}</button>
+       <button type="button" class="btn small fit" :class="{ primary: autoRefresh }" @click="toggleAutoRefresh"><span class="fit-sizer" aria-hidden="true">停止自动刷新</span><span class="fit-sizer" aria-hidden="true">自动刷新</span><span class="fit-value">{{ autoRefresh ? '停止自动刷新' : '自动刷新' }}</span></button>
+       <button type="button" class="btn small fit" :disabled="loading" @click="fetchLogs"><span class="fit-sizer" aria-hidden="true">刷新中…</span><span class="fit-sizer" aria-hidden="true">刷新</span><span class="fit-value">{{ loading ? '刷新中…' : '刷新' }}</span></button>
     </div>
 
     <p v-if="error" class="error" role="alert">{{ error }}</p>

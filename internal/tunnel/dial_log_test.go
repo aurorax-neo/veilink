@@ -36,7 +36,7 @@ func TestDialDiagnosticsThrottleRecoveryAndRedaction(t *testing.T) {
 		t.Fatalf("transition count %d", len(entries))
 	}
 	for _, e := range entries {
-		if strings.Contains(e.Message, b.UUID) || strings.Contains(e.Message, b.Domain) || strings.Contains(e.Message, gateway.Address) {
+		if strings.Contains(e.Message, b.UUID) || strings.Contains(e.Message, b.Domain) {
 			t.Fatal("sensitive value logged")
 		}
 	}
@@ -92,7 +92,7 @@ func TestClientFailedDialReachesNodeLog(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if entries := ring.Query("node", "", "WARN", 10); len(entries) > 0 {
-			if !strings.Contains(entries[0].Message, "connection_refused") || strings.Contains(entries[0].Message, strconv.Itoa(port)) || strings.Contains(entries[0].Message, b.UUID) {
+			if !strings.Contains(entries[0].Message, "connection_refused") || !strings.Contains(entries[0].Message, "127.0.0.1") || !strings.Contains(entries[0].Message, strconv.Itoa(port)) || strings.Contains(entries[0].Message, b.UUID) {
 				t.Fatalf("unsafe or missing diagnostic: %+v", entries)
 			}
 			return
