@@ -30,6 +30,7 @@ const desk = reactive<Desk>({
   trafficLoaded: false,
   trafficError: '',
   loading: false,
+  refreshing: false,
   loaded: false,
   error: '',
   notice: '',
@@ -114,6 +115,7 @@ function resetDesk() {
   desk.trafficLoaded = false
   desk.trafficError = ''
   desk.loading = false
+  desk.refreshing = false
   desk.error = ''
   dismissNotice()
 }
@@ -198,7 +200,7 @@ watch(page, (next) => {
 let liveTimer: ReturnType<typeof setInterval> | undefined
 let liveBusy = false
 async function refreshLive() {
-  if (phase.value !== 'app' || document.visibilityState === 'hidden' || desk.loading || liveBusy) return
+  if (phase.value !== 'app' || document.visibilityState === 'hidden' || desk.loading || desk.refreshing || liveBusy) return
   liveBusy = true
   try {
     await desk.reload({ silent: true })

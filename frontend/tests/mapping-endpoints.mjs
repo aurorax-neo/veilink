@@ -21,7 +21,7 @@ function setup() {
     { id: 'client', name: 'Client', role: 'client' },
   ], mappings: [], reload: async () => {}, notify: () => {} })
   let tick = () => {}, unmount = () => {}
-  const context = vm.createContext({ exports: {}, computed, reactive, ref, watch, watchEffect, ...format.exports, inject: () => desk, deskKey: {}, api: async (...args) => requests.push(args), onMounted: cb => { tick = cb }, onUnmounted: cb => { unmount = cb }, setInterval: cb => { tick = cb; return 7 }, clearInterval: () => {} })
+  const context = vm.createContext({ exports: {}, computed, reactive, ref, watch, watchEffect, ...format.exports, inject: () => desk, deskKey: {}, api: async (...args) => requests.push(args), onMounted: cb => { tick = cb }, onUnmounted: cb => { unmount = cb }, setInterval: cb => { tick = cb; return 7 }, clearInterval: () => {}, registerPageRefresh: () => () => {} })
   vm.runInContext(transpile(script + '\nglobalThis.editor = { open, draft, save, fields, connections, missingConnection, connectionLabel, tunnelState, statuses, now, ask, run };'), context)
   const editor = context.editor
   editor.open()

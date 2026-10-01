@@ -9,6 +9,7 @@ export interface Desk {
   trafficLoaded: boolean
   trafficError: string
   loading: boolean
+  refreshing: boolean
   loaded: boolean
   error: string
   notice: string

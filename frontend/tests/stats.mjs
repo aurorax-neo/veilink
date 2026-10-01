@@ -39,7 +39,7 @@ test('Dashboard metrics use actual node and mapping state', () => {
   })
   const vue = source('../src/views/DashboardView.vue')
   const script = vue.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import .*$/gm, '')
-  const context = vm.createContext({ exports: {}, computed, byNameAndId, inject: key => key === 'desk' ? desk : () => {}, deskKey: 'desk', navigateKey: 'navigate', heartbeatOnline, attentionReasons, nodeName, presence, revisionState })
+  const context = vm.createContext({ exports: {}, computed, byNameAndId, inject: key => key === 'desk' ? desk : () => {}, deskKey: 'desk', navigateKey: 'navigate', heartbeatOnline, attentionReasons, nodeName, presence, revisionState, onMounted: () => {}, onUnmounted: () => {}, registerPageRefresh: () => () => {} })
   vm.runInContext(transpile(script + '\nglobalThis.metrics = { onlineServers, onlineClients, attention };'), context)
   assert.equal(context.metrics.onlineServers.value, 1)
   assert.equal(context.metrics.onlineClients.value, 1)

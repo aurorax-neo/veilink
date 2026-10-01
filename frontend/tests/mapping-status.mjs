@@ -18,7 +18,7 @@ function setup() {
  let mount,unmount
  const timers=[]
  const responses=[]
- const context=vm.createContext({exports:{},computed,reactive,ref,watch,watchEffect,...format.exports,inject:()=>desk,deskKey:{},api:()=>new Promise((resolve,reject)=>responses.push({resolve,reject})),onMounted:cb=>{mount=cb},onUnmounted:cb=>{unmount=cb},setInterval:(cb,delay)=>{timers.push({cb,delay});return timers.length},clearInterval:()=>{}})
+ const context=vm.createContext({exports:{},computed,reactive,ref,watch,watchEffect,...format.exports,inject:()=>desk,deskKey:{},api:()=>new Promise((resolve,reject)=>responses.push({resolve,reject})),onMounted:cb=>{mount=cb},onUnmounted:cb=>{unmount=cb},setInterval:(cb,delay)=>{timers.push({cb,delay});return timers.length},clearInterval:()=>{},registerPageRefresh:()=>()=>{}})
  vm.runInContext(transpile(script+'\nglobalThis.view={tunnelState,refreshStatus,statuses,statusError};'),context)
  return { desk,timers,responses,mount:()=>mount(),unmount:()=>unmount(),...context.view }
 }

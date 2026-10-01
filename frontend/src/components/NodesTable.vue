@@ -2,6 +2,7 @@
 import { computed, inject, onMounted, onUnmounted, ref } from 'vue'
 import { api } from '../api'
 import { deskKey } from '../desk'
+import { registerPageRefresh } from '../pageRefresh'
 import { byNameAndId, endpoint, needsAttention, presence, revisionState, seenText } from '../format'
 import type { Node } from '../types'
 import Badge from './Badge.vue'
@@ -28,6 +29,7 @@ const refreshFeedback = ref<Record<string, { text: string; bad: boolean; hideAt:
 let active = true
 let settling = false
 let clockTimer: ReturnType<typeof setInterval> | undefined
+let unregisterPageRefresh: (() => void) | undefined
 const now = ref(Date.now())
 onMounted(() => {
   clockTimer = setInterval(() => {
@@ -38,9 +40,12 @@ onMounted(() => {
     }
     return settleRefresh()
   }, 1000)
+  unregisterPageRefresh = registerPageRefresh(refreshRole)
 })
 onUnmounted(() => {
   active = false
+  unregisterPageRefresh?.()
+  unregisterPageRefresh = undefined
   if (clockTimer) clearInterval(clockTimer)
   clockTimer = undefined
 })
@@ -143,6 +148,12 @@ async function refreshNode(node: Node) {
     setRefreshing(node.id, false)
   }
 }
+function statusLine(node: Node) {
+  return refreshFeedback.value[node.id]?.text || `最后上报：${seenText(node.last_seen, now.value, false)}`
+}
+async function refreshRole() {
+  await Promise.all(desk.nodes.filter(node => node.role === props.role && !node.revoked).map(node => refreshNode(node)))
+}
 async function run() {
   if (!pending.value || (pending.value.embedded && action.value !== 'disable' && action.value !== 'enable')) return false
   const path = `/nodes/${encodeURIComponent(pending.value.id)}`
@@ -175,7 +186,7 @@ async function run() {
         <thead><tr><th scope="col">名称 / 软件版本</th><th scope="col">状态</th><th v-if="role === 'server'" scope="col">本地监听 / 客户端连接地址</th><th v-if="role === 'server'" scope="col">隧道</th><th scope="col">映射</th><th scope="col">配置是否最新</th><th scope="col">操作</th></tr></thead>
         <tbody><tr v-for="node in rows" :key="node.id" :class="{ selected: selectedId === node.id }">
           <td><button type="button" class="text-btn" :aria-expanded="selectedId === node.id" @click="selectedId = selectedId === node.id ? '' : node.id">{{ node.name }}</button><small class="node-id" :title="node.id">{{ node.id }}</small><small v-if="node.embedded">内置节点</small><small class="software-version" :title="node.software_version || '等待节点上报运行版本'">软件：{{ node.software_version || '未上报' }}</small></td>
-          <td><div class="node-presence"><Badge reserve="尚未连接" :text="presence(node, now).text" :tone="presence(node, now).tone" /><button type="button" class="icon-btn refresh-node" :disabled="node.revoked || refreshing.has(node.id)" @click="refreshNode(node)" :class="{ spinning: refreshing.has(node.id) }" :aria-busy="refreshing.has(node.id)" title="请求节点刷新状态" :aria-label="`刷新节点 ${node.name}`"><span aria-hidden="true">↻</span></button></div><small class="last-seen fit"><span class="fit-sizer" aria-hidden="true">最后上报：尚未上报</span><span class="fit-sizer" aria-hidden="true">最后上报：{{ seenText(node.last_seen, now, false) }}</span><span class="fit-value">最后上报：{{ seenText(node.last_seen, now, false) }}</span></small><span v-if="refreshFeedback[node.id]?.text" class="node-refresh-feedback fit" :class="{ bad: refreshFeedback[node.id]?.bad }" role="status"><span class="fit-sizer" aria-hidden="true">请求节点更新状态失败，请稍后重试。</span><span class="fit-sizer" aria-hidden="true">推送通道未连接，重连后自动同步</span><span class="fit-sizer" aria-hidden="true">已请求上报，等待节点反馈</span><span class="fit-sizer" aria-hidden="true">节点尚未上报新状态</span><span class="fit-sizer" aria-hidden="true">刷新响应无效，请重试。</span><span class="fit-sizer" aria-hidden="true">{{ refreshFeedback[node.id].text }}</span><span class="fit-value">{{ refreshFeedback[node.id].text }}</span></span></td>
+          <td><div class="node-presence"><Badge reserve="尚未连接" :text="presence(node, now).text" :tone="presence(node, now).tone" /><button type="button" class="icon-btn refresh-node" :disabled="node.revoked || refreshing.has(node.id)" @click="refreshNode(node)" :class="{ spinning: refreshing.has(node.id) }" :aria-busy="refreshing.has(node.id)" title="请求节点刷新状态" :aria-label="`刷新节点 ${node.name}`"><span aria-hidden="true">↻</span></button></div><small class="last-seen fit" :class="{ 'node-refresh-feedback': !!refreshFeedback[node.id]?.text, bad: !!refreshFeedback[node.id]?.bad }" :role="refreshFeedback[node.id]?.text ? 'status' : undefined"><span class="fit-sizer" aria-hidden="true">最后上报：尚未上报</span><span class="fit-sizer" aria-hidden="true">最后上报：{{ seenText(node.last_seen, now, false) }}</span><span class="fit-sizer" aria-hidden="true">请求节点更新状态失败，请稍后重试。</span><span class="fit-sizer" aria-hidden="true">推送通道未连接，重连后自动同步</span><span class="fit-sizer" aria-hidden="true">已请求上报，等待节点反馈</span><span class="fit-sizer" aria-hidden="true">节点尚未上报新状态</span><span class="fit-sizer" aria-hidden="true">刷新响应无效，请重试。</span><span v-if="refreshFeedback[node.id]?.text" class="fit-sizer" aria-hidden="true">{{ refreshFeedback[node.id].text }}</span><span class="fit-value">{{ statusLine(node) }}</span></small></td>
           <td v-if="role === 'server'"><small v-if="released(node)">未监听</small><small v-else>监听：{{ localListen(node) }} · {{ node.tunnel?.protocol === 'hysteria2' || node.tunnel?.hysteria2?.password ? 'UDP' : 'TCP' }}</small><small v-for="item in connectList(node)" :key="item.id">{{ item.name }} · {{ endpoint(item.host, item.port) }}</small></td>
           <td v-if="role === 'server'">{{ tunnelLabel(node) }}</td><td>{{ mappings(node.id).length }}</td>
           <td><div class="revision-status" role="group" :title="revisionDescription(node)" :aria-label="revisionDescription(node)"><Badge reserve="尚无配置" :text="revisionLabel(node)" :tone="revisionState(node).tone" /></div></td>

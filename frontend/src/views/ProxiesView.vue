@@ -2,6 +2,7 @@
 import { computed, inject, onMounted, onUnmounted, reactive, ref, watch, watchEffect } from 'vue'
 import { api } from '../api'
 import { deskKey } from '../desk'
+import { askNodes, nodeBaseline, nodeChanged, registerPageRefresh, waitForReports } from '../pageRefresh'
 import { byNameAndId, endpoint, heartbeatOnline, nodeName, validateMapping } from '../format'
 import type { Mapping, TrafficRow } from '../types'
 import Badge from '../components/Badge.vue'
@@ -22,6 +23,7 @@ const statuses = ref<Record<string, MappingStatus>>({})
 const statusError = ref('')
 let statusGeneration = 0
 let active = false
+let unregisterPageRefresh: (() => void) | undefined
 let clock: ReturnType<typeof setInterval> | undefined
 let statusClock: ReturnType<typeof setInterval> | undefined
 async function refreshStatus() {
@@ -41,8 +43,23 @@ onMounted(() => {
   clock = setInterval(() => { now.value = Date.now() }, 1000)
   statusClock = setInterval(() => { void refreshStatus() }, 5000)
   void refreshStatus()
+  unregisterPageRefresh = registerPageRefresh(refreshReported)
 })
-onUnmounted(() => { active = false; ++statusGeneration; if (clock) clearInterval(clock); if (statusClock) clearInterval(statusClock) })
+onUnmounted(() => { active = false; ++statusGeneration; unregisterPageRefresh?.(); unregisterPageRefresh = undefined; if (clock) clearInterval(clock); if (statusClock) clearInterval(statusClock) })
+async function refreshReported() {
+  const ids = [...new Set(desk.mappings.flatMap(mapping => [mapping.server_id, mapping.client_id]))].filter(id => {
+    const node = desk.nodes.find(item => item.id === id)
+    return !!node && !node.revoked
+  })
+  const baseline = new Map(ids.map(id => [id, nodeBaseline(desk.nodes.find(item => item.id === id)!)]))
+  const connected = await askNodes(ids)
+  const waiting = () => active && connected.some(id => !nodeChanged(desk.nodes.find(item => item.id === id), baseline.get(id)!))
+  await waitForReports(async () => {
+    if (!active) return
+    await desk.reload({ silent: true })
+    if (active) await refreshStatus()
+  }, waiting)
+}
 watch(() => desk.mappings, () => { if (active) void refreshStatus() })
 watch(() => desk.loading, (loading, previous) => { if (active && previous && !loading) void refreshStatus() })
 

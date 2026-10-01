@@ -202,7 +202,7 @@ function setupTable(role = 'server') {
   const requests = []
   const desk = reactive({ nodes: [], mappings: [], reload: async () => {}, notify: () => {} })
   const tableScript = tableSource.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import .*$/gm, '')
-  const context = vm.createContext({ exports: {}, computed, ref, byNameAndId, inject: () => desk, deskKey: {}, defineProps: () => ({ role }), onMounted: callback => callback(), onUnmounted: () => {}, setInterval: () => 7, clearInterval: () => {}, api: async (...args) => { requests.push(args) } })
+  const context = vm.createContext({ exports: {}, computed, ref, byNameAndId, inject: () => desk, deskKey: {}, defineProps: () => ({ role }), onMounted: callback => callback(), onUnmounted: () => {}, setInterval: () => 7, clearInterval: () => {}, registerPageRefresh: () => () => {}, api: async (...args) => { requests.push(args) } })
   vm.runInContext(transpile(tableScript + '\nglobalThis.table = { tunnelLabel, effectiveSources, openConfig, ask, run, pending, configNode };'), context)
   return { ...context.table, desk, requests }
 }

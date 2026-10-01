@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, inject } from 'vue'
+import { computed, inject, onMounted, onUnmounted } from 'vue'
 import { deskKey, navigateKey } from '../desk'
 import { attentionReasons, byNameAndId, heartbeatOnline, nodeName, presence, revisionState } from '../format'
+import { askNodes, nodeBaseline, nodeChanged, registerPageRefresh, waitForReports } from '../pageRefresh'
 import Badge from '../components/Badge.vue'
 import EmptyState from '../components/EmptyState.vue'
 
@@ -12,6 +13,18 @@ const onlineClients = computed(() => desk.nodes.filter(n => n.role === 'client' 
 const attention = computed(() => desk.nodes.filter(n => attentionReasons(n).length).sort(byNameAndId))
 const servers = computed(() => desk.nodes.filter(n => n.role === 'server').sort(byNameAndId))
 function clientsOf(id: string) { return [...new Set(desk.mappings.filter(m => m.server_id === id).map(m => m.client_id))].sort((a, b) => byNameAndId({ id: a, name: nodeName(desk.nodes, a) }, { id: b, name: nodeName(desk.nodes, b) })).map(clientId => nodeName(desk.nodes, clientId)).join('、') || '—' }
+let active = true
+let unregister = () => {}
+onMounted(() => {
+  unregister = registerPageRefresh(async () => {
+    const nodes = desk.nodes.filter(node => !node.revoked)
+    const baseline = new Map(nodes.map(node => [node.id, nodeBaseline(node)]))
+    const connected = await askNodes(nodes.map(node => node.id))
+    const waiting = () => active && connected.some(id => !nodeChanged(desk.nodes.find(node => node.id === id), baseline.get(id)!))
+    await waitForReports(() => desk.reload({ silent: true }), waiting)
+  })
+})
+onUnmounted(() => { active = false; unregister() })
 </script>
 
 <template>

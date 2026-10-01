@@ -21,15 +21,17 @@ function setup(response = { connected: true }, reload = async () => {}, role = '
     reloadNodes: async id => { nodeReloads.push(id); await reload() },
     notify: (text, bad = false) => notices.push({ text, bad }),
   }
+  const pageRefreshers = []
   const context = vm.createContext({
     exports: {}, computed, ref, Error, ...format.exports,
     defineProps: () => ({ role }), inject: () => desk, deskKey: {},
     onMounted: callback => callback(), onUnmounted: callback => { unmount = callback },
     setInterval: callback => { tick = callback; return 7 }, clearInterval: id => { cleared = id },
+    registerPageRefresh: fn => { pageRefreshers.push(fn); return () => { const index = pageRefreshers.indexOf(fn); if (index >= 0) pageRefreshers.splice(index, 1) } },
     api: async (...args) => { calls.push(structuredClone(args)); return typeof response === 'function' ? response(...args) : response },
   })
-  vm.runInContext(transpile(script + '\nglobalThis.state = { refreshNode, refreshing, refreshFeedback, pendingRefresh, revisionLabel, revisionDescription, saved, now };'), context)
-  return { ...context.state, desk, calls, notices, nodeReloads, tick: () => tick?.(), unmount: () => unmount?.(), get cleared() { return cleared }, get reloads() { return reloads } }
+  vm.runInContext(transpile(script + '\nglobalThis.state = { refreshNode, refreshing, refreshFeedback, pendingRefresh, revisionLabel, revisionDescription, saved, now, statusLine, refreshRole };'), context)
+  return { ...context.state, desk, calls, notices, nodeReloads, pageRefreshers, tick: () => tick?.(), unmount: () => unmount?.(), get cleared() { return cleared }, get reloads() { return reloads } }
 }
 const node = { id: 'node/id', name: 'node', revoked: false, desired_revision: 4, applied_revision: 4, last_seen: 1000, error: '' }
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
@@ -155,6 +157,31 @@ test('row updates when a later poll sees a new report and times out without one'
   assert.equal(quiet.refreshFeedback.value.quiet.text, '节点尚未上报新状态')
   assert.equal(quiet.pendingRefresh.value.quiet, undefined)
   assert.match(table, /seenText\(node\.last_seen, now, false\)/)
+  assert.match(table, /statusLine\(node\)/)
+  assert.doesNotMatch(table, /class="node-refresh-feedback fit"/)
   assert.match(table, /seenText\(selected\.last_seen, now, false\)/)
   assert.doesNotMatch(table, /秒前/)
+})
+test('status line shows either the last report or the refresh feedback', async () => {
+  const s = setup({ connected: true })
+  const target = { ...node, role: 'server' }
+  s.desk.nodes.push(target)
+  assert.match(s.statusLine(target), /^最后上报：/)
+  await s.refreshNode(target)
+  assert.match(s.statusLine(target), /已请求上报/)
+  assert.doesNotMatch(s.statusLine(target), /最后上报/)
+})
+test('page refresh requests each non-revoked node of this role and unregisters', async () => {
+  const s = setup({ connected: true })
+  s.desk.nodes.push(
+    { ...node, role: 'server' },
+    { ...node, id: 'b', role: 'server' },
+    { ...node, id: 'client', role: 'client' },
+    { ...node, id: 'gone', role: 'server', revoked: true },
+  )
+  assert.equal(s.pageRefreshers.length, 1)
+  await s.refreshRole()
+  assert.deepEqual(s.calls.map(call => call[0]).sort(), ['/nodes/b/refresh', '/nodes/node%2Fid/refresh'])
+  s.unmount()
+  assert.equal(s.pageRefreshers.length, 0)
 })

@@ -2,6 +2,7 @@
 import { computed, inject, onMounted, onUnmounted, ref } from 'vue'
 import { api } from '../api'
 import { deskKey } from '../desk'
+import { askNodes, nodeBaseline, nodeChanged, registerPageRefresh, waitForReports } from '../pageRefresh'
 import { byNameAndId, logLevelTone, nodeName } from '../format'
 import type { LogEntry } from '../types'
 import EmptyState from '../components/EmptyState.vue'
@@ -16,6 +17,8 @@ const sortedNodes = computed(() => [...desk.nodes].sort(byNameAndId))
 const loading = ref(false)
 const error = ref('')
 let request = 0
+let active = true
+let unregisterPageRefresh: (() => void) | undefined
 const autoRefresh = ref(false)
 let timer: ReturnType<typeof setInterval> | null = null
 
@@ -25,10 +28,10 @@ function sourceLabel(entry: LogEntry): string {
   const role = desk.nodes.find(n => n.id === entry.node_id)?.role
   return `${role === 'server' ? 'Server' : role === 'client' ? 'Client' : '节点'} · ${nodeName(desk.nodes, entry.node_id)}`
 }
-async function fetchLogs() {
+async function fetchLogs(options?: { silent?: boolean }) {
   const ticket = ++request
   error.value = ''
-  loading.value = true
+  if (!options?.silent) loading.value = true
   try {
     const params = new URLSearchParams()
     if (source.value !== 'all') params.set('source', source.value)
@@ -36,12 +39,25 @@ async function fetchLogs() {
     if (level.value) params.set('level', level.value)
     params.set('limit', '500')
     const result = await api<LogEntry[]>(`/logs?${params.toString()}`)
-    if (ticket === request) logs.value = result || []
+    if (ticket === request && active) logs.value = result || []
   } catch (reason) {
-    if (ticket === request) error.value = reason instanceof Error ? reason.message : '加载失败'
+    if (ticket === request && active) error.value = reason instanceof Error ? reason.message : '加载失败'
   } finally {
-    if (ticket === request) loading.value = false
+    if (ticket === request && !options?.silent) loading.value = false
   }
+}
+async function refreshFromPage() {
+  await fetchLogs()
+  if (!active || source.value === 'master') return
+  const ids = (source.value === 'node' && nodeId.value ? desk.nodes.filter(node => node.id === nodeId.value) : desk.nodes).filter(node => !node.revoked).map(node => node.id)
+  const baseline = new Map(ids.map(id => [id, nodeBaseline(desk.nodes.find(node => node.id === id)!)]))
+  const connected = await askNodes(ids)
+  const waiting = () => active && connected.some(id => !nodeChanged(desk.nodes.find(node => node.id === id), baseline.get(id)!))
+  await waitForReports(async () => {
+    if (!active) return
+    await Promise.all(connected.map(id => desk.reloadNodes(id).catch(() => undefined)))
+    if (active) await fetchLogs({ silent: true })
+  }, waiting)
 }
 
 function toggleAutoRefresh() {
@@ -54,8 +70,8 @@ function toggleAutoRefresh() {
   }
 }
 
-onMounted(fetchLogs)
-onUnmounted(() => { if (timer) clearInterval(timer) })
+onMounted(() => { void fetchLogs(); unregisterPageRefresh = registerPageRefresh(refreshFromPage) })
+onUnmounted(() => { active = false; unregisterPageRefresh?.(); if (timer) clearInterval(timer) })
 </script>
 
 <template>
@@ -77,7 +93,7 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
         <button type="button" :aria-pressed="level === 'ERROR'" @click="level = 'ERROR'; fetchLogs()">ERROR</button>
       </div>
        <button type="button" class="btn small fit" :class="{ primary: autoRefresh }" @click="toggleAutoRefresh"><span class="fit-sizer" aria-hidden="true">停止自动刷新</span><span class="fit-sizer" aria-hidden="true">自动刷新</span><span class="fit-value">{{ autoRefresh ? '停止自动刷新' : '自动刷新' }}</span></button>
-       <button type="button" class="btn small fit" :disabled="loading" @click="fetchLogs"><span class="fit-sizer" aria-hidden="true">刷新中…</span><span class="fit-sizer" aria-hidden="true">刷新</span><span class="fit-value">{{ loading ? '刷新中…' : '刷新' }}</span></button>
+       <button type="button" class="btn small fit" :disabled="loading" @click="fetchLogs()"><span class="fit-sizer" aria-hidden="true">刷新中…</span><span class="fit-sizer" aria-hidden="true">刷新</span><span class="fit-value">{{ loading ? '刷新中…' : '刷新' }}</span></button>
     </div>
 
     <p v-if="error" class="error" role="alert">{{ error }}</p>

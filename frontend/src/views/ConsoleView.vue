@@ -2,6 +2,7 @@
 import { inject, onMounted, ref } from 'vue'
 import { api } from '../api'
 import { deskKey } from '../desk'
+import { runPageRefresh } from '../pageRefresh'
 import { pages, type PageId } from '../types'
 import AuditView from './AuditView.vue'
 import ClientsView from './ClientsView.vue'
@@ -22,7 +23,12 @@ async function loadVersion() {
 }
 onMounted(loadVersion)
 async function refresh() {
-  try { await desk.reload() } catch { /* desk displays the error. */ }
+  if (desk.loading || desk.refreshing) return
+  desk.refreshing = true
+  try {
+    await desk.reload()
+    await runPageRefresh()
+  } catch { /* desk displays the error. */ } finally { desk.refreshing = false }
 }
 </script>
 
@@ -70,7 +76,7 @@ async function refresh() {
           <div>
             <h1>{{ pages[page].title }}</h1>
           </div>
-           <button type="button" class="btn fit" :disabled="desk.loading" @click="refresh"><span class="fit-sizer" aria-hidden="true">刷新中…</span><span class="fit-sizer" aria-hidden="true">刷新</span><span class="fit-value">{{ desk.loading ? '刷新中…' : '刷新' }}</span></button>
+           <button type="button" class="btn fit" :disabled="desk.loading || desk.refreshing" @click="refresh"><span class="fit-sizer" aria-hidden="true">刷新中…</span><span class="fit-sizer" aria-hidden="true">刷新</span><span class="fit-value">{{ desk.loading || desk.refreshing ? '刷新中…' : '刷新' }}</span></button>
         </div>
         <div class="notice-layer" aria-live="polite" aria-atomic="true">
           <div v-if="desk.notice" :key="noticeKey" class="notice toast" :class="{ bad: desk.noticeBad }" :role="desk.noticeBad ? 'alert' : undefined">
