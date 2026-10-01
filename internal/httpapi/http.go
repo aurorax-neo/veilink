@@ -341,6 +341,9 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			err = a.store.SetNodeDisabled(id, in.Disabled)
+			if err == nil {
+				result = map[string]bool{"connected": a.store.ControlConnected(id)}
+			}
 		case r.Method == "POST" && len(p) == 3 && p[2] == "join":
 			a.joinCommand(w, r, id)
 			return

@@ -44,6 +44,10 @@ test('Dashboard metrics use actual node and mapping state', () => {
   assert.equal(context.metrics.onlineServers.value, 1)
   assert.equal(context.metrics.onlineClients.value, 1)
   assert.equal(context.metrics.attention.value.length, 2)
+  assert.equal(attentionReasons({ id: 'off', disabled: true, last_seen: 0, applied_revision: 1, desired_revision: 4, error: 'apply failed' }).length, 0)
+  desk.nodes.push({ id: 'stopped', role: 'server', disabled: true, last_seen: now, applied_revision: 1, desired_revision: 9 })
+  assert.equal(context.metrics.attention.value.length, 2)
+  assert.equal(context.metrics.onlineServers.value, 1)
   const expression = vue.match(/{{\s*(desk\.mappings\.filter\(m => m\.enabled\)\.length)\s*}}/)[1]
   assert.equal(vm.runInContext(expression, context), 1)
   desk.mappings[0].enabled = false

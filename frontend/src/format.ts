@@ -50,7 +50,7 @@ export function revisionState(node: Node): { text: string; tone: Tone } {
 }
 
 export function attentionReasons(node: Node, now = Date.now()): string[] {
-  if (node.revoked) return []
+  if (node.revoked || node.disabled) return []
   const reasons: string[] = []
   if (node.error) reasons.push('应用失败')
   if (node.applied_revision !== node.desired_revision) reasons.push('配置待应用')

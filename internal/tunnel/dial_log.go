@@ -27,6 +27,7 @@ type dialDiagnostics struct {
 }
 type dialStatus struct {
 	failing bool
+	up      bool
 	last    time.Time
 }
 
@@ -78,23 +79,25 @@ func (d *dialDiagnostics) report(ctx context.Context, b model.Binding, gateway m
 		}
 		d.state[b.ID] = dialStatus{failing: true, last: now}
 	} else {
-		if !previous.failing {
+		if previous.up && !previous.failing {
 			d.mu.Unlock()
 			return
 		}
-		d.state[b.ID] = dialStatus{}
+		d.state[b.ID] = dialStatus{up: true}
 	}
 	d.mu.Unlock()
 	if attempt < 1 {
 		attempt = 1
 	}
 	host, port := dialTarget(gateway)
-	args := []any{"role", "client", "id", b.ID, "node_id", gateway.ID, "attempt", attempt}
+	args := []any{"role", "client", "event", "session", "id", b.ID, "node_id", gateway.ID, "attempt", attempt, "network", gateway.Tunnel.EffectiveProtocol()}
 	if host != "" && port > 0 {
 		args = append(args, "addr", host, "port", port)
 	}
 	if failed {
-		d.logger.Warn("client tunnel connection failed ("+dialFailureReason(dialErr)+"); backing off", args...)
+		d.logger.Warn("client tunnel connection failed ("+dialFailureReason(dialErr)+"); backing off", append(args, "err", dialErr)...)
+	} else if previous.failing {
+		d.logger.Info("client tunnel connected again", args...)
 	} else {
 		d.logger.Info("client tunnel connected", args...)
 	}

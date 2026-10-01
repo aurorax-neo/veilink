@@ -164,7 +164,7 @@ func (h *handler) Handle(_ context.Context, rec slog.Record) error {
 	var details []string
 	rec.Attrs(func(a slog.Attr) bool {
 		switch a.Key {
-		case "role", "revision", "resource", "method", "id", "node_id", "addr", "scheme", "port", "attempt", "reason":
+		case "role", "revision", "resource", "method", "id", "node_id", "addr", "scheme", "port", "attempt", "reason", "err", "network", "listen", "target", "remote", "event":
 			value := fmt.Sprint(a.Value.Any())
 			value = strings.Map(func(c rune) rune {
 				if c < 32 || c == 127 {
@@ -172,8 +172,12 @@ func (h *handler) Handle(_ context.Context, rec slog.Record) error {
 				}
 				return c
 			}, value)
-			if len(value) > 128 {
-				value = value[:128]
+			if len(value) > 180 {
+				value = value[:180]
+			}
+			lower := strings.ToLower(value)
+			if strings.Contains(lower, "begin ") || strings.Contains(lower, "credential") || strings.Contains(lower, "token") || strings.Contains(lower, "private") {
+				value = "redacted"
 			}
 			details = append(details, a.Key+"="+value)
 		}

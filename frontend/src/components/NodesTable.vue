@@ -69,6 +69,7 @@ function tunnelLabel(node: Node) {
   if (t?.transport_security === 'tls') return `VLESS / TCP · TLS${additive}`
   return '未配置安全模式'
 }
+function released(node: Node) { return !!node.disabled && !node.error && !!node.desired_revision && node.applied_revision === node.desired_revision }
 function localListen(node: Node) { return endpoint(node.tunnel?.listen_host || '127.0.0.1', node.tunnel?.listen_port || 0) }
 function connectList(node: Node) { return (node.connect_endpoints || []).filter(item => item.enabled) }
 function openConfig(node: Node) { configNode.value = node; configModal.value?.open() }
@@ -146,9 +147,11 @@ async function run() {
   if (!pending.value || (pending.value.embedded && action.value !== 'disable' && action.value !== 'enable')) return false
   const path = `/nodes/${encodeURIComponent(pending.value.id)}`
   if (action.value === 'disable' || action.value === 'enable') {
-    await api(`${path}/disabled`, 'POST', { disabled: action.value === 'disable' })
+    const disabling = action.value === 'disable'
+    const result = await api<{ connected: boolean }>(`${path}/disabled`, 'POST', { disabled: disabling })
+    if (!result || typeof result.connected !== 'boolean') throw new Error('停用响应无效')
     await desk.reload()
-    desk.notify(action.value === 'disable' ? '节点已停用，对端不再拨号。' : '节点已启用。')
+    desk.notify(!result.connected ? (disabling ? '节点未连接，重连后才会停止。' : '节点未连接，重连后才会恢复。') : (disabling ? '节点已停用。' : '节点已启用。'))
     return true
   }
   await api(action.value === 'revoke' ? `${path}/revoke` : path, action.value === 'revoke' ? 'POST' : 'DELETE', action.value === 'revoke' ? {} : undefined)
@@ -173,7 +176,7 @@ async function run() {
         <tbody><tr v-for="node in rows" :key="node.id" :class="{ selected: selectedId === node.id }">
           <td><button type="button" class="text-btn" :aria-expanded="selectedId === node.id" @click="selectedId = selectedId === node.id ? '' : node.id">{{ node.name }}</button><small class="node-id" :title="node.id">{{ node.id }}</small><small v-if="node.embedded">内置节点</small><small class="software-version" :title="node.software_version || '等待节点上报运行版本'">软件：{{ node.software_version || '未上报' }}</small></td>
           <td><div class="node-presence"><Badge reserve="尚未连接" :text="presence(node, now).text" :tone="presence(node, now).tone" /><button type="button" class="icon-btn refresh-node" :disabled="node.revoked || refreshing.has(node.id)" @click="refreshNode(node)" :class="{ spinning: refreshing.has(node.id) }" :aria-busy="refreshing.has(node.id)" title="请求节点刷新状态" :aria-label="`刷新节点 ${node.name}`"><span aria-hidden="true">↻</span></button></div><small class="last-seen fit"><span class="fit-sizer" aria-hidden="true">最后上报：尚未上报</span><span class="fit-sizer" aria-hidden="true">最后上报：{{ seenText(node.last_seen, now, false) }}</span><span class="fit-value">最后上报：{{ seenText(node.last_seen, now, false) }}</span></small><span v-if="refreshFeedback[node.id]?.text" class="node-refresh-feedback fit" :class="{ bad: refreshFeedback[node.id]?.bad }" role="status"><span class="fit-sizer" aria-hidden="true">请求节点更新状态失败，请稍后重试。</span><span class="fit-sizer" aria-hidden="true">推送通道未连接，重连后自动同步</span><span class="fit-sizer" aria-hidden="true">已请求上报，等待节点反馈</span><span class="fit-sizer" aria-hidden="true">节点尚未上报新状态</span><span class="fit-sizer" aria-hidden="true">刷新响应无效，请重试。</span><span class="fit-sizer" aria-hidden="true">{{ refreshFeedback[node.id].text }}</span><span class="fit-value">{{ refreshFeedback[node.id].text }}</span></span></td>
-          <td v-if="role === 'server'"><small>监听：{{ localListen(node) }} · {{ node.tunnel?.protocol === 'hysteria2' || node.tunnel?.hysteria2?.password ? 'UDP' : 'TCP' }}</small><small v-for="item in connectList(node)" :key="item.id">{{ item.name }} · {{ endpoint(item.host, item.port) }}</small></td>
+          <td v-if="role === 'server'"><small v-if="released(node)">未监听</small><small v-else>监听：{{ localListen(node) }} · {{ node.tunnel?.protocol === 'hysteria2' || node.tunnel?.hysteria2?.password ? 'UDP' : 'TCP' }}</small><small v-for="item in connectList(node)" :key="item.id">{{ item.name }} · {{ endpoint(item.host, item.port) }}</small></td>
           <td v-if="role === 'server'">{{ tunnelLabel(node) }}</td><td>{{ mappings(node.id).length }}</td>
           <td><div class="revision-status" role="group" :title="revisionDescription(node)" :aria-label="revisionDescription(node)"><Badge reserve="尚无配置" :text="revisionLabel(node)" :tone="revisionState(node).tone" /></div></td>
           <td><div class="actions"><button type="button" class="btn small" :disabled="node.revoked" @click="editor?.open(node)">编辑</button><button type="button" class="btn small" :disabled="node.revoked" @click="ask(node, node.disabled ? 'enable' : 'disable')">{{ node.disabled ? '启用' : '停用' }}</button><button v-if="role === 'client'" type="button" class="btn small" :disabled="node.revoked || node.disabled || !effectiveSources(node).length" @click="openConfig(node)">查看配置</button><button v-if="!node.embedded" type="button" class="btn small" :disabled="node.revoked" @click="onboarding?.open(node)">快捷接入</button><button v-if="!node.embedded" type="button" class="btn small danger" @click="ask(node, 'delete')">删除</button></div></td>
@@ -195,7 +198,7 @@ async function run() {
   <Modal ref="confirm" :title="action === 'revoke' ? '吊销节点' : action === 'delete' ? '删除节点' : action === 'disable' ? '停用节点' : '启用节点'" save-label="确认" :danger="action === 'delete' || action === 'revoke' || action === 'disable'" :submit="run">
     <p v-if="action === 'revoke'">吊销「{{ pending?.name }}」的节点凭据？此操作不可撤销。</p>
     <p v-else-if="action === 'delete'">删除「{{ pending?.name }}」及其 {{ pending ? mappings(pending.id).length : 0 }} 条映射？此操作不可撤销。</p>
-    <p v-else-if="action === 'disable'">停用「{{ pending?.name }}」？绑定该节点的隧道会停止拨号，启用后恢复。</p>
+    <p v-else-if="action === 'disable'">停用「{{ pending?.name }}」？相关监听会关闭，拨号会停止。节点未连接时，重连后执行。</p>
     <p v-else>启用「{{ pending?.name }}」？</p>
   </Modal>
   <Modal ref="configModal" title="有效隧道配置（只读）" :hide-save="true">

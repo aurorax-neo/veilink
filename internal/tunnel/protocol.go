@@ -112,6 +112,12 @@ func (s *service) dialProtocol(gateway model.Node, peer *clientGateway, b model.
 // serveAuthorized starts only a session selected by an authenticated protocol.
 func (s *service) serveAuthorized(conn net.Conn, id [16]byte, binding model.Binding, port uint16) {
 	defer conn.Close()
+	remote := ""
+	if conn.RemoteAddr() != nil {
+		remote = conn.RemoteAddr().String()
+	}
+	s.noteSession("accepted", binding.ID, remote)
+	defer s.noteSession("closed", binding.ID, remote)
 	if port == singMuxPort {
 		s.acceptSingMux(conn, id, binding)
 		return

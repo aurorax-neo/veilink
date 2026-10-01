@@ -202,7 +202,11 @@ func RunWithLogger(ctx context.Context, c config.Config, role string, logger *sl
 			continue
 		}
 		state.connected.Store(false)
-		logger.Warn("control connection unavailable; retaining last successful configuration", "role", role, "err", e)
+		if configurationQuiesced(st.Snapshot) {
+			logger.Warn("control connection unavailable; tunnel remains stopped", "role", role, "err", e)
+		} else {
+			logger.Warn("control connection unavailable; retaining last successful configuration", "role", role, "err", e)
+		}
 		delay := backoff + time.Duration(rand.Int64N(int64(backoff/2)+1))
 		select {
 		case <-ctx.Done():
@@ -217,6 +221,24 @@ func RunWithLogger(ctx context.Context, c config.Config, role string, logger *sl
 		}
 	}
 	return nil
+}
+
+func configurationQuiesced(s *model.Snapshot) bool {
+	if s == nil {
+		return false
+	}
+	if s.Node.Disabled {
+		return true
+	}
+	if len(s.Bindings) != 0 {
+		return false
+	}
+	for _, m := range s.Mappings {
+		if m.Enabled {
+			return false
+		}
+	}
+	return true
 }
 
 // runtimeDriver permits deterministic slow-apply tests without real listeners.
@@ -517,7 +539,11 @@ func cycle(ctx context.Context, client pb.ControlClient, c config.Config, role s
 					return errors.New("cannot persist runtime cache")
 				}
 				if previous != result.revision || wasFailed {
-					logger.Info("runtime configuration applied", "role", role, "revision", result.snapshot.Revision)
+					if configurationQuiesced(&result.snapshot) {
+						logger.Info("tunnel stopped; configuration sync idle until the node is enabled", "role", role, "revision", result.snapshot.Revision, "event", "stop")
+					} else {
+						logger.Info("runtime configuration applied", "role", role, "revision", result.snapshot.Revision)
+					}
 				}
 				select {
 				case report <- struct{}{}:

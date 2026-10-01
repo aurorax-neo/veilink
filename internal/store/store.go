@@ -851,7 +851,9 @@ func (s *Store) saveNode(n model.Node, embedded bool) (model.Node, error) {
 }
 
 // SetNodeDisabled stops or resumes a node without revoking its credential.
-// A disabled server is removed from client snapshots, so clients do not dial it.
+// Both snapshots omit that node's tunnels. A connected server closes its
+// listeners and a client stops dialing; an offline node does so after it
+// reconnects and applies the snapshot.
 func (s *Store) SetNodeDisabled(id string, disabled bool) error {
 	return s.mutate("node.disable", id, func(st *state) error {
 		n, ok := st.Nodes[id]
@@ -863,6 +865,20 @@ func (s *Store) SetNodeDisabled(id string, disabled bool) error {
 		return nil
 	})
 }
+
+// ControlConnected reports whether the node currently has a control stream.
+// It is not tunnel liveness and not proof that listeners have already closed.
+func (s *Store) ControlConnected(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, nodeID := range s.listeners {
+		if nodeID == id {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Store) RemoveNode(id string, remove bool) error {
 	return s.mutate("node.revoke", id, func(st *state) error {
 		n, ok := st.Nodes[id]

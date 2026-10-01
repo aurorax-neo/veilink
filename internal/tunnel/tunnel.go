@@ -189,7 +189,21 @@ func (r *Runtime) LinkedBindings() []string {
 }
 
 // Apply prevalidates before touching listeners. A failed start restores the
-// last running configuration when one exists.
+// last running configuration when one exists. An idle snapshot is the
+// exception: nothing is authorized to listen or dial, so a failed replacement
+// must not put the previous listeners back.
+func idleSnapshot(s model.Snapshot) bool {
+	if len(s.Bindings) != 0 {
+		return false
+	}
+	for _, m := range s.Mappings {
+		if m.Enabled {
+			return false
+		}
+	}
+	return true
+}
+
 func (r *Runtime) Apply(s model.Snapshot) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -224,6 +238,10 @@ func (r *Runtime) Apply(s model.Snapshot) error {
 	r.traffic.prepareActive(s.Mappings, s.Node.Role == "server")
 	instance, err := startWithDiagnostics(s, effective, r.dialLog, r.traffic)
 	if err != nil {
+		if idleSnapshot(s) {
+			r.traffic.setActive(nil, false)
+			return fmt.Errorf("stop listeners: %w", err)
+		}
 		defer func() {
 			if r.good != nil {
 				r.traffic.setActive(r.good.Mappings, r.good.Node.Role == "server")
@@ -509,6 +527,9 @@ func startWithDiagnostics(s model.Snapshot, local model.LocalTLS, diagnostics *d
 
 func (s *service) stop() {
 	s.once.Do(func() {
+		if s.dialLog != nil && s.dialLog.logger != nil {
+			s.dialLog.logger.Info("tunnel listeners stopped", "role", s.snapshot.Node.Role, "id", s.snapshot.Node.ID, "event", "stop")
+		}
 		if s.inbound != nil {
 			s.inbound.Close()
 		}
@@ -676,6 +697,12 @@ func (s *service) authenticate(conn net.Conn) {
 
 func (s *service) openPublic(conn net.Conn, m model.Mapping) {
 	defer s.untrack(conn)
+	remote := ""
+	if conn.RemoteAddr() != nil {
+		remote = conn.RemoteAddr().String()
+	}
+	s.noteMapping("opened", m, remote)
+	defer s.noteMapping("closed", m, remote)
 	public := &countedConn{Conn: conn, traffic: s.traffic, id: m.ID}
 	if !m.Mux {
 		s.openApplication(public, m)
@@ -763,7 +790,21 @@ func (s *service) noteServer(reason string) {
 	if s.dialLog == nil {
 		return
 	}
-	s.dialLog.warnLimited("server-"+reason, "server tunnel handshake failed ("+reason+")", "role", "server", "id", s.snapshot.Node.ID, "reason", reason)
+	s.dialLog.warnLimited("server-"+reason, "server tunnel handshake failed ("+reason+")", "role", "server", "id", s.snapshot.Node.ID, "reason", reason, "event", "handshake")
+}
+
+func (s *service) noteSession(event, bindingID, remote string) {
+	if s.dialLog == nil || s.dialLog.logger == nil {
+		return
+	}
+	s.dialLog.logger.Info("server tunnel session "+event, "role", "server", "event", event, "id", bindingID, "remote", remote)
+}
+
+func (s *service) noteMapping(event string, m model.Mapping, remote string) {
+	if s.dialLog == nil || s.dialLog.logger == nil {
+		return
+	}
+	s.dialLog.logger.Info("mapping connection "+event, "role", "server", "event", event, "id", m.ID, "network", mappingNet(m.Network), "listen", m.ListenPort, "target", net.JoinHostPort(m.TargetHost, strconv.Itoa(m.TargetPort)), "remote", remote)
 }
 
 func (s *service) afterShort(b model.Binding, gateway model.Node, started time.Time, attempt int) (int, bool) {
