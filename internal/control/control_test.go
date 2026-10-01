@@ -114,11 +114,12 @@ func TestTLSProtocolAndLiveRevocation(t *testing.T) {
 	if e = s.RemoveNode(n.ID, false); e != nil {
 		t.Fatal(e)
 	}
-	if e = stream.Send(beat); e != nil {
-		t.Fatal(e)
-	}
-	if _, e = stream.Recv(); status.Code(e) != codes.Unauthenticated {
-		t.Fatal("revoked live stream", e)
+	// Revocation notifies the live stream immediately. The server can close
+	// before this send finishes, so either side may surface Unauthenticated.
+	sendErr := stream.Send(beat)
+	_, recvErr := stream.Recv()
+	if status.Code(sendErr) != codes.Unauthenticated && status.Code(recvErr) != codes.Unauthenticated {
+		t.Fatalf("revoked live stream send=%v recv=%v", sendErr, recvErr)
 	}
 	if _, e = c.Pull(ctx, req); status.Code(e) != codes.Unauthenticated {
 		t.Fatal("revoked pull", e)
