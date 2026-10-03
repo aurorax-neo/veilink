@@ -2,44 +2,57 @@ package httpapi
 
 import (
 	"fmt"
-	"net/http/httptest"
 	"path/filepath"
-	"strings"
 	"testing"
-	"time"
 
+	"veilink/internal/httpapi/backend"
 	"veilink/internal/store"
 )
 
-func TestResetAdminClearsFullRevokedSessionCapacity(t *testing.T) {
+// TestKeyRevocationIsolation 验证吊销单个 key 不影响其他 key，
+// 且 key 存储没有人为的容量上限（替代旧版 100 session 上限测试）。
+func TestKeyRevocationIsolation(t *testing.T) {
 	d := t.TempDir()
 	s, err := store.Open(filepath.Join(d, "db"), filepath.Join(d, "key"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if err := s.InitAdmin("admin", "old test password"); err != nil {
-		t.Fatal(err)
+	h := New(s, false, nil)
+
+	// 创建超过旧版 session 上限数量的 key，验证无容量限制
+	keys := make([]string, 0, 150)
+	for i := 0; i < 150; i++ {
+		plaintext, err := h.(*API).keyStore.Create(fmt.Sprintf("key-%d", i), backend.RoleAdmin)
+		if err != nil {
+			t.Fatalf("key creation failed at %d: %v", i, err)
+		}
+		keys = append(keys, plaintext)
 	}
-	old, err := s.AdminVersion()
+
+	// 吊销其中一个
+	listed, err := h.(*API).keyStore.List()
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := New(s, false, nil, nil).(*API)
-	for i := 0; i < 100; i++ {
-		a.sessions[fmt.Sprint(i)] = session{csrf: "old", version: old, expires: time.Now().Add(time.Hour)}
+	var revokedID int64
+	for _, k := range listed {
+		if k.Name == "key-0" {
+			revokedID = k.ID
+		}
 	}
-	if err := s.ResetAdminPassword("new test password"); err != nil {
+	if err := h.(*API).keyStore.Revoke(revokedID); err != nil {
 		t.Fatal(err)
 	}
-	r := httptest.NewRequest("POST", "/api/login", strings.NewReader(`{"username":"admin","password":"new test password"}`))
-	r.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	a.ServeHTTP(w, r)
-	if w.Code != 200 {
-		t.Fatalf("new login rejected: %d %s", w.Code, w.Body.String())
+
+	// 被吊销的 key 应被拒绝
+	if w := testCall(h, keys[0], "GET", "/api/v1/nodes", ""); w.Code != 401 {
+		t.Fatalf("revoked key accepted: %d", w.Code)
 	}
-	if len(a.sessions) != 1 {
-		t.Fatalf("revoked sessions retained: %d", len(a.sessions))
+	// 其他 key 仍可用
+	for _, k := range keys[1:5] {
+		if w := testCall(h, k, "GET", "/api/v1/nodes", ""); w.Code != 200 {
+			t.Fatalf("valid key rejected: %d", w.Code)
+		}
 	}
 }

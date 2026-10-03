@@ -18,7 +18,6 @@ import (
 
 	pb "veilink/api/control/v1"
 	"veilink/internal/config"
-	"veilink/internal/console"
 	"veilink/internal/control"
 	"veilink/internal/httpapi"
 	"veilink/internal/logring"
@@ -65,7 +64,7 @@ func Run(ctx context.Context, c config.Config) error {
 	pb.RegisterControlServer(g, &control.Service{Store: s, NodeRing: logring.NewNodeRing(ring)})
 
 	insecure := mode == "http"
-	panel := httpapi.New(s, insecure, console.Handler(console.Locate(c.HTMLDir)), ring)
+	panel := httpapi.New(s, insecure, ring)
 
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {

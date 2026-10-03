@@ -12,7 +12,7 @@ func TestPEMRequestBudget(t *testing.T) {
 		size int
 		want bool
 	}{
-		{"/api/nodes", 200000, true}, {"/api/nodes", 600000, false}, {"/api/login", 70000, false},
+		{"/api/v1/nodes", 200000, true}, {"/api/v1/nodes", 600000, false}, {"/api/v1/other", 70000, false},
 	} {
 		r := httptest.NewRequest("POST", tc.path, strings.NewReader(`{"value":"`+strings.Repeat("x", tc.size)+`"}`))
 		r.Header.Set("Content-Type", "application/json")

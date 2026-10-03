@@ -11,15 +11,18 @@ import LogsView from './LogsView.vue'
 import ProxiesView from './ProxiesView.vue'
 import ServersView from './ServersView.vue'
 
-defineProps<{ page: PageId; account: string; noticeKey: number }>()
+defineProps<{ page: PageId; noticeKey: number }>()
 const emit = defineEmits<{ navigate: [page: PageId]; logout: [] }>()
 const desk = inject(deskKey)!
 const nav: PageId[] = ['dashboard', 'servers', 'clients', 'proxies', 'logs', 'audit']
-const software = ref<{ version: string; commit: string } | null>(null)
+const software = ref<{ backend_version: string; api_version: string; web_version: string } | null>(null)
 const versionError = ref(false)
 async function loadVersion() {
   versionError.value = false
-  try { software.value = await api('/version') } catch { versionError.value = true }
+  try {
+    // /api/version 是公开路径，直接 fetch 不走 api() 封装
+    software.value = await fetch('/api/version').then(r => r.json())
+  } catch { versionError.value = true }
 }
 onMounted(loadVersion)
 async function refresh() {
@@ -60,15 +63,16 @@ async function refresh() {
         <p>管理中心 <span>/ {{ pages[page].title }}</span></p>
         <div class="top-actions">
           <details class="build-version">
-             <summary :title="software?.version"><span class="fit"><span class="fit-sizer" aria-hidden="true">软件 加载中…</span><span class="fit-sizer" aria-hidden="true">软件 未获取</span><span class="fit-sizer" aria-hidden="true">软件 {{ software?.version || '加载中…' }}</span><span class="fit-value">软件 {{ software?.version || (versionError ? '未获取' : '加载中…') }}</span></span></summary>
+             <summary :title="software?.backend_version"><span class="fit"><span class="fit-sizer" aria-hidden="true">软件 加载中…</span><span class="fit-sizer" aria-hidden="true">软件 未获取</span><span class="fit-sizer" aria-hidden="true">软件 {{ software?.backend_version || '加载中…' }}</span><span class="fit-value">软件 {{ software?.backend_version || (versionError ? '未获取' : '加载中…') }}</span></span></summary>
             <div class="build-details">
-              <p>管理中心：{{ software?.version || '未知' }}</p>
-              <p>构建提交：<code>{{ software?.commit || '未知' }}</code></p>
+              <p>后端版本：{{ software?.backend_version || '未知' }}</p>
+              <p>API 契约：{{ software?.api_version || '未知' }}</p>
+              <p>前端版本：{{ software?.web_version || '未知' }}</p>
               <button v-if="versionError" type="button" class="btn small" @click="loadVersion">重试</button>
             </div>
           </details>
-          <span class="who">{{ account || '当前账号' }}</span>
-          <button type="button" class="btn quiet" @click="emit('logout')">退出登录</button>
+          <span class="who">API Key</span>
+          <button type="button" class="btn quiet" @click="emit('logout')">断开连接</button>
         </div>
       </header>
       <main id="main" class="stage" tabindex="-1">

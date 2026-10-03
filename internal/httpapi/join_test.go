@@ -4,12 +4,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+	"veilink/internal/httpapi/backend"
 	"veilink/internal/model"
 	"veilink/internal/store"
 )
@@ -50,43 +50,23 @@ func TestJoinCommandAuthenticationRotationAndRevocation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if err = s.InitAdmin("admin", "long test password"); err != nil {
-		t.Fatal(err)
-	}
 	n, err := s.SaveNode(model.Node{Name: "join-client", Role: "client"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := New(s, true, nil, nil)
-	var cookie *http.Cookie
-	csrf := ""
-	call := func(method, path, body string) *httptest.ResponseRecorder {
-		r := httptest.NewRequest(method, path, strings.NewReader(body))
-		r.Header.Set("Content-Type", "application/json")
-		r.Header.Set("X-CSRF-Token", csrf)
-		if cookie != nil {
-			r.AddCookie(cookie)
-		}
-		w := httptest.NewRecorder()
-		h.ServeHTTP(w, r)
-		return w
+	h := New(s, true, nil)
+	apiKey, err := h.(*API).keyStore.Create("test", backend.RoleAdmin)
+	if err != nil {
+		t.Fatal(err)
 	}
-	path := "/api/nodes/" + n.ID + "/join"
+	call := func(method, path, body string) *httptest.ResponseRecorder {
+		return testCall(h, apiKey, method, path, body)
+	}
+	path := "/api/v1/nodes/" + n.ID + "/join"
 	body := `{"master_url":"https://panel.example:8443","ttl_seconds":60}`
-	if w := call("POST", path, body); w.Code != 401 {
+	if w := testCall(h, "", "POST", path, body); w.Code != 401 {
 		t.Fatal("unauthenticated join", w.Code)
 	}
-	w := call("POST", "/api/login", `{"username":"admin","password":"long test password"}`)
-	if w.Code != 200 {
-		t.Fatal(w.Body.String())
-	}
-	cookie = w.Result().Cookies()[0]
-	var login map[string]string
-	json.Unmarshal(w.Body.Bytes(), &login)
-	if w = call("POST", path, body); w.Code != 403 {
-		t.Fatal("join missing csrf", w.Code)
-	}
-	csrf = login["csrf"]
 	type response struct {
 		Command string `json:"command"`
 		Prepare string `json:"prepare"`
@@ -140,7 +120,8 @@ func TestJoinCommandAuthenticationRotationAndRevocation(t *testing.T) {
 	if strings.Contains(fresh.Command, old.Token) || !strings.Contains(old.Command, shellQuote(old.Token)) {
 		t.Fatal("rotation did not replace command credential")
 	}
-	if w = call("DELETE", "/api/nodes/"+n.ID+"/enroll", ""); w.Code != 200 {
+	var w *httptest.ResponseRecorder
+	if w = call("DELETE", "/api/v1/nodes/"+n.ID+"/enroll", ""); w.Code != 200 {
 		t.Fatal(w.Code, w.Body.String())
 	}
 	if _, err = s.Enroll(n.ID, fresh.Token); err == nil {
@@ -155,7 +136,7 @@ func TestJoinCommandAuthenticationRotationAndRevocation(t *testing.T) {
 	if err != nil || credentialAgain != credential {
 		t.Fatal("active join token was not reusable")
 	}
-	if w = call("DELETE", "/api/nodes/"+n.ID+"/enroll", ""); w.Code != 200 {
+	if w = call("DELETE", "/api/v1/nodes/"+n.ID+"/enroll", ""); w.Code != 200 {
 		t.Fatal(w.Code)
 	}
 	if _, err = s.Snapshot(n.ID, credential); err != nil {
@@ -175,7 +156,7 @@ func TestJoinCommandAuthenticationRotationAndRevocation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	serverPath := "/api/nodes/" + server.ID + "/join"
+	serverPath := "/api/v1/nodes/" + server.ID + "/join"
 	body = `{"master_url":"https://panel.example:8443","ttl_seconds":60}`
 	w = call("POST", serverPath, body)
 	if w.Code != 200 {
@@ -212,7 +193,7 @@ func TestJoinCommandAuthenticationRotationAndRevocation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w = call("POST", "/api/nodes/"+longNode.ID+"/join", body)
+	w = call("POST", "/api/v1/nodes/"+longNode.ID+"/join", body)
 	if w.Code != 200 {
 		t.Fatal("long ID join failed", w.Code, w.Body.String())
 	}
@@ -226,7 +207,7 @@ func TestJoinCommandAuthenticationRotationAndRevocation(t *testing.T) {
 	if !strings.Contains(serverJoin.Command, " -v "+shellQuote(serverRoot+"/config:/config:ro")) || !strings.Contains(serverJoin.Command, " -v "+shellQuote(serverRoot+"/data:/data")) || !strings.Contains(serverJoin.Command, " -enroll-token "+shellQuote(serverJoin.Token)) {
 		t.Fatal("server lost data or enrollment token")
 	}
-	if w = call("GET", "/api/bindings", ""); w.Code != 404 {
+	if w = call("GET", "/api/v1/bindings", ""); w.Code != 404 {
 		t.Fatal("binding management still exposed")
 	}
 	if err = s.RemoveNode(n.ID, false); err != nil {

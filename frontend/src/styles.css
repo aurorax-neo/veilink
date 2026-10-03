@@ -185,3 +185,23 @@ tr.selected td { background: rgba(85, 183, 199, .08); } tbody tr:hover td { back
 td small.node-refresh-feedback { color: var(--warn); }
 td small.node-refresh-feedback.bad, .node-refresh-feedback.bad { color: var(--danger); }
 .traffic-figure { font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; }
+
+/* 骨架屏：与真实布局同尺寸，避免加载闪屏 */
+.skeleton { pointer-events: none; }
+.skeleton .sk {
+  border-radius: 6px;
+  background: linear-gradient(90deg, var(--surface) 25%, var(--surface-soft) 50%, var(--surface) 25%);
+  background-size: 200% 100%;
+  animation: sk-pulse 1.4s ease-in-out infinite;
+}
+.skeleton .sk-brand { height: 28px; width: 140px; margin-bottom: 24px; }
+.skeleton .sk-title { height: 24px; width: 200px; margin-bottom: 20px; }
+.skeleton .sk-line { height: 14px; margin: 12px 0; }
+.skeleton .sk-line:nth-child(odd) { width: 92%; }
+.skeleton .sk-line:nth-child(even) { width: 78%; }
+@keyframes sk-pulse { to { background-position: -200% 0; } }
+@media (prefers-reduced-motion: reduce) { .skeleton .sk { animation: none; } }
+
+/* 滚动条槽位：全局保留，杜绝布局抖动 */
+html { scrollbar-gutter: stable; }
+.side { scrollbar-gutter: stable; }

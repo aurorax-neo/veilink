@@ -1,15 +1,14 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, provide, reactive, ref, watch } from 'vue'
-import { api, ApiError, clearCsrf, setCsrf, setUnauthorized } from './api'
+import { api, ApiError, getApiKey, setApiKey, clearApiKey, setUnauthorized, checkApiCompatibility } from './api'
 import { deskKey, navigateKey, type Desk } from './desk'
 import { pageFromHash, pages, type Audit, type Mapping, type Node, type PageId } from './types'
 import ConsoleView from './views/ConsoleView.vue'
 import LoginView from './views/LoginView.vue'
 
-const phase = ref<'boot' | 'setup-error' | 'register' | 'login' | 'app'>('boot')
+const phase = ref<'boot' | 'login' | 'app'>('boot')
 const loginError = ref('')
 const loginBusy = ref(false)
-const account = ref('')
 const page = ref<PageId>(pageFromHash())
 // A new key remounts the live region when identical messages are sent again.
 const noticeKey = ref(0)
@@ -133,60 +132,35 @@ function onHash() {
 provide(deskKey, desk)
 provide(navigateKey, navigate)
 
-async function enter(session: { csrf?: string }, name = '') {
-  if (!session.csrf) throw new Error('会话缺少 CSRF 凭据，请重新登录。')
-  setCsrf(session.csrf)
-  account.value = name
+async function enter() {
   phase.value = 'app'
   loginError.value = ''
   document.title = `Veilink · ${pages[page.value].title}`
   try {
     await desk.reload()
   } catch {
-    // Shown in the console. A failed read is not a failed login.
+    // 数据加载失败不影响进入，控制台内会显示错误
   }
 }
 
-async function loadSetup(restoreSession = false) {
-  phase.value = 'boot'
-  try {
-    const setup = await api<{ registration_required: boolean }>('/setup')
-    if (typeof setup.registration_required !== 'boolean') throw new Error('初始化状态无效')
-    phase.value = setup.registration_required ? 'register' : restoreSession ? 'boot' : 'login'
-  } catch (reason) {
-    phase.value = 'setup-error'
-    loginError.value = reason instanceof Error ? reason.message : '无法确认初始化状态'
-  }
-}
-
-async function submitLogin(username: string, password: string) {
+async function submitLogin(apiKey: string) {
   loginBusy.value = true
   loginError.value = ''
   try {
-    if (phase.value === 'register') {
-      await api('/register', 'POST', { username, password })
-      phase.value = 'login'
-      loginError.value = '注册成功，请使用新账号登录。'
-    } else {
-      await enter(await api<{ csrf?: string }>('/login', 'POST', { username, password }), username.trim())
-    }
+    setApiKey(apiKey)
+    // 用一个轻量接口验证 Key 有效性
+    await api('/stats')
+    await enter()
   } catch (reason) {
-    if (reason instanceof ApiError && reason.status === 409) await loadSetup()
-    loginError.value = reason instanceof Error ? reason.message : '登录失败'
+    clearApiKey()
+    loginError.value = reason instanceof Error ? reason.message : '连接失败'
   } finally {
     loginBusy.value = false
   }
 }
 
-async function logout() {
-  try {
-    await api('/logout', 'POST', {})
-  } catch (reason) {
-    desk.notify(reason instanceof Error ? reason.message : '退出失败', true)
-    return
-  }
-  clearCsrf()
-  account.value = ''
+function logout() {
+  clearApiKey()
   resetDesk()
   phase.value = 'login'
   document.title = 'Veilink · 穿透控制台'
@@ -211,28 +185,36 @@ async function refreshLive() {
 
 function onVisible() { if (document.visibilityState === 'visible') void refreshLive() }
 onMounted(async () => {
-  setUnauthorized((path) => {
-    if (path === '/session') return
-    clearCsrf()
-    account.value = ''
+  setUnauthorized(() => {
+    clearApiKey()
     resetDesk()
     phase.value = 'login'
-    loginError.value = '会话已失效，请重新登录。'
+    loginError.value = 'API Key 已失效，请重新输入。'
     document.title = 'Veilink · 穿透控制台'
   })
   window.addEventListener('hashchange', onHash)
   window.addEventListener('visibilitychange', onVisible)
   liveTimer = window.setInterval(() => { void refreshLive() }, 5000)
-  await loadSetup(true)
-  if (phase.value !== 'boot') return
+
+  // 启动时检查 API 契约版本
   try {
-    await enter(await api<{ csrf?: string }>('/session'))
+    await checkApiCompatibility()
   } catch (reason) {
-    phase.value = 'login'
-    if (!(reason instanceof ApiError) || reason.status !== 401) {
-      loginError.value = reason instanceof Error ? reason.message : '无法确认会话'
+    loginError.value = reason instanceof Error ? reason.message : '版本检查失败'
+    // 版本不兼容也允许进入，由页面显示警告
+  }
+
+  // 有 Key 则尝试直接进入
+  if (getApiKey()) {
+    try {
+      await api('/stats')
+      await enter()
+      return
+    } catch {
+      clearApiKey()
     }
   }
+  phase.value = 'login'
 })
 
 onUnmounted(() => {
@@ -245,8 +227,17 @@ onUnmounted(() => {
 
 <template>
   <a class="skip" :href="phase === 'app' ? '#main' : '#login-main'">跳转到主内容</a>
-  <p v-if="phase === 'boot'" class="boot">正在确认会话…</p>
-  <div v-else-if="phase === 'setup-error'" class="boot" role="alert">{{ loginError }} <button class="btn" @click="loadSetup()">重试</button></div>
-  <LoginView v-else-if="phase === 'login' || phase === 'register'" :key="phase" :register="phase === 'register'" :error="loginError" :busy="loginBusy" @submit="submitLogin" />
-  <ConsoleView v-else :page="page" :account="account" :notice-key="noticeKey" @navigate="navigate" @logout="logout" />
+  <!-- 骨架屏：布局与真实界面一致，避免闪屏 -->
+  <div v-if="phase === 'boot'" class="shell skeleton" aria-hidden="true">
+    <aside class="side">
+      <div class="sk sk-brand"></div>
+      <div class="sk sk-line" v-for="i in 6" :key="i"></div>
+    </aside>
+    <main class="stage">
+      <div class="sk sk-title"></div>
+      <div class="sk sk-line" v-for="i in 8" :key="i"></div>
+    </main>
+  </div>
+  <LoginView v-else-if="phase === 'login'" :error="loginError" :busy="loginBusy" @submit="submitLogin" />
+  <ConsoleView v-else :page="page" :notice-key="noticeKey" @navigate="navigate" @logout="logout" />
 </template>

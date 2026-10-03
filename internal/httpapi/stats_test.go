@@ -7,10 +7,10 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
 
+	"veilink/internal/httpapi/backend"
 	"veilink/internal/model"
 	"veilink/internal/store"
 	"veilink/internal/tunnel"
@@ -24,32 +24,23 @@ func TestStatsHeartbeatAndMappingLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if err := s.InitAdmin("admin", "long test password"); err != nil {
+	h := New(s, true, nil)
+	apiKey, err := h.(*API).keyStore.Create("test", backend.RoleAdmin)
+	if err != nil {
 		t.Fatal(err)
 	}
-	h := New(s, true, nil, nil)
-	var cookie *http.Cookie
 	call := func(method, path, body string) *httptest.ResponseRecorder {
-		r := httptest.NewRequest(method, path, strings.NewReader(body))
-		r.Header.Set("Content-Type", "application/json")
-		if cookie != nil {
-			r.AddCookie(cookie)
-		}
-		w := httptest.NewRecorder()
-		h.ServeHTTP(w, r)
-		return w
+		return testCall(h, apiKey, method, path, body)
 	}
-	if w := call("GET", "/api/stats", ""); w.Code != http.StatusUnauthorized {
-		t.Fatal("stats accessible without login", w.Code)
+	if w := testCall(h, "", "GET", "/api/v1/stats", ""); w.Code != http.StatusUnauthorized {
+		t.Fatal("stats accessible without key", w.Code)
 	}
-	w := call("POST", "/api/login", `{"username":"admin","password":"long test password"}`)
-	if w.Code != http.StatusOK {
-		t.Fatal("login failed", w.Code)
+	if w := testCall(h, "vlk_invalid", "GET", "/api/v1/stats", ""); w.Code != http.StatusUnauthorized {
+		t.Fatal("stats accessible with invalid key", w.Code)
 	}
-	cookie = w.Result().Cookies()[0]
 	check := func(t *testing.T, nodes, online, mappings, enabled int) {
 		t.Helper()
-		w := call("GET", "/api/stats", "")
+		w := call("GET", "/api/v1/stats", "")
 		if w.Code != http.StatusOK {
 			t.Fatal("stats failed", w.Code)
 		}

@@ -49,28 +49,48 @@ Veilink 使用 Go 实现节点与隧道，Vue 3 提供管理界面。**一个 Do
 
 ## 部署准备
 
-### 镜像与版本
-
-在每台节点主机准备 Docker 和统一镜像。以下命令以 Linux Docker Engine 为部署环境：
+### 快速启动（零配置）
 
 ```sh
-docker pull ghcr.io/aurorax-neo/veilink:latest
+# Docker 一行启动（数据持久化可选）
+docker run -itd --restart unless-stopped --name veilink \
+  -e TZ=Asia/Shanghai \
+  --network host \
+  -v veilink-data:/data \
+  ghcr.io/aurorax-neo/veilink:latest master
 ```
 
-发布镜像面向 `linux/amd64` 和 `linux/arm64`。`latest` 是可变标签，不会自动更新运行中的容器；生产环境可按[发布说明](https://github.com/aurorax-neo/veilink/releases)选择具体版本标签，例如 `:0.2.0`。当前源码的功能不一定已包含在旧版本镜像中。
+首次启动自动完成：
+- 生成管理员 API Key（日志中显示一次，请保存）
+- 拉取最新前端（`WEB_MODE=pull` 默认）
+- 数据目录自动初始化，无需手动 `mkdir`/`chown`
 
-从仓库根目录构建当前源码时，仍只构建一个镜像；此命令不会推送 GHCR：
-
+查看 API Key：
 ```sh
-docker build -t ghcr.io/aurorax-neo/veilink:latest .
+docker logs veilink 2>&1 | grep "API Key"
+```
+
+### 镜像与版本
+
+前后端独立发布：
+- 后端：`ghcr.io/aurorax-neo/veilink-backend:v1.2.0`（tag `v*` 触发）
+- 前端：`ghcr.io/aurorax-neo/veilink-web:web-v1.0.0`（tag `web-v*` 触发）
+- 统一：`ghcr.io/aurorax-neo/veilink:latest`（手动组装，含预置前端）
+
+原生二进制（Linux/macOS/Windows）：
+```sh
+# Linux/macOS
+curl -fsSL https://get.veilink.dev | sh
+
+# Windows (PowerShell)
+irm https://get.veilink.dev/install.ps1 | iex
 ```
 
 ### 目录与网络
 
-- 容器以 UID/GID `65532:65532` 运行，持久化数据挂载到 `/data`，宿主机目录统一放在 `/opt/docker/<app_name>/`。
-- Master、Server 使用 Host 网络承载动态入站端口，**不要添加 `-p`**；Client 使用默认 Bridge。
-- `/config` 只读挂载 Master 身份证书或控制面 CA。隧道证书和私钥通过 Web 保存为 PEM，不放入节点启动参数。
-- 以下目录准备命令需要相应的宿主机权限。已有数据库、key 和状态目录不得删除或覆盖，先备份。
+- 容器 entrypoint 自动修复 `/data` 权限，无需手动 `mkdir`/`chown`
+- Master、Server 使用 Host 网络承载动态入站端口，**不要添加 `-p`**；Client 使用默认 Bridge
+- 命名卷（`veilink-data`）推荐用于持久化，权限自动处理
 
 | 端口示例 | 用途 | 放行范围 |
 | --- | --- | --- |

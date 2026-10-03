@@ -308,6 +308,10 @@ CREATE TABLE audit(at INTEGER NOT NULL,action TEXT NOT NULL,object TEXT NOT NULL
 }
 func (s *Store) Close() error { return s.db.Close() }
 
+// DB exposes the underlying database for auxiliary stores (e.g. API keys).
+// Callers must not close the returned DB.
+func (s *Store) DB() *sql.DB { return s.db }
+
 // Subscribe returns coalescing configuration-change notifications for one node.
 // The revision is only a wake-up hint; callers must Pull the authorized snapshot.
 func (s *Store) Subscribe(nodeID string) (<-chan int64, func()) {

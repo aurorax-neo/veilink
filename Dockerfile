@@ -2,8 +2,8 @@ ARG NPM_REGISTRY=https://registry.npmmirror.com
 ARG GOPROXY=https://goproxy.cn,direct
 ARG APK_MIRROR=https://mirrors.ustc.edu.cn/alpine
 
-# Compile on the builder host; only the runtime stage needs target emulation.
-FROM --platform=$BUILDPLATFORM golang:1.27-alpine3.23 AS build
+# ============ 后端构建 ============
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine3.23 AS build-backend
 WORKDIR /src
 ARG GOPROXY
 ENV GOPROXY=${GOPROXY}
@@ -16,7 +16,8 @@ ARG VERSION=dev
 ARG COMMIT=unknown
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w -X veilink/internal/buildinfo.Version=${VERSION} -X veilink/internal/buildinfo.Commit=${COMMIT}" -o /out/veilink ./cmd/veilink
 
-FROM --platform=$BUILDPLATFORM node:22-alpine3.23 AS ui
+# ============ 前端构建 ============
+FROM --platform=$BUILDPLATFORM node:22-alpine3.23 AS build-web
 WORKDIR /src/frontend
 ARG NPM_REGISTRY
 RUN npm config set registry ${NPM_REGISTRY}
@@ -25,27 +26,45 @@ RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
-# One release image; the required subcommand selects the runtime role.
-FROM alpine:3.23
+# ============ 后端镜像（纯 API + pull 前端） ============
+FROM alpine:3.23 AS backend
 ARG APK_MIRROR
 ARG VERSION=dev
 ARG COMMIT=unknown
-ARG SOURCE_URL=local
 RUN printf '%s/v3.23/main\n%s/v3.23/community\n' "$APK_MIRROR" "$APK_MIRROR" > /etc/apk/repositories \
- && apk add --no-cache ca-certificates tzdata curl sqlite \
- && mkdir -p /data \
- && chown 65532:65532 /data
-LABEL org.opencontainers.image.title="veilink" \
-      org.opencontainers.image.description="Unified Veilink master/server/client image" \
+ && apk add --no-cache ca-certificates tzdata sqlite su-exec \
+ && mkdir -p /data/web \
+ && adduser -D -u 65532 -g 65532 veilink \
+ && chown -R veilink:veilink /data
+LABEL org.opencontainers.image.title="veilink-backend" \
       org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.revision="${COMMIT}" \
-      org.opencontainers.image.source="${SOURCE_URL}"
-COPY --from=build /out/veilink /usr/local/bin/veilink
-COPY --from=ui /src/html /usr/local/html
-COPY docker-healthcheck.sh /usr/local/bin/docker-healthcheck.sh
-RUN chmod 755 /usr/local/bin/docker-healthcheck.sh
+      org.opencontainers.image.revision="${COMMIT}"
+COPY --from=build-backend /out/veilink /usr/local/bin/veilink
+COPY docker-entrypoint.sh docker-healthcheck.sh /usr/local/bin/
+RUN chmod 755 /usr/local/bin/docker-entrypoint.sh /usr/local/bin/docker-healthcheck.sh
 WORKDIR /data
-USER 65532:65532
-ENTRYPOINT ["/usr/local/bin/veilink"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["master"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
   CMD ["/usr/local/bin/docker-healthcheck.sh"]
+
+# ============ 前端镜像（nginx 托管静态资源） ============
+FROM nginx:alpine AS web
+ARG VERSION=dev
+COPY --from=build-web /src/frontend/dist /usr/share/nginx/html
+COPY frontend/nginx.conf /etc/nginx/conf.d/default.conf
+LABEL org.opencontainers.image.title="veilink-web" \
+      org.opencontainers.image.version="${VERSION}"
+EXPOSE 80
+
+# ============ 统一镜像（后端 + 预置前端，master 开箱即用） ============
+FROM backend AS unified
+ARG VERSION=dev
+ARG COMMIT=unknown
+LABEL org.opencontainers.image.title="veilink" \
+      org.opencontainers.image.description="Veilink master/server/client with pre-bundled web UI" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${COMMIT}"
+COPY --from=build-web /src/frontend/dist /opt/veilink-web/
+# 预置前端：WebManager 优先使用本地版本，无需下载
+ENV WEB_PREBUNDLED_DIR=/opt/veilink-web

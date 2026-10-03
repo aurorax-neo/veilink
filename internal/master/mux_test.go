@@ -41,6 +41,9 @@ func TestWebAndGRPCShareOnePort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// WEB_MODE=off keeps the test deterministic: no frontend download attempt,
+	// root path serves the api-only JSON fallback.
+	t.Setenv("WEB_MODE", "off")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errc := make(chan error, 1)
@@ -69,8 +72,8 @@ func TestWebAndGRPCShareOnePort(t *testing.T) {
 	if page.StatusCode != http.StatusOK {
 		t.Fatalf("http status %d", page.StatusCode)
 	}
-	if !strings.Contains(string(pageBody), "Veilink management API") {
-		t.Fatalf("embedded console must not be served, body %q", pageBody)
+	if !strings.Contains(string(pageBody), `"mode":"api-only"`) {
+		t.Fatalf("expected api-only fallback body, got %q", pageBody)
 	}
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{InsecureSkipVerify: true})))
 	if err != nil {

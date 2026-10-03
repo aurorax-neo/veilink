@@ -8,11 +8,11 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
 	"veilink/internal/config"
+	"veilink/internal/httpapi/backend"
 	"veilink/internal/model"
 	"veilink/internal/store"
 )
@@ -39,9 +39,6 @@ func TestEmbeddedServerLifecycleAndRegistration(t *testing.T) {
 	dbPath := filepath.Join(dir, "veilink.db")
 	keyPath := filepath.Join(dir, "veilink.key")
 
-	t.Setenv("VEILINK_INIT_ADMIN_PASSWORD", "SuperSecureAdminPassword123!")
-	t.Setenv("VEILINK_INIT_ADMIN_USERNAME", "admin-root")
-
 	c, err := config.ParseFlags("master", []string{"-database", dbPath, "-deployment-key", keyPath, "-listen-addr", masterAddr, "-state-dir", filepath.Join(dir, "state"), "-scheme=https", "-cert-file", cert, "-key-file", key, "-embedded-server-enabled", "-embedded-server-name=integrated-gateway", "-embedded-server-port", strconv.Itoa(serverPort), "-embedded-server-address=127.0.0.1"})
 	if err != nil {
 		t.Fatal(err)
@@ -64,7 +61,7 @@ func TestEmbeddedServerLifecycleAndRegistration(t *testing.T) {
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		resp, err := httpClient.Get("https://" + masterAddr + "/api/v1/auth/login")
+		resp, err := httpClient.Get("https://" + masterAddr + "/healthz")
 		if err == nil {
 			resp.Body.Close()
 			break
@@ -75,27 +72,33 @@ func TestEmbeddedServerLifecycleAndRegistration(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	// Environment bootstrap is ignored; only public registration creates admin.
+	// 2. API Key auth: first boot auto-generates an admin key, no username/password exists.
 	s, err := store.Open(dbPath, keyPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
 
-	hasAdmin, err := s.HasAdmin()
+	ks := backend.NewKeyStore(s.DB())
+	if err := ks.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := ks.List()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hasAdmin || s.Login("admin-root", "SuperSecureAdminPassword123!") {
-		t.Fatal("environment created administrator")
+	if len(keys) == 0 {
+		t.Fatal("expected auto-generated admin API key on first boot")
 	}
-	resp, err := httpClient.Post("https://"+masterAddr+"/api/register", "application/json", strings.NewReader(`{"username":"admin-root","password":"SuperSecureAdminPassword123!"}`))
-	if err != nil {
-		t.Fatal(err)
+	foundAdmin := false
+	for _, k := range keys {
+		if k.Name == "default-admin" && k.Role == "admin" {
+			foundAdmin = true
+			break
+		}
 	}
-	resp.Body.Close()
-	if resp.StatusCode != 201 || !s.Login("admin-root", "SuperSecureAdminPassword123!") {
-		t.Fatal("registration failed")
+	if !foundAdmin {
+		t.Fatalf("expected default-admin key, got %+v", keys)
 	}
 
 	// 3. Verify embedded server node auto-registration and heartbeat in database
@@ -220,7 +223,7 @@ func TestEmbeddedServerDisabled(t *testing.T) {
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		resp, err := httpClient.Get("https://" + masterAddr + "/api/v1/auth/login")
+		resp, err := httpClient.Get("https://" + masterAddr + "/healthz")
 		if err == nil {
 			resp.Body.Close()
 			break

@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	"veilink/internal/auth"
+	"veilink/internal/httpapi/backend"
 	"veilink/internal/model"
 	"veilink/internal/store"
 	"veilink/internal/tunnel"
@@ -34,34 +34,13 @@ func TestGenerationAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if err := s.InitAdmin("admin", "generation test password"); err != nil {
+	h := New(s, false, nil)
+	apiKey, err := h.(*API).keyStore.Create("test", backend.RoleAdmin)
+	if err != nil {
 		t.Fatal(err)
 	}
-	h := New(s, false, nil, nil).(*API)
-	login := httptest.NewRequest("POST", "/api/login", strings.NewReader(`{"username":"admin","password":"generation test password"}`))
-	login.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, login)
-	if w.Code != http.StatusOK {
-		t.Fatal("login failed", w.Code)
-	}
-	cookie := w.Result().Cookies()[0]
-	var sessionReply map[string]string
-	if err := json.Unmarshal(w.Body.Bytes(), &sessionReply); err != nil {
-		t.Fatal(err)
-	}
-	csrf := sessionReply["csrf"]
-	call := func(method, body, token string, c *http.Cookie) *httptest.ResponseRecorder {
-		r := httptest.NewRequest(method, "/api/nodes/generate", strings.NewReader(body))
-		r.Header.Set("Content-Type", "application/json")
-		r.Header.Set("X-CSRF-Token", token)
-		// A bearer header never replaces an administrator session.
-		r.Header.Set("Authorization", "Bearer node-token")
-		if c != nil {
-			r.AddCookie(c)
-		}
-		w := httptest.NewRecorder()
-		h.ServeHTTP(w, r)
+	call := func(method, body, key string) *httptest.ResponseRecorder {
+		w := testCall(h, key, method, "/api/v1/nodes/generate", body)
 		if w.Header().Get("Cache-Control") != "no-store" {
 			t.Fatal("generation response may be cached")
 		}
@@ -69,7 +48,7 @@ func TestGenerationAPI(t *testing.T) {
 	}
 	generate := func(body string) map[string]string {
 		t.Helper()
-		w := call("POST", body, csrf, cookie)
+		w := call("POST", body, apiKey)
 		if w.Code != http.StatusOK {
 			t.Fatalf("generation failed: %d", w.Code)
 		}
@@ -96,31 +75,45 @@ func TestGenerationAPI(t *testing.T) {
 		}
 		return out
 	}
-	before := snapshot()
 	t.Run("authentication", func(t *testing.T) {
 		body := `{"role":"server","kind":"reality"}`
 		for _, tc := range []struct {
-			cookie *http.Cookie
-			csrf   string
-			want   int
+			key  string
+			want int
 		}{
-			{nil, csrf, 401}, {&http.Cookie{Name: "veilink_session", Value: "invalid"}, csrf, 401},
-			{cookie, "", 403}, {cookie, "wrong", 403},
+			{"", 401}, {"vlk_invalid_key", 401}, {"Bearer " + apiKey, 401},
 		} {
-			if got := call("POST", body, tc.csrf, tc.cookie).Code; got != tc.want {
+			if got := call("POST", body, tc.key).Code; got != tc.want {
 				t.Fatalf("got %d, want %d", got, tc.want)
 			}
 		}
-		h.sessions[auth.Hash("expired")] = session{csrf: csrf, expires: time.Now().Add(-time.Minute)}
-		if got := call("POST", body, csrf, &http.Cookie{Name: "veilink_session", Value: "expired"}).Code; got != 401 {
-			t.Fatalf("expired session accepted: %d", got)
+		// 吊销后的 key 应被拒绝
+		revoked, err := h.(*API).keyStore.Create("revoked", backend.RoleAdmin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys, err := h.(*API).keyStore.List()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, k := range keys {
+			if k.Name == "revoked" {
+				if err := h.(*API).keyStore.Revoke(k.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		if got := call("POST", body, revoked).Code; got != 401 {
+			t.Fatalf("revoked key accepted: %d", got)
 		}
 		for _, method := range []string{"GET", "PUT", "DELETE"} {
-			if got := call(method, body, csrf, cookie).Code; got != 404 {
+			if got := call(method, body, apiKey).Code; got != 404 {
 				t.Fatalf("unexpected %s status %d", method, got)
 			}
 		}
 	})
+	// authentication 子测试会操作 key 表，基准快照在其后采集
+	before := snapshot()
 	t.Run("invalid inputs", func(t *testing.T) {
 		for _, body := range []string{
 			`{}`, `null`, `{"kind":"reality"}`, `{"kind":"reality","role":"client"}`,
@@ -138,13 +131,13 @@ func TestGenerationAPI(t *testing.T) {
 			`{"role":"server","kind":"short_id"} {}`, `{"role":"server",`,
 			`{"role":"server","kind":"short_id"}` + strings.Repeat(" ", 4096),
 		} {
-			if got := call("POST", body, csrf, cookie).Code; got != 400 {
+			if got := call("POST", body, apiKey).Code; got != 400 {
 				t.Fatalf("invalid input accepted: %d", got)
 			}
 		}
 		for _, name := range []string{"", "*.example.com", "https://example.com", "example.com:443", "host/path", "a..b", "-host", "host-", "host\n", " host", "host.", "host_name", "[::1]", "fe80::1%eth0", strings.Repeat("a", 64) + ".com", strings.Repeat("a.", 127) + "a"} {
 			body := fmt.Sprintf(`{"role":"server","kind":"certificate","host":%q}`, name)
-			if got := call("POST", body, csrf, cookie).Code; got != 400 {
+			if got := call("POST", body, apiKey).Code; got != 400 {
 				t.Fatalf("unsafe name accepted: %q (%d)", name, got)
 			}
 		}

@@ -1,53 +1,82 @@
 package httpapi
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
-	"veilink/internal/auth"
 	"veilink/internal/buildinfo"
+	"veilink/internal/httpapi/backend"
+	"veilink/internal/httpapi/web"
 	"veilink/internal/logring"
 	"veilink/internal/model"
 	"veilink/internal/store"
 )
 
-type session struct {
-	version string
-	csrf    string
-	expires time.Time
-}
 type API struct {
-	store       *store.Store
-	insecure    bool
-	web         http.Handler
-	ring        *logring.Ring
-	mu          sync.Mutex
-	sessions    map[string]session
-	loginWindow time.Time
-	attempts    int
+	store      *store.Store
+	insecure   bool
+	ring       *logring.Ring
+	keyStore   *backend.KeyStore
+	webManager *web.WebManager
+	streamHub  *backend.StreamHub
+	tokenStore *backend.StreamTokenStore
+	webCfg     web.WebConfig
 }
 
-func New(s *store.Store, insecureLoopback bool, web http.Handler, ring *logring.Ring) http.Handler {
-	if web == nil {
-		web = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			w.Write([]byte("Veilink management API\n"))
-		})
+// New 创建 Master 的 HTTP API 处理器。
+// 注意：仅 Master 角色调用此函数，Server/Client 角色不启动 Web/API。
+// WebManager 仅在 Master 下初始化（pull 前端），s/c 二进制不包含也不触发拉取逻辑。
+func New(s *store.Store, insecureLoopback bool, ring *logring.Ring) http.Handler {
+	// API Key 存储初始化（含旧版迁移）
+	ks := backend.NewKeyStore(s.DB())
+	if err := ks.Migrate(); err != nil {
+		slog.Error("api keys migration failed", "err", err)
 	}
-	return &API{store: s, insecure: insecureLoopback, web: web, ring: ring, sessions: map[string]session{}}
+	// 旧版迁移提示
+	if mk := ks.MigratedKey(); mk != "" {
+		slog.Warn("检测到旧版管理员账号，已自动迁移为 API Key（旧用户名密码已失效）",
+			"key", mk, "note", "请妥善保存，此 Key 仅显示一次")
+	}
+	// 首次启动自动生成
+	if plaintext, created, err := ks.EnsureDefaultAdmin(); err != nil {
+		slog.Error("ensure default admin key failed", "err", err)
+	} else if created {
+		slog.Warn("未配置 API Key，已自动生成管理员 Key（仅显示一次，请妥善保存）",
+			"key", plaintext)
+	}
+
+	// WebManager 初始化
+	webCfg := web.LoadConfigFromEnv()
+	wm := web.NewWebManager(webCfg)
+	if _, err := wm.Ensure(); err != nil {
+		slog.Error("前端初始化失败，降级为纯 API 模式", "err", err)
+	}
+
+	a := &API{
+		store:      s,
+		insecure:   insecureLoopback,
+		ring:       ring,
+		keyStore:   ks,
+		webManager: wm,
+		streamHub:  backend.NewStreamHub(),
+		tokenStore: backend.NewStreamTokenStore(),
+		webCfg:     webCfg,
+	}
+	return a
 }
+
 func output(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(v)
 }
+
 func failure(w http.ResponseWriter, code int) {
 	text := "request failed"
 	switch code {
@@ -56,7 +85,7 @@ func failure(w http.ResponseWriter, code int) {
 	case 401:
 		text = "authentication required"
 	case 403:
-		text = "CSRF validation failed"
+		text = "forbidden"
 	case 404:
 		text = "not found"
 	case 429:
@@ -64,17 +93,17 @@ func failure(w http.ResponseWriter, code int) {
 	}
 	output(w, code, map[string]string{"error": text})
 }
+
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	if !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 		failure(w, 400)
 		return false
 	}
 	limit := int64(64 << 10)
-	if r.URL.Path == "/api/nodes/generate" {
+	if r.URL.Path == "/api/v1/nodes/generate" {
 		limit = 4 << 10
 	}
-	// Three PEM fields may each contain up to 64 KiB; JSON escaping adds overhead.
-	if r.URL.Path == "/api/nodes" || (strings.HasPrefix(r.URL.Path, "/api/nodes/") && r.Method == http.MethodPut) {
+	if r.URL.Path == "/api/v1/nodes" || (strings.HasPrefix(r.URL.Path, "/api/v1/nodes/") && r.Method == http.MethodPut) {
 		limit = 512 << 10
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, limit)
@@ -91,143 +120,213 @@ func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	}
 	return true
 }
-func (a *API) cookie(w http.ResponseWriter, value string, maxAge int) {
-	http.SetCookie(w, &http.Cookie{Name: "veilink_session", Value: value, Path: "/", HttpOnly: true, Secure: !a.insecure, SameSite: http.SameSiteStrictMode, MaxAge: maxAge})
+
+// publicPaths 免认证路径
+var publicPaths = map[string]bool{
+	"/api/version": true,
+	"/healthz":     true,
+	"/api/health":  true,
 }
+
+func (a *API) authenticate(r *http.Request) (backend.KeyRole, bool) {
+	if publicPaths[r.URL.Path] {
+		return backend.RoleAdmin, true // 公开路径视为通过（不做权限检查）
+	}
+	key := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if key == "" {
+		key = r.Header.Get("X-API-Key")
+	}
+	// query 参数方式默认关闭，需显式开启
+	if key == "" && os.Getenv("WEB_ALLOW_QUERY_KEY") == "true" {
+		key = r.URL.Query().Get("api_key")
+	}
+	if key == "" {
+		return "", false
+	}
+	return a.keyStore.Validate(key)
+}
+
 func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+
+	// 1. CORS
+	if a.webCfg.EnableCORS {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+
+	// 2. 健康检查（免认证）
 	if r.URL.Path == "/healthz" || r.URL.Path == "/api/health" {
 		output(w, 200, map[string]string{"status": "ok"})
 		return
 	}
-	if !strings.HasPrefix(r.URL.Path, "/api/") {
-		a.web.ServeHTTP(w, r)
+
+	// 3. 版本契约（免认证）
+	if r.URL.Path == "/api/version" {
+		output(w, 200, map[string]string{
+			"api_version":     "v1",
+			"backend_version": buildinfo.Version,
+			"web_version":     a.webManager.Version(),
+			"web_mode":        string(a.webCfg.Mode),
+		})
 		return
 	}
-	w.Header().Set("Cache-Control", "no-store")
-	// Reject browser cross-site mutations, including login CSRF. Same-origin JSON
-	// and the CSRF header cannot be sent by an untrusted origin without preflight.
-	origin := r.Header.Get("Origin")
-	parsed, originErr := url.Parse(origin)
-	scheme := "https"
-	if a.insecure {
-		scheme = "http"
-	}
-	if r.Method != "GET" && (r.Header.Get("Sec-Fetch-Site") == "cross-site" || (origin != "" && (originErr != nil || parsed.Host != r.Host || parsed.Scheme != scheme))) {
-		failure(w, 403)
+
+	// 4. 老 API 路径 301 重定向到 /api/v1/*
+	if strings.HasPrefix(r.URL.Path, "/api/") && !strings.HasPrefix(r.URL.Path, "/api/v1/") {
+		http.Redirect(w, r, "/api/v1"+strings.TrimPrefix(r.URL.Path, "/api"), http.StatusMovedPermanently)
 		return
 	}
-	if r.URL.Path == "/api/setup" && r.Method == "GET" {
-		has, err := a.store.HasAdmin()
-		if err != nil {
-			failure(w, 503)
-			return
-		}
-		output(w, 200, map[string]bool{"registration_required": !has})
-		return
+
+	// API 响应一律不缓存（认证前设置，401 也要带）
+	if strings.HasPrefix(r.URL.Path, "/api/") {
+		w.Header().Set("Cache-Control", "no-store")
 	}
-	if (r.URL.Path == "/api/login" || r.URL.Path == "/api/register") && r.Method == "POST" {
-		a.mu.Lock()
-		now := time.Now()
-		if now.Sub(a.loginWindow) > time.Minute {
-			a.loginWindow = now
-			a.attempts = 0
-		}
-		a.attempts++
-		allowed := a.attempts <= 10
-		a.mu.Unlock()
-		if !allowed {
-			failure(w, 429)
-			return
-		}
-		var in struct {
-			Username string `json:"username"`
-			Password string `json:"password"`
-		}
-		if !decode(w, r, &in) {
-			return
-		}
-		if r.URL.Path == "/api/register" {
-			err := a.store.InitAdmin(in.Username, in.Password)
-			if err == store.ErrRegistrationClosed {
-				failure(w, 409)
-				return
-			}
-			if err == store.ErrInvalid {
-				failure(w, 400)
-				return
-			}
-			if err != nil {
-				failure(w, 503)
-				return
-			}
-			output(w, 201, map[string]bool{"ok": true})
-			slog.Info("console account registered")
-			return
-		}
-		version, valid := a.store.LoginVersion(in.Username, in.Password)
-		if !valid {
+
+	// 5. API Key 认证（SSE 用一次性 token，跳过 Key 检查）
+	var role backend.KeyRole
+	var ok bool
+	isStream := strings.HasPrefix(r.URL.Path, "/api/v1/stream")
+	if !isStream {
+		role, ok = a.authenticate(r)
+		if !ok && strings.HasPrefix(r.URL.Path, "/api/") {
 			failure(w, 401)
 			return
 		}
-		token := auth.Token()
-		s := session{csrf: auth.Token(), version: version, expires: now.Add(12 * time.Hour)}
-		a.mu.Lock()
-		for k, v := range a.sessions {
-			if now.After(v.expires) || v.version != version {
-				delete(a.sessions, k)
-			}
-		}
-		if len(a.sessions) >= 100 {
-			a.mu.Unlock()
-			failure(w, 429)
+	}
+
+	// 6. SSE 流
+	if r.URL.Path == "/api/v1/stream" && r.Method == "GET" {
+		// EventSource 不能带 Header，用一次性 token
+		if !a.tokenStore.Consume(r.URL.Query().Get("token")) {
+			failure(w, 401)
 			return
 		}
-		a.sessions[auth.Hash(token)] = s
-		a.mu.Unlock()
-		slog.Info("console login succeeded")
-		a.cookie(w, token, 43200)
-		output(w, 200, map[string]string{"csrf": s.csrf})
+		a.streamHub.ServeHTTP(w, r)
 		return
 	}
-	c, e := r.Cookie("veilink_session")
-	if e != nil {
-		failure(w, 401)
+	if r.URL.Path == "/api/v1/stream/token" && r.Method == "POST" {
+		output(w, 200, map[string]any{
+			"token":      a.tokenStore.Issue(),
+			"expires_in": 60,
+		})
 		return
 	}
-	a.mu.Lock()
-	s, ok := a.sessions[auth.Hash(c.Value)]
-	if time.Now().After(s.expires) {
-		delete(a.sessions, auth.Hash(c.Value))
-		ok = false
-	}
-	a.mu.Unlock()
-	version, versionErr := a.store.AdminVersion()
-	if !ok || versionErr != nil || s.version != version {
-		failure(w, 401)
+
+	// 7. Key 管理接口（仅 admin）
+	if strings.HasPrefix(r.URL.Path, "/api/v1/keys") {
+		a.serveKeys(w, r, role)
 		return
 	}
-	if r.Method != "GET" && subtle.ConstantTimeCompare([]byte(r.Header.Get("X-CSRF-Token")), []byte(s.csrf)) != 1 {
-		failure(w, 403)
-		return
-	}
-	if r.URL.Path == "/api/session" && r.Method == "GET" {
-		output(w, 200, map[string]string{"csrf": s.csrf})
-		return
-	}
-	if r.URL.Path == "/api/logout" && r.Method == "POST" {
-		a.mu.Lock()
-		delete(a.sessions, auth.Hash(c.Value))
-		a.mu.Unlock()
-		a.cookie(w, "", -1)
-		slog.Info("console logout")
+
+	// 8. 前端热更新（仅 admin）
+	if r.URL.Path == "/api/v1/web/update" && r.Method == "POST" {
+		if role != backend.RoleAdmin {
+			failure(w, 403)
+			return
+		}
+		var req struct {
+			Version string `json:"version"`
+		}
+		if !decode(w, r, &req) {
+			return
+		}
+		if err := a.webManager.Update(req.Version); err != nil {
+			slog.Error("web update failed", "err", err)
+			failure(w, 500)
+			return
+		}
 		output(w, 200, map[string]bool{"ok": true})
 		return
 	}
-	p := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/"), "/")
+
+	// 9. 业务 API（/api/v1/*）
+	if strings.HasPrefix(r.URL.Path, "/api/v1/") {
+		a.serveAPI(w, r)
+		return
+	}
+
+	// 10. 前端静态资源
+	if root := a.webManager.Root(); root != "" {
+		p := filepath.Join(root, filepath.Clean(r.URL.Path))
+		if info, err := os.Stat(p); os.IsNotExist(err) || info.IsDir() {
+			http.ServeFile(w, r, filepath.Join(root, "index.html"))
+			return
+		}
+		http.FileServer(http.Dir(root)).ServeHTTP(w, r)
+		return
+	}
+
+	// 11. 纯 API 模式兜底
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"mode":"api-only","message":"Web UI not hosted. Set WEB_MODE=pull or deploy veilink-web separately."}`))
+}
+
+// serveKeys API Key 管理接口
+func (a *API) serveKeys(w http.ResponseWriter, r *http.Request, role backend.KeyRole) {
+	if role != backend.RoleAdmin {
+		failure(w, 403)
+		return
+	}
+	switch {
+	case r.URL.Path == "/api/v1/keys" && r.Method == "GET":
+		keys, err := a.keyStore.List()
+		if err != nil {
+			failure(w, 500)
+			return
+		}
+		output(w, 200, keys)
+	case r.URL.Path == "/api/v1/keys" && r.Method == "POST":
+		var req struct {
+			Name string `json:"name"`
+			Role string `json:"role"`
+		}
+		if !decode(w, r, &req) {
+			return
+		}
+		if req.Name == "" {
+			req.Name = "key-" + strconv.Itoa(int(a.keyStore.Count()+1))
+		}
+		r := backend.RoleAdmin
+		if req.Role == "readonly" {
+			r = backend.RoleReadonly
+		}
+		plaintext, err := a.keyStore.Create(req.Name, r)
+		if err != nil {
+			failure(w, 400)
+			return
+		}
+		// 明文仅返回一次
+		output(w, 201, map[string]string{"key": plaintext, "name": req.Name})
+	case strings.HasPrefix(r.URL.Path, "/api/v1/keys/") && r.Method == "DELETE":
+		idStr := strings.TrimPrefix(r.URL.Path, "/api/v1/keys/")
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			failure(w, 400)
+			return
+		}
+		if err := a.keyStore.Revoke(id); err != nil {
+			failure(w, 400)
+			return
+		}
+		output(w, 200, map[string]bool{"ok": true})
+	default:
+		failure(w, 404)
+	}
+}
+
+// serveAPI 业务 API（路径已确认为 /api/v1/* 前缀）
+func (a *API) serveAPI(w http.ResponseWriter, r *http.Request) {
+	// 去掉 /api/v1 前缀，复用原有分发逻辑
+	p := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/"), "/")
 	id := ""
 	if len(p) > 1 {
 		id = p[1]
@@ -236,12 +335,6 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var err error
 	matched := true
 	switch p[0] {
-	case "version":
-		if r.Method == "GET" && len(p) == 1 {
-			result = map[string]string{"version": buildinfo.Version, "commit": buildinfo.Commit}
-		} else {
-			matched = false
-		}
 	case "logs":
 		if r.Method == "GET" && len(p) == 1 {
 			q := r.URL.Query()
@@ -278,8 +371,6 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			matched = false
 		}
 	case "nodes":
-		// Embedded enrollment belongs exclusively to the local master. Guard all
-		// external token operations before they can issue, rotate, or revoke it.
 		if len(p) == 3 && (p[2] == "join" || p[2] == "enroll") {
 			nodes, loadErr := a.store.Nodes()
 			if loadErr != nil {
@@ -304,9 +395,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case r.Method == "GET" && len(p) == 1:
 			result, err = a.store.ReportedNodes()
 		case (r.Method == "POST" && len(p) == 1) || (r.Method == "PUT" && len(p) == 2):
-			// Shadow the response-only field with RawMessage so even explicit
-			// null (and case-insensitive JSON spellings) cannot bypass rejection.
-			type nodeInput model.Node // Do not inherit Node.UnmarshalJSON.
+			type nodeInput model.Node
 			var in struct {
 				nodeInput
 				ClientTunnel json.RawMessage `json:"client_tunnel"`
@@ -379,7 +468,6 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			result, err = a.store.Mappings()
 		case r.Method == http.MethodGet && len(p) == 2 && id == "status":
 			result, err = a.store.MappingStatuses()
-
 		case (r.Method == "POST" && len(p) == 1) || (r.Method == "PUT" && len(p) == 2):
 			var m model.Mapping
 			if !decode(w, r, &m) {
@@ -421,7 +509,6 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if result == nil {
 		result = map[string]bool{"ok": true}
 	}
-	// Session associations belong to node snapshots, never management payloads.
 	switch value := result.(type) {
 	case model.Mapping:
 		value.BindingID = ""

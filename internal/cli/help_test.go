@@ -16,7 +16,7 @@ func (forbiddenHelpInput) Read([]byte) (int, error) { panic("help read stdin") }
 
 func helpCases() [][]string {
 	cases := [][]string{{"--help"}, {"-h"}, {"help"}}
-	for _, command := range []string{"master", "server", "client", "reset-admin-username", "reset-admin-password", "version", "x25519", "vlessenc"} {
+	for _, command := range []string{"master", "server", "client", "keys", "version", "x25519", "vlessenc"} {
 		for _, flag := range []string{"--help", "-h", "help"} {
 			cases = append(cases, []string{command, flag})
 		}
@@ -28,7 +28,7 @@ func invalidHelpCases() [][]string {
 	return [][]string{{}, {"help", "unknown"}, {"unknown", "--help"}, {"help", "master", "extra"}, {"--help", "master"},
 		{"master", "--bad", "--help"}, {"master", "-embedded-server-port=bad", "-h"}, {"client", "--", "-h"},
 		{"server", "extra", "--help"}, {"version", "--bad"}, {"x25519", "--help", "extra"},
-		{"reset-admin-password", "--password=private-value", "--help"}, {"reset-admin-username", "-username"}}
+		{"keys", "unknown"}}
 }
 func TestHelpHasNoSideEffects(t *testing.T) {
 	for _, args := range helpCases() {
@@ -56,7 +56,7 @@ func TestHelpHasNoSideEffects(t *testing.T) {
 	}
 	dir := t.TempDir()
 	db := filepath.Join(dir, "missing.db")
-	for _, command := range []string{"master", "reset-admin-password", "reset-admin-username"} {
+	for _, command := range []string{"master", "keys"} {
 		var out bytes.Buffer
 		if err := RunWithInput(context.Background(), []string{command, "-database", db, "--help"}, forbiddenHelpInput{}, &out); err != nil {
 			t.Fatal(err)

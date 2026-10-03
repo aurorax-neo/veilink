@@ -1,0 +1,66 @@
+name: Release Web
+
+on:
+  push:
+    tags:
+      - 'web-v*'
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm ci
+          npm run build
+      - name: Package
+        run: |
+          VERSION=${GITHUB_REF_NAME#web-v}
+          tar -czf veilink-web-${VERSION}.tar.gz -C frontend/dist .
+          # 校验包内容
+          tar -tzf veilink-web-${VERSION}.tar.gz | head -5
+          # 生成校验文件
+          sha256sum veilink-web-${VERSION}.tar.gz > veilink-web-${VERSION}.tar.gz.sha256
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          title: "[Web] ${{ github.ref_name }}"
+          files: |
+            veilink-web-*.tar.gz
+            veilink-web-*.tar.gz.sha256
+          generate_release_notes: true
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push web image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: web
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}-web:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}-web:latest
+          build-args: |
+            VERSION=${{ github.ref_name }}

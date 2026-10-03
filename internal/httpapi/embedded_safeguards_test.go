@@ -6,11 +6,10 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
 
-	"veilink/internal/auth"
+	"veilink/internal/httpapi/backend"
 	"veilink/internal/model"
 	"veilink/internal/store"
 )
@@ -30,26 +29,19 @@ func TestEmbeddedAPISafeguards(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := New(s, true, nil, nil).(*API)
-	if err := s.InitAdmin("admin", "long test password"); err != nil {
-		t.Fatal(err)
-	}
-	version, err := s.AdminVersion()
-	if err != nil {
-		t.Fatal(err)
-	}
-	h.sessions[auth.Hash("session")] = session{csrf: "csrf", version: version, expires: time.Now().Add(time.Hour)}
+	h := New(s, true, nil)
+	apiKey := func() string {
+		plaintext, err := h.(*API).keyStore.Create("test", backend.RoleAdmin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return plaintext
+	}()
 	call := func(method, path, body string) *httptest.ResponseRecorder {
-		r := httptest.NewRequest(method, path, strings.NewReader(body))
-		r.Header.Set("Content-Type", "application/json")
-		r.Header.Set("X-CSRF-Token", "csrf")
-		r.AddCookie(&http.Cookie{Name: "veilink_session", Value: "session"})
-		w := httptest.NewRecorder()
-		h.ServeHTTP(w, r)
-		return w
+		return testCall(h, apiKey, method, path, body)
 	}
 	for _, method := range []string{"POST", "PUT"} {
-		path := "/api/nodes"
+		path := "/api/v1/nodes"
 		if method == "PUT" {
 			path += "/" + n.ID
 		}
@@ -71,13 +63,13 @@ func TestEmbeddedAPISafeguards(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct{ method, path, body string }{
-		{"POST", "/api/nodes/" + n.ID + "/join", `{"master_url":"http://localhost:8443"}`},
-		{"POST", "/api/nodes/" + n.ID + "/enroll", `{}`},
-		{"DELETE", "/api/nodes/" + n.ID + "/enroll", ""},
-		{"POST", "/api/nodes/" + n.ID + "/revoke", ""},
-		{"DELETE", "/api/nodes/" + n.ID, ""},
-		{"POST", "/api/nodes", `{"name":"spoof","role":"client","embedded":true}`},
-		{"PUT", "/api/nodes/" + ordinary.ID, `{"name":"ordinary","role":"client","embedded":true}`},
+		{"POST", "/api/v1/nodes/" + n.ID + "/join", `{"master_url":"http://localhost:8443"}`},
+		{"POST", "/api/v1/nodes/" + n.ID + "/enroll", `{}`},
+		{"DELETE", "/api/v1/nodes/" + n.ID + "/enroll", ""},
+		{"POST", "/api/v1/nodes/" + n.ID + "/revoke", ""},
+		{"DELETE", "/api/v1/nodes/" + n.ID, ""},
+		{"POST", "/api/v1/nodes", `{"name":"spoof","role":"client","embedded":true}`},
+		{"PUT", "/api/v1/nodes/" + ordinary.ID, `{"name":"ordinary","role":"client","embedded":true}`},
 	} {
 		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
 			pending, err := s.EnrollToken(n.ID, time.Hour)
@@ -121,7 +113,7 @@ func TestEmbeddedAPISafeguards(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		w := call("PUT", "/api/nodes/"+n.ID, string(body))
+		w := call("PUT", "/api/v1/nodes/"+n.ID, string(body))
 		var saved model.Node
 		if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &saved) != nil || !saved.Embedded {
 			t.Fatal("embedded roundtrip/omission failed", w.Body.String())
@@ -132,13 +124,13 @@ func TestEmbeddedAPISafeguards(t *testing.T) {
 		if suffix == "/enroll" {
 			body = `{}`
 		}
-		w := call("POST", "/api/nodes/"+ordinary.ID+suffix, body)
+		w := call("POST", "/api/v1/nodes/"+ordinary.ID+suffix, body)
 		if w.Code != 200 {
 			t.Fatal("ordinary enrollment blocked", w.Body.String())
 		}
 	}
 	for _, tc := range []struct{ method, suffix string }{{"DELETE", "/enroll"}, {"POST", "/revoke"}, {"DELETE", ""}} {
-		if w := call(tc.method, "/api/nodes/"+ordinary.ID+tc.suffix, ""); w.Code != 200 {
+		if w := call(tc.method, "/api/v1/nodes/"+ordinary.ID+tc.suffix, ""); w.Code != 200 {
 			t.Fatal("ordinary operation blocked", w.Body.String())
 		}
 	}

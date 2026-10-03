@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"veilink/internal/httpapi/backend"
 	"veilink/internal/model"
 	"veilink/internal/store"
 	"veilink/internal/tunnel"
@@ -23,37 +24,16 @@ func TestXHTTPJSONAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if err = s.InitAdmin("admin", "long test password"); err != nil {
+	h := New(s, true, nil)
+	apiKey, err := h.(*API).keyStore.Create("test", backend.RoleAdmin)
+	if err != nil {
 		t.Fatal(err)
 	}
-	h := New(s, true, nil, nil)
-	var cookie *http.Cookie
-	csrf := ""
 	call := func(body string) *httptest.ResponseRecorder {
-		r := httptest.NewRequest("POST", "/api/nodes", strings.NewReader(body))
-		r.Header.Set("Content-Type", "application/json")
-		r.Header.Set("X-CSRF-Token", csrf)
-		if cookie != nil {
-			r.AddCookie(cookie)
-		}
-		w := httptest.NewRecorder()
-		h.ServeHTTP(w, r)
-		return w
+		return testCall(h, apiKey, "POST", "/api/v1/nodes", body)
 	}
-	if w := call(`{"role":"server","name":"xhttp"}`); w.Code != 401 {
+	if w := testCall(h, "", "POST", "/api/v1/nodes", `{"role":"server","name":"xhttp"}`); w.Code != 401 {
 		t.Fatal(w.Code)
-	}
-	r := httptest.NewRequest("POST", "/api/login", strings.NewReader(`{"username":"admin","password":"long test password"}`))
-	r.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, r)
-	if w.Code != 200 {
-		t.Fatal(w.Code, w.Body.String())
-	}
-	cookie = w.Result().Cookies()[0]
-	var login map[string]string
-	if err = json.Unmarshal(w.Body.Bytes(), &login); err != nil {
-		t.Fatal(err)
 	}
 	dec, _, _, _, err := tunnel.GenerateVLESSEnc()
 	if err != nil {
@@ -61,10 +41,6 @@ func TestXHTTPJSONAPI(t *testing.T) {
 	}
 	body := fmt.Sprintf(`{"name":"xhttp","role":"server","address":"cdn.example.com","port":443,"connect_endpoints":[{"id":"up","name":"上行","host":"cdn.example.com","port":443,"enabled":true},{"id":"down","name":"下行","host":"download.example.com","port":443,"enabled":true},{"id":"off","name":"禁用","host":"off.example.com","port":443,"enabled":false}],"tunnel":{"transport_security":"plain","listen_port":8444,"decryption":%q,"xhttp":{"path":"/cdn/","mode":"packet-up","tls":true,"download_endpoint_id":"down"}}}`, dec)
 	h2cBody := fmt.Sprintf(`{"name":"h2c","role":"server","address":"127.0.0.1","port":8445,"tunnel":{"transport_security":"plain","listen_port":8445,"decryption":%q,"xhttp":{"host":"edge.example.com","path":"/h2c/","mode":"packet-up","tls":false,"http_version":"2","uplink_http_method":"PUT"}}}`, dec)
-	if w = call(body); w.Code != 403 {
-		t.Fatal("CSRF bypass", w.Code)
-	}
-	csrf = login["csrf"]
 	for name, bad := range map[string]string{
 		"stream-policy-packet":       strings.Replace(body, `"tls":true`, `"tls":true,"stream_up_server_secs":1`, 1),
 		"stream-policy-type":         strings.Replace(body, `"tls":true`, `"tls":true,"stream_up_server_secs":"1"`, 1),
@@ -115,6 +91,7 @@ func TestXHTTPJSONAPI(t *testing.T) {
 			}
 		})
 	}
+	var w *httptest.ResponseRecorder
 	w = call(strings.Replace(body, `"tls":true`, `"tls":true,"headers":{"x-custom-route":"east","User-Agent":"Veilink-Test"},"session_id_placement":"header","session_id_key":"X-Veilink-SID","seq_placement":"query","seq_key":"number","session_id_table":"hex","session_id_length":32,"max_each_post_bytes":2048,"post_bytes_max":4096,"min_posts_interval_ms":45,"max_posts_interval_ms":75,"no_sse_header":true,"server_max_header_bytes":16384,"uplink_http_method":"PUT"`, 1))
 	if w.Code != 200 {
 		t.Fatal(w.Code, w.Body.String())
