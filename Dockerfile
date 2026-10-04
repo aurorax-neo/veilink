@@ -1,6 +1,6 @@
-ARG NPM_REGISTRY=https://registry.npmmirror.com
-ARG GOPROXY=https://goproxy.cn,direct
-ARG APK_MIRROR=https://mirrors.ustc.edu.cn/alpine
+ARG NPM_REGISTRY=https://registry.npmjs.org
+ARG GOPROXY=https://proxy.golang.org,direct
+ARG APK_MIRROR=https://dl-cdn.alpinelinux.org/alpine
 
 # ============ 后端构建 ============
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine3.23 AS build-backend
@@ -33,7 +33,7 @@ ARG APK_MIRROR
 ARG VERSION=dev
 ARG COMMIT=unknown
 ARG SOURCE_URL=unknown
-RUN printf '%s/v3.23/main\n%s/v3.23/community\n' "$APK_MIRROR" "$APK_MIRROR" > /etc/apk/repositories \
+RUN if [ -n "$APK_MIRROR" ] && [ "$APK_MIRROR" != "https://dl-cdn.alpinelinux.org/alpine" ]; then printf '%s/v3.23/main\n%s/v3.23/community\n' "$APK_MIRROR" "$APK_MIRROR" > /etc/apk/repositories; fi \
  && apk add --no-cache ca-certificates tzdata sqlite su-exec \
  && mkdir -p /data/web \
  && adduser -D -u 65532 -g 65532 veilink \
