@@ -230,6 +230,8 @@ openssl s_client -connect panel.example.com:8843 \
 
 ### API Key 管理
 
+Web 控制台「设置」页可直接管理（列表/新建/撤销），或用 CLI：
+
 ```sh
 # 查看现有 Key（仅显示前缀，不显示明文）
 docker exec veilink /usr/local/bin/veilink keys list
@@ -242,6 +244,16 @@ docker exec veilink /usr/local/bin/veilink keys revoke <id>
 ```
 
 旧版用户名密码用户升级：首次启动检测到旧 `admin` 表数据时自动生成 API Key 并在日志中提示，旧账号即刻失效。
+
+### 设置页
+
+Web 控制台「设置」页集中管理：
+
+- **前端地址**：CPA 式自定义前端地址，设置后访问 `/` 跳转到分离部署的前端
+- **下载加速**：多加速地址管理（增删改排序），拉取前端时按顺序尝试
+- **版本更新**：指定前端版本号或拉取最新
+- **服务配置**：监听地址、协议、证书、Web 模式（修改后需重启）
+- **API Key**：列表/新建/撤销（明文仅显示一次）
 
 ### 如何理解状态
 
@@ -402,6 +414,8 @@ tools/backup-master.sh restore master \
 先在隔离环境验证登录、节点身份、上报和业务探针，再切换正式挂载。保留原数据副本，禁止旧、新 Master 同时提供写服务。旧 schema 不自动迁移或删库，任何数据删除都须先备份并得到明确授权。
 
 ### API Key 维护
+
+Web 控制台「设置」页可直接管理，或用 CLI：
 
 ```sh
 # 列出所有 Key（仅显示前缀）
