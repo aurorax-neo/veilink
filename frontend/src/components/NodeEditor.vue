@@ -170,7 +170,7 @@ const uploads = reactive<Record<PEMField, { busy: boolean; error: string; status
 })
 const reading = computed(() => Object.values(uploads).some(state => state.busy))
 const uploadError = computed(() => pemFields.value.map(field => uploads[field].error).find(Boolean))
-type GenerateKind = 'reality' | 'short_id' | 'mldsa65' | 'vless' | 'hysteria2' | 'certificate'
+type GenerateKind = 'reality' | 'short_id' | 'mldsa65' | 'spider_x' | 'vless' | 'hysteria2' | 'certificate'
 const generation = reactive({ busy: '' as GenerateKind | '', error: '', status: '', revision: 0 })
 const options = reactive({ mode: 'native', authentication: 'x25519', ttl: 30 })
 function clearUpload(field: PEMField) { Object.assign(uploads[field], { busy: false, error: '', status: '', revision: uploads[field].revision + 1 }) }
@@ -217,11 +217,12 @@ async function generate(kind: GenerateKind) {
     })
     if (revision !== generation.revision) return
     if (snapshot !== generationSnapshot()) { generation.status = '表单已变更，已丢弃过期生成结果。请重新生成。'; return }
-    const required = { reality: ['private_key', 'public_key', 'short_id'], short_id: ['short_id'], mldsa65: ['private_key', 'public_key'], vless: ['decryption', 'encryption'], hysteria2: ['password'], certificate: ['cert_pem', 'key_pem', 'ca_pem', 'expires_at'] }[kind]
+    const required = { reality: ['private_key', 'public_key', 'short_id'], short_id: ['short_id'], mldsa65: ['private_key', 'public_key'], spider_x: ['spider_x'], vless: ['decryption', 'encryption'], hysteria2: ['password'], certificate: ['cert_pem', 'key_pem', 'ca_pem', 'expires_at'] }[kind]
     if (!result || required.some(field => typeof result[field] !== 'string' || !result[field])) throw new Error('invalid response')
     if (kind === 'reality') { draft.privateKey = result.private_key!; draft.shortIDs = result.short_id! }
     if (kind === 'short_id') draft.shortIDs = result.short_id!
     if (kind === 'mldsa65') draft.mldsa65Verify = result.public_key!
+    if (kind === 'spider_x') draft.spiderX = result.spider_x!
     if (kind === 'vless') draft.enc = result.decryption!
     if (kind === 'hysteria2') draft.password = result.password!
     if (kind === 'certificate') {
@@ -474,7 +475,7 @@ defineExpose({ open })
           <SecretField id="node-private" v-model="draft.privateKey" label="REALITY 私钥"><button type="button" class="btn small" :disabled="!!generation.busy || reading" @click="generate('reality')">生成密钥对</button></SecretField>
           <label for="node-names">伪装域名</label><input id="node-names" v-model="draft.names" placeholder="逗号分隔" />
           <label for="node-short">Short IDs</label><div class="field-actions"><input id="node-short" v-model="draft.shortIDs" placeholder="逗号分隔" /><button type="button" class="btn small" :disabled="!!generation.busy || reading" @click="generate('short_id')">生成 Short ID</button></div>
-          <label for="node-spiderx">伪装爬取起点（SpiderX）</label><input id="node-spiderx" v-model="draft.spiderX" placeholder="/（验证失败时伪装浏览用）" />
+          <label for="node-spiderx">伪装爬取起点（SpiderX）</label><div class="field-actions"><input id="node-spiderx" v-model="draft.spiderX" placeholder="留空随机，验证失败时伪装浏览用" /><button type="button" class="btn small" :disabled="!!generation.busy || reading" @click="generate('spider_x')">随机生成</button></div>
           <label for="node-spidery">伪装爬取参数（SpiderY）</label><input id="node-spidery" v-model="draft.spiderY" placeholder="10 个逗号分隔整数，留空用默认" />
           <label for="node-mldsa65">ML-DSA-65 验证公钥</label><div class="field-actions"><input id="node-mldsa65" v-model="draft.mldsa65Verify" placeholder="后量子额外验证，可选" /><button type="button" class="btn small" :disabled="!!generation.busy || reading" @click="generate('mldsa65')">生成密钥对</button></div>
         </template>

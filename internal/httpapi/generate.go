@@ -59,6 +59,10 @@ func generate(w http.ResponseWriter, r *http.Request) {
 		var private, public string
 		private, public, err = tunnel.GenerateMldsa65()
 		result = map[string]string{"private_key": private, "public_key": public}
+	case "spider_x":
+		var spiderX string
+		spiderX, err = tunnel.GenerateSpiderX()
+		result = map[string]string{"spider_x": spiderX}
 	case "vless":
 		if in.Mode == "" {
 			in.Mode = "native"
