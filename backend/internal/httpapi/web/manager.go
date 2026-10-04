@@ -221,17 +221,13 @@ func (m *WebManager) downloadURL(version string) string {
 	return buildDownloadURL(m.cfg.Repo, version, first)
 }
 
-// normalizeWebTagAndFile 解析前端版本对应的 release tag 和文件名标识
+// normalizeWebTagAndFile 解析前端版本对应的 release tag 和纯版本号
 func normalizeWebTagAndFile(version string) (tag string, fileVer string) {
 	v := strings.TrimSpace(version)
 	if v == "" || v == "latest" {
 		return "latest", ""
 	}
-	if strings.HasPrefix(v, "web-") {
-		// 显式以 web- 开头，tag 保持原样，文件名使用完整版本字符串（兼容已发布资产）
-		return v, v
-	}
-	clean := strings.TrimPrefix(v, "v")
+	clean := strings.TrimPrefix(strings.TrimPrefix(v, "web-"), "v")
 	return "web-v" + clean, clean
 }
 
@@ -243,8 +239,7 @@ func candidatePaths(repo, version string) []string {
 			fmt.Sprintf("%s/releases/latest/download/veilink-web.tar.gz", repo),
 		}
 	}
-	tag, fileVer := normalizeWebTagAndFile(v)
-	cleanVer := strings.TrimPrefix(strings.TrimPrefix(v, "web-"), "v")
+	tag, cleanVer := normalizeWebTagAndFile(v)
 
 	var paths []string
 	seen := map[string]bool{}
@@ -255,16 +250,14 @@ func candidatePaths(repo, version string) []string {
 		}
 	}
 
-	// 1. 首选规范路径
-	add(fmt.Sprintf("%s/releases/download/%s/veilink-web-%s.tar.gz", repo, tag, fileVer))
-	// 2. 如果 fileVer 是 web-v...，尝试纯版本号 veilink-web-<cleanVer>.tar.gz
-	if cleanVer != "" && cleanVer != fileVer {
-		add(fmt.Sprintf("%s/releases/download/%s/veilink-web-%s.tar.gz", repo, tag, cleanVer))
-	}
-	// 3. 通用资产名称 veilink-web.tar.gz
+	// 1. 标准资产名: veilink-web-${cleanVer}.tar.gz
+	add(fmt.Sprintf("%s/releases/download/%s/veilink-web-%s.tar.gz", repo, tag, cleanVer))
+	// 2. 冗余 tag 命名前缀资产名: veilink-web-${tag}.tar.gz (如 veilink-web-web-v0.4.0.tar.gz)
+	add(fmt.Sprintf("%s/releases/download/%s/veilink-web-%s.tar.gz", repo, tag, tag))
+	// 3. 通用资产名称: veilink-web.tar.gz
 	add(fmt.Sprintf("%s/releases/download/%s/veilink-web.tar.gz", repo, tag))
 
-	// 4. 容错尝试原始版本作为 tag
+	// 4. 容错尝试原始输入作为 tag（如果用户输入了非标准 tag）
 	if v != tag {
 		add(fmt.Sprintf("%s/releases/download/%s/veilink-web-%s.tar.gz", repo, v, cleanVer))
 		add(fmt.Sprintf("%s/releases/download/%s/veilink-web-%s.tar.gz", repo, v, v))

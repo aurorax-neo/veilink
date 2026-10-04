@@ -12,7 +12,7 @@ func TestBuildDownloadURL(t *testing.T) {
 		want    string
 	}{
 		{"latest", "", "https://github.com/aurorax-neo/veilink/releases/latest/download/veilink-web.tar.gz"},
-		{"web-v1.2.0", "", "https://github.com/aurorax-neo/veilink/releases/download/web-v1.2.0/veilink-web-web-v1.2.0.tar.gz"},
+		{"web-v1.2.0", "", "https://github.com/aurorax-neo/veilink/releases/download/web-v1.2.0/veilink-web-1.2.0.tar.gz"},
 		{"0.4.0", "", "https://github.com/aurorax-neo/veilink/releases/download/web-v0.4.0/veilink-web-0.4.0.tar.gz"},
 		{"v0.4.0", "", "https://github.com/aurorax-neo/veilink/releases/download/web-v0.4.0/veilink-web-0.4.0.tar.gz"},
 		{"latest", "https://ghfast.top", "https://ghfast.top/aurorax-neo/veilink/releases/latest/download/veilink-web.tar.gz"},
@@ -137,13 +137,34 @@ func TestMirrorApplyAndSet(t *testing.T) {
 
 func TestDownloadCandidatesNormalization(t *testing.T) {
 	m := NewWebManager(WebConfig{Repo: "aurorax-neo/veilink"})
-	urls := m.downloadCandidates("0.4.0")
-	if len(urls) == 0 {
-		t.Fatal("expected candidate urls for 0.4.0")
-	}
-	// 首选直连地址必须规范解析到 web-v0.4.0 并且文件为 veilink-web-0.4.0.tar.gz
-	wantFirst := "https://github.com/aurorax-neo/veilink/releases/download/web-v0.4.0/veilink-web-0.4.0.tar.gz"
-	if urls[0] != wantFirst {
-		t.Errorf("urls[0] = %q, want %q", urls[0], wantFirst)
+	inputs := []string{"0.4.0", "v0.4.0", "web-v0.4.0"}
+	for _, in := range inputs {
+		urls := m.downloadCandidates(in)
+		if len(urls) == 0 {
+			t.Fatalf("expected candidate urls for %s", in)
+		}
+		// 首选直连地址必须规范解析到 web-v0.4.0 并且文件为 veilink-web-0.4.0.tar.gz
+		wantFirst := "https://github.com/aurorax-neo/veilink/releases/download/web-v0.4.0/veilink-web-0.4.0.tar.gz"
+		if urls[0] != wantFirst {
+			t.Errorf("input %s: urls[0] = %q, want %q", in, urls[0], wantFirst)
+		}
+		// 候选列表必须包含冗余 tag 命名前缀以及通用 veilink-web.tar.gz
+		var hasWebTagVer, hasGeneric bool
+		wantWebTagVer := "https://github.com/aurorax-neo/veilink/releases/download/web-v0.4.0/veilink-web-web-v0.4.0.tar.gz"
+		wantGeneric := "https://github.com/aurorax-neo/veilink/releases/download/web-v0.4.0/veilink-web.tar.gz"
+		for _, u := range urls {
+			if u == wantWebTagVer {
+				hasWebTagVer = true
+			}
+			if u == wantGeneric {
+				hasGeneric = true
+			}
+		}
+		if !hasWebTagVer {
+			t.Errorf("input %s: missing candidate %s", in, wantWebTagVer)
+		}
+		if !hasGeneric {
+			t.Errorf("input %s: missing candidate %s", in, wantGeneric)
+		}
 	}
 }
