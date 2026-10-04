@@ -176,13 +176,8 @@ const service = ref({
   cert_file: '',
   key_file: '',
   web_mode: 'pull',
-  embedded_enabled: false,
-  embedded_name: '',
-  embedded_address: '',
-  embedded_port: 0,
 })
 const savingService = ref(false)
-const savingEmbedded = ref(false)
 const serviceMsg = ref('')
 const serviceBad = ref(false)
 
@@ -195,7 +190,6 @@ async function loadService() {
 
 async function saveService() {
   savingService.value = true
-  savingEmbedded.value = true
   serviceMsg.value = ''
   serviceBad.value = false
   try {
@@ -207,7 +201,6 @@ async function saveService() {
     serviceMsg.value = e instanceof ApiError ? e.message : '保存失败'
   } finally {
     savingService.value = false
-    savingEmbedded.value = false
   }
 }
 
@@ -470,36 +463,6 @@ onMounted(() => {
         </label>
       </div>
       <p v-if="serviceMsg" class="hint" :class="{ bad: serviceBad }">{{ serviceMsg }}</p>
-    </section>
-
-    <section class="panel">
-      <header class="panel-head">
-        <div>
-          <h2>内嵌服务</h2>
-          <p class="muted">可选的内置服务。修改后<span class="tag warn">需重启</span>生效。</p>
-        </div>
-        <button type="button" class="btn" :disabled="savingEmbedded" @click="saveService">
-          {{ savingEmbedded ? '保存中…' : '保存' }}
-        </button>
-      </header>
-      <div class="form-grid">
-        <label class="field check">
-          <input v-model="service.embedded_enabled" type="checkbox" />
-          <span>启用内嵌服务</span>
-        </label>
-        <label class="field">
-          <span>服务名称</span>
-          <input v-model="service.embedded_name" type="text" :disabled="!service.embedded_enabled" />
-        </label>
-        <label class="field">
-          <span>监听地址</span>
-          <input v-model="service.embedded_address" type="text" :disabled="!service.embedded_enabled" />
-        </label>
-        <label class="field">
-          <span>端口</span>
-          <input v-model.number="service.embedded_port" type="number" min="0" max="65535" :disabled="!service.embedded_enabled" />
-        </label>
-      </div>
     </section>
 
     <section class="panel">

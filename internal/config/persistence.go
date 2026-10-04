@@ -25,11 +25,6 @@ type MasterConfigUpdate struct {
 	CertFile   *string `json:"cert_file"`
 	KeyFile    *string `json:"key_file"`
 	WebMode    *string `json:"web_mode"`
-	// 内嵌服务
-	EmbeddedEnabled *bool   `json:"embedded_enabled"`
-	EmbeddedName    *string `json:"embedded_name"`
-	EmbeddedAddress *string `json:"embedded_address"`
-	EmbeddedPort    *int    `json:"embedded_port"`
 }
 
 // UpdateMasterConfig 更新 master_config 表中的通用配置（设置页运行时调用）
@@ -84,38 +79,6 @@ func UpdateMasterConfig(dbPath string, update MasterConfigUpdate) ([]string, err
 		}
 		set("WebMode", mode, true)
 	}
-	if update.EmbeddedEnabled != nil || update.EmbeddedName != nil || update.EmbeddedAddress != nil || update.EmbeddedPort != nil {
-		// 读取现有内嵌配置
-		var embedded map[string]json.RawMessage
-		if raw, ok := doc["EmbeddedServer"]; ok {
-			_ = json.Unmarshal(raw, &embedded)
-		}
-		if embedded == nil {
-			embedded = map[string]json.RawMessage{}
-		}
-		setEmbedded := func(key string, v any) {
-			raw, _ := json.Marshal(v)
-			embedded[key] = raw
-		}
-		if update.EmbeddedEnabled != nil {
-			setEmbedded("Enabled", *update.EmbeddedEnabled)
-		}
-		if update.EmbeddedName != nil {
-			setEmbedded("EmbeddedName", *update.EmbeddedName)
-		}
-		if update.EmbeddedAddress != nil {
-			setEmbedded("Address", *update.EmbeddedAddress)
-		}
-		if update.EmbeddedPort != nil {
-			if *update.EmbeddedPort < 0 || *update.EmbeddedPort > 65535 {
-				return nil, errors.New("embedded port must be 0-65535")
-			}
-			setEmbedded("Port", *update.EmbeddedPort)
-		}
-		embeddedRaw, _ := json.Marshal(embedded)
-		doc["EmbeddedServer"] = embeddedRaw
-		needRestart = append(needRestart, "EmbeddedServer")
-	}
 	body, err := json.Marshal(doc)
 	if err != nil {
 		return nil, err
@@ -126,15 +89,11 @@ func UpdateMasterConfig(dbPath string, update MasterConfigUpdate) ([]string, err
 
 // MasterConfigView 设置页展示用的 master 配置（脱敏）
 type MasterConfigView struct {
-	ListenAddr      string `json:"listen_addr"`
-	Scheme          string `json:"scheme"`
-	CertFile        string `json:"cert_file"`
-	KeyFile         string `json:"key_file"`
-	WebMode         string `json:"web_mode"`
-	EmbeddedEnabled bool   `json:"embedded_enabled"`
-	EmbeddedName    string `json:"embedded_name"`
-	EmbeddedAddress string `json:"embedded_address"`
-	EmbeddedPort    int    `json:"embedded_port"`
+	ListenAddr string `json:"listen_addr"`
+	Scheme     string `json:"scheme"`
+	CertFile   string `json:"cert_file"`
+	KeyFile    string `json:"key_file"`
+	WebMode    string `json:"web_mode"`
 }
 
 // GetMasterConfigView 从 DB 读取设置页展示用的配置
@@ -164,10 +123,6 @@ func GetMasterConfigView(dbPath string) (MasterConfigView, error) {
 	if view.WebMode == "" {
 		view.WebMode = "pull"
 	}
-	view.EmbeddedEnabled = cfg.EmbeddedServer.Enabled
-	view.EmbeddedName = cfg.EmbeddedServer.Name
-	view.EmbeddedAddress = cfg.EmbeddedServer.Address
-	view.EmbeddedPort = cfg.EmbeddedServer.Port
 	return view, nil
 }
 
