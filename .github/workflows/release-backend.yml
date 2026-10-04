@@ -57,10 +57,9 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          title: "[Backend] ${{ github.ref_name }}"
+          title: "${{ github.ref_name }}"
           files: dist/veilink-*
           generate_release_notes: true
-
   docker:
     needs: build
     runs-on: ubuntu-latest
@@ -73,14 +72,16 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push backend image
+      - name: Build and push unified image
         uses: docker/build-push-action@v6
         with:
           context: .
-          target: backend
+          target: unified
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}:latest
             ghcr.io/${{ github.repository }}-backend:${{ github.ref_name }}
             ghcr.io/${{ github.repository }}-backend:latest
           build-args: |
