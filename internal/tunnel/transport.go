@@ -25,13 +25,10 @@ func checkTransportSecurity(local model.LocalTLS) error {
 		return errors.New("plain transport_security cannot be combined with REALITY or Hysteria2")
 	}
 	if x := local.XHTTP; x.Enabled() {
-		if x.Mode != "packet-up" && x.Mode != "stream-up" && x.Mode != "stream-one" && x.Mode != "auto" {
+		if x.Mode != "packet-up" && x.Mode != "stream-up" && x.Mode != "stream-one" && x.Mode != "auto" && x.Mode != "" {
 			return errors.New("xhttp mode must be packet-up, stream-up, stream-one or auto")
 		}
-		mode := x.Mode
-		if mode == "auto" {
-			mode = "packet-up"
-		}
+		mode := xhttpEffectiveMode(x, local.Reality.Enabled())
 		if err := checkXHTTPMeta(x, mode); err != nil {
 			return err
 		}
@@ -74,8 +71,8 @@ func checkTransportSecurity(local model.LocalTLS) error {
 		if x.HTTPVersion == "2" && !x.TLS && (mode != "packet-up" || local.Reality.Enabled() || local.TransportSecurity != "plain") {
 			return errors.New("xhttp h2c requires packet-up, direct HTTP and plain origin with VLESS encryption")
 		}
-		if mode != "packet-up" && (!x.TLS || local.Reality.Enabled() || local.TransportSecurity != "tls") {
-			return errors.New("xhttp streaming modes require direct HTTPS with HTTP/2 or HTTP/3 and TLS origin")
+		if mode != "packet-up" && !local.Reality.Enabled() && (!x.TLS || local.TransportSecurity != "tls") {
+			return errors.New("xhttp streaming modes require direct HTTPS with HTTP/2 or HTTP/3 and TLS origin (or REALITY)")
 		}
 		if mode == "packet-up" && x.NoGRPCHeader {
 			return errors.New("xhttp no_grpc_header applies only to streaming modes")
