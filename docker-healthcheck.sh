@@ -10,9 +10,11 @@ case "$role" in
   *) exit 1 ;;
 esac
 flag() {
-  printf '%s\n' "$args" | awk -v name="-$1" '
-    $0 == name { if (getline > 0) value = $0; next }
-    index($0, name "=") == 1 { value = substr($0, length(name) + 2) }
+  printf '%s\n' "$args" | awk -v k="$1" '
+    BEGIN { s1 = "-" k; s2 = "--" k }
+    $0 == s1 || $0 == s2 { if (getline > 0) value = $0; next }
+    index($0, s1 "=") == 1 { value = substr($0, length(s1) + 2) }
+    index($0, s2 "=") == 1 { value = substr($0, length(s2) + 2) }
     END { print value }
   '
 }
@@ -45,7 +47,7 @@ case "$host" in
 esac
 
 case "$scheme" in
-  https) curl --noproxy '*' --insecure --fail --silent --max-time 4 "https://${host}:${port}/healthz" >/dev/null ;;
-  http) curl --noproxy '*' --fail --silent --max-time 4 "http://${host}:${port}/healthz" >/dev/null ;;
+  https) curl --noproxy '*' --insecure --fail --silent --show-error --max-time 4 "https://${host}:${port}/healthz" >/dev/null ;;
+  http) curl --noproxy '*' --fail --silent --show-error --max-time 4 "http://${host}:${port}/healthz" >/dev/null ;;
   *) exit 1 ;;
 esac

@@ -34,7 +34,7 @@ ARG VERSION=dev
 ARG COMMIT=unknown
 ARG SOURCE_URL=unknown
 RUN if [ -n "$APK_MIRROR" ] && [ "$APK_MIRROR" != "https://dl-cdn.alpinelinux.org/alpine" ]; then printf '%s/v3.23/main\n%s/v3.23/community\n' "$APK_MIRROR" "$APK_MIRROR" > /etc/apk/repositories; fi \
- && apk add --no-cache ca-certificates tzdata sqlite su-exec \
+ && apk add --no-cache ca-certificates tzdata sqlite su-exec curl \
  && mkdir -p /data/web \
  && adduser -D -u 65532 -g 65532 veilink \
  && chown -R veilink:veilink /data

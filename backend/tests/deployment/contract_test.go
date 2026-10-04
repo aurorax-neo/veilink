@@ -66,6 +66,7 @@ func TestUnifiedImageContents(t *testing.T) {
 		"COPY --from=build-backend /out/veilink /usr/local/bin/veilink",
 		"COPY --from=build-web /src/frontend/dist /opt/veilink-web/",
 		"ENTRYPOINT [\"/usr/local/bin/docker-entrypoint.sh\"]",
+		"apk add --no-cache ca-certificates tzdata sqlite su-exec curl",
 		"HEALTHCHECK ", "org.opencontainers.image.version", "org.opencontainers.image.revision", "org.opencontainers.image.source",
 	} {
 		if !strings.Contains(file, required) {

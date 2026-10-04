@@ -39,6 +39,8 @@ func TestMasterHealthcheckPersistedListenerAfterRestart(t *testing.T) {
 		{"explicit listener and scheme", "127.0.0.1:19543", "http", []string{"-listen-addr", "[::1]:24443", "-scheme=https"}, "https://[::1]:24443/healthz", true},
 		{"explicit listener persisted scheme", "127.0.0.1:19543", "https", []string{"-listen-addr=127.0.0.1:24443"}, "https://127.0.0.1:24443/healthz", true},
 		{"explicit scheme persisted listener", "127.0.0.1:19543", "https", []string{"-scheme", "http"}, "http://127.0.0.1:19543/healthz", false},
+		{"explicit double dash listener and scheme", "127.0.0.1:19543", "http", []string{"--listen-addr", "[::1]:24443", "--scheme=https"}, "https://[::1]:24443/healthz", true},
+		{"explicit double dash listener with equal", "127.0.0.1:19543", "https", []string{"--listen-addr=127.0.0.1:24443"}, "https://127.0.0.1:24443/healthz", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
