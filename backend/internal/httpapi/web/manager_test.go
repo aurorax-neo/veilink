@@ -168,3 +168,20 @@ func TestDownloadCandidatesNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestProbeOnlySavedMirrors(t *testing.T) {
+	// 未配置镜像：Probe 结果必须为空
+	m := NewWebManager(WebConfig{Repo: "aurorax-neo/veilink"})
+	res := m.Probe("latest")
+	if len(res) != 0 {
+		t.Fatalf("expected 0 probe results for empty mirrors, got %d", len(res))
+	}
+}
+
+func TestVersionFallbackToBuildinfo(t *testing.T) {
+	m := NewWebManager(WebConfig{Repo: "aurorax-neo/veilink"})
+	// 初始状态 Version() 应该回退到 buildinfo.Version
+	if v := m.Version(); v == "" {
+		t.Fatalf("expected non-empty version, got %q", v)
+	}
+}

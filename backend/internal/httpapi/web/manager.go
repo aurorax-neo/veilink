@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"veilink/internal/buildinfo"
 )
 
 // 内置加速镜像：直连失败时自动尝试
@@ -177,7 +179,11 @@ func (m *WebManager) Ensure() (string, error) {
 		if _, err := os.Stat(filepath.Join(prebundled, "index.html")); err == nil {
 			m.mu.Lock()
 			m.root = prebundled
-			m.ver = "prebundled"
+			ver := buildinfo.Version
+			if ver == "" || ver == "dev" {
+				ver = "prebundled"
+			}
+			m.ver = ver
 			m.mu.Unlock()
 			return m.ver, nil
 		}
@@ -430,19 +436,30 @@ type WebStatus struct {
 }
 
 // Status 返回当前前端配置与状态
+// Status 返回当前前端配置与状态
 func (m *WebManager) Status() WebStatus {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	activeVer := m.ver
+	isPrebundled := m.ver == "prebundled"
+	if activeVer == "" || activeVer == "prebundled" {
+		if buildinfo.Version != "" && buildinfo.Version != "dev" {
+			activeVer = buildinfo.Version
+		}
+	}
+	if m.cfg.Version == "" && m.root != "" && m.cfg.FrontendURL == "" {
+		isPrebundled = true
+	}
 	return WebStatus{
 		Mode:        string(m.cfg.Mode),
 		WantVersion: m.cfg.Version,
-		ActiveVer:   m.ver,
+		ActiveVer:   activeVer,
 		Mirrors:     append([]string{}, m.cfg.GithubMirrors...),
 		FrontendURL: m.cfg.FrontendURL,
 		Repo:        m.cfg.Repo,
 		Root:        m.root,
 		Serving:     m.root != "",
-		Prebundled:  m.ver == "prebundled",
+		Prebundled:  isPrebundled,
 	}
 }
 
@@ -493,6 +510,7 @@ func (m *WebManager) SetMirrors(mirrors []string) error {
 
 // ProbeResult 连通性探测结果
 type ProbeResult struct {
+	Mirror  string `json:"mirror"`
 	URL     string `json:"url"`
 	OK      bool   `json:"ok"`
 	Status  int    `json:"status,omitempty"`
@@ -500,7 +518,7 @@ type ProbeResult struct {
 	Error   string `json:"error,omitempty"`
 }
 
-// Probe 探测各候选下载地址的连通性（HEAD 请求，不下载）
+// Probe 探测已保存的各加速地址的连通性（HEAD 请求，不下载）
 func (m *WebManager) Probe(version string) []ProbeResult {
 	if version == "" {
 		version = m.cfg.Version
@@ -509,16 +527,39 @@ func (m *WebManager) Probe(version string) []ProbeResult {
 		}
 	}
 	results := make([]ProbeResult, 0)
-	client := &http.Client{Timeout: 15 * time.Second}
-	for _, url := range m.downloadCandidates(version) {
+	m.mu.RLock()
+	mirrors := append([]string(nil), m.cfg.GithubMirrors...)
+	repo := m.cfg.Repo
+	m.mu.RUnlock()
+
+	// 需求：只测试保存过的地址
+	if len(mirrors) == 0 {
+		return results
+	}
+
+	paths := candidatePaths(repo, version)
+	var testPath string
+	if len(paths) > 0 {
+		testPath = paths[0]
+	} else {
+		testPath = fmt.Sprintf("%s/releases/latest/download/veilink-web.tar.gz", repo)
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	for _, mirror := range mirrors {
+		targetURL := assembleURL(testPath, mirror)
 		start := time.Now()
-		r := ProbeResult{URL: redactURL(url)}
-		req, err := http.NewRequest(http.MethodHead, url, nil)
+		r := ProbeResult{
+			Mirror: mirror,
+			URL:    redactURL(targetURL),
+		}
+		req, err := http.NewRequest(http.MethodHead, targetURL, nil)
 		if err != nil {
 			r.Error = err.Error()
 			results = append(results, r)
 			continue
 		}
+		req.Header.Set("User-Agent", "Veilink-Probe/1.0")
 		resp, err := client.Do(req)
 		r.Elapsed = time.Since(start).Milliseconds()
 		if err != nil {
@@ -526,7 +567,7 @@ func (m *WebManager) Probe(version string) []ProbeResult {
 		} else {
 			resp.Body.Close()
 			r.Status = resp.StatusCode
-			r.OK = resp.StatusCode == http.StatusOK
+			r.OK = resp.StatusCode >= 200 && resp.StatusCode < 400
 			if !r.OK {
 				r.Error = fmt.Sprintf("status %d", resp.StatusCode)
 			}
@@ -545,6 +586,15 @@ func (m *WebManager) Root() string {
 func (m *WebManager) Version() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.ver == "" || m.ver == "prebundled" {
+		if buildinfo.Version != "" && buildinfo.Version != "dev" {
+			return buildinfo.Version
+		}
+		if m.ver != "" {
+			return m.ver
+		}
+		return buildinfo.Version
+	}
 	return m.ver
 }
 

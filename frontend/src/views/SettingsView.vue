@@ -15,18 +15,13 @@ interface WebStatus {
 }
 
 interface ProbeResult {
+  mirror?: string
   url: string
   ok: boolean
   status?: number
   elapsed_ms: number
   error?: string
 }
-
-const builtinPresets = [
-  { label: 'ghfast.top', value: 'https://ghfast.top', desc: '国内加速' },
-  { label: 'ghproxy.com', value: 'https://ghproxy.com/https://github.com', desc: '代理加速' },
-  { label: 'mirror.ghproxy.com', value: 'https://mirror.ghproxy.com', desc: '备用镜像' },
-]
 
 const status = ref<WebStatus | null>(null)
 const loading = ref(true)
@@ -61,6 +56,24 @@ const hasChanges = computed(() => {
   return a.length !== b.length || a.some((v, i) => v !== b[i])
 })
 
+const probeSuccessCount = computed(() => {
+  if (!probes.value) return 0
+  return probes.value.filter(p => p.ok).length
+})
+
+const displayActiveVersion = computed(() => {
+  if (!status.value) return '—'
+  const v = status.value.active_version
+  if (v && v !== 'prebundled') return v
+  return '内置版本'
+})
+
+function latencyClass(ms: number): string {
+  if (ms < 300) return 'fast'
+  if (ms < 800) return 'medium'
+  return 'slow'
+}
+
 function normalizeUrl(v: string): string {
   v = v.trim()
   if (!v) return ''
@@ -82,9 +95,9 @@ async function load() {
   }
 }
 
-function addMirror(preset?: string) {
+function addMirror() {
   mirrorError.value = ''
-  const v = normalizeUrl(preset ?? newMirror.value)
+  const v = normalizeUrl(newMirror.value)
   if (!v) {
     mirrorError.value = '请输入有效的加速地址'
     return
@@ -141,11 +154,18 @@ async function saveFrontendUrl() {
 }
 
 async function probe() {
+  if (hasChanges.value) {
+    await saveMirrors()
+  }
+  if (!mirrors.value.length) {
+    probes.value = []
+    return
+  }
   probing.value = true
   probes.value = null
   try {
     const r = await api<{ results: ProbeResult[] }>('/web/probe', 'POST', {})
-    probes.value = r.results
+    probes.value = r.results || []
   } catch {
     probes.value = []
   } finally {
@@ -293,7 +313,10 @@ onMounted(() => {
         </div>
         <div class="stat">
           <dt>运行版本</dt>
-          <dd><code>{{ status.active_version || '—' }}</code></dd>
+          <dd>
+            <code>{{ displayActiveVersion }}</code>
+            <span v-if="status.prebundled" class="tag ro" style="margin-left: 4px;">内置</span>
+          </dd>
         </div>
         <div class="stat">
           <dt>加速地址</dt>
@@ -374,32 +397,55 @@ onMounted(() => {
         />
         <button type="button" class="btn" @click="addMirror()">添加</button>
       </div>
-      <div class="presets">
-        <button
-          v-for="p in builtinPresets"
-          :key="p.value"
-          type="button"
-          class="chip"
-          :title="p.desc"
-          @click="addMirror(p.value)"
-        ><span class="chip-plus" aria-hidden="true">+</span>{{ p.label }}</button>
-      </div>
       <p v-if="mirrorError" class="hint bad">{{ mirrorError }}</p>
 
       <!-- 探测 -->
       <div class="probe-actions">
-        <button type="button" class="btn" :disabled="probing" @click="probe">
+        <button
+          type="button"
+          class="btn"
+          :disabled="probing || mirrors.length === 0"
+          :title="mirrors.length === 0 ? '请先添加加速地址' : '检测已保存加速地址连通性'"
+          @click="probe"
+        >
           {{ probing ? '检测中…' : '检测连通性' }}
         </button>
+        <span v-if="mirrors.length === 0" class="hint-inline muted">（请先添加加速地址）</span>
       </div>
-      <ul v-if="probes && probes.length" class="probe-list">
-        <li v-for="r in probes" :key="r.url" :class="{ ok: r.ok }">
-          <span class="probe-dot" aria-hidden="true"></span>
-          <code>{{ r.url }}</code>
-          <small>{{ r.ok ? `${r.status} · ${r.elapsed_ms}ms` : (r.error || '失败') }}</small>
-        </li>
-      </ul>
-      <p v-else-if="probes && !probes.length" class="hint bad">检测失败，请检查网络。</p>
+
+      <div v-if="probes !== null" class="probe-box">
+        <div class="probe-summary">
+          <span class="probe-summary-title">检测结果</span>
+          <span class="probe-summary-badge" :class="probeSuccessCount > 0 ? 'good' : 'bad'">
+            {{ probes.length === 0 ? '无测试目标' : `${probeSuccessCount} / ${probes.length} 可用` }}
+          </span>
+        </div>
+        <ul v-if="probes.length" class="probe-cards">
+          <li v-for="r in probes" :key="r.url" class="probe-card" :class="{ ok: r.ok, fail: !r.ok }">
+            <div class="probe-card-left">
+              <span class="probe-dot" :class="{ ok: r.ok }" aria-hidden="true"></span>
+              <div class="probe-info">
+                <div class="probe-title-line">
+                  <strong class="probe-host">{{ r.mirror || r.url }}</strong>
+                  <span class="status-badge" :class="r.ok ? 'good' : 'bad'">
+                    {{ r.ok ? `${r.status || 200} OK` : '失败' }}
+                  </span>
+                </div>
+                <div class="probe-target-url" :title="r.url">{{ r.url }}</div>
+              </div>
+            </div>
+            <div class="probe-card-right">
+              <span v-if="r.ok" class="probe-latency" :class="latencyClass(r.elapsed_ms)">
+                {{ r.elapsed_ms }} ms
+              </span>
+              <span v-else class="probe-error" :title="r.error">
+                {{ r.error || '连通失败' }}
+              </span>
+            </div>
+          </li>
+        </ul>
+        <p v-else class="hint muted">未检测到已保存的加速地址，请先添加并保存。</p>
+      </div>
     </section>
 
     <!-- 版本更新 -->
@@ -523,7 +569,7 @@ onMounted(() => {
 </template>
 
 <style scoped>
-.settings { display: grid; gap: 20px; max-width: 860px; }
+.settings { display: grid; gap: 20px; max-width: 860px; margin: 0 auto; width: 100%; }
 .hero {
   background: linear-gradient(135deg, var(--surface-raised), var(--surface));
   border: 1px solid var(--line);
@@ -591,44 +637,175 @@ onMounted(() => {
 
 .add-row { display: flex; gap: 10px; margin-top: 12px; }
 .add-row input { flex: 1; }
-.presets { display: flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
-.chip {
-  display: inline-flex; align-items: center; gap: 6px;
-  border: 1px dashed var(--line-strong);
-  background: transparent;
-  border-radius: 20px;
-  padding: 5px 12px 5px 8px;
+.probe-actions {
+  margin-top: 16px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.hint-inline {
   font-size: 12px;
-  color: var(--muted);
-  cursor: pointer;
-  transition: all 140ms ease;
 }
-.chip:hover { border-color: var(--accent); color: var(--accent-strong); border-style: solid; }
-.chip-plus {
-  display: inline-grid; place-items: center;
-  width: 16px; height: 16px;
-  border-radius: 50%;
-  background: var(--accent-soft);
-  color: var(--accent-strong);
-  font-size: 12px; line-height: 1; font-weight: 700;
+.probe-box {
+  margin-top: 16px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 14px 16px;
 }
-
-.probe-actions { margin-top: 16px; }
-.probe-list { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 8px; }
-.probe-list li {
-  display: flex; align-items: center; gap: 10px;
-  padding: 9px 12px;
+.probe-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+.probe-summary-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.probe-summary-badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+.probe-summary-badge.good {
+  background: rgba(34, 197, 94, 0.15);
+  color: #22c55e;
+}
+.probe-summary-badge.bad {
+  background: rgba(239, 68, 68, 0.15);
+  color: #ef4444;
+}
+.probe-cards {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+.probe-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 14px;
   background: var(--surface-raised);
   border: 1px solid var(--line);
-  border-radius: 8px;
-  font-size: 12px;
+  border-radius: 10px;
+  transition: border-color 140ms ease;
 }
-.probe-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); flex: none; }
-.probe-list li.ok .probe-dot { background: var(--good); box-shadow: 0 0 6px var(--good); }
-.probe-list code { flex: 1; overflow: hidden; text-overflow: ellipsis; color: var(--muted); }
-.probe-list small { color: var(--faint); flex: none; }
-.probe-list li.ok small { color: var(--good); }
-
+.probe-card:hover {
+  border-color: var(--line-strong);
+}
+.probe-card.fail {
+  border-color: rgba(239, 68, 68, 0.3);
+}
+.probe-card-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1;
+  min-width: 0;
+}
+.probe-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--danger);
+  flex: none;
+}
+.probe-dot.ok {
+  background: var(--good);
+  box-shadow: 0 0 6px var(--good);
+}
+.probe-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+}
+.probe-title-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.probe-host {
+  font-size: 13px;
+  color: var(--text);
+  word-break: break-all;
+}
+.status-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 6px;
+  line-height: 1.4;
+}
+.status-badge.good {
+  background: rgba(34, 197, 94, 0.12);
+  color: #22c55e;
+}
+.status-badge.bad {
+  background: rgba(239, 68, 68, 0.12);
+  color: #ef4444;
+}
+.probe-target-url {
+  font-size: 11px;
+  color: var(--faint);
+  font-family: ui-monospace, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.probe-card-right {
+  flex: none;
+  text-align: right;
+}
+.probe-latency {
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 6px;
+}
+.probe-latency.fast {
+  background: rgba(34, 197, 94, 0.12);
+  color: #22c55e;
+}
+.probe-latency.medium {
+  background: rgba(245, 158, 11, 0.12);
+  color: #f59e0b;
+}
+.probe-latency.slow {
+  background: rgba(239, 68, 68, 0.12);
+  color: #ef4444;
+}
+.probe-error {
+  font-size: 11px;
+  color: var(--danger);
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: inline-block;
+}
+@media (max-width: 640px) {
+  .probe-card {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .probe-card-right {
+    align-self: flex-end;
+  }
+}
 @media (max-width: 640px) {
   .hero-stats { grid-template-columns: repeat(2, 1fr); }
   .url-row, .add-row { flex-direction: column; }

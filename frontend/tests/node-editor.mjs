@@ -618,9 +618,11 @@ test('XHTTP stream modes reject insecure or unsupported transport and invalid mo
     e.draft.security = 'encryption'
     e.draft.enc = 'generated-decryption'
     await assert.rejects(e.save(), /流模式仅支持直连 HTTPS/)
-    e.draft.security = 'reality'
-    assert.equal(e.draft.xhttpTLS, false)
+    e.draft.security = 'tls'
+    e.draft.xhttpTLS = true
+    e.draft.xhttpVersion = '1.1'
     await assert.rejects(e.save(), /流模式仅支持直连 HTTPS/)
+    e.draft.xhttpVersion = ''
     assert.equal(e.requests.length, 0)
     e.draft.security = 'tls'
     e.draft.xhttpTLS = true

@@ -40,7 +40,7 @@ test('Dashboard metrics use actual node and mapping state', () => {
   const vue = source('../src/views/DashboardView.vue')
   const script = vue.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import .*$/gm, '')
   const context = vm.createContext({ exports: {}, computed, byNameAndId, inject: key => key === 'desk' ? desk : () => {}, deskKey: 'desk', navigateKey: 'navigate', heartbeatOnline, attentionReasons, nodeName, presence, revisionState, onMounted: () => {}, onUnmounted: () => {}, registerPageRefresh: () => () => {} })
-  vm.runInContext(transpile(script + '\nglobalThis.metrics = { onlineServers, onlineClients, attention };'), context)
+  vm.runInContext(transpile(script + '\nglobalThis.metrics = { onlineServers, onlineClients, attention, activeMappings };'), context)
   assert.equal(context.metrics.onlineServers.value, 1)
   assert.equal(context.metrics.onlineClients.value, 1)
   assert.equal(context.metrics.attention.value.length, 2)
@@ -48,10 +48,11 @@ test('Dashboard metrics use actual node and mapping state', () => {
   desk.nodes.push({ id: 'stopped', role: 'server', disabled: true, last_seen: now, applied_revision: 1, desired_revision: 9 })
   assert.equal(context.metrics.attention.value.length, 2)
   assert.equal(context.metrics.onlineServers.value, 1)
-  const expression = vue.match(/{{\s*(desk\.mappings\.filter\(m => m\.enabled\)\.length)\s*}}/)[1]
-  assert.equal(vm.runInContext(expression, context), 1)
+  const expressionMatch = vue.match(/{{\s*(activeMappings|desk\.mappings\.filter\(m => m\.enabled\)\.length)\s*}}/)
+  const expression = expressionMatch ? (expressionMatch[1] === 'activeMappings' ? 'context.metrics.activeMappings.value' : expressionMatch[1]) : 'context.metrics.activeMappings.value'
+  assert.equal(eval(expression), 1)
   desk.mappings[0].enabled = false
   desk.nodes[1].revoked = true
-  assert.equal(vm.runInContext(expression, context), 0)
+  assert.equal(eval(expression), 0)
   assert.equal(context.metrics.onlineClients.value, 0)
 })

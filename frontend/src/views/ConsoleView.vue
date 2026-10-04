@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { inject, onMounted, ref } from 'vue'
-import { api } from '../api'
+import { api, getVersionInfo, type VersionInfo } from '../api'
 import { deskKey } from '../desk'
 import { runPageRefresh } from '../pageRefresh'
 import { pages, type PageId } from '../types'
@@ -16,13 +16,12 @@ defineProps<{ page: PageId; noticeKey: number }>()
 const emit = defineEmits<{ navigate: [page: PageId]; logout: [] }>()
 const desk = inject(deskKey)!
 const nav: PageId[] = ['dashboard', 'servers', 'clients', 'proxies', 'logs', 'audit', 'settings']
-const software = ref<{ backend_version: string; api_version: string; web_version: string } | null>(null)
+const software = ref<VersionInfo | null>(null)
 const versionError = ref(false)
 async function loadVersion() {
   versionError.value = false
   try {
-    // /api/version 是公开路径，直接 fetch 不走 api() 封装
-    software.value = await fetch('/api/version').then(r => r.json())
+    software.value = await getVersionInfo()
   } catch { versionError.value = true }
 }
 onMounted(loadVersion)
@@ -68,7 +67,7 @@ async function refresh() {
             <div class="build-details">
               <p>后端版本：{{ software?.backend_version || '未知' }}</p>
               <p>API 契约：{{ software?.api_version || '未知' }}</p>
-              <p>前端版本：{{ software?.web_version || '未知' }}</p>
+              <p>前端版本：{{ (software?.web_version && software.web_version !== 'prebundled') ? software.web_version : (software?.backend_version || '未知') }}</p>
               <button v-if="versionError" type="button" class="btn small" @click="loadVersion">重试</button>
             </div>
           </details>

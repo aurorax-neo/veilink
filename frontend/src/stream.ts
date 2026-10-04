@@ -1,5 +1,5 @@
 // frontend/src/stream.ts — SSE 订阅封装（替换所有 WebSocket 代码）
-import { api } from './api';
+import { api, buildUrl } from './api';
 
 type EventHandler = (data: any) => void;
 
@@ -22,7 +22,7 @@ export class VeilinkStream {
     // 2. 建连
     const params = new URLSearchParams({ token });
     if (types?.length) params.set('types', types.join(','));
-    this.url = `/api/v1/stream?${params}`;
+    this.url = buildUrl(`/api/v1/stream?${params}`);
     this.es = new EventSource(this.url);
 
     this.es.addEventListener('hello', () => {
