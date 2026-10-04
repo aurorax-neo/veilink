@@ -82,8 +82,6 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository }}:${{ github.ref_name }}
             ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}-backend:${{ github.ref_name }}
-            ghcr.io/${{ github.repository }}-backend:latest
           build-args: |
             VERSION=${{ github.ref_name }}
             COMMIT=${{ github.sha }}
