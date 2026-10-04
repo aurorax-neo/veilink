@@ -56,7 +56,7 @@ Veilink 使用 Go 实现节点与隧道，Vue 3 提供管理界面。**一个 Do
 docker run -itd --restart unless-stopped --name veilink-master \
   -e TZ=Asia/Shanghai \
   --network host \
-  -v /opt/docker/veilink-master:/data \
+  -v /opt/docker/veilink-master/data:/data \
   ghcr.io/aurorax-neo/veilink:latest master
 ```
 
@@ -109,7 +109,7 @@ irm https://get.veilink.dev/install.ps1 | iex
 docker run -itd \
   --name veilink-master --restart unless-stopped --net host \
   -e TZ=Asia/Shanghai \
-  -v /opt/docker/veilink-master:/data \
+  -v /opt/docker/veilink-master/data:/data \
   ghcr.io/aurorax-neo/veilink:latest master
 ```
 
