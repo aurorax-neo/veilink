@@ -41,7 +41,7 @@ jobs:
         with:
           title: "[Web] ${{ github.ref_name }}"
           files: |
-            veilink-web-*.tar.gz
-            veilink-web-*.tar.gz.sha256
+            veilink-web*.tar.gz
+            veilink-web*.tar.gz.sha256
           generate_release_notes: true
 

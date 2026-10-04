@@ -100,7 +100,7 @@ type WebManager struct {
 func NewWebManager(cfg WebConfig) *WebManager {
 	return &WebManager{
 		cfg:    cfg,
-		client: &http.Client{Timeout: 5 * time.Minute},
+		client: &http.Client{Timeout: 15 * time.Second},
 	}
 }
 
@@ -132,8 +132,42 @@ func (m *WebManager) ApplyPersisted(mirrors []string, version string, frontendUR
 
 // Ensure 保证前端可用，返回实际 serving 的目录（空 = 纯 API 模式）
 func (m *WebManager) Ensure() (string, error) {
-	// 统一镜像预置：优先使用本地预置版本，无需下载
-	if prebundled := os.Getenv("WEB_PREBUNDLED_DIR"); prebundled != "" {
+	if m.cfg.Mode == WebModeOff {
+		return "", nil
+	}
+
+	// 1. 如果用户持久化配置了特定前端版本，优先走 pull 缓存目录
+	if m.cfg.Version != "" {
+		switch m.cfg.Mode {
+		case WebModePull:
+			return m.ensurePulled()
+		default:
+			return "", fmt.Errorf("unknown web mode: %s", m.cfg.Mode)
+		}
+	}
+
+	// 2. 统一镜像预置：在未指定自定义版本时，默认使用本地预置版本，无需下载
+	prebundled := os.Getenv("WEB_PREBUNDLED_DIR")
+	if prebundled == "" {
+		if fi, err := os.Stat("/opt/veilink-web/index.html"); err == nil && !fi.IsDir() {
+			prebundled = "/opt/veilink-web"
+		} else {
+			dir, _ := os.Getwd()
+			for i := 0; i < 5; i++ {
+				cand := filepath.Join(dir, "frontend", "dist")
+				if fi, err := os.Stat(filepath.Join(cand, "index.html")); err == nil && !fi.IsDir() {
+					prebundled = cand
+					break
+				}
+				parent := filepath.Dir(dir)
+				if parent == dir {
+					break
+				}
+				dir = parent
+			}
+		}
+	}
+	if prebundled != "" {
 		if _, err := os.Stat(filepath.Join(prebundled, "index.html")); err == nil {
 			m.mu.Lock()
 			m.root = prebundled
@@ -187,9 +221,63 @@ func (m *WebManager) downloadURL(version string) string {
 	return buildDownloadURL(m.cfg.Repo, version, first)
 }
 
+// normalizeWebTagAndFile 解析前端版本对应的 release tag 和文件名标识
+func normalizeWebTagAndFile(version string) (tag string, fileVer string) {
+	v := strings.TrimSpace(version)
+	if v == "" || v == "latest" {
+		return "latest", ""
+	}
+	if strings.HasPrefix(v, "web-") {
+		// 显式以 web- 开头，tag 保持原样，文件名使用完整版本字符串（兼容已发布资产）
+		return v, v
+	}
+	clean := strings.TrimPrefix(v, "v")
+	return "web-v" + clean, clean
+}
+
+// candidatePaths 返回该版本可能对应的 release 下载相对路径列表（按优先级排序）
+func candidatePaths(repo, version string) []string {
+	v := strings.TrimSpace(version)
+	if v == "" || v == "latest" {
+		return []string{
+			fmt.Sprintf("%s/releases/latest/download/veilink-web.tar.gz", repo),
+		}
+	}
+	tag, fileVer := normalizeWebTagAndFile(v)
+	cleanVer := strings.TrimPrefix(strings.TrimPrefix(v, "web-"), "v")
+
+	var paths []string
+	seen := map[string]bool{}
+	add := func(p string) {
+		if !seen[p] {
+			seen[p] = true
+			paths = append(paths, p)
+		}
+	}
+
+	// 1. 首选规范路径
+	add(fmt.Sprintf("%s/releases/download/%s/veilink-web-%s.tar.gz", repo, tag, fileVer))
+	// 2. 如果 fileVer 是 web-v...，尝试纯版本号 veilink-web-<cleanVer>.tar.gz
+	if cleanVer != "" && cleanVer != fileVer {
+		add(fmt.Sprintf("%s/releases/download/%s/veilink-web-%s.tar.gz", repo, tag, cleanVer))
+	}
+	// 3. 通用资产名称 veilink-web.tar.gz
+	add(fmt.Sprintf("%s/releases/download/%s/veilink-web.tar.gz", repo, tag))
+
+	// 4. 容错尝试原始版本作为 tag
+	if v != tag {
+		add(fmt.Sprintf("%s/releases/download/%s/veilink-web-%s.tar.gz", repo, v, cleanVer))
+		add(fmt.Sprintf("%s/releases/download/%s/veilink-web-%s.tar.gz", repo, v, v))
+		add(fmt.Sprintf("%s/releases/download/%s/veilink-web.tar.gz", repo, v))
+	}
+
+	return paths
+}
+
 // downloadCandidates 返回按优先级排序的下载地址：
 // 1. 配置的镜像列表（按顺序）；2. 直连；3. 内置公共镜像
 func (m *WebManager) downloadCandidates(version string) []string {
+	paths := candidatePaths(m.cfg.Repo, version)
 	var urls []string
 	seen := map[string]bool{}
 	add := func(u string) {
@@ -198,19 +286,23 @@ func (m *WebManager) downloadCandidates(version string) []string {
 			urls = append(urls, u)
 		}
 	}
-	for _, mirror := range m.cfg.GithubMirrors {
-		add(buildDownloadURL(m.cfg.Repo, version, mirror))
-	}
-	add(buildDownloadURL(m.cfg.Repo, version, ""))
+
 	configured := map[string]bool{}
 	for _, mirror := range m.cfg.GithubMirrors {
 		configured[normalizeMirror(mirror)] = true
 	}
-	for _, b := range builtinMirrors {
-		if configured[normalizeMirror(b)] {
-			continue
+
+	for _, p := range paths {
+		for _, mirror := range m.cfg.GithubMirrors {
+			add(assembleURL(p, mirror))
 		}
-		add(buildDownloadURL(m.cfg.Repo, version, b))
+		add(assembleURL(p, ""))
+		for _, b := range builtinMirrors {
+			if configured[normalizeMirror(b)] {
+				continue
+			}
+			add(assembleURL(p, b))
+		}
 	}
 	return urls
 }
@@ -219,15 +311,19 @@ func normalizeMirror(m string) string {
 	return strings.ToLower(strings.TrimRight(strings.TrimSpace(m), "/"))
 }
 
-// buildDownloadURL 拼接下载地址，支持加速镜像
+// buildDownloadURL 拼接下载首选地址，支持加速镜像
 func buildDownloadURL(repo, version, mirror string) string {
+	paths := candidatePaths(repo, version)
 	var path string
-	if version == "latest" {
-		path = fmt.Sprintf("%s/releases/latest/download/veilink-web.tar.gz", repo)
+	if len(paths) > 0 {
+		path = paths[0]
 	} else {
-		path = fmt.Sprintf("%s/releases/download/%s/veilink-web-%s.tar.gz",
-			repo, version, version)
+		path = fmt.Sprintf("%s/releases/latest/download/veilink-web.tar.gz", repo)
 	}
+	return assembleURL(path, mirror)
+}
+
+func assembleURL(path, mirror string) string {
 	mirror = strings.TrimRight(strings.TrimSpace(mirror), "/")
 	if mirror == "" {
 		return "https://github.com/" + path
@@ -238,15 +334,16 @@ func buildDownloadURL(repo, version, mirror string) string {
 	if strings.Contains(mirror, "://github.com") || strings.HasSuffix(mirror, "github.com") {
 		return mirror + "/" + path
 	}
-	// 纯域名镜像：替换 github.com
 	return mirror + "/" + path
 }
-
 func (m *WebManager) pull(version, dir string) error {
 	var lastErr error
 	for _, url := range m.downloadCandidates(version) {
 		if err := m.pullFrom(url, version, dir); err != nil {
 			slog.Warn("前端下载失败，尝试下一个地址", "url", redactURL(url), "err", err)
+			if os.IsPermission(err) || strings.Contains(err.Error(), "read-only file system") {
+				return fmt.Errorf("local cache dir error: %w", err)
+			}
 			lastErr = err
 			continue
 		}

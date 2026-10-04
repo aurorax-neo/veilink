@@ -51,13 +51,6 @@ CMD ["master"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
   CMD ["/usr/local/bin/docker-healthcheck.sh"]
 
-FROM nginx:alpine AS web
-ARG VERSION=dev
-COPY --from=build-web /src/frontend/dist /usr/share/nginx/html
-COPY frontend/nginx.conf /etc/nginx/conf.d/default.conf
-LABEL org.opencontainers.image.title="veilink-web" \
-      org.opencontainers.image.version="${VERSION}"
-EXPOSE 80
 
 # ============ 统一镜像（后端 + 预置前端，master 开箱即用） ============
 FROM backend AS unified

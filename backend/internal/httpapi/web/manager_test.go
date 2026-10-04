@@ -13,9 +13,12 @@ func TestBuildDownloadURL(t *testing.T) {
 	}{
 		{"latest", "", "https://github.com/aurorax-neo/veilink/releases/latest/download/veilink-web.tar.gz"},
 		{"web-v1.2.0", "", "https://github.com/aurorax-neo/veilink/releases/download/web-v1.2.0/veilink-web-web-v1.2.0.tar.gz"},
+		{"0.4.0", "", "https://github.com/aurorax-neo/veilink/releases/download/web-v0.4.0/veilink-web-0.4.0.tar.gz"},
+		{"v0.4.0", "", "https://github.com/aurorax-neo/veilink/releases/download/web-v0.4.0/veilink-web-0.4.0.tar.gz"},
 		{"latest", "https://ghfast.top", "https://ghfast.top/aurorax-neo/veilink/releases/latest/download/veilink-web.tar.gz"},
 		{"latest", "https://ghfast.top/", "https://ghfast.top/aurorax-neo/veilink/releases/latest/download/veilink-web.tar.gz"},
 		{"latest", "https://ghproxy.com/https://github.com", "https://ghproxy.com/https://github.com/aurorax-neo/veilink/releases/latest/download/veilink-web.tar.gz"},
+		{"0.4.0", "https://ghfast.top", "https://ghfast.top/aurorax-neo/veilink/releases/download/web-v0.4.0/veilink-web-0.4.0.tar.gz"},
 	}
 	for _, c := range cases {
 		got := buildDownloadURL(repo, c.version, c.mirror)
@@ -129,5 +132,18 @@ func TestMirrorApplyAndSet(t *testing.T) {
 	}
 	if len(gotMirrors) != 0 {
 		t.Errorf("persist after clear = %v, want empty", gotMirrors)
+	}
+}
+
+func TestDownloadCandidatesNormalization(t *testing.T) {
+	m := NewWebManager(WebConfig{Repo: "aurorax-neo/veilink"})
+	urls := m.downloadCandidates("0.4.0")
+	if len(urls) == 0 {
+		t.Fatal("expected candidate urls for 0.4.0")
+	}
+	// 首选直连地址必须规范解析到 web-v0.4.0 并且文件为 veilink-web-0.4.0.tar.gz
+	wantFirst := "https://github.com/aurorax-neo/veilink/releases/download/web-v0.4.0/veilink-web-0.4.0.tar.gz"
+	if urls[0] != wantFirst {
+		t.Errorf("urls[0] = %q, want %q", urls[0], wantFirst)
 	}
 }

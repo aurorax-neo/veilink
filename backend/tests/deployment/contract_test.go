@@ -72,12 +72,12 @@ func TestUnifiedImageContents(t *testing.T) {
 			t.Errorf("unified image missing %q", required)
 		}
 	}
-	for _, forbidden := range []string{"COPY web", "/src/web", " AS master", " AS server", " AS client"} {
+	for _, forbidden := range []string{"COPY web", "/src/web", " AS master", " AS server", " AS client", " AS web"} {
 		if strings.Contains(file, forbidden) {
 			t.Errorf("obsolete Dockerfile reference %q", forbidden)
 		}
 	}
-	if strings.Count("\n"+file, "\nFROM ") != 5 || strings.Count(file, "ENTRYPOINT ") != 1 || strings.Count(file, "HEALTHCHECK ") != 1 {
-		t.Error("expected two build stages, backend/web intermediates, unified runtime and one healthcheck")
+	if strings.Count("\n"+file, "\nFROM ") != 4 || strings.Count(file, "ENTRYPOINT ") != 1 || strings.Count(file, "HEALTHCHECK ") != 1 {
+		t.Error("expected two build stages, backend intermediate, unified runtime and one healthcheck")
 	}
 }
