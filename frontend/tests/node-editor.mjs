@@ -243,6 +243,31 @@ test('client list omits server-only address and tunnel columns', () => {
 const ca = cert.replace('ZGVtbw==', 'Y3VzdG9t')
 const tlsNode = () => ({ id: 'server', name: 'Server', address: 'example.com', port: 443, connect_endpoints: [{ id: 'primary', name: '首选地址', host: 'example.com', port: 443, enabled: true }], tunnel: { listen_port: 8444, transport_security: 'tls', cert_pem: cert, key_pem: key, ca_pem: cert }, client_tunnel: { transport_security: 'tls', ca_pem: ca } })
 const realityNode = () => ({ id: 'reality', name: 'Reality', address: 'example.com', port: 443, connect_endpoints: [{ id: 'primary', name: '首选地址', host: 'example.com', port: 443, enabled: true }], tunnel: { listen_port: 8444, reality: { private_key: 'private', short_ids: 'aa,bb', server_names: 'example.com', dest: 'example.com:443' } }, client_tunnel: { reality: { public_key: 'public', short_id: 'bb', fingerprint: 'firefox', server_names: 'example.com', max_time_diff: '1m' } } })
+
+test('clearing optional encryption and REALITY fields removes saved values and can re-enable', async () => {
+  const e = setup()
+  const node = realityNode()
+  Object.assign(node.tunnel.reality, { mldsa65_seed: 'seed', mldsa65_verify: 'verify', spider_x: '/old', spider_y: 'old', max_time_diff: '1m' })
+  node.tunnel.decryption = 'old-encryption'
+  node.tunnel.flow = 'xtls-rprx-vision'
+  e.open(node)
+  Object.assign(e.draft, { mldsa65Seed: '', mldsa65Verify: '', spiderX: '', spiderY: '', enc: '', flow: '' })
+  await e.save()
+  for (const field of ['mldsa65_seed', 'mldsa65_verify', 'spider_x', 'spider_y']) assert.equal(payload(e).reality[field], undefined)
+  assert.equal(payload(e).reality.max_time_diff, '1m')
+  assert.equal(payload(e).decryption, undefined)
+  assert.equal(payload(e).flow, undefined)
+  e.open({ ...node, tunnel: JSON.parse(JSON.stringify(payload(e))) })
+  assert.equal(e.draft.mldsa65Seed, '')
+  assert.equal(e.draft.enc, '')
+  Object.assign(e.draft, { mldsa65Seed: 'new-seed', mldsa65Verify: 'new-verify', enc: 'new-encryption' })
+  await e.save()
+  assert.equal(payload(e).reality.mldsa65_seed, 'new-seed')
+  assert.equal(payload(e).decryption, 'new-encryption')
+  e.draft.security = 'tls'; e.draft.cert = cert; e.draft.key = key
+  await e.save()
+  assert.equal(payload(e).reality, undefined)
+})
 const body = e => e.requests.at(-1)[2]
 
 test('server metadata and material saves never submit a separate client template', async () => {

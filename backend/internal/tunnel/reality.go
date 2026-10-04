@@ -28,9 +28,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	utls "github.com/refraction-networking/utls"
 	"github.com/xtls/reality"
-	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/net/http2"
 
@@ -72,6 +72,28 @@ func checkRealityServer(r model.Reality, fallback string) error {
 	if _, err := decodeKey(r.PrivateKey); err != nil {
 		return fmt.Errorf("REALITY private key: %w", err)
 	}
+	if r.Mldsa65Seed != "" {
+		seed, err := decodeMLDSA(r.Mldsa65Seed, mldsa65.SeedSize)
+		if err != nil {
+			return fmt.Errorf("REALITY ML-DSA-65 seed: %w", err)
+		}
+		private, _ := decodeKey(r.PrivateKey)
+		if bytes.Equal(seed, private) {
+			return errors.New("REALITY ML-DSA-65 seed must differ from X25519 private key")
+		}
+		if r.Mldsa65Verify != "" {
+			verify, err := decodeMLDSA(r.Mldsa65Verify, mldsa65.PublicKeySize)
+			if err != nil {
+				return fmt.Errorf("REALITY ML-DSA-65 verify: %w", err)
+			}
+			pub, _ := mldsa65.NewKeyFromSeed((*[mldsa65.SeedSize]byte)(seed))
+			if !bytes.Equal(verify, pub.Bytes()) {
+				return errors.New("REALITY ML-DSA-65 public key does not match seed")
+			}
+		}
+	} else if r.Mldsa65Verify != "" {
+		return errors.New("REALITY ML-DSA-65 verify requires a server seed")
+	}
 	if _, err := parseShortIDs(r.ShortID, r.ShortIDs); err != nil {
 		return err
 	}
@@ -86,7 +108,7 @@ func checkRealityServer(r model.Reality, fallback string) error {
 }
 
 func checkRealityClient(r model.Reality) error {
-	if strings.TrimSpace(r.PrivateKey) != "" || strings.TrimSpace(r.Dest) != "" || strings.TrimSpace(r.ShortIDs) != "" {
+	if strings.TrimSpace(r.PrivateKey) != "" || strings.TrimSpace(r.Dest) != "" || strings.TrimSpace(r.ShortIDs) != "" || r.Mldsa65Seed != "" {
 		return errors.New("client REALITY accepts public_key, short_id and fingerprint only")
 	}
 	if _, err := decodeKey(r.PublicKey); err != nil {
@@ -94,6 +116,11 @@ func checkRealityClient(r model.Reality) error {
 	}
 	if _, err := parseShortIDs(r.ShortID, ""); err != nil {
 		return err
+	}
+	if r.Mldsa65Verify != "" {
+		if _, err := decodeMLDSA(r.Mldsa65Verify, mldsa65.PublicKeySize); err != nil {
+			return fmt.Errorf("REALITY ML-DSA-65 verify: %w", err)
+		}
 	}
 	_, err := fingerprint(r.Fingerprint)
 	return err
@@ -317,13 +344,12 @@ func newRealityConfig(r model.Reality, fallback string) (*reality.Config, error)
 	// ML-DSA-65 后量子签名密钥（服务端）
 	var mldsa65Key []byte
 	if r.Mldsa65Seed != "" {
-		mldsa65Key, err = base64.RawURLEncoding.DecodeString(r.Mldsa65Seed)
+		seed, err := decodeMLDSA(r.Mldsa65Seed, mldsa65.SeedSize)
 		if err != nil {
-			mldsa65Key, err = base64.StdEncoding.DecodeString(r.Mldsa65Seed)
-			if err != nil {
-				return nil, err
-			}
+			return nil, err
 		}
+		_, privKey := mldsa65.NewKeyFromSeed((*[mldsa65.SeedSize]byte)(seed))
+		mldsa65Key = privKey.Bytes()
 	}
 	cfg := &reality.Config{
 		DialContext:            (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
@@ -494,7 +520,7 @@ func realityCertificate(authKey []byte, rawCerts [][]byte) bool {
 
 // realityMldsa65Verify 对齐 Xray-core 的 ML-DSA-65 后量子额外验证
 func realityMldsa65Verify(authKey []byte, rawCerts [][]byte, mldsa65VerifyB64 string, uconn *utls.UConn) bool {
-	if len(rawCerts) == 0 || mldsa65VerifyB64 == "" || uconn == nil {
+	if len(authKey) != 32 || len(rawCerts) == 0 || mldsa65VerifyB64 == "" || uconn == nil {
 		return false
 	}
 	cert, err := x509.ParseCertificate(rawCerts[0])
@@ -509,30 +535,37 @@ func realityMldsa65Verify(authKey []byte, rawCerts [][]byte, mldsa65VerifyB64 st
 		return false
 	}
 	// 解码 ML-DSA-65 公钥
-	pubKeyBytes, err := base64.RawURLEncoding.DecodeString(mldsa65VerifyB64)
+	pubKeyBytes, err := decodeMLDSA(mldsa65VerifyB64, mldsa65.PublicKeySize)
 	if err != nil {
-		// 尝试标准 base64
-		pubKeyBytes, err = base64.StdEncoding.DecodeString(mldsa65VerifyB64)
-		if err != nil {
-			return false
-		}
+		return false
 	}
 	verifyKey, err := mldsa65.Scheme().UnmarshalBinaryPublicKey(pubKeyBytes)
 	if err != nil {
 		return false
 	}
-	// 构造待验证消息：HMAC(pub) + Hello.Raw + ServerHello.Raw
-	mac := hmac.New(sha512.New, authKey)
-	_, _ = mac.Write(pub)
-	h := mac.Sum(nil)
 	state := uconn.HandshakeState
-	if state.Hello == nil || state.ServerHello == nil {
+	if state.Hello == nil || state.ServerHello == nil || len(state.Hello.Raw) == 0 || len(state.ServerHello.Raw) == 0 {
 		return false
 	}
-	h = append(h, state.Hello.Raw...)
-	h = append(h, state.ServerHello.Raw...)
+	// 构造待验证消息：在已写入 pub 的同一个 HMAC-SHA512 哈希器中继续写入 Hello.Raw 和 ServerHello.Raw 后取 Sum(nil)
+	mac := hmac.New(sha512.New, authKey)
+	_, _ = mac.Write(pub)
+	_, _ = mac.Write(state.Hello.Raw)
+	_, _ = mac.Write(state.ServerHello.Raw)
+	msg := mac.Sum(nil)
 	// 验证证书第一个扩展中的签名
-	return mldsa65.Verify(verifyKey.(*mldsa65.PublicKey), h, nil, cert.Extensions[0].Value)
+	return mldsa65.Verify(verifyKey.(*mldsa65.PublicKey), msg, nil, cert.Extensions[0].Value)
+}
+
+func decodeMLDSA(value string, size int) ([]byte, error) {
+	data, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		data, err = base64.StdEncoding.DecodeString(value)
+	}
+	if err != nil || len(data) != size {
+		return nil, fmt.Errorf("expected base64 encoding of %d bytes", size)
+	}
+	return data, nil
 }
 
 // spiderPathCache 缓存每个目标站点的已发现路径（对齐 Xray-core maps）
@@ -817,17 +850,10 @@ func GenerateX25519() (string, string, error) {
 
 // GenerateMldsa65 生成 ML-DSA-65 后量子密钥对（对齐 Xray-core）
 func GenerateMldsa65() (string, string, error) {
-	pub, priv, err := mldsa65.GenerateKey(rand.Reader)
-	if err != nil {
+	var seed [32]byte
+	if _, err := rand.Read(seed[:]); err != nil {
 		return "", "", err
 	}
-	pubBytes, err := pub.MarshalBinary()
-	if err != nil {
-		return "", "", err
-	}
-	privBytes, err := priv.MarshalBinary()
-	if err != nil {
-		return "", "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(privBytes), base64.RawURLEncoding.EncodeToString(pubBytes), nil
+	pub, _ := mldsa65.NewKeyFromSeed(&seed)
+	return base64.RawURLEncoding.EncodeToString(seed[:]), base64.RawURLEncoding.EncodeToString(pub.Bytes()), nil
 }

@@ -362,6 +362,10 @@ async function save() {
     } else if (draft.protocol === 'vless' && draft.security === 'reality') {
       tunnel.reality = { ...original.reality, dest: draft.dest.trim(), private_key: draft.privateKey.trim(), short_ids: draft.shortIDs.trim(), server_names: draft.names.trim(), ...(draft.spiderX.trim() ? { spider_x: draft.spiderX.trim() } : {}), ...(draft.spiderY.trim() ? { spider_y: draft.spiderY.trim() } : {}), ...(draft.mldsa65Verify.trim() ? { mldsa65_verify: draft.mldsa65Verify.trim() } : {}), ...(draft.mldsa65Seed.trim() ? { mldsa65_seed: draft.mldsa65Seed.trim() } : {}) }
       delete tunnel.reality.public_key
+      // Empty optional fields must replace saved values, not inherit them.
+      for (const [field, value] of [['spider_x', draft.spiderX], ['spider_y', draft.spiderY], ['mldsa65_verify', draft.mldsa65Verify], ['mldsa65_seed', draft.mldsa65Seed]] as const) {
+        if (!value.trim()) delete tunnel.reality[field]
+      }
     }
     if (draft.protocol === 'vless' && draft.transport === 'tcp' && draft.security === 'encryption' && (!draft.enc.trim() || draft.enc.trim() === 'none')) throw new Error('plain 无 TLS：请输入 VLESS 解密配置，或点击生成配对配置；不能使用 none。')
     if (draft.protocol === 'vless' && draft.enc.trim() && draft.enc.trim() !== 'none') tunnel.decryption = draft.enc.trim()
@@ -477,10 +481,10 @@ defineExpose({ open })
           <label for="node-spiderx">伪装爬取起点（SpiderX）</label><input id="node-spiderx" v-model="draft.spiderX" placeholder="留空则随机生成" />
           <label for="node-spidery">伪装爬取参数（SpiderY）</label><input id="node-spidery" v-model="draft.spiderY" placeholder="10 个逗号分隔整数，留空用默认" />
           <label for="node-mldsa65">ML-DSA-65 验证公钥</label><div class="field-actions"><input id="node-mldsa65" v-model="draft.mldsa65Verify" placeholder="后量子额外验证，可选" /><button type="button" class="btn small" :disabled="!!generation.busy || reading" @click="generate('mldsa65')">生成密钥对</button></div>
-          <label for="node-mldsa65-seed">ML-DSA-65 种子（服务端）</label><input id="node-mldsa65-seed" v-model="draft.mldsa65Seed" placeholder="服务端签名用，不下发客户端" />
+          <SecretField id="node-mldsa65-seed" v-model="draft.mldsa65Seed" label="ML-DSA-65 种子（服务端）"><button type="button" class="btn small" :disabled="!!generation.busy || reading || !(draft.mldsa65Seed || draft.mldsa65Verify)" @click="draft.mldsa65Seed = ''; draft.mldsa65Verify = ''">关闭 ML-DSA-65</button></SecretField>
         </template>
         <template v-if="draft.protocol === 'vless'">
-          <SecretField id="node-encryption" v-model="draft.enc" label="VLESS 解密配置" :required="draft.security === 'encryption' || draft.transport === 'xhttp' && !draft.xhttpTLS"><button type="button" class="btn small" :disabled="!!generation.busy || reading" @click="generate('vless')">生成配对配置</button></SecretField>
+          <SecretField id="node-encryption" v-model="draft.enc" label="VLESS 解密配置" :required="draft.security === 'encryption' || draft.transport === 'xhttp' && !draft.xhttpTLS"><button type="button" class="btn small" :disabled="!!generation.busy || reading" @click="generate('vless')">生成配对配置</button><button type="button" class="btn small" :disabled="!!generation.busy || reading || !draft.enc || draft.security === 'encryption' || draft.transport === 'xhttp' && !draft.xhttpTLS && draft.security !== 'reality'" @click="draft.enc = ''">关闭 Encryption</button></SecretField>
           <small class="help">VLESS Encryption：服务端保存 decryption，客户端只接收配对 encryption，不能互换。TLS、REALITY 下可选，plain 下必填；重新生成后须保存并等待双方应用新修订。</small>
           <div class="grid-2"><div><label for="vless-mode">生成模式</label><select id="vless-mode" v-model="options.mode"><option v-for="mode in ['native', 'xorpub', 'random']" :key="mode">{{ mode }}</option></select></div><div><label for="vless-auth">认证算法</label><select id="vless-auth" v-model="options.authentication"><option>x25519</option><option>mlkem768</option></select></div></div>
           <template v-if="flowAllowed"><label for="node-flow">Flow</label><select id="node-flow" v-model="draft.flow"><option value="">无</option><option>xtls-rprx-vision</option></select></template>

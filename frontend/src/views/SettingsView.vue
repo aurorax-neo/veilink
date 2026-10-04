@@ -51,8 +51,8 @@ const updateBad = ref(false)
 
 const hasChanges = computed(() => {
   if (!status.value) return false
-  const a = [...mirrors.value].sort()
-  const b = [...(status.value.mirrors || [])].sort()
+  const a = mirrors.value
+  const b = status.value.mirrors || []
   return a.length !== b.length || a.some((v, i) => v !== b[i])
 })
 
@@ -129,8 +129,10 @@ async function saveMirrors() {
   try {
     status.value = await api<WebStatus>('/web/config', 'POST', { mirrors: mirrors.value })
     mirrors.value = [...(status.value.mirrors || [])]
+    return true
   } catch (e) {
     mirrorError.value = e instanceof ApiError ? e.message : '保存失败'
+    return false
   } finally {
     savingMirrors.value = false
   }
@@ -178,12 +180,13 @@ async function update() {
   updateMsg.value = ''
   updateBad.value = false
   try {
+    if (hasChanges.value && !await saveMirrors()) throw new Error(mirrorError.value || '保存镜像失败')
     await api<{ ok: boolean }>('/web/update', 'POST', { version: updateVersion.value.trim() })
     updateMsg.value = '前端更新成功，已切换到新版本'
     await load()
   } catch (e) {
     updateBad.value = true
-    updateMsg.value = e instanceof ApiError ? e.message : '更新失败'
+    updateMsg.value = e instanceof Error ? e.message : '更新失败'
   } finally {
     updating.value = false
   }

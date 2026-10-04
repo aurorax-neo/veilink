@@ -12,6 +12,7 @@ Veilink 原创代码及文档（另有声明者除外）采用 **GPL-3.0-or-late
 | :--- | :--- | :--- |
 | `github.com/apernet/quic-go v0.61.1-0.20260806010916-184d081eef3e` | MIT | `LICENSE`（quic-go authors & Google, Inc.） |
 | `github.com/refraction-networking/utls v1.8.3-0.20260301010127-aa6edf4b11af` | BSD-3-Clause | `LICENSE`（Go Authors） |
+| `github.com/cloudflare/circl v1.6.5` | BSD-3-Clause | `LICENSE`（Cloudflare 与 Go Authors）；用于 ML-DSA-65 签名与验证 |
 | `github.com/xtls/xray-core v1.260327.1-0.20260920225103-d562d8947d31` | MPL-2.0 | `LICENSE`（与 `ref/Xray-core/LICENSE` 一致） |
 | `github.com/xtls/reality v0.0.0-20260908062103-8cdf7bf9c7f0` | MPL-2.0；Go 派生部分另保留 BSD-3-Clause | `LICENSE`（Copyright (c) 2023 RPRX）、`LICENSE-Go` |
 | `golang.org/x/crypto v0.57.0` | BSD-3-Clause | `LICENSE` |

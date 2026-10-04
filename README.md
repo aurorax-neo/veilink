@@ -339,6 +339,8 @@ docker run -itd \
 | Hysteria2 | 独立 UDP/QUIC + TLS；需要证书、私钥和密码；不叠加 VLESS Encryption、REALITY、XHTTP、Vision |
 | XHTTP | Veilink 双端业务通道；HTTP 版本与模式须符合下表和能力矩阵 |
 
+ML-DSA-65 使用独立的 32 字节种子（Base64）生成签名密钥，不能填写展开的私钥或复用 REALITY 的 X25519 私钥。只填写种子时自动派生验证公钥；同时填写公钥时必须与种子配对。回落目标须支持 TLS 1.3，且其证书握手记录需要容纳额外的 3309 字节签名，过短的证书链可能导致握手失败。种子只保存在服务端，不下发客户端。关闭时清空种子和验证公钥，或使用“关闭 ML-DSA-65”后保存。TLS / REALITY 下可清空可选 VLESS Encryption；无 TLS 的 plain / HTTP 仍须保留 Encryption，不能关闭全部传输保护。
+
 TCP 映射可选择关闭 mux 或使用 `smux`、`yamux`、`h2mux`；UDP 业务使用授权 XUDP，不启用 TCP mux，也不代表原生 Hysteria2 datagram 互通。
 
 Vision 只用于 TCP + TLS/REALITY。只有独立已认证连接上的内层 TLS 1.3 满足结构和记录边界条件才可能直拷；mux、控制和 UDP 不裸传，Encryption 或无法安全识别的流保留加密回退。不宣称内核零拷贝。

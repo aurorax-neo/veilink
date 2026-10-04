@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"strconv"
 	"strings"
+
+	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 )
 
 // ConnectEndpoint is a public Client dial candidate for a Server. Host and Port
@@ -202,7 +204,7 @@ type Reality struct {
 
 // Enabled reports whether any REALITY setting is present.
 func (r Reality) Enabled() bool {
-	return strings.TrimSpace(r.Dest) != "" || strings.TrimSpace(r.PrivateKey) != "" || strings.TrimSpace(r.PublicKey) != "" || strings.TrimSpace(r.ShortID) != "" || strings.TrimSpace(r.ShortIDs) != "" || strings.TrimSpace(r.ServerNames) != ""
+	return strings.TrimSpace(r.Dest) != "" || strings.TrimSpace(r.PrivateKey) != "" || strings.TrimSpace(r.PublicKey) != "" || strings.TrimSpace(r.ShortID) != "" || strings.TrimSpace(r.ShortIDs) != "" || strings.TrimSpace(r.ServerNames) != "" || strings.TrimSpace(r.Mldsa65Seed) != "" || strings.TrimSpace(r.Mldsa65Verify) != ""
 }
 
 // Hysteria2 configures the QUIC/TLS sibling protocol, not a VLESS transport.
@@ -284,6 +286,18 @@ func (base LocalTLS) Merge(override LocalTLS) LocalTLS {
 	if override.Reality.MaxTimeDiff != "" {
 		res.Reality.MaxTimeDiff = override.Reality.MaxTimeDiff
 	}
+	if override.Reality.SpiderX != "" {
+		res.Reality.SpiderX = override.Reality.SpiderX
+	}
+	if override.Reality.SpiderY != "" {
+		res.Reality.SpiderY = override.Reality.SpiderY
+	}
+	if override.Reality.Mldsa65Seed != "" {
+		res.Reality.Mldsa65Seed = override.Reality.Mldsa65Seed
+	}
+	if override.Reality.Mldsa65Verify != "" {
+		res.Reality.Mldsa65Verify = override.Reality.Mldsa65Verify
+	}
 	if override.Hysteria2.Password != "" {
 		res.Hysteria2.Password = override.Hysteria2.Password
 	}
@@ -312,6 +326,24 @@ func DeriveX25519Public(privateKey string) string {
 		return ""
 	}
 	return base64.RawURLEncoding.EncodeToString(k.PublicKey().Bytes())
+}
+
+// DeriveMldsa65Verify computes the base64 raw URL encoded ML-DSA-65 public key from a 32-byte seed.
+func DeriveMldsa65Verify(seed string) string {
+	s := strings.TrimSpace(seed)
+	if s == "" {
+		return ""
+	}
+	enc := base64.RawURLEncoding
+	if strings.ContainsAny(s, "+/=") {
+		enc = base64.StdEncoding
+	}
+	b, err := enc.DecodeString(s)
+	if err != nil || len(b) != 32 {
+		return ""
+	}
+	pub, _ := mldsa65.NewKeyFromSeed((*[32]byte)(b))
+	return base64.RawURLEncoding.EncodeToString(pub.Bytes())
 }
 
 // DeriveClientTunnel generates public settings solely from the authoritative
@@ -350,6 +382,9 @@ func DeriveClientTunnel(serverTunnel LocalTLS, serverNode Node) LocalTLS {
 		res.Reality.SpiderX = r.SpiderX
 		res.Reality.SpiderY = r.SpiderY
 		res.Reality.Mldsa65Verify = r.Mldsa65Verify
+		if res.Reality.Mldsa65Verify == "" && r.Mldsa65Seed != "" {
+			res.Reality.Mldsa65Verify = DeriveMldsa65Verify(r.Mldsa65Seed)
+		}
 	}
 	// Trust is explicit: never promote the server's leaf certificate to a CA.
 	return res

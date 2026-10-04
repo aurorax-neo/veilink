@@ -266,7 +266,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := a.webManager.Update(req.Version); err != nil {
 			slog.Error("web update failed", "err", err)
-			failure(w, 500)
+			output(w, 500, map[string]string{"error": "前端更新失败：请检查版本是否存在、镜像连通性及缓存目录写权限。当前前端未切换，详细原因见 Master 日志。"})
 			return
 		}
 		output(w, 200, map[string]bool{"ok": true})

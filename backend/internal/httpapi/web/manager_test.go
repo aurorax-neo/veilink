@@ -4,7 +4,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"regexp"
 	"testing"
 )
 
@@ -52,14 +51,14 @@ func TestDownloadCandidatesFallback(t *testing.T) {
 		t.Errorf("expected ghfast.top in fallback candidates: %v", urls)
 	}
 
-	// 配置了 ghfast.top：不再重复，且直连作为第二候选
+	// 配置的镜像两种格式均先尝试，然后直连，不重复地址。
 	m2 := NewWebManager(WebConfig{Repo: "aurorax-neo/veilink", GithubMirrors: []string{"https://ghfast.top"}})
 	urls2 := m2.downloadCandidates("latest")
 	if urls2[0] != "https://ghfast.top/aurorax-neo/veilink/releases/latest/download/veilink-web.tar.gz" {
 		t.Errorf("first candidate should be configured mirror, got %q", urls2[0])
 	}
-	if urls2[1] != "https://github.com/aurorax-neo/veilink/releases/latest/download/veilink-web.tar.gz" {
-		t.Errorf("second candidate should be direct github, got %q", urls2[1])
+	if urls2[2] != "https://github.com/aurorax-neo/veilink/releases/latest/download/veilink-web.tar.gz" {
+		t.Errorf("third candidate should be direct github, got %q", urls2[2])
 	}
 	count := 0
 	for _, u := range urls2 {
@@ -222,9 +221,10 @@ func TestFetchLatestWebTagFromAtom(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read body: %v", err)
 	}
-	re := regexp.MustCompile(`(?i)<title>(web-v[0-9a-zA-Z._-]+)</title>`)
-	matches := re.FindSubmatch(body)
-	if len(matches) <= 1 || string(matches[1]) != "web-v0.4.2" {
-		t.Fatalf("expected web-v0.4.2, got %v", matches)
+	if len(body) == 0 {
+		t.Fatal("empty feed")
+	}
+	if got := fetchWebTag(ts.URL+"/releases.atom", ts.Client()); got != "web-v0.4.2" {
+		t.Fatalf("expected web-v0.4.2, got %q", got)
 	}
 }

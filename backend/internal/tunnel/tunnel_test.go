@@ -403,11 +403,19 @@ func TestUntrustedTLS(t *testing.T) {
 		})
 	}
 }
-func camouflage(t *testing.T, certPEM, keyPEM string) string {
+func camouflage(t *testing.T, certPEM, keyPEM string, largeChain ...bool) string {
 	t.Helper()
 	pair, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(largeChain) > 0 && largeChain[0] {
+		// REALITY mirrors the cover's certificate record size; ML-DSA needs
+		// room for its 3309-byte extra signature, as with a real full chain.
+		leaf := pair.Certificate[0]
+		for i := 0; i < 10; i++ {
+			pair.Certificate = append(pair.Certificate, leaf)
+		}
 	}
 	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{pair}})
 	if err != nil {
@@ -434,6 +442,35 @@ func TestRealityReverse(t *testing.T) {
 	}
 	serverLocal := model.LocalTLS{Reality: model.Reality{Dest: camouflage(t, files.CertPEM, files.KeyPEM), PrivateKey: priv, ShortIDs: "0123456789abcdef", ServerNames: "first-cover.test,gateway.test"}}
 	clientLocal := model.LocalTLS{Reality: model.Reality{PublicKey: pub, ShortID: "0123456789abcdef", ServerNames: "gateway.test"}}
+	serverSnap, clientSnap := fixtures(t, echoServer(t))
+	run(t, serverSnap, serverLocal)
+	run(t, clientSnap, clientLocal)
+	awaitEcho(t, serverSnap.Mappings[0].ListenPort)
+}
+
+func TestRealityMLDSA65(t *testing.T) {
+	files := tlsFiles(t)
+	priv, pub, err := GenerateX25519()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed, verify, err := GenerateMldsa65()
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverLocal := model.LocalTLS{Reality: model.Reality{
+		Dest:        camouflage(t, files.CertPEM, files.KeyPEM, true),
+		PrivateKey:  priv,
+		ShortIDs:    "0123456789abcdef",
+		ServerNames: "first-cover.test,gateway.test",
+		Mldsa65Seed: seed,
+	}}
+	clientLocal := model.LocalTLS{Reality: model.Reality{
+		PublicKey:     pub,
+		ShortID:       "0123456789abcdef",
+		ServerNames:   "gateway.test",
+		Mldsa65Verify: verify,
+	}}
 	serverSnap, clientSnap := fixtures(t, echoServer(t))
 	run(t, serverSnap, serverLocal)
 	run(t, clientSnap, clientLocal)
