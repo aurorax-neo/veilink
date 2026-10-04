@@ -18,7 +18,7 @@ func TestKeyRevocationIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	h := New(s, false, nil)
+	h := New(s, false, nil, WebPersistConfig{})
 
 	// 创建超过旧版 session 上限数量的 key，验证无容量限制
 	keys := make([]string, 0, 150)

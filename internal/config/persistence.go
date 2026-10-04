@@ -18,6 +18,40 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// UpdateWebConfig 更新 master_config 表中的前端拉取配置（设置页运行时调用）
+func UpdateWebConfig(dbPath, mirror, version string, updateVersion bool) error {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if _, err = db.Exec(`PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS master_config(id INTEGER PRIMARY KEY CHECK(id=1), data BLOB NOT NULL)`); err != nil {
+		return err
+	}
+	var data []byte
+	err = db.QueryRow("SELECT data FROM master_config WHERE id=1").Scan(&data)
+	if err != nil {
+		return err
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return err
+	}
+	mirrorRaw, _ := json.Marshal(mirror)
+	doc["WebMirror"] = mirrorRaw
+	if updateVersion {
+		versionRaw, _ := json.Marshal(version)
+		doc["WebVersion"] = versionRaw
+	}
+	body, err := json.Marshal(doc)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec("UPDATE master_config SET data=? WHERE id=1", body)
+	return err
+}
+
 // PersistMaster resolves and immediately commits settings for non-listening callers.
 // Master startup must use ResolveMaster and commit only after opening its listener.
 func PersistMaster(local Config) (Config, error) {

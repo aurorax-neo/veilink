@@ -20,7 +20,7 @@ func TestAPIKeyAuthAndLimits(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer s.Close()
-	h := New(s, false, nil)
+	h := New(s, false, nil, WebPersistConfig{})
 	apiKey, e := h.(*API).keyStore.Create("test", backend.RoleAdmin)
 	if e != nil {
 		t.Fatal(e)

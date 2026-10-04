@@ -29,7 +29,7 @@ func TestEmbeddedAPISafeguards(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := New(s, true, nil)
+	h := New(s, true, nil, WebPersistConfig{})
 	apiKey := func() string {
 		plaintext, err := h.(*API).keyStore.Create("test", backend.RoleAdmin)
 		if err != nil {

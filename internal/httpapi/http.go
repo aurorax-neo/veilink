@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 	"veilink/internal/buildinfo"
+	"veilink/internal/config"
 	"veilink/internal/httpapi/backend"
 	"veilink/internal/httpapi/web"
 	"veilink/internal/logring"
@@ -29,10 +30,17 @@ type API struct {
 	webCfg     web.WebConfig
 }
 
+// WebPersistConfig 前端配置的 DB 持久化参数（master_config 表）
+type WebPersistConfig struct {
+	Mirror  string
+	Version string
+	DBPath  string
+}
+
 // New 创建 Master 的 HTTP API 处理器。
 // 注意：仅 Master 角色调用此函数，Server/Client 角色不启动 Web/API。
 // WebManager 仅在 Master 下初始化（pull 前端），s/c 二进制不包含也不触发拉取逻辑。
-func New(s *store.Store, insecureLoopback bool, ring *logring.Ring) http.Handler {
+func New(s *store.Store, insecureLoopback bool, ring *logring.Ring, webPersist WebPersistConfig) http.Handler {
 	// API Key 存储初始化（含旧版迁移）
 	ks := backend.NewKeyStore(s.DB())
 	if err := ks.Migrate(); err != nil {
@@ -54,6 +62,15 @@ func New(s *store.Store, insecureLoopback bool, ring *logring.Ring) http.Handler
 	// WebManager 初始化
 	webCfg := web.LoadConfigFromEnv()
 	wm := web.NewWebManager(webCfg)
+	// DB 持久化的配置覆盖环境变量（设置页/CLI 保存的值优先）
+	wm.ApplyPersisted(webPersist.Mirror, webPersist.Version)
+	// 设置页的保存写回 DB 的 master_config 表
+	if webPersist.DBPath != "" {
+		dbPath := webPersist.DBPath
+		wm.SetPersist(func(mirror, version string) error {
+			return config.UpdateWebConfig(dbPath, mirror, version, true)
+		})
+	}
 	if _, err := wm.Ensure(); err != nil {
 		slog.Error("前端初始化失败，降级为纯 API 模式", "err", err)
 	}

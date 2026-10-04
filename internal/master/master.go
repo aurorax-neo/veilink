@@ -64,7 +64,11 @@ func Run(ctx context.Context, c config.Config) error {
 	pb.RegisterControlServer(g, &control.Service{Store: s, NodeRing: logring.NewNodeRing(ring)})
 
 	insecure := mode == "http"
-	panel := httpapi.New(s, insecure, ring)
+	panel := httpapi.New(s, insecure, ring, httpapi.WebPersistConfig{
+		Mirror:  c.WebMirror,
+		Version: c.WebVersion,
+		DBPath:  c.Database,
+	})
 
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {

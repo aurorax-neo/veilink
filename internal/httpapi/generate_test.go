@@ -34,7 +34,7 @@ func TestGenerationAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	h := New(s, false, nil)
+	h := New(s, false, nil, WebPersistConfig{})
 	apiKey, err := h.(*API).keyStore.Create("test", backend.RoleAdmin)
 	if err != nil {
 		t.Fatal(err)

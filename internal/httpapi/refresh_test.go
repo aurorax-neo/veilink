@@ -20,7 +20,7 @@ func TestNodeRefreshAuthenticationAndStatus(t *testing.T) {
 	if err = s.InitAdmin("admin", "long test password"); err != nil {
 		t.Fatal(err)
 	}
-	h := New(s, true, nil)
+	h := New(s, true, nil, WebPersistConfig{})
 	apiKey, err := h.(*API).keyStore.Create("test", backend.RoleAdmin)
 	if err != nil {
 		t.Fatal(err)

@@ -5,7 +5,6 @@ import (
 	"compress/gzip"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -25,8 +24,9 @@ var builtinMirrors = []string{
 }
 
 // LoadConfigFromEnv 从环境变量加载配置
+// DB 持久化的 WebMirror/WebVersion 由调用方在 NewWebManager 后通过 ApplyPersisted 覆盖
 func LoadConfigFromEnv() WebConfig {
-	cfg := WebConfig{
+	return WebConfig{
 		Mode:         WebMode(getenv("WEB_MODE", "pull")),
 		Version:      os.Getenv("WEB_VERSION"),
 		CacheDir:     getenv("WEB_CACHE_DIR", "/data/web"),
@@ -34,16 +34,6 @@ func LoadConfigFromEnv() WebConfig {
 		Repo:         getenv("WEB_REPO", "aurorax-neo/veilink"),
 		EnableCORS:   getenv("WEB_CORS", "true") == "true",
 	}
-	// 本地持久化配置覆盖环境变量（设置页保存的优先）
-	if saved, err := loadSavedConfig(cfg.CacheDir); err == nil && saved != nil {
-		if saved.GithubMirror != "" || saved.mirrorTouched {
-			cfg.GithubMirror = saved.GithubMirror
-		}
-		if saved.Version != "" {
-			cfg.Version = saved.Version
-		}
-	}
-	return cfg
 }
 
 func getenv(key, def string) string {
@@ -90,12 +80,34 @@ type WebManager struct {
 	root   string
 	ver    string
 	client *http.Client
+	// persist 将配置变更写回 DB（由 httpapi 注入）
+	persist func(mirror, version string) error
 }
 
 func NewWebManager(cfg WebConfig) *WebManager {
 	return &WebManager{
 		cfg:    cfg,
 		client: &http.Client{Timeout: 5 * time.Minute},
+	}
+}
+
+// SetPersist 设置配置持久化回调（master 将 DB 写回函数注入进来）
+func (m *WebManager) SetPersist(fn func(mirror, version string) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.persist = fn
+}
+
+// ApplyPersisted 用 DB 中持久化的值覆盖环境变量（master 启动时调用）
+func (m *WebManager) ApplyPersisted(mirror, version string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// DB 有值才覆盖：环境变量优先于空 DB 值
+	if mirror != "" {
+		m.cfg.GithubMirror = mirror
+	}
+	if version != "" {
+		m.cfg.Version = version
 	}
 }
 
@@ -265,9 +277,14 @@ func (m *WebManager) pullFrom(url, version, dir string) error {
 // Update 热更新前端（供 API 调用）
 func (m *WebManager) Update(version string) error {
 	if version != "" {
+		m.mu.Lock()
 		m.cfg.Version = version
-		if err := m.saveConfig(); err != nil {
-			slog.Warn("保存前端配置失败", "err", err)
+		persist := m.persist
+		m.mu.Unlock()
+		if persist != nil {
+			if err := persist(m.cfg.GithubMirror, version); err != nil {
+				slog.Warn("保存前端配置失败", "err", err)
+			}
 		}
 	}
 	m.mu.Lock()
@@ -305,60 +322,18 @@ func (m *WebManager) Status() WebStatus {
 	}
 }
 
-// SetMirror 更新加速镜像并持久化（空字符串 = 直连）
+// SetMirror 更新加速镜像并持久化到 DB（空字符串 = 直连）
 func (m *WebManager) SetMirror(mirror string) error {
 	mirror = strings.TrimSpace(mirror)
 	m.mu.Lock()
 	m.cfg.GithubMirror = mirror
+	persist := m.persist
+	version := m.cfg.Version
 	m.mu.Unlock()
-	return m.saveConfig()
-}
-
-// savedWebConfig 持久化到本地的配置（设置页保存）
-type savedWebConfig struct {
-	GithubMirror  string `json:"github_mirror"`
-	Version       string `json:"version,omitempty"`
-	mirrorTouched bool   // 内存标记：用户是否显式设置过镜像（含清空）
-}
-
-func webConfigPath(cacheDir string) string {
-	return filepath.Join(cacheDir, "web-config.json")
-}
-
-func loadSavedConfig(cacheDir string) (*savedWebConfig, error) {
-	data, err := os.ReadFile(webConfigPath(cacheDir))
-	if err != nil {
-		return nil, err
+	if persist != nil {
+		return persist(mirror, version)
 	}
-	var sc savedWebConfig
-	if err := json.Unmarshal(data, &sc); err != nil {
-		return nil, err
-	}
-	sc.mirrorTouched = true
-	return &sc, nil
-}
-
-func (m *WebManager) saveConfig() error {
-	m.mu.RLock()
-	sc := savedWebConfig{
-		GithubMirror:  m.cfg.GithubMirror,
-		Version:       m.cfg.Version,
-		mirrorTouched: true,
-	}
-	dir := m.cfg.CacheDir
-	m.mu.RUnlock()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(sc, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := webConfigPath(dir) + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, webConfigPath(dir))
+	return nil
 }
 
 // ProbeResult 连通性探测结果

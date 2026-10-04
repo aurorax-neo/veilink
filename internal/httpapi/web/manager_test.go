@@ -1,8 +1,6 @@
 package web
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
 )
 
@@ -67,36 +65,39 @@ func TestDownloadCandidatesFallback(t *testing.T) {
 	}
 }
 
-func TestMirrorPersistence(t *testing.T) {
-	dir := t.TempDir()
-	m := NewWebManager(WebConfig{CacheDir: dir, Repo: "aurorax-neo/veilink"})
-	if err := m.SetMirror("https://ghfast.top"); err != nil {
+func TestMirrorApplyAndSet(t *testing.T) {
+	m := NewWebManager(WebConfig{Repo: "aurorax-neo/veilink"})
+	// ApplyPersisted: DB 有值才覆盖
+	m.ApplyPersisted("https://ghfast.top", "web-v1.0.0")
+	if m.cfg.GithubMirror != "https://ghfast.top" {
+		t.Errorf("mirror = %q, want ghfast.top", m.cfg.GithubMirror)
+	}
+	if m.cfg.Version != "web-v1.0.0" {
+		t.Errorf("version = %q", m.cfg.Version)
+	}
+	// 空值不覆盖已有
+	m.ApplyPersisted("", "")
+	if m.cfg.GithubMirror != "https://ghfast.top" {
+		t.Errorf("empty ApplyPersisted should not overwrite, got %q", m.cfg.GithubMirror)
+	}
+
+	// SetMirror 触发 persist 回调
+	var gotMirror, gotVersion string
+	m.SetPersist(func(mirror, version string) error {
+		gotMirror, gotVersion = mirror, version
+		return nil
+	})
+	if err := m.SetMirror("https://ghproxy.com/https://github.com"); err != nil {
 		t.Fatalf("SetMirror: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "web-config.json")); err != nil {
-		t.Fatalf("config file not written: %v", err)
+	if gotMirror != "https://ghproxy.com/https://github.com" || gotVersion != "web-v1.0.0" {
+		t.Errorf("persist got (%q, %q)", gotMirror, gotVersion)
 	}
-	// 重新加载：持久化的镜像应覆盖环境变量（空）
-	cfg := LoadConfigFromEnv()
-	// LoadConfigFromEnv 用默认 CacheDir，这里直接测 loadSavedConfig
-	saved, err := loadSavedConfig(dir)
-	if err != nil {
-		t.Fatalf("loadSavedConfig: %v", err)
-	}
-	if saved.GithubMirror != "https://ghfast.top" {
-		t.Errorf("saved mirror = %q, want ghfast.top", saved.GithubMirror)
-	}
-	_ = cfg
-
-	// 清空镜像也能持久化
+	// 清空也触发
 	if err := m.SetMirror(""); err != nil {
 		t.Fatalf("SetMirror empty: %v", err)
 	}
-	saved2, err := loadSavedConfig(dir)
-	if err != nil {
-		t.Fatalf("loadSavedConfig after clear: %v", err)
-	}
-	if saved2.GithubMirror != "" {
-		t.Errorf("saved mirror after clear = %q, want empty", saved2.GithubMirror)
+	if gotMirror != "" {
+		t.Errorf("persist after clear = %q, want empty", gotMirror)
 	}
 }

@@ -34,6 +34,10 @@ type Config struct {
 	StateDir          string
 	EmbeddedServer    EmbeddedServerConfig
 
+	// 前端拉取配置（持久化在 master_config 表）
+	WebMirror  string
+	WebVersion string
+
 	// explicit tracks visited CLI flags; defaults never overwrite stored settings.
 	explicit map[string]bool
 }
@@ -81,6 +85,8 @@ func ParseFlagsOutput(role string, args []string, out io.Writer) (Config, error)
 		f.IntVar(&c.EmbeddedServer.Port, "embedded-server-port", c.EmbeddedServer.Port, "")
 		fields["embedded-server-port"] = "embedded_server.port"
 		stringFlag("embedded-server-state-dir", "embedded_server.state_dir", &c.EmbeddedServer.StateDir)
+		stringFlag("web-mirror", "web_mirror", &c.WebMirror)
+		stringFlag("web-version", "web_version", &c.WebVersion)
 	case "server", "client":
 		stringFlag("master-addr", "master_addr", &c.MasterAddr)
 		stringFlag("node-id", "node_id", &c.NodeID)

@@ -24,7 +24,7 @@ func TestXHTTPJSONAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	h := New(s, true, nil)
+	h := New(s, true, nil, WebPersistConfig{})
 	apiKey, err := h.(*API).keyStore.Create("test", backend.RoleAdmin)
 	if err != nil {
 		t.Fatal(err)

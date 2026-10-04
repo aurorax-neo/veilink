@@ -142,3 +142,63 @@ func TestMasterExplicitEmptySchemeDoesNotCommit(t *testing.T) {
 		}
 	}
 }
+
+func TestUpdateWebConfig(t *testing.T) {
+	dir := t.TempDir()
+	database := filepath.Join(dir, "master.db")
+	bootstrap := []string{"-database", database, "-deployment-key", filepath.Join(dir, "master.key")}
+	c, err := ParseFlags("master", bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err = PersistMaster(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 初始为空
+	if c.WebMirror != "" || c.WebVersion != "" {
+		t.Fatalf("initial web config = (%q, %q), want empty", c.WebMirror, c.WebVersion)
+	}
+	// 更新镜像
+	if err := UpdateWebConfig(database, "https://ghfast.top", "", false); err != nil {
+		t.Fatal(err)
+	}
+	c2, err := ParseFlags("master", bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2, _, err = ResolveMaster(c2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.WebMirror != "https://ghfast.top" {
+		t.Errorf("WebMirror = %q, want ghfast.top", c2.WebMirror)
+	}
+	// CLI 显式标志优先于 DB
+	c3, err := ParseFlags("master", append(bootstrap, "-web-mirror=https://example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c3, _, err = ResolveMaster(c3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c3.WebMirror != "https://example.com" {
+		t.Errorf("explicit flag should win, got %q", c3.WebMirror)
+	}
+	// 清空镜像
+	if err := UpdateWebConfig(database, "", "web-v1.0.0", true); err != nil {
+		t.Fatal(err)
+	}
+	c4, err := ParseFlags("master", bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c4, _, err = ResolveMaster(c4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c4.WebMirror != "" || c4.WebVersion != "web-v1.0.0" {
+		t.Errorf("after clear = (%q, %q)", c4.WebMirror, c4.WebVersion)
+	}
+}
