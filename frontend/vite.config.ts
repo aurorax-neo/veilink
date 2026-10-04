@@ -12,7 +12,7 @@ export default defineConfig(({ mode }) => {
   return {
     plugins: [vue(), basicSsl()],
     base: './',
-    build: { outDir: '../html', emptyOutDir: true },
+    build: { outDir: 'dist', emptyOutDir: true },
     server: { host: '127.0.0.1', port: 5173, proxy },
     preview: { host: '127.0.0.1', port: 4173, proxy },
   }
