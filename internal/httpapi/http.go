@@ -248,6 +248,52 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 8b. 前端配置查询/更新（仅 admin）
+	if r.URL.Path == "/api/v1/web/config" {
+		if role != backend.RoleAdmin {
+			failure(w, 403)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			output(w, 200, a.webManager.Status())
+			return
+		case http.MethodPost:
+			var req struct {
+				Mirror *string `json:"mirror"`
+			}
+			if !decode(w, r, &req) {
+				return
+			}
+			if req.Mirror != nil {
+				if err := a.webManager.SetMirror(*req.Mirror); err != nil {
+					slog.Error("web config save failed", "err", err)
+					failure(w, 500)
+					return
+				}
+			}
+			output(w, 200, a.webManager.Status())
+			return
+		default:
+			failure(w, 404)
+			return
+		}
+	}
+
+	// 8c. 前端下载地址连通性探测（仅 admin）
+	if r.URL.Path == "/api/v1/web/probe" && r.Method == "POST" {
+		if role != backend.RoleAdmin {
+			failure(w, 403)
+			return
+		}
+		var req struct {
+			Version string `json:"version"`
+		}
+		_ = decode(w, r, &req)
+		output(w, 200, map[string]any{"results": a.webManager.Probe(req.Version)})
+		return
+	}
+
 	// 9. 业务 API（/api/v1/*）
 	if strings.HasPrefix(r.URL.Path, "/api/v1/") {
 		a.serveAPI(w, r)

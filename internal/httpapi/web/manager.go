@@ -5,8 +5,10 @@ import (
 	"compress/gzip"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,9 +17,16 @@ import (
 	"time"
 )
 
+// 内置加速镜像：直连失败时自动尝试
+var builtinMirrors = []string{
+	"https://ghfast.top",
+	"https://ghproxy.com/https://github.com",
+	"https://mirror.ghproxy.com",
+}
+
 // LoadConfigFromEnv 从环境变量加载配置
 func LoadConfigFromEnv() WebConfig {
-	return WebConfig{
+	cfg := WebConfig{
 		Mode:         WebMode(getenv("WEB_MODE", "pull")),
 		Version:      os.Getenv("WEB_VERSION"),
 		CacheDir:     getenv("WEB_CACHE_DIR", "/data/web"),
@@ -25,6 +34,16 @@ func LoadConfigFromEnv() WebConfig {
 		Repo:         getenv("WEB_REPO", "aurorax-neo/veilink"),
 		EnableCORS:   getenv("WEB_CORS", "true") == "true",
 	}
+	// 本地持久化配置覆盖环境变量（设置页保存的优先）
+	if saved, err := loadSavedConfig(cfg.CacheDir); err == nil && saved != nil {
+		if saved.GithubMirror != "" || saved.mirrorTouched {
+			cfg.GithubMirror = saved.GithubMirror
+		}
+		if saved.Version != "" {
+			cfg.Version = saved.Version
+		}
+	}
+	return cfg
 }
 
 func getenv(key, def string) string {
@@ -129,20 +148,55 @@ func (m *WebManager) ensurePulled() (string, error) {
 
 // downloadURL 拼接下载地址，支持加速镜像
 func (m *WebManager) downloadURL(version string) string {
+	return buildDownloadURL(m.cfg.Repo, version, m.cfg.GithubMirror)
+}
+
+// downloadCandidates 返回按优先级排序的下载地址：
+// 1. 配置的镜像（或直连）；2. 直连（如果配置了镜像）；3. 内置公共镜像
+func (m *WebManager) downloadCandidates(version string) []string {
+	var urls []string
+	seen := map[string]bool{}
+	add := func(u string) {
+		if !seen[u] {
+			seen[u] = true
+			urls = append(urls, u)
+		}
+	}
+	mirror := strings.TrimSpace(m.cfg.GithubMirror)
+	add(buildDownloadURL(m.cfg.Repo, version, mirror))
+	if mirror != "" {
+		add(buildDownloadURL(m.cfg.Repo, version, ""))
+	}
+	for _, b := range builtinMirrors {
+		// 跳过与已配置镜像等价的内置项
+		if normalizeMirror(b) == normalizeMirror(mirror) {
+			continue
+		}
+		add(buildDownloadURL(m.cfg.Repo, version, b))
+	}
+	return urls
+}
+
+func normalizeMirror(m string) string {
+	return strings.ToLower(strings.TrimRight(strings.TrimSpace(m), "/"))
+}
+
+// buildDownloadURL 拼接下载地址，支持加速镜像
+func buildDownloadURL(repo, version, mirror string) string {
 	var path string
 	if version == "latest" {
-		path = fmt.Sprintf("%s/releases/latest/download/veilink-web.tar.gz", m.cfg.Repo)
+		path = fmt.Sprintf("%s/releases/latest/download/veilink-web.tar.gz", repo)
 	} else {
 		path = fmt.Sprintf("%s/releases/download/%s/veilink-web-%s.tar.gz",
-			m.cfg.Repo, version, version)
+			repo, version, version)
 	}
-	mirror := strings.TrimRight(m.cfg.GithubMirror, "/")
+	mirror = strings.TrimRight(strings.TrimSpace(mirror), "/")
 	if mirror == "" {
 		return "https://github.com/" + path
 	}
 	// 加速地址格式兼容两种写法：
 	// 1. https://gh-proxy.com/https://github.com  → 拼接完整 URL
-	// 2. https://mirror.ghproxy.com/              → 替换域名
+	// 2. https://mirror.ghproxy.com/ / https://ghfast.top → 替换域名
 	if strings.Contains(mirror, "://github.com") || strings.HasSuffix(mirror, "github.com") {
 		return mirror + "/" + path
 	}
@@ -151,7 +205,34 @@ func (m *WebManager) downloadURL(version string) string {
 }
 
 func (m *WebManager) pull(version, dir string) error {
-	url := m.downloadURL(version)
+	var lastErr error
+	for _, url := range m.downloadCandidates(version) {
+		if err := m.pullFrom(url, version, dir); err != nil {
+			slog.Warn("前端下载失败，尝试下一个地址", "url", redactURL(url), "err", err)
+			lastErr = err
+			continue
+		}
+		if url != buildDownloadURL(m.cfg.Repo, version, m.cfg.GithubMirror) {
+			slog.Info("前端经备用地址下载成功", "url", redactURL(url))
+		}
+		return nil
+	}
+	return fmt.Errorf("download web %s: all candidates failed: %w", version, lastErr)
+}
+
+func redactURL(u string) string {
+	// 日志脱敏：只保留 host，隐藏完整路径
+	if i := strings.Index(u, "://"); i >= 0 {
+		rest := u[i+3:]
+		if j := strings.Index(rest, "/"); j >= 0 {
+			return u[:i+3] + rest[:j] + "/…"
+		}
+		return u
+	}
+	return u
+}
+
+func (m *WebManager) pullFrom(url, version, dir string) error {
 	resp, err := m.client.Get(url)
 	if err != nil {
 		return fmt.Errorf("download web %s: %w", version, err)
@@ -185,12 +266,144 @@ func (m *WebManager) pull(version, dir string) error {
 func (m *WebManager) Update(version string) error {
 	if version != "" {
 		m.cfg.Version = version
+		if err := m.saveConfig(); err != nil {
+			slog.Warn("保存前端配置失败", "err", err)
+		}
 	}
 	m.mu.Lock()
 	m.ver = ""
 	m.mu.Unlock()
 	_, err := m.ensurePulled()
 	return err
+}
+
+// WebStatus 前端状态（供设置页展示）
+type WebStatus struct {
+	Mode         string `json:"mode"`
+	WantVersion  string `json:"want_version"`
+	ActiveVer    string `json:"active_version"`
+	Mirror       string `json:"mirror"`
+	Repo         string `json:"repo"`
+	Root         string `json:"-"`
+	Serving      bool   `json:"serving"`
+	Prebundled   bool   `json:"prebundled"`
+}
+
+// Status 返回当前前端配置与状态
+func (m *WebManager) Status() WebStatus {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return WebStatus{
+		Mode:        string(m.cfg.Mode),
+		WantVersion: m.cfg.Version,
+		ActiveVer:   m.ver,
+		Mirror:      m.cfg.GithubMirror,
+		Repo:        m.cfg.Repo,
+		Root:        m.root,
+		Serving:     m.root != "",
+		Prebundled:  m.ver == "prebundled",
+	}
+}
+
+// SetMirror 更新加速镜像并持久化（空字符串 = 直连）
+func (m *WebManager) SetMirror(mirror string) error {
+	mirror = strings.TrimSpace(mirror)
+	m.mu.Lock()
+	m.cfg.GithubMirror = mirror
+	m.mu.Unlock()
+	return m.saveConfig()
+}
+
+// savedWebConfig 持久化到本地的配置（设置页保存）
+type savedWebConfig struct {
+	GithubMirror  string `json:"github_mirror"`
+	Version       string `json:"version,omitempty"`
+	mirrorTouched bool   // 内存标记：用户是否显式设置过镜像（含清空）
+}
+
+func webConfigPath(cacheDir string) string {
+	return filepath.Join(cacheDir, "web-config.json")
+}
+
+func loadSavedConfig(cacheDir string) (*savedWebConfig, error) {
+	data, err := os.ReadFile(webConfigPath(cacheDir))
+	if err != nil {
+		return nil, err
+	}
+	var sc savedWebConfig
+	if err := json.Unmarshal(data, &sc); err != nil {
+		return nil, err
+	}
+	sc.mirrorTouched = true
+	return &sc, nil
+}
+
+func (m *WebManager) saveConfig() error {
+	m.mu.RLock()
+	sc := savedWebConfig{
+		GithubMirror:  m.cfg.GithubMirror,
+		Version:       m.cfg.Version,
+		mirrorTouched: true,
+	}
+	dir := m.cfg.CacheDir
+	m.mu.RUnlock()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(sc, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := webConfigPath(dir) + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, webConfigPath(dir))
+}
+
+// ProbeResult 连通性探测结果
+type ProbeResult struct {
+	URL     string `json:"url"`
+	OK      bool   `json:"ok"`
+	Status  int    `json:"status,omitempty"`
+	Elapsed int64  `json:"elapsed_ms"`
+	Error   string `json:"error,omitempty"`
+}
+
+// Probe 探测各候选下载地址的连通性（HEAD 请求，不下载）
+func (m *WebManager) Probe(version string) []ProbeResult {
+	if version == "" {
+		version = m.cfg.Version
+		if version == "" {
+			version = "latest"
+		}
+	}
+	results := make([]ProbeResult, 0)
+	client := &http.Client{Timeout: 15 * time.Second}
+	for _, url := range m.downloadCandidates(version) {
+		start := time.Now()
+		r := ProbeResult{URL: redactURL(url)}
+		req, err := http.NewRequest(http.MethodHead, url, nil)
+		if err != nil {
+			r.Error = err.Error()
+			results = append(results, r)
+			continue
+		}
+		resp, err := client.Do(req)
+		r.Elapsed = time.Since(start).Milliseconds()
+		if err != nil {
+			r.Error = err.Error()
+		} else {
+			resp.Body.Close()
+			r.Status = resp.StatusCode
+			r.OK = resp.StatusCode == http.StatusOK
+			if !r.OK {
+				r.Error = fmt.Sprintf("status %d", resp.StatusCode)
+			}
+		}
+		results = append(results, r)
+	}
+	return results
 }
 
 func (m *WebManager) Root() string {

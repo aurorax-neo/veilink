@@ -102,7 +102,7 @@ export interface Stats {
   active_mappings: number
 }
 
-export type PageId = 'dashboard' | 'servers' | 'clients' | 'proxies' | 'logs' | 'audit'
+export type PageId = 'dashboard' | 'servers' | 'clients' | 'proxies' | 'logs' | 'audit' | 'settings'
 
 export const pages: Record<PageId, { title: string; kicker: string; lead: string; icon: string }> = {
   dashboard: {
@@ -140,6 +140,12 @@ export const pages: Record<PageId, { title: string; kicker: string; lead: string
     kicker: 'AUDIT',
     lead: '管理写操作记录。',
     icon: '✎',
+  },
+  settings: {
+    title: '设置',
+    kicker: 'SETTINGS',
+    lead: '前端版本与下载加速配置。',
+    icon: '⚙',
   },
 }
 

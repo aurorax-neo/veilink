@@ -10,11 +10,12 @@ import DashboardView from './DashboardView.vue'
 import LogsView from './LogsView.vue'
 import ProxiesView from './ProxiesView.vue'
 import ServersView from './ServersView.vue'
+import SettingsView from './SettingsView.vue'
 
 defineProps<{ page: PageId; noticeKey: number }>()
 const emit = defineEmits<{ navigate: [page: PageId]; logout: [] }>()
 const desk = inject(deskKey)!
-const nav: PageId[] = ['dashboard', 'servers', 'clients', 'proxies', 'logs', 'audit']
+const nav: PageId[] = ['dashboard', 'servers', 'clients', 'proxies', 'logs', 'audit', 'settings']
 const software = ref<{ backend_version: string; api_version: string; web_version: string } | null>(null)
 const versionError = ref(false)
 async function loadVersion() {
@@ -94,7 +95,8 @@ async function refresh() {
         <ClientsView v-else-if="page === 'clients'" />
         <ProxiesView v-else-if="page === 'proxies'" />
         <LogsView v-else-if="page === 'logs'" />
-        <AuditView v-else />
+        <AuditView v-else-if="page === 'audit'" />
+        <SettingsView v-else />
       </main>
     </div>
   </div>
