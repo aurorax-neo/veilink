@@ -431,7 +431,8 @@ test('onboarding displays role-specific flag commands and accepts HTTP only for 
   assert.match(e.result.value.prepare, /chown -R 65532:65532/)
   assert.match(e.result.value.warning, /-control-ca \/config\/ca.pem/)
   assert.match(source('../src/components/NodeOnboarding.vue'), /统一镜像 ghcr.io\/aurorax-neo\/veilink:latest.*server 或 client 子命令/)
-  assert.match(source('../src/components/NodeOnboarding.vue'), /id="join-prepare"[^>]+:value="result.prepare"/)
+  assert.doesNotMatch(source('../src/components/NodeOnboarding.vue'), /id="join-prepare"|目录准备命令/)
+  assert.match(source('../src/components/NodeOnboarding.vue'), /id="join-command"[^>]+:value="result.command"/)
   e.masterURL.value = 'http://192.168.1.10:8443'
   await e.generate()
   assert.equal(JSON.stringify(requests[1][2]), JSON.stringify({ master_url: 'http://192.168.1.10:8443' }))

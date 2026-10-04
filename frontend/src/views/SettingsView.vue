@@ -340,19 +340,21 @@ onMounted(() => {
           <p class="muted">CPA 式分离部署：设置后访问 <code>/</code> 将跳转到该地址，适用于前端部署在 CDN 或独立域名。</p>
         </div>
       </header>
-      <div class="url-row">
-        <input
-          v-model="frontendUrl"
-          type="url"
-          placeholder="https://veilink.example.com（留空使用内置前端）"
-          aria-label="自定义前端地址"
-        />
-        <button type="button" class="btn primary" :disabled="savingUrl" @click="saveFrontendUrl">
-          {{ savingUrl ? '保存中…' : '保存' }}
-        </button>
+      <div class="panel-body">
+        <div class="url-row">
+          <input
+            v-model="frontendUrl"
+            type="url"
+            placeholder="https://veilink.example.com（留空使用内置前端）"
+            aria-label="自定义前端地址"
+          />
+          <button type="button" class="btn primary" :disabled="savingUrl" @click="saveFrontendUrl">
+            {{ savingUrl ? '保存中…' : '保存' }}
+          </button>
+        </div>
+        <p v-if="urlMsg" class="hint" :class="{ bad: urlBad }">{{ urlMsg }}</p>
+        <p v-else-if="status.prebundled" class="hint">当前为统一镜像预置版本，无需下载。</p>
       </div>
-      <p v-if="urlMsg" class="hint" :class="{ bad: urlBad }">{{ urlMsg }}</p>
-      <p v-else-if="status.prebundled" class="hint">当前为统一镜像预置版本，无需下载。</p>
     </section>
 
     <!-- 下载加速 -->
@@ -373,78 +375,81 @@ onMounted(() => {
       </header>
 
       <!-- 已添加列表 -->
-      <ul v-if="mirrors.length" class="mirror-list">
-        <li v-for="(m, i) in mirrors" :key="m" class="mirror-item">
-          <span class="mirror-order" aria-hidden="true">{{ i + 1 }}</span>
-          <code class="mirror-url">{{ m }}</code>
-          <div class="mirror-actions">
-            <button type="button" class="icon-btn sm" :disabled="i === 0" @click="moveMirror(i, -1)" aria-label="上移" title="上移">↑</button>
-            <button type="button" class="icon-btn sm" :disabled="i === mirrors.length - 1" @click="moveMirror(i, 1)" aria-label="下移" title="下移">↓</button>
-            <button type="button" class="icon-btn sm danger" @click="removeMirror(i)" aria-label="删除" title="删除">×</button>
-          </div>
-        </li>
-      </ul>
-      <p v-else class="hint">未配置加速地址，将直连 GitHub（失败时仍会尝试内置镜像）。</p>
-
-      <!-- 添加 -->
-      <div class="add-row">
-        <input
-          v-model="newMirror"
-          type="url"
-          placeholder="https://ghfast.top"
-          aria-label="新增加速地址"
-          @keyup.enter="addMirror()"
-        />
-        <button type="button" class="btn" @click="addMirror()">添加</button>
-      </div>
-      <p v-if="mirrorError" class="hint bad">{{ mirrorError }}</p>
-
-      <!-- 探测 -->
-      <div class="probe-actions">
-        <button
-          type="button"
-          class="btn"
-          :disabled="probing || mirrors.length === 0"
-          :title="mirrors.length === 0 ? '请先添加加速地址' : '检测已保存加速地址连通性'"
-          @click="probe"
-        >
-          {{ probing ? '检测中…' : '检测连通性' }}
-        </button>
-        <span v-if="mirrors.length === 0" class="hint-inline muted">（请先添加加速地址）</span>
-      </div>
-
-      <div v-if="probes !== null" class="probe-box">
-        <div class="probe-summary">
-          <span class="probe-summary-title">检测结果</span>
-          <span class="probe-summary-badge" :class="probeSuccessCount > 0 ? 'good' : 'bad'">
-            {{ probes.length === 0 ? '无测试目标' : `${probeSuccessCount} / ${probes.length} 可用` }}
-          </span>
-        </div>
-        <ul v-if="probes.length" class="probe-cards">
-          <li v-for="r in probes" :key="r.url" class="probe-card" :class="{ ok: r.ok, fail: !r.ok }">
-            <div class="probe-card-left">
-              <span class="probe-dot" :class="{ ok: r.ok }" aria-hidden="true"></span>
-              <div class="probe-info">
-                <div class="probe-title-line">
-                  <strong class="probe-host">{{ r.mirror || r.url }}</strong>
-                  <span class="status-badge" :class="r.ok ? 'good' : 'bad'">
-                    {{ r.ok ? `${r.status || 200} OK` : '失败' }}
-                  </span>
-                </div>
-                <div class="probe-target-url" :title="r.url">{{ r.url }}</div>
-              </div>
-            </div>
-            <div class="probe-card-right">
-              <span v-if="r.ok" class="probe-latency" :class="latencyClass(r.elapsed_ms)">
-                {{ r.elapsed_ms }} ms
-              </span>
-              <span v-else class="probe-error" :title="r.error">
-                {{ r.error || '连通失败' }}
-              </span>
+      <div class="panel-body">
+        <!-- 已添加列表 -->
+        <ul v-if="mirrors.length" class="mirror-list">
+          <li v-for="(m, i) in mirrors" :key="m" class="mirror-item">
+            <span class="mirror-order" aria-hidden="true">{{ i + 1 }}</span>
+            <code class="mirror-url">{{ m }}</code>
+            <div class="mirror-actions">
+              <button type="button" class="icon-btn sm" :disabled="i === 0" @click="moveMirror(i, -1)" aria-label="上移" title="上移">↑</button>
+              <button type="button" class="icon-btn sm" :disabled="i === mirrors.length - 1" @click="moveMirror(i, 1)" aria-label="下移" title="下移">↓</button>
+              <button type="button" class="icon-btn sm danger" @click="removeMirror(i)" aria-label="删除" title="删除">×</button>
             </div>
           </li>
         </ul>
-        <p v-else class="hint muted">未检测到已保存的加速地址，请先添加并保存。</p>
+        <p v-else class="hint">未配置加速地址，将直连 GitHub（失败时仍会尝试内置镜像）。</p>
+
+        <!-- 添加 -->
+        <div class="add-row">
+          <input
+            v-model="newMirror"
+            type="url"
+            placeholder="https://ghfast.top"
+            aria-label="新增加速地址"
+            @keyup.enter="addMirror()"
+          />
+          <button type="button" class="btn" @click="addMirror()">添加</button>
+        </div>
+        <p v-if="mirrorError" class="hint bad">{{ mirrorError }}</p>
+
+        <!-- 探测 -->
+        <div class="probe-actions">
+          <button
+            type="button"
+            class="btn"
+            :disabled="probing || mirrors.length === 0"
+            :title="mirrors.length === 0 ? '请先添加加速地址' : '检测已保存加速地址连通性'"
+            @click="probe"
+          >
+            {{ probing ? '检测中…' : '检测连通性' }}
+          </button>
+          <span v-if="mirrors.length === 0" class="hint-inline muted">（请先添加加速地址）</span>
+        </div>
+
+        <div v-if="probes !== null" class="probe-box">
+          <div class="probe-summary">
+            <span class="probe-summary-title">检测结果</span>
+            <span class="probe-summary-badge" :class="probeSuccessCount > 0 ? 'good' : 'bad'">
+              {{ probes.length === 0 ? '无测试目标' : `${probeSuccessCount} / ${probes.length} 可用` }}
+            </span>
+          </div>
+          <ul v-if="probes.length" class="probe-cards">
+            <li v-for="r in probes" :key="r.url" class="probe-card" :class="{ ok: r.ok, fail: !r.ok }">
+              <div class="probe-card-left">
+                <span class="probe-dot" :class="{ ok: r.ok }" aria-hidden="true"></span>
+                <div class="probe-info">
+                  <div class="probe-title-line">
+                    <strong class="probe-host">{{ r.mirror || r.url }}</strong>
+                    <span class="status-badge" :class="r.ok ? 'good' : 'bad'">
+                      {{ r.ok ? `${r.status || 200} OK` : '失败' }}
+                    </span>
+                  </div>
+                  <div class="probe-target-url" :title="r.url">{{ r.url }}</div>
+                </div>
+              </div>
+              <div class="probe-card-right">
+                <span v-if="r.ok" class="probe-latency" :class="latencyClass(r.elapsed_ms)">
+                  {{ r.elapsed_ms }} ms
+                </span>
+                <span v-else class="probe-error" :title="r.error">
+                  {{ r.error || '连通失败' }}
+                </span>
+              </div>
+            </li>
+          </ul>
+          <p v-else class="hint muted">未检测到已保存的加速地址，请先添加并保存。</p>
+        </div>
       </div>
     </section>
 
@@ -456,18 +461,20 @@ onMounted(() => {
           <p class="muted">留空拉取最新版，或指定 <code>web-v1.2.0</code> 这样的版本号。</p>
         </div>
       </header>
-      <div class="url-row">
-        <input
-          v-model="updateVersion"
-          type="text"
-          placeholder="web-v1.2.0（留空拉取最新）"
-          aria-label="前端版本"
-        />
-        <button type="button" class="btn primary" :disabled="updating" @click="update">
-          {{ updating ? '更新中…' : '拉取更新' }}
-        </button>
+      <div class="panel-body">
+        <div class="url-row">
+          <input
+            v-model="updateVersion"
+            type="text"
+            placeholder="web-v1.2.0（留空拉取最新）"
+            aria-label="前端版本"
+          />
+          <button type="button" class="btn primary" :disabled="updating" @click="update">
+            {{ updating ? '更新中…' : '拉取更新' }}
+          </button>
+        </div>
+        <p v-if="updateMsg" class="hint" :class="{ bad: updateBad }">{{ updateMsg }}</p>
       </div>
-      <p v-if="updateMsg" class="hint" :class="{ bad: updateBad }">{{ updateMsg }}</p>
     </section>
 
     <section class="panel">
@@ -480,35 +487,37 @@ onMounted(() => {
           {{ savingService ? '保存中…' : '保存' }}
         </button>
       </header>
-      <div class="form-grid">
-        <label class="field">
-          <span>监听地址</span>
-          <input v-model="service.listen_addr" type="text" placeholder=":8080 或 127.0.0.1:8080" />
-        </label>
-        <label class="field">
-          <span>协议</span>
-          <select v-model="service.scheme">
-            <option value="http">http</option>
-            <option value="https">https</option>
-          </select>
-        </label>
-        <label v-if="service.scheme === 'https'" class="field">
-          <span>证书文件</span>
-          <input v-model="service.cert_file" type="text" placeholder="/path/to/cert.pem" />
-        </label>
-        <label v-if="service.scheme === 'https'" class="field">
-          <span>私钥文件</span>
-          <input v-model="service.key_file" type="text" placeholder="/path/to/key.pem" />
-        </label>
-        <label class="field">
-          <span>Web 模式</span>
-          <select v-model="service.web_mode">
-            <option value="pull">pull（拉取托管前端）</option>
-            <option value="off">off（纯 API 模式）</option>
-          </select>
-        </label>
+      <div class="panel-body">
+        <div class="form-grid">
+          <label class="field">
+            <span>监听地址</span>
+            <input v-model="service.listen_addr" type="text" placeholder=":8080 或 127.0.0.1:8080" />
+          </label>
+          <label class="field">
+            <span>协议</span>
+            <select v-model="service.scheme">
+              <option value="http">http</option>
+              <option value="https">https</option>
+            </select>
+          </label>
+          <label v-if="service.scheme === 'https'" class="field">
+            <span>证书文件</span>
+            <input v-model="service.cert_file" type="text" placeholder="/path/to/cert.pem" />
+          </label>
+          <label v-if="service.scheme === 'https'" class="field">
+            <span>私钥文件</span>
+            <input v-model="service.key_file" type="text" placeholder="/path/to/key.pem" />
+          </label>
+          <label class="field">
+            <span>Web 模式</span>
+            <select v-model="service.web_mode">
+              <option value="pull">pull（拉取托管前端）</option>
+              <option value="off">off（纯 API 模式）</option>
+            </select>
+          </label>
+        </div>
+        <p v-if="serviceMsg" class="hint" :class="{ bad: serviceBad }">{{ serviceMsg }}</p>
       </div>
-      <p v-if="serviceMsg" class="hint" :class="{ bad: serviceBad }">{{ serviceMsg }}</p>
     </section>
 
     <section class="panel">
@@ -521,49 +530,51 @@ onMounted(() => {
           {{ showKeyForm ? '取消' : '新建 Key' }}
         </button>
       </header>
-      <div v-if="showKeyForm" class="form-grid key-form">
-        <label class="field">
-          <span>名称</span>
-          <input v-model="newKey.name" type="text" placeholder="留空自动生成" />
-        </label>
-        <label class="field">
-          <span>角色</span>
-          <select v-model="newKey.role">
-            <option value="admin">admin（完全控制）</option>
-            <option value="readonly">readonly（只读）</option>
-          </select>
-        </label>
-        <div class="field">
-          <span>&nbsp;</span>
-          <button type="button" class="btn primary" :disabled="creatingKey" @click="createKey">
-            {{ creatingKey ? '创建中…' : '创建' }}
-          </button>
-        </div>
-      </div>
-      <div v-if="createdKeyPlain" class="new-key">
-        <p class="hint good">创建成功，明文只显示一次：</p>
-        <code class="key-plain">{{ createdKeyPlain }}</code>
-        <button type="button" class="btn small" @click="copyKey">复制</button>
-      </div>
-      <ul v-if="keys.length" class="key-list">
-        <li v-for="k in keys" :key="k.id" class="key-item">
-          <div class="key-meta">
-            <strong>{{ k.name }}</strong>
-            <span class="tag" :class="k.role === 'admin' ? 'admin' : 'ro'">{{ k.role }}</span>
-            <span class="muted mono">{{ k.prefix }}…</span>
+      <div class="panel-body">
+        <div v-if="showKeyForm" class="form-grid key-form">
+          <label class="field">
+            <span>名称</span>
+            <input v-model="newKey.name" type="text" placeholder="留空自动生成" />
+          </label>
+          <label class="field">
+            <span>角色</span>
+            <select v-model="newKey.role">
+              <option value="admin">admin（完全控制）</option>
+              <option value="readonly">readonly（只读）</option>
+            </select>
+          </label>
+          <div class="field">
+            <span>&nbsp;</span>
+            <button type="button" class="btn primary" :disabled="creatingKey" @click="createKey">
+              {{ creatingKey ? '创建中…' : '创建' }}
+            </button>
           </div>
-          <div class="key-sub muted">{{ k.created_at }}</div>
-          <button
-            type="button"
-            class="btn danger small"
-            :disabled="k.id === currentKeyId"
-            :title="k.id === currentKeyId ? '当前使用的 Key 不能删除' : '撤销'"
-            @click="revokeKey(k)"
-          >撤销</button>
-        </li>
-      </ul>
-      <p v-else class="muted">暂无 Key。</p>
-      <p v-if="keyMsg" class="hint" :class="{ bad: keyBad }">{{ keyMsg }}</p>
+        </div>
+        <div v-if="createdKeyPlain" class="new-key">
+          <p class="hint good">创建成功，明文只显示一次：</p>
+          <code class="key-plain">{{ createdKeyPlain }}</code>
+          <button type="button" class="btn small" @click="copyKey">复制</button>
+        </div>
+        <ul v-if="keys.length" class="key-list">
+          <li v-for="k in keys" :key="k.id" class="key-item">
+            <div class="key-meta">
+              <strong>{{ k.name }}</strong>
+              <span class="tag" :class="k.role === 'admin' ? 'admin' : 'ro'">{{ k.role }}</span>
+              <span class="muted mono">{{ k.prefix }}…</span>
+            </div>
+            <div class="key-sub muted">{{ k.created_at }}</div>
+            <button
+              type="button"
+              class="btn danger small"
+              :disabled="k.id === currentKeyId"
+              :title="k.id === currentKeyId ? '当前使用的 Key 不能删除' : '撤销'"
+              @click="revokeKey(k)"
+            >撤销</button>
+          </li>
+        </ul>
+        <p v-else class="muted">暂无 Key。</p>
+        <p v-if="keyMsg" class="hint" :class="{ bad: keyBad }">{{ keyMsg }}</p>
+      </div>
     </section>
   </div>
 </template>
@@ -600,6 +611,8 @@ onMounted(() => {
 .panel-head > div { flex: 1; }
 .panel-head h2 { margin-bottom: 4px; }
 .panel-head .muted { margin: 0; font-size: 12px; }
+.panel-body { padding: 16px; }
+.panel-body > :first-child { margin-top: 0; }
 
 .url-row { display: flex; gap: 10px; margin-top: 12px; }
 .url-row input { flex: 1; }

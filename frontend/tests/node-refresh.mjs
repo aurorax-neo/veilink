@@ -185,3 +185,28 @@ test('page refresh requests each non-revoked node of this role and unregisters',
   s.unmount()
   assert.equal(s.pageRefreshers.length, 0)
 })
+test('rapid double click on refresh does not duplicate POST, settles immediately if reported, and avoids slow timeout', async () => {
+  const target = { ...node, last_seen: 1000 }
+  let reloadCount = 0
+  const s = setup({ connected: true }, async () => {
+    reloadCount++
+    if (reloadCount >= 2) {
+      s.desk.nodes[0].last_seen = 1001
+    }
+  })
+  s.desk.nodes.push(target)
+
+  await s.refreshNode(target)
+  assert.equal(s.calls.length, 1)
+  assert.equal(s.pendingRefresh.value[node.id]?.seen, 1000)
+  assert.match(s.refreshFeedback.value[node.id]?.text, /已请求上报/)
+
+  await s.refreshNode(target)
+  assert.equal(s.calls.length, 1, '连点不应重复发送 POST 刷新请求')
+  assert.equal(s.desk.nodes[0].last_seen, 1001)
+  assert.equal(s.pendingRefresh.value[node.id], undefined, '连点且已收到上报时应立即结算')
+  assert.equal(s.refreshFeedback.value[node.id], undefined, '连点且已收到上报时不应留存等待文案')
+
+  await s.refreshNode(s.desk.nodes[0])
+  assert.equal(s.calls.length, 1, '冷却期内连点不应再次触发 POST')
+})

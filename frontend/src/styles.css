@@ -113,6 +113,7 @@ input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent);
 .metric strong { display: block; margin-top: 4px; color: var(--text); font: 27px ui-monospace, monospace; letter-spacing: -.05em; }
 .panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); min-width: 0; box-shadow: 0 12px 32px rgba(0, 0, 0, .12); }
 .panel-head { padding: 13px 16px; border-bottom: 1px solid var(--line); }
+.panel-body { padding: 16px; }
 .table-scroll { overflow-x: auto; min-width: 0; -webkit-overflow-scrolling: touch; }
 table { width: 100%; border-collapse: collapse; min-width: 760px; table-layout: auto; }
 .table-scroll > table { width: max-content; min-width: 100%; }

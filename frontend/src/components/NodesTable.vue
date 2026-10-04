@@ -26,6 +26,7 @@ const label = computed(() => props.role === 'server' ? '服务端' : '客户端'
 const refreshing = ref(new Set<string>())
 const pendingRefresh = ref<Record<string, { seen: number; revision: number; error: string; until: number }>>({})
 const refreshFeedback = ref<Record<string, { text: string; bad: boolean; hideAt: number }>>({})
+const lastRefreshedAt = ref<Record<string, number>>({})
 let active = true
 let settling = false
 let clockTimer: ReturnType<typeof setInterval> | undefined
@@ -112,6 +113,7 @@ async function settleRefresh() {
       if (changedSinceRefresh(id)) {
         delete pendingRefresh.value[id]
         delete refreshFeedback.value[id]
+        lastRefreshedAt.value[id] = Date.now()
       } else if (Date.now() > pendingRefresh.value[id].until) {
         delete pendingRefresh.value[id]
         refreshFeedback.value[id] = { text: '节点尚未上报新状态', bad: false, hideAt: Date.now() + 2000 }
@@ -123,9 +125,37 @@ async function settleRefresh() {
 }
 async function refreshNode(node: Node) {
   if (!active || node.revoked || refreshing.value.has(node.id)) return
+  if (pendingRefresh.value[node.id]) {
+    setRefreshing(node.id, true)
+    try {
+      await desk.reloadNodes(node.id)
+      if (!active) return
+      if (changedSinceRefresh(node.id)) {
+        delete pendingRefresh.value[node.id]
+        delete refreshFeedback.value[node.id]
+        lastRefreshedAt.value[node.id] = Date.now()
+        return
+      }
+    } catch {
+      // Keep existing waiting and feedback state.
+    } finally {
+      setRefreshing(node.id, false)
+    }
+    return
+  }
+  const recent = lastRefreshedAt.value[node.id] || 0
+  if (Date.now() - recent < 2000) {
+    setRefreshing(node.id, true)
+    try {
+      await desk.reloadNodes(node.id)
+    } finally {
+      setRefreshing(node.id, false)
+    }
+    return
+  }
   setRefreshing(node.id, true)
   delete refreshFeedback.value[node.id]
-  const baseline = { seen: node.last_seen, revision: node.applied_revision, error: node.error || '', until: Date.now() + 15000 }
+  const baseline = { seen: node.last_seen, revision: node.applied_revision, error: node.error || '', until: Date.now() + 6000 }
   try {
     const result = await api<{ connected: boolean }>(`/nodes/${encodeURIComponent(node.id)}/refresh`, 'POST', {})
     if (!active) return
@@ -139,6 +169,7 @@ async function refreshNode(node: Node) {
     pendingRefresh.value[node.id] = baseline
     if (changedSinceRefresh(node.id)) {
       delete pendingRefresh.value[node.id]
+      lastRefreshedAt.value[node.id] = Date.now()
       return
     }
     refreshFeedback.value[node.id] = { text: '已请求上报，等待节点反馈', bad: false, hideAt: 0 }

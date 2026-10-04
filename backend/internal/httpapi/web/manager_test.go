@@ -1,6 +1,10 @@
 package web
 
 import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"regexp"
 	"testing"
 )
 
@@ -183,5 +187,44 @@ func TestVersionFallbackToBuildinfo(t *testing.T) {
 	// 初始状态 Version() 应该回退到 buildinfo.Version
 	if v := m.Version(); v == "" {
 		t.Fatalf("expected non-empty version, got %q", v)
+	}
+}
+
+func TestFetchLatestWebTagFromAtom(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/releases.atom", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/atom+xml")
+		w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <title>v0.4.2</title>
+    <link rel="alternate" type="text/html" href="https://github.com/aurorax-neo/veilink/releases/tag/v0.4.2"/>
+  </entry>
+  <entry>
+    <title>web-v0.4.2</title>
+    <link rel="alternate" type="text/html" href="https://github.com/aurorax-neo/veilink/releases/tag/web-v0.4.2"/>
+  </entry>
+</feed>`))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/releases.atom", nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	re := regexp.MustCompile(`(?i)<title>(web-v[0-9a-zA-Z._-]+)</title>`)
+	matches := re.FindSubmatch(body)
+	if len(matches) <= 1 || string(matches[1]) != "web-v0.4.2" {
+		t.Fatalf("expected web-v0.4.2, got %v", matches)
 	}
 }

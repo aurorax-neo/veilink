@@ -3,6 +3,7 @@ package web
 import (
 	"archive/tar"
 	"compress/gzip"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +27,83 @@ var builtinMirrors = []string{
 	"https://mirror.ghproxy.com",
 }
 
+var (
+	latestWebTagMu         sync.RWMutex
+	cachedLatestWebTag     string
+	cachedLatestWebTagTime time.Time
+)
+
+// fetchLatestWebTagFromAtom 从 GitHub release atom feed 提取最新的 web-v* tag
+func fetchLatestWebTagFromAtom(repo string, client *http.Client) string {
+	c := &http.Client{Timeout: 4 * time.Second}
+	if client != nil {
+		*c = *client
+		c.Timeout = 4 * time.Second
+	}
+	feedURL := fmt.Sprintf("https://github.com/%s/releases.atom", repo)
+	req, err := http.NewRequest(http.MethodGet, feedURL, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("User-Agent", "Veilink-WebManager/1.0")
+	resp, err := c.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	limitReader := io.LimitReader(resp.Body, 64*1024)
+	body, err := io.ReadAll(limitReader)
+	if err != nil {
+		return ""
+	}
+	re := regexp.MustCompile(`(?i)<title>(web-v[0-9a-zA-Z._-]+)</title>`)
+	matches := re.FindSubmatch(body)
+	if len(matches) > 1 {
+		return string(matches[1])
+	}
+	reLink := regexp.MustCompile(`releases/tag/(web-v[0-9a-zA-Z._-]+)`)
+	matchesLink := reLink.FindSubmatch(body)
+	if len(matchesLink) > 1 {
+		return string(matchesLink[1])
+	}
+	return ""
+}
+
+// resolveLatestWebTag 解析最新前端发布 tag
+func resolveLatestWebTag(repo string, client *http.Client) string {
+	latestWebTagMu.RLock()
+	if cachedLatestWebTag != "" && time.Since(cachedLatestWebTagTime) < 5*time.Minute {
+		tag := cachedLatestWebTag
+		latestWebTagMu.RUnlock()
+		return tag
+	}
+	latestWebTagMu.RUnlock()
+
+	tag := fetchLatestWebTagFromAtom(repo, client)
+	if tag == "" {
+		if buildinfo.Version != "" && buildinfo.Version != "dev" {
+			clean := strings.TrimPrefix(strings.TrimPrefix(buildinfo.Version, "web-"), "v")
+			tag = "web-v" + clean
+		}
+	}
+	if tag != "" {
+		latestWebTagMu.Lock()
+		cachedLatestWebTag = tag
+		cachedLatestWebTagTime = time.Now()
+		latestWebTagMu.Unlock()
+	}
+	return tag
+}
+
+func (m *WebManager) resolveLatestTag() string {
+	m.mu.RLock()
+	repo := m.cfg.Repo
+	m.mu.RUnlock()
+	return resolveLatestWebTag(repo, m.client)
+}
 // LoadConfigFromEnv 从环境变量加载配置
 // DB 持久化的 WebMirrors/WebVersion 由调用方在 NewWebManager 后通过 ApplyPersisted 覆盖
 func LoadConfigFromEnv() WebConfig {
@@ -251,8 +330,8 @@ func candidatePaths(repo, version string) []string {
 			fmt.Sprintf("%s/releases/latest/download/veilink-web.tar.gz", repo),
 		}
 	}
-	tag, cleanVer := normalizeWebTagAndFile(v)
 
+	tag, cleanVer := normalizeWebTagAndFile(v)
 	var paths []string
 	seen := map[string]bool{}
 	add := func(p string) {
@@ -263,22 +342,26 @@ func candidatePaths(repo, version string) []string {
 	}
 
 	// 1. 标准资产名: veilink-web-${cleanVer}.tar.gz
-	add(fmt.Sprintf("%s/releases/download/%s/veilink-web-%s.tar.gz", repo, tag, cleanVer))
-	// 2. 冗余 tag 命名前缀资产名: veilink-web-${tag}.tar.gz (如 veilink-web-web-v0.4.0.tar.gz)
-	add(fmt.Sprintf("%s/releases/download/%s/veilink-web-%s.tar.gz", repo, tag, tag))
-	// 3. 通用资产名称: veilink-web.tar.gz
+	if cleanVer != "" {
+		add(fmt.Sprintf("%s/releases/download/%s/veilink-web-%s.tar.gz", repo, tag, cleanVer))
+	}
+	// 2. 通用资产名称: veilink-web.tar.gz
 	add(fmt.Sprintf("%s/releases/download/%s/veilink-web.tar.gz", repo, tag))
+	// 3. 冗余 tag 命名前缀资产名: veilink-web-${tag}.tar.gz (如 veilink-web-web-v0.4.0.tar.gz)
+	add(fmt.Sprintf("%s/releases/download/%s/veilink-web-%s.tar.gz", repo, tag, tag))
 
 	// 4. 容错尝试原始输入作为 tag（如果用户输入了非标准 tag）
 	if v != tag {
-		add(fmt.Sprintf("%s/releases/download/%s/veilink-web-%s.tar.gz", repo, v, cleanVer))
-		add(fmt.Sprintf("%s/releases/download/%s/veilink-web-%s.tar.gz", repo, v, v))
+		if cleanVer != "" {
+			add(fmt.Sprintf("%s/releases/download/%s/veilink-web-%s.tar.gz", repo, v, cleanVer))
+		}
 		add(fmt.Sprintf("%s/releases/download/%s/veilink-web.tar.gz", repo, v))
 	}
 
+	// 5. fallback: latest
+	add(fmt.Sprintf("%s/releases/latest/download/veilink-web.tar.gz", repo))
 	return paths
 }
-
 // downloadCandidates 返回按优先级排序的下载地址：
 // 1. 配置的镜像列表（按顺序）；2. 直连；3. 内置公共镜像
 func (m *WebManager) downloadCandidates(version string) []string {
@@ -342,9 +425,24 @@ func assembleURL(path, mirror string) string {
 	return mirror + "/" + path
 }
 func (m *WebManager) pull(version, dir string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	targetVer := strings.TrimSpace(version)
+	if targetVer == "" || targetVer == "latest" {
+		if resolved := m.resolveLatestTag(); resolved != "" {
+			targetVer = resolved
+		} else {
+			targetVer = "latest"
+		}
+	}
 	var lastErr error
-	for _, url := range m.downloadCandidates(version) {
-		if err := m.pullFrom(url, version, dir); err != nil {
+	candidates := m.downloadCandidates(targetVer)
+	for _, url := range candidates {
+		if ctx.Err() != nil {
+			return fmt.Errorf("download web %s timed out after 25s: %w", version, ctx.Err())
+		}
+		if err := m.pullFrom(ctx, url, version, dir); err != nil {
 			slog.Warn("前端下载失败，尝试下一个地址", "url", redactURL(url), "err", err)
 			if os.IsPermission(err) || strings.Contains(err.Error(), "read-only file system") {
 				return fmt.Errorf("local cache dir error: %w", err)
@@ -372,8 +470,18 @@ func redactURL(u string) string {
 	return u
 }
 
-func (m *WebManager) pullFrom(url, version, dir string) error {
-	resp, err := m.client.Get(url)
+func (m *WebManager) pullFrom(ctx context.Context, url, version, dir string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("download web %s: %w", version, err)
+	}
+	req.Header.Set("User-Agent", "Veilink-WebManager/1.0")
+
+	candCtx, candCancel := context.WithTimeout(ctx, 8*time.Second)
+	defer candCancel()
+	req = req.WithContext(candCtx)
+
+	resp, err := m.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("download web %s: %w", version, err)
 	}
@@ -381,7 +489,6 @@ func (m *WebManager) pullFrom(url, version, dir string) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("download web %s: status %d (url: %s)", version, resp.StatusCode, url)
 	}
-
 	tmpDir := dir + ".tmp"
 	os.RemoveAll(tmpDir)
 	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
@@ -526,7 +633,6 @@ func (m *WebManager) Probe(version string) []ProbeResult {
 			version = "latest"
 		}
 	}
-	results := make([]ProbeResult, 0)
 	m.mu.RLock()
 	mirrors := append([]string(nil), m.cfg.GithubMirrors...)
 	repo := m.cfg.Repo
@@ -534,10 +640,24 @@ func (m *WebManager) Probe(version string) []ProbeResult {
 
 	// 需求：只测试保存过的地址
 	if len(mirrors) == 0 {
-		return results
+		return make([]ProbeResult, 0)
 	}
 
-	paths := candidatePaths(repo, version)
+	targetVer := strings.TrimSpace(version)
+	if targetVer == "" {
+		m.mu.RLock()
+		targetVer = m.cfg.Version
+		m.mu.RUnlock()
+	}
+	if targetVer == "" || targetVer == "latest" {
+		if resolved := m.resolveLatestTag(); resolved != "" {
+			targetVer = resolved
+		} else {
+			targetVer = "latest"
+		}
+	}
+
+	paths := candidatePaths(repo, targetVer)
 	var testPath string
 	if len(paths) > 0 {
 		testPath = paths[0]
@@ -545,35 +665,43 @@ func (m *WebManager) Probe(version string) []ProbeResult {
 		testPath = fmt.Sprintf("%s/releases/latest/download/veilink-web.tar.gz", repo)
 	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	for _, mirror := range mirrors {
-		targetURL := assembleURL(testPath, mirror)
-		start := time.Now()
-		r := ProbeResult{
-			Mirror: mirror,
-			URL:    redactURL(targetURL),
-		}
-		req, err := http.NewRequest(http.MethodHead, targetURL, nil)
-		if err != nil {
-			r.Error = err.Error()
-			results = append(results, r)
-			continue
-		}
-		req.Header.Set("User-Agent", "Veilink-Probe/1.0")
-		resp, err := client.Do(req)
-		r.Elapsed = time.Since(start).Milliseconds()
-		if err != nil {
-			r.Error = err.Error()
-		} else {
-			resp.Body.Close()
-			r.Status = resp.StatusCode
-			r.OK = resp.StatusCode >= 200 && resp.StatusCode < 400
-			if !r.OK {
-				r.Error = fmt.Sprintf("status %d", resp.StatusCode)
+	results := make([]ProbeResult, len(mirrors))
+	var wg sync.WaitGroup
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	for i, mirror := range mirrors {
+		wg.Add(1)
+		go func(idx int, mir string) {
+			defer wg.Done()
+			targetURL := assembleURL(testPath, mir)
+			start := time.Now()
+			r := ProbeResult{
+				Mirror: mir,
+				URL:    redactURL(targetURL),
 			}
-		}
-		results = append(results, r)
+			req, err := http.NewRequest(http.MethodHead, targetURL, nil)
+			if err != nil {
+				r.Error = err.Error()
+				results[idx] = r
+				return
+			}
+			req.Header.Set("User-Agent", "Veilink-Probe/1.0")
+			resp, err := client.Do(req)
+			r.Elapsed = time.Since(start).Milliseconds()
+			if err != nil {
+				r.Error = err.Error()
+			} else {
+				resp.Body.Close()
+				r.Status = resp.StatusCode
+				r.OK = resp.StatusCode >= 200 && resp.StatusCode < 400
+				if !r.OK {
+					r.Error = fmt.Sprintf("status %d", resp.StatusCode)
+				}
+			}
+			results[idx] = r
+		}(i, mirror)
 	}
+	wg.Wait()
 	return results
 }
 
