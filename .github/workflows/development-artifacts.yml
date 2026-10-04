@@ -33,13 +33,14 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version-file: backend/go.mod
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - name: Go checks
+        working-directory: backend
         run: |
           go test ./...
           go vet ./...
@@ -55,7 +56,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: shared-web
-          path: html/
+          path: frontend/dist/
           if-no-files-found: error
           retention-days: 7
 
@@ -74,7 +75,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version-file: backend/go.mod
       - uses: actions/download-artifact@v4
         with:
           name: shared-web
@@ -87,15 +88,16 @@ jobs:
         run: |
           suffix=''
           if [[ "$GOOS" == windows ]]; then suffix='.exe'; fi
-          go build -trimpath -ldflags="-s -w -X veilink/internal/buildinfo.Version=dev -X veilink/internal/buildinfo.Commit=${GITHUB_SHA}" -o "bundle/veilink${suffix}" ./cmd/veilink
-          cp LICENSE NOTICE THIRD_PARTY_NOTICES.md README.md bundle/
+          cd backend
+          go build -trimpath -ldflags="-s -w -X veilink/internal/buildinfo.Version=dev -X veilink/internal/buildinfo.Commit=${GITHUB_SHA}" -o "../bundle/veilink${suffix}" ./cmd/veilink
+          cp ../LICENSE ../NOTICE ../THIRD_PARTY_NOTICES.md ../README.md ../bundle/
           printf '%s\n' "Source: https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}" \
             'Unified executable: master|server|client subcommands; no role-specific packages.' \
             'Development archive, not a host production deployment guide.' \
-            'Master Web assets are in html/ (select with -html-dir); default management transport is HTTP, TLS is optional.' > bundle/BUILD.txt
-          mkdir -p dist
-          tar -czf "dist/veilink-${GOOS}-${GOARCH}.tar.gz" -C bundle .
-          (cd dist && sha256sum ./*.tar.gz > SHA256SUMS)
+            'Master Web assets are in html/ (select with -html-dir); default management transport is HTTP, TLS is optional.' > ../bundle/BUILD.txt
+          mkdir -p ../dist
+          tar -czf "../dist/veilink-${GOOS}-${GOARCH}.tar.gz" -C ../bundle .
+          (cd ../dist && sha256sum ./*.tar.gz > SHA256SUMS)
       - uses: actions/upload-artifact@v4
         with:
           name: package-${{ matrix.goos }}-${{ matrix.goarch }}
