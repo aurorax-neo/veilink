@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"unicode"
@@ -56,6 +57,8 @@ func UpdateMasterConfig(dbPath string, update MasterConfigUpdate) ([]string, err
 			needRestart = append(needRestart, key)
 		}
 	}
+	delete(doc, "HTMLDir")
+	delete(doc, "html_dir")
 	if update.ListenAddr != nil {
 		set("ListenAddr", *update.ListenAddr, true)
 	}
@@ -153,6 +156,8 @@ func UpdateWebConfig(dbPath string, mirrors []string, version string, updateVers
 	}
 	// 兼容旧单值字段：清理
 	delete(doc, "WebMirror")
+	delete(doc, "HTMLDir")
+	delete(doc, "html_dir")
 	if updateVersion {
 		versionRaw, _ := json.Marshal(version)
 		doc["WebVersion"] = versionRaw
@@ -223,6 +228,11 @@ func ResolveMaster(local Config) (Config, func() error, error) {
 	effective.Database = local.Database
 	effective.DeploymentKey = local.DeploymentKey
 	effective.EnrollToken = local.EnrollToken
+	if !effective.explicit["html_dir"] && effective.HTMLDir != "" {
+		if info, err := os.Stat(filepath.Join(effective.HTMLDir, "index.html")); err != nil || info.IsDir() {
+			effective.HTMLDir = ""
+		}
+	}
 	if effective.Scheme == "" && !effective.explicit["scheme"] {
 		effective.Scheme = "http"
 	}
@@ -285,6 +295,8 @@ func ResolveMaster(local Config) (Config, func() error, error) {
 	delete(document, "Database")
 	delete(document, "DeploymentKey")
 	delete(document, "EnrollToken")
+	delete(document, "HTMLDir")
+	delete(document, "html_dir")
 	body, err = json.Marshal(document)
 	if err != nil {
 		return local, nil, err

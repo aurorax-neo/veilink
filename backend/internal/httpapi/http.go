@@ -38,6 +38,7 @@ type WebPersistConfig struct {
 	FrontendURL string
 	Mode        string
 	DBPath      string
+	HTMLDir     string
 }
 
 // New 创建 Master 的 HTTP API 处理器。
@@ -64,6 +65,9 @@ func New(s *store.Store, insecureLoopback bool, ring *logring.Ring, webPersist W
 
 	// WebManager 初始化
 	webCfg := web.LoadConfigFromEnv()
+	if webPersist.HTMLDir != "" {
+		webCfg.PrebundledDir = webPersist.HTMLDir
+	}
 	wm := web.NewWebManager(webCfg)
 	// DB 持久化的配置覆盖环境变量（设置页/CLI 保存的值优先）
 	wm.ApplyPersisted(webPersist.Mirrors, webPersist.Version, webPersist.FrontendURL, webPersist.Mode)

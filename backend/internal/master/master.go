@@ -70,6 +70,7 @@ func Run(ctx context.Context, c config.Config) error {
 		FrontendURL: c.FrontendURL,
 		Mode:        c.WebMode,
 		DBPath:      c.Database,
+		HTMLDir:     c.HTMLDir,
 	})
 
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

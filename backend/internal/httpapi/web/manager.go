@@ -84,6 +84,9 @@ type WebConfig struct {
 
 	// CORS 开关（分离部署时前端跨域调用 API）
 	EnableCORS bool `env:"WEB_CORS" default:"true"`
+
+	// 本地静态资源目录（优先于环境变量 WEB_PREBUNDLED_DIR）
+	PrebundledDir string `json:"-"`
 }
 
 // WebManager 管理前端静态资源的拉取与 serving
@@ -147,7 +150,10 @@ func (m *WebManager) Ensure() (string, error) {
 	}
 
 	// 2. 统一镜像预置：在未指定自定义版本时，默认使用本地预置版本，无需下载
-	prebundled := os.Getenv("WEB_PREBUNDLED_DIR")
+	prebundled := m.cfg.PrebundledDir
+	if prebundled == "" {
+		prebundled = os.Getenv("WEB_PREBUNDLED_DIR")
+	}
 	if prebundled == "" {
 		if fi, err := os.Stat("/opt/veilink-web/index.html"); err == nil && !fi.IsDir() {
 			prebundled = "/opt/veilink-web"

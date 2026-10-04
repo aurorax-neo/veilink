@@ -60,7 +60,7 @@ func TestMasterPersistenceRedeployAndOverrides(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range []string{"Database", "DeploymentKey", "EnrollToken"} {
+	for _, field := range []string{"Database", "DeploymentKey", "EnrollToken", "HTMLDir", "html_dir"} {
 		if _, ok := doc[field]; ok {
 			t.Errorf("bootstrap/transient field %s persisted", field)
 		}
@@ -221,5 +221,74 @@ func TestUpdateWebConfig(t *testing.T) {
 	}
 	if len(c5.WebMirrors) != 0 || c5.WebVersion != "web-v1.0.0" || c5.FrontendURL != "" {
 		t.Errorf("after clear = (%v, %q, %q)", c5.WebMirrors, c5.WebVersion, c5.FrontendURL)
+	}
+}
+
+func TestMasterPersistenceStaleHTMLDir(t *testing.T) {
+	dir := t.TempDir()
+	database := filepath.Join(dir, "master.db")
+	dbKey := filepath.Join(dir, "master.key")
+	bootstrap := []string{"-database", database, "-deployment-key", dbKey}
+
+	// 初始化一个含有历史残留 HTMLDir 的 master_config 记录
+	c, err := ParseFlags("master", bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PersistMaster(c); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite", database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// 模拟旧版本将不存在的 /usr/local/html 写入了 master_config
+	legacyJSON := `{"ListenAddr":"127.0.0.1:2545","Scheme":"http","HTMLDir":"/usr/local/html"}`
+	if _, err := db.Exec("UPDATE master_config SET data=? WHERE id=1", []byte(legacyJSON)); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. 无 -html-dir 启动，必须成功且自动清空失效的 HTMLDir，平滑迁移
+	c1, err := ParseFlags("master", bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eff1, commit1, err := ResolveMaster(c1)
+	if err != nil {
+		t.Fatalf("expected successful startup with stale html_dir, got: %v", err)
+	}
+	if eff1.HTMLDir != "" {
+		t.Fatalf("expected HTMLDir to be reset to empty, got: %q", eff1.HTMLDir)
+	}
+	if err := commit1(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 验证 commit 之后数据库中不再包含 HTMLDir 或 html_dir
+	var raw string
+	if err := db.QueryRow("SELECT data FROM master_config WHERE id=1").Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := doc["HTMLDir"]; ok {
+		t.Error("HTMLDir persisted after stale cleanup")
+	}
+	if _, ok := doc["html_dir"]; ok {
+		t.Error("html_dir persisted after stale cleanup")
+	}
+
+	// 2. 显式指定不存在的 -html-dir，必须报错校验失败
+	c2, err := ParseFlags("master", append(bootstrap, "-html-dir=/nonexistent/html/custom"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ResolveMaster(c2); err == nil || !strings.Contains(err.Error(), "html_dir must contain index.html") {
+		t.Fatalf("expected html_dir validation error, got: %v", err)
 	}
 }
