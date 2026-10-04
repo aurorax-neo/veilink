@@ -463,7 +463,8 @@ func sealSessionID(authKey []byte, hello *utls.PubClientHelloMsg, shortID [8]byt
 	// in SessionId and the AAD must be this raw hello with those bytes zeroed.
 	hello.SessionId = make([]byte, 32)
 	copy(hello.Raw[39:], hello.SessionId)
-	// 对齐 Xray-core：SessionId[0:4] 填版本号 [26, 9, 30, 0]，留零会成为可观测指纹差异
+	// 对齐 Xray-core：SessionId[0:4] 填版本号 [26, 9, 30, 0]
+	// 服务端靠这个识别 REALITY 客户端，留零会导致服务端走回落代理
 	hello.SessionId[0] = 26
 	hello.SessionId[1] = 9
 	hello.SessionId[2] = 30
