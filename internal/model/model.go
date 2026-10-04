@@ -192,6 +192,8 @@ type Reality struct {
 	ServerNames string `json:"server_names"`
 	Fingerprint string `json:"fingerprint"`
 	MaxTimeDiff string `json:"max_time_diff"`
+	SpiderX     string `json:"spider_x,omitempty"`
+	SpiderY     string `json:"spider_y,omitempty"`
 }
 
 // Enabled reports whether any REALITY setting is present.

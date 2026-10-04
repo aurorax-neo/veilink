@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -17,14 +18,20 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"math/big"
 	"net"
+	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
 	"github.com/xtls/reality"
 	"golang.org/x/crypto/hkdf"
+	"golang.org/x/net/http2"
 
 	"veilink/internal/model"
 )
@@ -399,7 +406,8 @@ func dialReality(ctx context.Context, addr, serverName string, r model.Reality) 
 		return nil, err
 	}
 	if !verified {
-		_ = uconn.Close()
+		// 对齐 Xray-core：验证失败时伪装成正常浏览器爬目标站（反探测），而非直接断开
+		camouflageBrowse(uconn, serverName, r.SpiderX, r.SpiderY)
 		return nil, errors.New("REALITY certificate was not authenticated")
 	}
 	return ownTLS(uconn, gate), nil
@@ -435,6 +443,11 @@ func sealSessionID(authKey []byte, hello *utls.PubClientHelloMsg, shortID [8]byt
 	// in SessionId and the AAD must be this raw hello with those bytes zeroed.
 	hello.SessionId = make([]byte, 32)
 	copy(hello.Raw[39:], hello.SessionId)
+	// 对齐 Xray-core：SessionId[0:4] 填版本号 [26, 9, 30, 0]，留零会成为可观测指纹差异
+	hello.SessionId[0] = 26
+	hello.SessionId[1] = 9
+	hello.SessionId[2] = 30
+	hello.SessionId[3] = 0 // reserved
 	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(time.Now().Unix()))
 	copy(hello.SessionId[8:], shortID[:])
 	sealed := aead.Seal(hello.SessionId[:0], hello.Random[20:], hello.SessionId[:16], hello.Raw)
@@ -461,6 +474,144 @@ func realityCertificate(authKey []byte, rawCerts [][]byte) bool {
 	mac := hmac.New(sha512.New, authKey)
 	_, _ = mac.Write(pub)
 	return hmac.Equal(mac.Sum(nil), cert.Signature)
+}
+
+// spiderPathCache 缓存每个目标站点的已发现路径（对齐 Xray-core maps）
+var spiderPathCache struct {
+	sync.Mutex
+	maps map[string]map[string]struct{}
+}
+
+var spiderHrefRe = regexp.MustCompile(`href="([/h].*?)"`)
+var spiderDot = []byte(".")
+
+func spiderGetPathLocked(paths map[string]struct{}) string {
+	if len(paths) == 0 {
+		return "/"
+	}
+	n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(paths))))
+	stopAt := int(n.Int64())
+	i := 0
+	for s := range paths {
+		if i == stopAt {
+			return s
+		}
+		i++
+	}
+	return "/"
+}
+
+func spiderRandBetween(min, max int64) int64 {
+	if max <= min {
+		return min
+	}
+	n, _ := rand.Int(rand.Reader, big.NewInt(max-min+1))
+	return min + n.Int64()
+}
+
+// parseSpiderY 解析 spider_y 配置（10 个整数），缺省用 Xray-core 常用值
+func parseSpiderY(s string) [10]int64 {
+	// 默认值：padding 32-64，并发 1-2，每路径请求 1-3，间隔 0-100ms，返回前等待 0-50ms
+	def := [10]int64{32, 64, 1, 2, 1, 3, 0, 100, 0, 50}
+	if strings.TrimSpace(s) == "" {
+		return def
+	}
+	parts := strings.Split(s, ",")
+	for i := 0; i < 10 && i < len(parts); i++ {
+		if v, err := strconv.ParseInt(strings.TrimSpace(parts[i]), 10, 64); err == nil {
+			def[i] = v
+		}
+	}
+	return def
+}
+
+// camouflageBrowse 对齐 Xray-core：证书验证失败时，像正常浏览器一样爬目标站
+// （反探测设计，缺失后失败连接模式更易被区分）
+func camouflageBrowse(conn net.Conn, serverName, spiderX, spiderY string) {
+	spiderYVals := parseSpiderY(spiderY)
+	if spiderX == "" {
+		spiderX = "/"
+	}
+	go func() {
+		client := &http.Client{
+			Transport: &http2.Transport{
+				DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+					return conn, nil
+				},
+			},
+		}
+		prefix := []byte("https://" + serverName)
+		spiderPathCache.Lock()
+		if spiderPathCache.maps == nil {
+			spiderPathCache.maps = make(map[string]map[string]struct{})
+		}
+		paths := spiderPathCache.maps[serverName]
+		if paths == nil {
+			paths = make(map[string]struct{})
+			paths[spiderX] = struct{}{}
+			spiderPathCache.maps[serverName] = paths
+		}
+		firstURL := string(prefix) + spiderGetPathLocked(paths)
+		spiderPathCache.Unlock()
+		get := func(first bool) {
+			var req *http.Request
+			if first {
+				req, _ = http.NewRequest("GET", firstURL, nil)
+			} else {
+				spiderPathCache.Lock()
+				req, _ = http.NewRequest("GET", string(prefix)+spiderGetPathLocked(paths), nil)
+				spiderPathCache.Unlock()
+			}
+			if req == nil {
+				return
+			}
+			// 模拟浏览器默认头
+			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+			req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+			req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+			times := 1
+			if !first {
+				times = int(spiderRandBetween(spiderYVals[4], spiderYVals[5]))
+			}
+			for j := 0; j < times; j++ {
+				if !first && j == 0 {
+					req.Header.Set("Referer", firstURL)
+				}
+				req.AddCookie(&http.Cookie{Name: "padding", Value: strings.Repeat("0", int(spiderRandBetween(spiderYVals[0], spiderYVals[1])))})
+				resp, err := client.Do(req)
+				if err != nil {
+					break
+				}
+				func() {
+					defer resp.Body.Close()
+					req.Header.Set("Referer", req.URL.String())
+					body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+					if err != nil {
+						return
+					}
+					spiderPathCache.Lock()
+					for _, m := range spiderHrefRe.FindAllSubmatch(body, -1) {
+						m[1] = bytes.TrimPrefix(m[1], prefix)
+						if !bytes.Contains(m[1], spiderDot) {
+							paths[string(m[1])] = struct{}{}
+						}
+					}
+					req.URL.Path = spiderGetPathLocked(paths)
+					spiderPathCache.Unlock()
+				}()
+				if !first {
+					time.Sleep(time.Duration(spiderRandBetween(spiderYVals[6], spiderYVals[7])) * time.Millisecond)
+				}
+			}
+		}
+		get(true)
+		concurrency := int(spiderRandBetween(spiderYVals[2], spiderYVals[3]))
+		for i := 0; i < concurrency; i++ {
+			go get(false)
+		}
+		// 不关闭连接，留给对端
+	}()
+	time.Sleep(time.Duration(spiderRandBetween(spiderYVals[8], spiderYVals[9])) * time.Millisecond)
 }
 
 func decodeKey(s string) ([]byte, error) {
