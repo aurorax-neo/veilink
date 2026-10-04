@@ -1,7 +1,7 @@
 #!/bin/sh
 # install.sh — 全平台一键安装脚本
-# 用法: curl -fsSL https://get.veilink.dev | sh
-#   或: curl -fsSL https://get.veilink.dev | sh -s -- --no-service
+# 用法: curl -fsSL https://raw.githubusercontent.com/aurorax-neo/veilink/main/scripts/install.sh | sh
+#   或: curl -fsSL https://raw.githubusercontent.com/aurorax-neo/veilink/main/scripts/install.sh | sh -s -- --no-service
 set -eu
 
 REPO="aurorax-neo/veilink"

@@ -1,5 +1,5 @@
 # install.ps1 — Windows 一键安装脚本
-# 用法: irm https://get.veilink.dev/install.ps1 | iex
+# 用法: irm https://raw.githubusercontent.com/aurorax-neo/veilink/main/scripts/install.ps1 | iex
 
 $ErrorActionPreference = "Stop"
 $Repo = "aurorax-neo/veilink"

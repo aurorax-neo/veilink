@@ -80,10 +80,10 @@ docker logs veilink-master 2>&1 | grep "API Key"
 原生二进制（Linux/macOS/Windows）：
 ```sh
 # Linux/macOS
-curl -fsSL https://get.veilink.dev | sh
+curl -fsSL https://raw.githubusercontent.com/aurorax-neo/veilink/main/scripts/install.sh | sh
 
 # Windows (PowerShell)
-irm https://get.veilink.dev/install.ps1 | iex
+irm https://raw.githubusercontent.com/aurorax-neo/veilink/main/scripts/install.ps1 | iex
 ```
 
 ### 目录与网络
@@ -175,7 +175,7 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header X-Forwarded-For $remote_addr;
         # API Key 通过 Authorization 头传递，无需 cookie/CSRF 特殊处理
-        # SSE 推送如遇延迟，加一行 proxy_buffering off 即可
+        proxy_buffering off;
     }
 }
 ```
@@ -270,13 +270,7 @@ Web 控制台「设置」页集中管理：
 
 ## 接入独立 Server
 
-使用内置 Server 可跳过。先在 Web 创建 Server，获取节点 ID 和接入令牌；在 Server 主机准备镜像与目录：
-
-```sh
-mkdir -p /opt/docker/veilink-server/config /opt/docker/veilink-server/data
-chown 65532:65532 /opt/docker/veilink-server/config /opt/docker/veilink-server/data
-chmod 700 /opt/docker/veilink-server/config /opt/docker/veilink-server/data
-```
+使用内置 Server 可跳过。先在 Web 创建 Server，获取节点 ID 和接入令牌。
 
 以下连接到前述 nginx HTTPS 入口：
 
@@ -295,13 +289,7 @@ docker run -itd \
 
 ## 接入 Client
 
-先在 Web 创建 Client，获取节点 ID 和接入令牌；在 Client 主机准备镜像与目录：
-
-```sh
-mkdir -p /opt/docker/veilink-client/config /opt/docker/veilink-client/data
-chown 65532:65532 /opt/docker/veilink-client/config /opt/docker/veilink-client/data
-chmod 700 /opt/docker/veilink-client/config /opt/docker/veilink-client/data
-```
+先在 Web 创建 Client，获取节点 ID 和接入令牌。
 
 Client 保持默认 Bridge，不添加 `--net host` 或 `-p`：
 
@@ -437,6 +425,8 @@ docker exec veilink-master /usr/local/bin/veilink keys revoke <id>
 3. 拉取目标版本镜像，保留数据挂载，以原有角色和 flags 重建容器。
 4. 检查日志、健康接口、节点应用状态及实际业务请求。
 5. 回滚前备份当前状态，确认旧版本兼容性；不兼容时用匹配旧版本的成套备份在新目录验证，不直接覆盖数据库。
+
+**从旧版（用户名密码）升级**：首次启动自动检测旧 `admin` 表，生成 `migrated-admin` API Key 并在日志中显示一次（`docker logs veilink-master 2>&1 | grep "API Key"`）。旧用户名密码即刻失效，需改用 Key 登录；老 `/api/*` 路径 301 重定向到 `/api/v1/*`，旧前端可用。数据（节点、映射、配置）无缝保留。
 
 ## 故障排查
 
