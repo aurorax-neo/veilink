@@ -60,6 +60,7 @@ docker run -itd --restart unless-stopped --name veilink-master \
   -e TZ=Asia/Shanghai \
   --network host \
   -v /opt/docker/veilink-master/data:/data \
+  -v /opt/docker/veilink-master/web:/data/web \
   ghcr.io/aurorax-neo/veilink:latest master
 ```
 
@@ -110,13 +111,14 @@ irm https://raw.githubusercontent.com/aurorax-neo/veilink/main/scripts/install.p
 
 ```sh
 docker run -itd \
-  --name veilink-master --restart unless-stopped --net host \
+  --name veilink-master --restart unless-stopped --network host \
   -e TZ=Asia/Shanghai \
   -v /opt/docker/veilink-master/data:/data \
+  -v /opt/docker/veilink-master/web:/data/web \
   ghcr.io/aurorax-neo/veilink:latest master
 ```
 
-entrypoint 自动处理 `/data` 权限，无需手动 `mkdir`/`chown`。如需绑定宿主机目录，直接 `-v` 挂载即可。
+entrypoint 自动处理 `/data` 与 `/data/web` 权限，无需手动 `mkdir`/`chown`。宿主机映射目录中 `/opt/docker/veilink-master/data` 保存 SQLite 数据库与凭据，`/opt/docker/veilink-master/web` 映射前端静态资源目录。
 
 ### 2. 获取 API Key
 
