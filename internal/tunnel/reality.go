@@ -578,8 +578,8 @@ func parseSpiderY(s string) [10]int64 {
 
 // camouflageBrowse 对齐 Xray-core：证书验证失败时，像正常浏览器一样爬目标站
 // （反探测设计，缺失后失败连接模式更易被区分）
-// GenerateSpiderX 生成随机的伪装爬取起点路径（避免所有用户都用 "/" 形成指纹）
-func GenerateSpiderX() (string, error) {
+// generateSpiderX 生成随机的伪装爬取起点路径（避免所有用户都用 "/" 形成指纹）
+func generateSpiderX() (string, error) {
 	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {
@@ -596,7 +596,7 @@ func camouflageBrowse(conn net.Conn, serverName, spiderX, spiderY string) {
 	if spiderX == "" {
 		// 不固定用 "/"，随机生成避免指纹
 		var err error
-		spiderX, err = GenerateSpiderX()
+		spiderX, err = generateSpiderX()
 		if err != nil {
 			spiderX = "/"
 		}
