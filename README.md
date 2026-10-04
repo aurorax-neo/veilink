@@ -167,17 +167,6 @@ server {
         grpc_send_timeout 3600s;
     }
 
-    # SSE 实时推送：必须关闭缓冲，否则事件延迟
-    location /api/v1/stream {
-        proxy_pass http://127.0.0.1:2545;
-        proxy_buffering off;
-        proxy_cache off;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host:$server_port;
-        proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_read_timeout 3600s;
-    }
-
     location / {
         proxy_pass http://127.0.0.1:2545;
         client_max_body_size 1m;
@@ -186,6 +175,7 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header X-Forwarded-For $remote_addr;
         # API Key 通过 Authorization 头传递，无需 cookie/CSRF 特殊处理
+        # SSE 推送如遇延迟，加一行 proxy_buffering off 即可
     }
 }
 ```
@@ -202,7 +192,6 @@ openssl s_client -connect panel.example.com:8843 \
 
 - Web/API 用 `proxy_pass`，节点 gRPC 用 `grpc_pass`，两者不能互换。
 - nginx 如果运行在独立 Bridge 容器，`127.0.0.1` 是 nginx 自己，必须换成能到达的受限回源地址。
-- SSE 路径（`/api/v1/stream`）必须关闭代理缓冲，否则实时推送延迟。
 - API Key 通过 `Authorization` 头传递，nginx 无需特殊处理；不要盲目信任客户端转发的头。
 - 此反代仅处理管理面和控制面；业务隧道端口需按传输直达或 L4 透传。它不是 XHTTP 业务反代配置。
 
