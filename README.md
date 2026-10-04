@@ -160,12 +160,6 @@ server {
         return 404;
     }
 
-    # 只转换本站的精确 Origin，其它 Origin 原样交给 Master 校验。
-    set $veilink_origin $http_origin;
-    if ($http_origin = "https://$http_host") {
-        set $veilink_origin "http://$http_host";
-    }
-
     location /veilink.control.v1.Control/ {
         grpc_pass grpc://127.0.0.1:2545;
         grpc_set_header Host $host:$server_port;
@@ -173,15 +167,25 @@ server {
         grpc_send_timeout 3600s;
     }
 
+    # SSE 实时推送：必须关闭缓冲，否则事件延迟
+    location /api/v1/stream {
+        proxy_pass http://127.0.0.1:2545;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host:$server_port;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_read_timeout 3600s;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:2545;
         client_max_body_size 1m;
         proxy_http_version 1.1;
         proxy_set_header Host $host:$server_port;
-        proxy_set_header Origin $veilink_origin;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_cookie_flags veilink_session secure httponly samesite=strict;
+        # API Key 通过 Authorization 头传递，无需 cookie/CSRF 特殊处理
     }
 }
 ```
@@ -198,8 +202,8 @@ openssl s_client -connect panel.example.com:8843 \
 
 - Web/API 用 `proxy_pass`，节点 gRPC 用 `grpc_pass`，两者不能互换。
 - nginx 如果运行在独立 Bridge 容器，`127.0.0.1` 是 nginx 自己，必须换成能到达的受限回源地址。
-- 本例监听端口就是外部端口，所以 Host 使用 `$host:$server_port`。前置代理若改写端口，两处 Host 应填写真实外部域名和端口，并与 Origin 转换一致。
-- 不关闭 CSRF，不把所有 Origin 改成本域，不盲目信任客户端转发头。nginx 为会话 Cookie 添加 Secure；Master 不靠 `X-Forwarded-Proto` 放宽认证。
+- SSE 路径（`/api/v1/stream`）必须关闭代理缓冲，否则实时推送延迟。
+- API Key 通过 `Authorization` 头传递，nginx 无需特殊处理；不要盲目信任客户端转发的头。
 - 此反代仅处理管理面和控制面；业务隧道端口需按传输直达或 L4 透传。它不是 XHTTP 业务反代配置。
 
 ### 方式二：可信内网直接 HTTP
@@ -443,8 +447,7 @@ docker exec veilink /usr/local/bin/veilink keys revoke <id>
 | `flag provided but not defined` | 使用当前角色 `--help`；没有 `-embedded-server-server-name` 或 `-config` |
 | 远端无法访问 `127.0.0.1:2545` | 该地址仅本机可达；使用反代或受限内网监听 |
 | `tls: no application protocol` | 外部 HTTPS 是否协商 ALPN `h2`、nginx HTTP/2 模块和 `grpc_pass` |
-| 注册/登录直接 403 | Host、Origin 和非标准外部端口是否匹配 |
-| 登录后写操作 403 | 会话 Cookie、`X-CSRF-Token`、`Sec-Fetch-Site`；不要关闭 CSRF |
+| API Key 无效 401 | 检查 `Authorization: Bearer` 头是否正确，Key 是否被吊销 |
 | 节点未上报 | 节点日志、Master 地址、证书名称/CA、端口、节点 ID、令牌和状态目录 |
 | 配置待应用或应用失败 | 对比期望/已应用修订，查看节点错误；刷新请求不是成功确认 |
 | 配置已应用但业务失败 | Server 业务端口、Client 容器目标可达性、TCP/UDP 协议、防火墙/NAT、目标认证 |
