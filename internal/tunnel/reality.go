@@ -30,6 +30,7 @@ import (
 
 	utls "github.com/refraction-networking/utls"
 	"github.com/xtls/reality"
+	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/net/http2"
 
@@ -363,13 +364,20 @@ func dialReality(ctx context.Context, addr, serverName string, r model.Reality) 
 	gate := &recordBoundaryConn{Conn: raw}
 	verified := false
 	var authKey []byte
-	uconn := utls.UClient(gate, &utls.Config{
+	var uconn *utls.UConn
+	uconn = utls.UClient(gate, &utls.Config{
 		ServerName:             serverName,
 		InsecureSkipVerify:     true,
 		SessionTicketsDisabled: true,
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			if !realityCertificate(authKey, rawCerts) {
 				return errors.New("REALITY certificate authentication failed")
+			}
+			// 对齐 Xray-core：如配置了 mldsa65_verify，做后量子额外验证
+			if r.Mldsa65Verify != "" {
+				if !realityMldsa65Verify(authKey, rawCerts, r.Mldsa65Verify, uconn) {
+					return errors.New("REALITY ML-DSA-65 verification failed")
+				}
 			}
 			verified = true
 			return nil
@@ -474,6 +482,49 @@ func realityCertificate(authKey []byte, rawCerts [][]byte) bool {
 	mac := hmac.New(sha512.New, authKey)
 	_, _ = mac.Write(pub)
 	return hmac.Equal(mac.Sum(nil), cert.Signature)
+}
+
+// realityMldsa65Verify 对齐 Xray-core 的 ML-DSA-65 后量子额外验证
+func realityMldsa65Verify(authKey []byte, rawCerts [][]byte, mldsa65VerifyB64 string, uconn *utls.UConn) bool {
+	if len(rawCerts) == 0 || mldsa65VerifyB64 == "" || uconn == nil {
+		return false
+	}
+	cert, err := x509.ParseCertificate(rawCerts[0])
+	if err != nil {
+		return false
+	}
+	pub, ok := cert.PublicKey.(ed25519.PublicKey)
+	if !ok {
+		return false
+	}
+	if len(cert.Extensions) == 0 {
+		return false
+	}
+	// 解码 ML-DSA-65 公钥
+	pubKeyBytes, err := base64.RawURLEncoding.DecodeString(mldsa65VerifyB64)
+	if err != nil {
+		// 尝试标准 base64
+		pubKeyBytes, err = base64.StdEncoding.DecodeString(mldsa65VerifyB64)
+		if err != nil {
+			return false
+		}
+	}
+	verifyKey, err := mldsa65.Scheme().UnmarshalBinaryPublicKey(pubKeyBytes)
+	if err != nil {
+		return false
+	}
+	// 构造待验证消息：HMAC(pub) + Hello.Raw + ServerHello.Raw
+	mac := hmac.New(sha512.New, authKey)
+	_, _ = mac.Write(pub)
+	h := mac.Sum(nil)
+	state := uconn.HandshakeState
+	if state.Hello == nil || state.ServerHello == nil {
+		return false
+	}
+	h = append(h, state.Hello.Raw...)
+	h = append(h, state.ServerHello.Raw...)
+	// 验证证书第一个扩展中的签名
+	return mldsa65.Verify(verifyKey.(*mldsa65.PublicKey), h, nil, cert.Extensions[0].Value)
 }
 
 // spiderPathCache 缓存每个目标站点的已发现路径（对齐 Xray-core maps）
@@ -736,4 +787,21 @@ func GenerateX25519() (string, string, error) {
 		return "", "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(key.Bytes()), base64.RawURLEncoding.EncodeToString(key.PublicKey().Bytes()), nil
+}
+
+// GenerateMldsa65 生成 ML-DSA-65 后量子密钥对（对齐 Xray-core）
+func GenerateMldsa65() (string, string, error) {
+	pub, priv, err := mldsa65.GenerateKey(rand.Reader)
+	if err != nil {
+		return "", "", err
+	}
+	pubBytes, err := pub.MarshalBinary()
+	if err != nil {
+		return "", "", err
+	}
+	privBytes, err := priv.MarshalBinary()
+	if err != nil {
+		return "", "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(privBytes), base64.RawURLEncoding.EncodeToString(pubBytes), nil
 }

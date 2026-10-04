@@ -98,11 +98,11 @@ func runKeys(args []string, out io.Writer) error {
 
 func RunWithInput(ctx context.Context, args []string, in io.Reader, out io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: veilink master|server|client|keys|x25519|vlessenc|version [flags]")
+		return errors.New("usage: veilink master|server|client|keys|x25519|mldsa65|vlessenc|version [flags]")
 	}
 	if args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
 		if len(args) == 1 {
-			_, err := fmt.Fprintln(out, "Usage: veilink master|server|client|keys|x25519|vlessenc|version [flags]\nUse veilink help <command> for command help.")
+			_, err := fmt.Fprintln(out, "Usage: veilink master|server|client|keys|x25519|mldsa65|vlessenc|version [flags]\nUse veilink help <command> for command help.")
 			return err
 		}
 		if args[0] != "help" || len(args) != 2 {
@@ -112,7 +112,7 @@ func RunWithInput(ctx context.Context, args []string, in io.Reader, out io.Write
 	} else if len(args) == 2 && args[1] == "help" {
 		args = []string{args[0], "--help"}
 	}
-	if (args[0] == "version" || args[0] == "x25519" || args[0] == "vlessenc") && len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
+	if (args[0] == "version" || args[0] == "x25519" || args[0] == "mldsa65" || args[0] == "vlessenc") && len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
 		_, err := fmt.Fprintf(out, "Usage: veilink %s\nThis command accepts no flags.\n", args[0])
 		return err
 	}
@@ -120,7 +120,7 @@ func RunWithInput(ctx context.Context, args []string, in io.Reader, out io.Write
 		_, err := fmt.Fprintln(out, "Usage: veilink keys list|create|revoke [flags]\n\nSubcommands:\n  list              List API keys (prefix only, never plaintext)\n  create [name]     Create a new API key (plaintext shown once)\n  revoke <id>       Revoke an API key by ID\n\nFlags:\n  -database         Database path (default /data/veilink.db)\n  -deployment-key   Deployment key path (default /data/veilink.key)")
 		return err
 	}
-	if (args[0] == "version" || args[0] == "x25519" || args[0] == "vlessenc") && len(args) != 1 {
+	if (args[0] == "version" || args[0] == "x25519" || args[0] == "mldsa65" || args[0] == "vlessenc") && len(args) != 1 {
 		return errors.New("unexpected arguments")
 	}
 	if args[0] == "version" {
@@ -129,6 +129,14 @@ func RunWithInput(ctx context.Context, args []string, in io.Reader, out io.Write
 	}
 	if args[0] == "x25519" {
 		priv, pub, e := tunnel.GenerateX25519()
+		if e != nil {
+			return e
+		}
+		fmt.Fprintf(out, "Private key: %s\nPublic key: %s\n", priv, pub)
+		return nil
+	}
+	if args[0] == "mldsa65" {
+		priv, pub, e := tunnel.GenerateMldsa65()
 		if e != nil {
 			return e
 		}

@@ -140,17 +140,10 @@ func (r *tlsRecognition) eligible(direction int) bool {
 	if r.dirs[direction].failed || r.client == nil || r.server == nil {
 		return false
 	}
-	if !bytes.Equal(r.client.session, r.server.session) {
-		return false
-	}
-	found := false
-	for i := 0; i+1 < len(r.client.suites); i += 2 {
-		if bytes.Equal(r.client.suites[i:i+2], r.server.suites) {
-			found = true
-		}
-	}
+	// 对齐 xray：只需见过双向 hello，不要求 session ID 和 cipher suite 强匹配
+	// （xray 的 XtlsFilterTls 只做版本识别，不做一致性校验）
 	d := &r.dirs[direction]
-	return found && d.application && d.head == 0 && d.left == 0
+	return d.application && d.head == 0 && d.left == 0
 }
 
 func (r *tlsRecognition) fallback(direction int) bool {
