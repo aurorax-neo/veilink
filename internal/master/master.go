@@ -68,6 +68,7 @@ func Run(ctx context.Context, c config.Config) error {
 		Mirrors:     c.WebMirrors,
 		Version:     c.WebVersion,
 		FrontendURL: c.FrontendURL,
+		Mode:        c.WebMode,
 		DBPath:      c.Database,
 	})
 

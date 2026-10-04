@@ -169,7 +169,117 @@ async function update() {
   }
 }
 
-onMounted(load)
+// ---- 服务配置 ----
+const service = ref({
+  listen_addr: '',
+  scheme: 'http',
+  cert_file: '',
+  key_file: '',
+  web_mode: 'pull',
+  embedded_enabled: false,
+  embedded_name: '',
+  embedded_address: '',
+  embedded_port: 0,
+})
+const savingService = ref(false)
+const savingEmbedded = ref(false)
+const serviceMsg = ref('')
+const serviceBad = ref(false)
+
+async function loadService() {
+  try {
+    const cfg = await api<typeof service.value>('/master/config')
+    service.value = { ...service.value, ...cfg }
+  } catch { /* 忽略，保持默认值 */ }
+}
+
+async function saveService() {
+  savingService.value = true
+  savingEmbedded.value = true
+  serviceMsg.value = ''
+  serviceBad.value = false
+  try {
+    const res = await api<{ ok: boolean; need_restart: string[] }>('/master/config', 'POST', service.value)
+    const need = res.need_restart || []
+    serviceMsg.value = need.length ? `已保存，${need.length} 项需重启生效` : '已保存并生效'
+  } catch (e) {
+    serviceBad.value = true
+    serviceMsg.value = e instanceof ApiError ? e.message : '保存失败'
+  } finally {
+    savingService.value = false
+    savingEmbedded.value = false
+  }
+}
+
+// ---- API Key ----
+interface ApiKey {
+  id: number
+  name: string
+  role: string
+  prefix: string
+  created_at: string
+}
+const keys = ref<ApiKey[]>([])
+const showKeyForm = ref(false)
+const newKey = ref({ name: '', role: 'admin' })
+const creatingKey = ref(false)
+const createdKeyPlain = ref('')
+const keyMsg = ref('')
+const keyBad = ref(false)
+const currentKeyId = ref(-1)
+
+async function loadKeys() {
+  try {
+    keys.value = await api<ApiKey[]>('/keys')
+  } catch { keys.value = [] }
+}
+
+async function createKey() {
+  creatingKey.value = true
+  keyMsg.value = ''
+  keyBad.value = false
+  createdKeyPlain.value = ''
+  try {
+    const res = await api<{ key: string; name: string }>('/keys', 'POST', {
+      name: newKey.value.name.trim(),
+      role: newKey.value.role,
+    })
+    createdKeyPlain.value = res.key
+    newKey.value.name = ''
+    showKeyForm.value = false
+    await loadKeys()
+  } catch (e) {
+    keyBad.value = true
+    keyMsg.value = e instanceof ApiError ? e.message : '创建失败'
+  } finally {
+    creatingKey.value = false
+  }
+}
+
+async function revokeKey(k: ApiKey) {
+  if (!confirm(`确定撤销 Key「${k.name}」？撤销后立即失效。`)) return
+  keyMsg.value = ''
+  keyBad.value = false
+  try {
+    await api<{ ok: boolean }>(`/keys/${k.id}`, 'DELETE')
+    await loadKeys()
+  } catch (e) {
+    keyBad.value = true
+    keyMsg.value = e instanceof ApiError ? e.message : '撤销失败'
+  }
+}
+
+function copyKey() {
+  navigator.clipboard?.writeText(createdKeyPlain.value)
+  keyMsg.value = '已复制到剪贴板'
+  keyBad.value = false
+}
+
+onMounted(() => {
+  load()
+  loadService()
+  loadKeys()
+})
 </script>
 
 <template>
@@ -320,6 +430,132 @@ onMounted(load)
       </div>
       <p v-if="updateMsg" class="hint" :class="{ bad: updateBad }">{{ updateMsg }}</p>
     </section>
+
+    <section class="panel">
+      <header class="panel-head">
+        <div>
+          <h2>服务配置</h2>
+          <p class="muted">监听地址、协议与证书。修改后<span class="tag warn">需重启</span>生效。</p>
+        </div>
+        <button type="button" class="btn" :disabled="savingService" @click="saveService">
+          {{ savingService ? '保存中…' : '保存' }}
+        </button>
+      </header>
+      <div class="form-grid">
+        <label class="field">
+          <span>监听地址</span>
+          <input v-model="service.listen_addr" type="text" placeholder=":8080 或 127.0.0.1:8080" />
+        </label>
+        <label class="field">
+          <span>协议</span>
+          <select v-model="service.scheme">
+            <option value="http">http</option>
+            <option value="https">https</option>
+          </select>
+        </label>
+        <label v-if="service.scheme === 'https'" class="field">
+          <span>证书文件</span>
+          <input v-model="service.cert_file" type="text" placeholder="/path/to/cert.pem" />
+        </label>
+        <label v-if="service.scheme === 'https'" class="field">
+          <span>私钥文件</span>
+          <input v-model="service.key_file" type="text" placeholder="/path/to/key.pem" />
+        </label>
+        <label class="field">
+          <span>Web 模式</span>
+          <select v-model="service.web_mode">
+            <option value="pull">pull（拉取托管前端）</option>
+            <option value="off">off（纯 API 模式）</option>
+          </select>
+        </label>
+      </div>
+      <p v-if="serviceMsg" class="hint" :class="{ bad: serviceBad }">{{ serviceMsg }}</p>
+    </section>
+
+    <section class="panel">
+      <header class="panel-head">
+        <div>
+          <h2>内嵌服务</h2>
+          <p class="muted">可选的内置服务。修改后<span class="tag warn">需重启</span>生效。</p>
+        </div>
+        <button type="button" class="btn" :disabled="savingEmbedded" @click="saveService">
+          {{ savingEmbedded ? '保存中…' : '保存' }}
+        </button>
+      </header>
+      <div class="form-grid">
+        <label class="field check">
+          <input v-model="service.embedded_enabled" type="checkbox" />
+          <span>启用内嵌服务</span>
+        </label>
+        <label class="field">
+          <span>服务名称</span>
+          <input v-model="service.embedded_name" type="text" :disabled="!service.embedded_enabled" />
+        </label>
+        <label class="field">
+          <span>监听地址</span>
+          <input v-model="service.embedded_address" type="text" :disabled="!service.embedded_enabled" />
+        </label>
+        <label class="field">
+          <span>端口</span>
+          <input v-model.number="service.embedded_port" type="number" min="0" max="65535" :disabled="!service.embedded_enabled" />
+        </label>
+      </div>
+    </section>
+
+    <section class="panel">
+      <header class="panel-head">
+        <div>
+          <h2>API Key</h2>
+          <p class="muted">管理访问密钥。明文只在创建时显示一次，请妥善保存。</p>
+        </div>
+        <button type="button" class="btn primary" @click="showKeyForm = !showKeyForm">
+          {{ showKeyForm ? '取消' : '新建 Key' }}
+        </button>
+      </header>
+      <div v-if="showKeyForm" class="form-grid key-form">
+        <label class="field">
+          <span>名称</span>
+          <input v-model="newKey.name" type="text" placeholder="留空自动生成" />
+        </label>
+        <label class="field">
+          <span>角色</span>
+          <select v-model="newKey.role">
+            <option value="admin">admin（完全控制）</option>
+            <option value="readonly">readonly（只读）</option>
+          </select>
+        </label>
+        <div class="field">
+          <span>&nbsp;</span>
+          <button type="button" class="btn primary" :disabled="creatingKey" @click="createKey">
+            {{ creatingKey ? '创建中…' : '创建' }}
+          </button>
+        </div>
+      </div>
+      <div v-if="createdKeyPlain" class="new-key">
+        <p class="hint good">创建成功，明文只显示一次：</p>
+        <code class="key-plain">{{ createdKeyPlain }}</code>
+        <button type="button" class="btn small" @click="copyKey">复制</button>
+      </div>
+      <ul v-if="keys.length" class="key-list">
+        <li v-for="k in keys" :key="k.id" class="key-item">
+          <div class="key-meta">
+            <strong>{{ k.name }}</strong>
+            <span class="tag" :class="k.role === 'admin' ? 'admin' : 'ro'">{{ k.role }}</span>
+            <span class="muted mono">{{ k.prefix }}…</span>
+          </div>
+          <div class="key-sub muted">{{ k.created_at }}</div>
+          <button
+            type="button"
+            class="btn danger small"
+            :disabled="k.id === currentKeyId"
+            :title="k.id === currentKeyId ? '当前使用的 Key 不能删除' : '撤销'"
+            @click="revokeKey(k)"
+          >撤销</button>
+        </li>
+      </ul>
+      <p v-else class="muted">暂无 Key。</p>
+      <p v-if="keyMsg" class="hint" :class="{ bad: keyBad }">{{ keyMsg }}</p>
+    </section>
   </div>
 </template>
 
@@ -435,4 +671,120 @@ onMounted(load)
   .url-row, .add-row { flex-direction: column; }
   .mirror-actions .icon-btn.sm { padding: 6px 10px; }
 }
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+}
+.field > span:first-child {
+  color: var(--muted);
+  font-size: 12px;
+}
+.field input[type="text"],
+.field input[type="number"],
+.field select {
+  background: var(--input-bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 9px 12px;
+  color: var(--text);
+  font-size: 13px;
+}
+.field input:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.field.check {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+.field.check input {
+  width: 16px;
+  height: 16px;
+}
+.tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.tag.warn {
+  background: rgba(245, 158, 11, 0.15);
+  color: #f59e0b;
+}
+.tag.admin {
+  background: rgba(239, 68, 68, 0.12);
+  color: #ef4444;
+}
+.tag.ro {
+  background: rgba(59, 130, 246, 0.12);
+  color: #3b82f6;
+}
+.mono { font-family: ui-monospace, monospace; font-size: 12px; }
+.key-form { margin-bottom: 12px; }
+.key-list {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.key-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 14px;
+}
+.key-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.key-sub {
+  font-size: 12px;
+  margin-top: 2px;
+}
+.new-key {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: rgba(34, 197, 94, 0.08);
+  border: 1px solid rgba(34, 197, 94, 0.3);
+  border-radius: 10px;
+  padding: 10px 14px;
+  margin-top: 12px;
+}
+.key-plain {
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+  background: var(--input-bg);
+  padding: 6px 10px;
+  border-radius: 6px;
+  word-break: break-all;
+}
+.btn.danger {
+  border-color: rgba(239, 68, 68, 0.4);
+  color: #ef4444;
+}
+.btn.danger:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.1);
+}
+.btn.small { padding: 5px 10px; font-size: 12px; }
+.hint.good { color: #22c55e; }
 </style>

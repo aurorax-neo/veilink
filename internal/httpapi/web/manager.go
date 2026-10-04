@@ -112,7 +112,7 @@ func (m *WebManager) SetPersist(fn func(mirrors []string, version string, fronte
 }
 
 // ApplyPersisted 用 DB 中持久化的值覆盖环境变量（master 启动时调用）
-func (m *WebManager) ApplyPersisted(mirrors []string, version string, frontendURL string) {
+func (m *WebManager) ApplyPersisted(mirrors []string, version string, frontendURL string, mode string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	// DB 有值才覆盖：环境变量优先于空 DB 值
@@ -124,6 +124,9 @@ func (m *WebManager) ApplyPersisted(mirrors []string, version string, frontendUR
 	}
 	if frontendURL != "" {
 		m.cfg.FrontendURL = frontendURL
+	}
+	if mode == string(WebModePull) || mode == string(WebModeOff) {
+		m.cfg.Mode = WebMode(mode)
 	}
 }
 

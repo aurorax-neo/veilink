@@ -18,6 +18,159 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// MasterConfigUpdate 设置页可更新的 master 配置字段
+type MasterConfigUpdate struct {
+	ListenAddr *string `json:"listen_addr"`
+	Scheme     *string `json:"scheme"`
+	CertFile   *string `json:"cert_file"`
+	KeyFile    *string `json:"key_file"`
+	WebMode    *string `json:"web_mode"`
+	// 内嵌服务
+	EmbeddedEnabled *bool   `json:"embedded_enabled"`
+	EmbeddedName    *string `json:"embedded_name"`
+	EmbeddedAddress *string `json:"embedded_address"`
+	EmbeddedPort    *int    `json:"embedded_port"`
+}
+
+// UpdateMasterConfig 更新 master_config 表中的通用配置（设置页运行时调用）
+// 返回需要重启才能生效的字段列表
+func UpdateMasterConfig(dbPath string, update MasterConfigUpdate) ([]string, error) {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if _, err = db.Exec(`PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS master_config(id INTEGER PRIMARY KEY CHECK(id=1), data BLOB NOT NULL)`); err != nil {
+		return nil, err
+	}
+	var data []byte
+	err = db.QueryRow("SELECT data FROM master_config WHERE id=1").Scan(&data)
+	if err != nil {
+		return nil, err
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil, err
+	}
+	var needRestart []string
+	set := func(key string, v any, restart bool) {
+		raw, _ := json.Marshal(v)
+		doc[key] = raw
+		if restart {
+			needRestart = append(needRestart, key)
+		}
+	}
+	if update.ListenAddr != nil {
+		set("ListenAddr", *update.ListenAddr, true)
+	}
+	if update.Scheme != nil {
+		scheme := *update.Scheme
+		if scheme != "http" && scheme != "https" {
+			return nil, errors.New("scheme must be http or https")
+		}
+		set("Scheme", scheme, true)
+	}
+	if update.CertFile != nil {
+		set("CertFile", *update.CertFile, true)
+	}
+	if update.KeyFile != nil {
+		set("KeyFile", *update.KeyFile, true)
+	}
+	if update.WebMode != nil {
+		mode := *update.WebMode
+		if mode != "pull" && mode != "off" {
+			return nil, errors.New("web_mode must be pull or off")
+		}
+		set("WebMode", mode, true)
+	}
+	if update.EmbeddedEnabled != nil || update.EmbeddedName != nil || update.EmbeddedAddress != nil || update.EmbeddedPort != nil {
+		// 读取现有内嵌配置
+		var embedded map[string]json.RawMessage
+		if raw, ok := doc["EmbeddedServer"]; ok {
+			_ = json.Unmarshal(raw, &embedded)
+		}
+		if embedded == nil {
+			embedded = map[string]json.RawMessage{}
+		}
+		setEmbedded := func(key string, v any) {
+			raw, _ := json.Marshal(v)
+			embedded[key] = raw
+		}
+		if update.EmbeddedEnabled != nil {
+			setEmbedded("Enabled", *update.EmbeddedEnabled)
+		}
+		if update.EmbeddedName != nil {
+			setEmbedded("EmbeddedName", *update.EmbeddedName)
+		}
+		if update.EmbeddedAddress != nil {
+			setEmbedded("Address", *update.EmbeddedAddress)
+		}
+		if update.EmbeddedPort != nil {
+			if *update.EmbeddedPort < 0 || *update.EmbeddedPort > 65535 {
+				return nil, errors.New("embedded port must be 0-65535")
+			}
+			setEmbedded("Port", *update.EmbeddedPort)
+		}
+		embeddedRaw, _ := json.Marshal(embedded)
+		doc["EmbeddedServer"] = embeddedRaw
+		needRestart = append(needRestart, "EmbeddedServer")
+	}
+	body, err := json.Marshal(doc)
+	if err != nil {
+		return nil, err
+	}
+	_, err = db.Exec("UPDATE master_config SET data=? WHERE id=1", body)
+	return needRestart, err
+}
+
+// MasterConfigView 设置页展示用的 master 配置（脱敏）
+type MasterConfigView struct {
+	ListenAddr      string `json:"listen_addr"`
+	Scheme          string `json:"scheme"`
+	CertFile        string `json:"cert_file"`
+	KeyFile         string `json:"key_file"`
+	WebMode         string `json:"web_mode"`
+	EmbeddedEnabled bool   `json:"embedded_enabled"`
+	EmbeddedName    string `json:"embedded_name"`
+	EmbeddedAddress string `json:"embedded_address"`
+	EmbeddedPort    int    `json:"embedded_port"`
+}
+
+// GetMasterConfigView 从 DB 读取设置页展示用的配置
+func GetMasterConfigView(dbPath string) (MasterConfigView, error) {
+	var view MasterConfigView
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return view, err
+	}
+	defer db.Close()
+	var data []byte
+	err = db.QueryRow("SELECT data FROM master_config WHERE id=1").Scan(&data)
+	if err != nil {
+		return view, err
+	}
+	var cfg Config
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	// 不用 DisallowUnknownFields，兼容未来字段
+	if err := decoder.Decode(&cfg); err != nil {
+		return view, err
+	}
+	view.ListenAddr = cfg.ListenAddr
+	view.Scheme = cfg.Scheme
+	view.CertFile = cfg.CertFile
+	view.KeyFile = cfg.KeyFile
+	view.WebMode = cfg.WebMode
+	if view.WebMode == "" {
+		view.WebMode = "pull"
+	}
+	view.EmbeddedEnabled = cfg.EmbeddedServer.Enabled
+	view.EmbeddedName = cfg.EmbeddedServer.Name
+	view.EmbeddedAddress = cfg.EmbeddedServer.Address
+	view.EmbeddedPort = cfg.EmbeddedServer.Port
+	return view, nil
+}
+
 // UpdateWebConfig 更新 master_config 表中的前端拉取配置（设置页运行时调用）
 func UpdateWebConfig(dbPath string, mirrors []string, version string, updateVersion bool, frontendURL *string) error {
 	db, err := sql.Open("sqlite", dbPath)

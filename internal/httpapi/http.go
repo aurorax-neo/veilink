@@ -28,6 +28,7 @@ type API struct {
 	streamHub  *backend.StreamHub
 	tokenStore *backend.StreamTokenStore
 	webCfg     web.WebConfig
+	webPersist WebPersistConfig
 }
 
 // WebPersistConfig 前端配置的 DB 持久化参数（master_config 表）
@@ -35,6 +36,7 @@ type WebPersistConfig struct {
 	Mirrors     []string
 	Version     string
 	FrontendURL string
+	Mode        string
 	DBPath      string
 }
 
@@ -64,7 +66,7 @@ func New(s *store.Store, insecureLoopback bool, ring *logring.Ring, webPersist W
 	webCfg := web.LoadConfigFromEnv()
 	wm := web.NewWebManager(webCfg)
 	// DB 持久化的配置覆盖环境变量（设置页/CLI 保存的值优先）
-	wm.ApplyPersisted(webPersist.Mirrors, webPersist.Version, webPersist.FrontendURL)
+	wm.ApplyPersisted(webPersist.Mirrors, webPersist.Version, webPersist.FrontendURL, webPersist.Mode)
 	// 设置页的保存写回 DB 的 master_config 表
 	if webPersist.DBPath != "" {
 		dbPath := webPersist.DBPath
@@ -85,6 +87,7 @@ func New(s *store.Store, insecureLoopback bool, ring *logring.Ring, webPersist W
 		streamHub:  backend.NewStreamHub(),
 		tokenStore: backend.NewStreamTokenStore(),
 		webCfg:     webCfg,
+		webPersist: webPersist,
 	}
 	return a
 }
@@ -328,6 +331,42 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = decode(w, r, &req)
 		output(w, 200, map[string]any{"results": a.webManager.Probe(req.Version)})
+		return
+	}
+
+	// 8d. master 通用配置（仅 admin）
+	if r.URL.Path == "/api/v1/master/config" {
+		if role != backend.RoleAdmin {
+			failure(w, 403)
+			return
+		}
+		if r.Method == "GET" {
+			view, err := config.GetMasterConfigView(a.webPersist.DBPath)
+			if err != nil {
+				failure(w, 500)
+				return
+			}
+			output(w, 200, view)
+			return
+		}
+		if r.Method == "POST" {
+			var req config.MasterConfigUpdate
+			if !decode(w, r, &req) {
+				return
+			}
+			needRestart, err := config.UpdateMasterConfig(a.webPersist.DBPath, req)
+			if err != nil {
+				output(w, 400, map[string]string{"error": err.Error()})
+				return
+			}
+			// WebMode 生效：实时更新 webManager
+			if req.WebMode != nil {
+				a.webManager.ApplyPersisted(nil, "", "", *req.WebMode)
+			}
+			output(w, 200, map[string]any{"ok": true, "need_restart": needRestart})
+			return
+		}
+		failure(w, 405)
 		return
 	}
 

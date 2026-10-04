@@ -53,6 +53,8 @@ type Config struct {
 	WebVersion string
 	// CPA 式自定义前端地址（设置后 / 重定向到该地址）
 	FrontendURL string
+	// Web 托管模式：pull（拉取）/ off（纯 API）
+	WebMode string
 
 	// explicit tracks visited CLI flags; defaults never overwrite stored settings.
 	explicit map[string]bool
@@ -103,6 +105,7 @@ func ParseFlagsOutput(role string, args []string, out io.Writer) (Config, error)
 		stringFlag("embedded-server-state-dir", "embedded_server.state_dir", &c.EmbeddedServer.StateDir)
 		stringFlag("web-version", "web_version", &c.WebVersion)
 		stringFlag("frontend-url", "frontend_url", &c.FrontendURL)
+		stringFlag("web-mode", "web_mode", &c.WebMode)
 		f.Var((*stringSlice)(&c.WebMirrors), "web-mirror", "加速镜像（可重复指定或逗号分隔）")
 		fields["web-mirror"] = "web_mirrors"
 	case "server", "client":
