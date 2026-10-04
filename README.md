@@ -52,6 +52,9 @@ Veilink 使用 Go 实现节点与隧道，Vue 3 提供管理界面。**一个 Do
 ### 快速启动（零配置）
 
 ```sh
+# 拉取统一镜像
+docker pull ghcr.io/aurorax-neo/veilink:latest
+
 # Docker 一行启动
 docker run -itd --restart unless-stopped --name veilink-master \
   -e TZ=Asia/Shanghai \
@@ -463,26 +466,26 @@ docker exec veilink-master /usr/local/bin/veilink master --help
 
 | 路径 | 内容 |
 | --- | --- |
-| `cmd/veilink`、`internal/cli`、`internal/config` | 统一命令入口与角色参数 |
-| `internal/master`、`internal/control`、`internal/node` | 管理服务、控制面与节点配置应用 |
-| `internal/store`、`internal/httpapi` | 配置持久化与 Web API |
-| `internal/tunnel` | 隧道、复用与数据传输 |
+| `backend/cmd/veilink`、`backend/internal/cli`、`backend/internal/config` | 统一命令入口与角色参数 |
+| `backend/internal/master`、`backend/internal/control`、`backend/internal/node` | 管理服务、控制面与节点配置应用 |
+| `backend/internal/store`、`backend/internal/httpapi` | 配置持久化与 Web API |
+| `backend/internal/tunnel` | 隧道、复用与数据传输 |
 | `frontend` | 唯一 Web 界面，Vue 3 + TypeScript + Vite |
-| `tests/integration`、`tests/deployment` | 集成与部署测试 |
-| `tests/web` | 历史 Web 验收记录和截图 |
+| `backend/tests/integration`、`backend/tests/deployment` | 集成与部署测试 |
+| `frontend/tests/acceptance` | 历史 Web 验收记录和截图 |
 | `tools` | 离线备份及节点验证工具 |
 
-Go 版本以 [go.mod](go.mod) 为准；前端发布构建使用 Node.js 22 和 npm 锁文件。前端 `npm run build` 输出到 `frontend/dist/`，通过 `web-v*` tag 独立发布；Master 在 `pull` 模式下自动拉取，仅 Master 加载。
+Go 版本以 [backend/go.mod](backend/go.mod) 为准；前端发布构建使用 Node.js 22 和 npm 锁文件。前端 `npm run build` 输出到 `frontend/dist/`，通过 `web-v*` tag 独立发布；Master 在 `pull` 模式下自动拉取，仅 Master 加载。
 
 ### 检查命令
 
 以下是维护者验收命令，不代表本次文档更新已执行这些检查：
 
 ```sh
-go test ./...
-go vet ./...
-go test -race ./internal/store ./internal/control ./internal/httpapi ./internal/master ./internal/node ./internal/tunnel ./tests/deployment
-go test -tags=integration ./tests/integration -count=1
+cd backend && go test ./...
+cd backend && go vet ./...
+cd backend && go test -race ./internal/store ./internal/control ./internal/httpapi ./internal/master ./internal/node ./internal/tunnel ./tests/deployment
+cd backend && go test -tags=integration ./tests/integration -count=1
 (
   cd frontend &&
   npm ci &&
@@ -497,12 +500,12 @@ git diff --check
 
 ### 能力与验证材料
 
-- [协议矩阵](tests/deployment/protocol-matrix.md)：组合、授权和往返覆盖范围。
-- [XHTTP 能力边界](tests/deployment/xhttp-capability-matrix.md)：字段、模式与限制。
-- [XHTTP 验证记录](tests/deployment/xhttp.md)：对应阶段的执行证据。
-- [统一镜像验收记录](tests/web/unified-image-acceptance.md)：历史镜像与三角色验证。
+- [协议矩阵](backend/tests/deployment/protocol-matrix.md)：组合、授权和往返覆盖范围。
+- [XHTTP 能力边界](backend/tests/deployment/xhttp-capability-matrix.md)：字段、模式与限制。
+- [XHTTP 验证记录](backend/tests/deployment/xhttp.md)：对应阶段的执行证据。
+- [统一镜像验收记录](frontend/tests/acceptance/unified-image-acceptance.md)：历史镜像与三角色验证。
 
-`tests/` 下的执行结果只对应记录中的版本和环境，不是当前版本的生产认证。真实多主机 WAN/NAT、24–72 小时长稳、生产 CA 生命周期和供应链签名仍需目标环境验收。开发约束集中在 [AGENTS.md](AGENTS.md)。
+`backend/tests/` 与 `frontend/tests/` 下的执行结果只对应记录中的版本和环境，不是当前版本的生产认证。真实多主机 WAN/NAT、24–72 小时长稳、生产 CA 生命周期和供应链签名仍需目标环境验收。开发约束集中在 [AGENTS.md](AGENTS.md)。
 
 ## 许可证与第三方组件
 

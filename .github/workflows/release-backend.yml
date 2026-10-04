@@ -32,13 +32,14 @@ jobs:
         with:
           go-version: '1.27'
       - name: Build
+        working-directory: backend
         run: |
           VERSION=${GITHUB_REF_NAME#v}
           EXT=""
           [ "${{ matrix.goos }}" = "windows" ] && EXT=".exe"
           CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
             go build -trimpath -ldflags="-s -w -X veilink/internal/buildinfo.Version=${VERSION} -X veilink/internal/buildinfo.Commit=${GITHUB_SHA::8}" \
-            -o veilink-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}${EXT} ./cmd/veilink
+            -o ../veilink-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}${EXT} ./cmd/veilink
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

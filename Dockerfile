@@ -4,16 +4,17 @@ ARG APK_MIRROR=https://mirrors.ustc.edu.cn/alpine
 
 # ============ 后端构建 ============
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine3.23 AS build-backend
-WORKDIR /src
+WORKDIR /src/backend
 ARG GOPROXY
 ENV GOPROXY=${GOPROXY}
-COPY go.mod go.sum ./
+COPY backend/go.mod backend/go.sum ./
 RUN go mod download
-COPY . .
+COPY backend/ ./
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
 ARG COMMIT=unknown
+ARG SOURCE_URL=unknown
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w -X veilink/internal/buildinfo.Version=${VERSION} -X veilink/internal/buildinfo.Commit=${COMMIT}" -o /out/veilink ./cmd/veilink
 
 # ============ 前端构建 ============
@@ -31,6 +32,7 @@ FROM alpine:3.23 AS backend
 ARG APK_MIRROR
 ARG VERSION=dev
 ARG COMMIT=unknown
+ARG SOURCE_URL=unknown
 RUN printf '%s/v3.23/main\n%s/v3.23/community\n' "$APK_MIRROR" "$APK_MIRROR" > /etc/apk/repositories \
  && apk add --no-cache ca-certificates tzdata sqlite su-exec \
  && mkdir -p /data/web \
@@ -38,9 +40,10 @@ RUN printf '%s/v3.23/main\n%s/v3.23/community\n' "$APK_MIRROR" "$APK_MIRROR" > /
  && chown -R veilink:veilink /data
 LABEL org.opencontainers.image.title="veilink-backend" \
       org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.revision="${COMMIT}"
-COPY --from=build-backend /out/veilink /usr/local/bin/veilink
+      org.opencontainers.image.revision="${COMMIT}" \
+      org.opencontainers.image.source="${SOURCE_URL}"
 COPY docker-entrypoint.sh docker-healthcheck.sh /usr/local/bin/
+COPY --from=build-backend /out/veilink /usr/local/bin/veilink
 RUN chmod 755 /usr/local/bin/docker-entrypoint.sh /usr/local/bin/docker-healthcheck.sh
 WORKDIR /data
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
@@ -48,7 +51,6 @@ CMD ["master"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
   CMD ["/usr/local/bin/docker-healthcheck.sh"]
 
-# ============ 前端镜像（nginx 托管静态资源） ============
 FROM nginx:alpine AS web
 ARG VERSION=dev
 COPY --from=build-web /src/frontend/dist /usr/share/nginx/html
@@ -61,10 +63,11 @@ EXPOSE 80
 FROM backend AS unified
 ARG VERSION=dev
 ARG COMMIT=unknown
+ARG SOURCE_URL=unknown
 LABEL org.opencontainers.image.title="veilink" \
       org.opencontainers.image.description="Veilink master/server/client with pre-bundled web UI" \
       org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.revision="${COMMIT}"
+      org.opencontainers.image.revision="${COMMIT}" \
+      org.opencontainers.image.source="${SOURCE_URL}"
 COPY --from=build-web /src/frontend/dist /opt/veilink-web/
-# 预置前端：WebManager 优先使用本地版本，无需下载
 ENV WEB_PREBUNDLED_DIR=/opt/veilink-web
