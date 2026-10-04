@@ -345,6 +345,9 @@ func DeriveClientTunnel(serverTunnel LocalTLS, serverNode Node) LocalTLS {
 			res.Reality.Fingerprint = "chrome"
 		}
 		res.Reality.MaxTimeDiff = r.MaxTimeDiff
+		res.Reality.SpiderX = r.SpiderX
+		res.Reality.SpiderY = r.SpiderY
+		res.Reality.Mldsa65Verify = r.Mldsa65Verify
 	}
 	// Trust is explicit: never promote the server's leaf certificate to a CA.
 	return res
