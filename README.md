@@ -12,7 +12,7 @@ Veilink 使用 Go 实现节点与隧道，Vue 3 提供管理界面。**一个 Do
 - [部署准备](#部署准备)
 - [启动 Master](#启动-master)
 - [配置管理入口](#配置管理入口)
-- [首次注册与配置映射](#首次注册与配置映射)
+- [首次配置与映射](#首次配置与映射)
 - [接入独立 Server](#接入独立-server)
 - [接入 Client](#接入-client)
 - [协议与配置参考](#协议与配置参考)
@@ -99,34 +99,29 @@ irm https://get.veilink.dev/install.ps1 | iex
 | `8444` | 内置 Server 首次默认隧道监听 | 按传输放行 TCP 或 UDP |
 | Web 中设置的映射端口 | 业务访问入口 | 实际业务访问来源 |
 
-首次注册前必须限制管理入口来源。HTTPS 加密不能防止管理员被抢注。
+首次启动前建议限制管理入口来源。API Key 仅在首次启动日志中显示一次，请妥善保存。
 
 ## 启动 Master
 
-### 1. 准备目录
-
-```sh
-mkdir -p /opt/docker/veilink-master/config /opt/docker/veilink-master/data
-chown 65532:65532 /opt/docker/veilink-master/config /opt/docker/veilink-master/data
-chmod 700 /opt/docker/veilink-master/config /opt/docker/veilink-master/data
-```
-
-### 2. 启动容器
-
-默认 HTTP 不需要证书：
+### 1. 启动容器（零配置）
 
 ```sh
 docker run -itd \
-  --name veilink-master --restart unless-stopped --net host \
+  --name veilink --restart unless-stopped --net host \
   -e TZ=Asia/Shanghai \
-  -v /opt/docker/veilink-master/config:/config:ro \
-  -v /opt/docker/veilink-master/data:/data \
-  ghcr.io/aurorax-neo/veilink:latest master \
-  -database /data/veilink.db -deployment-key /data/veilink.key \
-  -state-dir /data/state -listen-addr 127.0.0.1:2545 \
-  -scheme http -html-dir /usr/local/html \
-  -embedded-server-enabled=true
+  -v veilink-data:/data \
+  ghcr.io/aurorax-neo/veilink:latest master
 ```
+
+entrypoint 自动处理 `/data` 权限，无需手动 `mkdir`/`chown`。如需绑定宿主机目录，直接 `-v` 挂载即可。
+
+### 2. 获取 API Key
+
+```sh
+docker logs veilink 2>&1 | grep "API Key"
+```
+
+在浏览器打开 `http://服务器IP:2545`，输入 Key 进入控制台。
 
 镜像名后必须先写 `master`，再写 flags。内置 Server 首次默认显示名为 `default`，端口为 `8444`；已有稳定身份和自定义名称保持不变。无需内置节点时，将 `-embedded-server-enabled` 改为 `false`。
 
@@ -144,7 +139,7 @@ curl -fsS http://127.0.0.1:2545/healthz
 
 ## 配置管理入口
 
-选择一种方式即可，不要求首次注册必须使用 HTTPS。
+选择一种方式即可。
 
 ### 方式一：nginx 终止 HTTPS
 
@@ -193,7 +188,7 @@ server {
 
 ```sh
 nginx -t && nginx -s reload
-curl -fsS https://panel.example.com:8843/api/setup
+curl -fsS https://panel.example.com:8843/api/version
 openssl s_client -connect panel.example.com:8843 \
   -servername panel.example.com -alpn h2 </dev/null 2>&1 \
   | grep -i 'ALPN protocol'
@@ -229,9 +224,9 @@ openssl s_client -connect panel.example.com:8843 \
 
 证书由实际终止 TLS 的组件管理。nginx 证书续期后先检查新证书，再执行 `nginx -t && nginx -s reload`。
 
-## 首次注册与配置映射
+## 首次配置与映射
 
-1. **注册管理员**：从可信或已限制来源的入口打开 Web。Master 不自动创建账号；`GET /api/setup` 返回是否需要注册，`POST /api/register` 仅允许无管理员时原子创建唯一账号。
+1. **获取 API Key**：首次启动 Master 时自动生成管理员 API Key，日志中显示一次（`docker logs veilink 2>&1 | grep "API Key"`）。在 Web 登录页输入该 Key 即可进入控制台。
 2. **配置 Server**：使用内置 `default` 或创建独立 Server。在 Web 保存隧道、连接入口和本地监听配置；客户端模板由 Server 配置自动派生。
 3. **创建 Client**：获取节点 ID 和接入令牌，按下文或 Web「快捷接入」生成的命令启动。生成命令和手工命令二选一。
 4. **创建映射**：选择 Server、Client、TCP/UDP、Server 监听地址与端口、Client 可达的目标地址与端口，以及 Pool（`1–32`）。没有独立的公开绑定管理。
@@ -239,6 +234,21 @@ openssl s_client -connect panel.example.com:8843 \
 6. **验证业务**：等待节点应用配置，从 Server 映射监听地址发起符合目标协议的实际请求。
 
 例如，Client 能访问 `192.168.10.20:8080` 的 HTTP 服务时，可建立 TCP 映射到 Server 的空闲业务端口。验证该映射应发送 HTTP 请求，而不是只确认 TCP 握手成功。目标必须从 Client 容器网络可达；容器内的 `127.0.0.1` 不是宿主机。
+
+### API Key 管理
+
+```sh
+# 查看现有 Key（仅显示前缀，不显示明文）
+docker exec veilink /usr/local/bin/veilink keys list
+
+# 创建新 Key（明文仅显示一次）
+docker exec veilink /usr/local/bin/veilink keys create my-key
+
+# 吊销 Key
+docker exec veilink /usr/local/bin/veilink keys revoke <id>
+```
+
+旧版用户名密码用户升级：首次启动检测到旧 `admin` 表数据时自动生成 API Key 并在日志中提示，旧账号即刻失效。
 
 ### 如何理解状态
 
@@ -398,23 +408,20 @@ tools/backup-master.sh restore master \
 
 先在隔离环境验证登录、节点身份、上报和业务探针，再切换正式挂载。保留原数据副本，禁止旧、新 Master 同时提供写服务。旧 schema 不自动迁移或删库，任何数据删除都须先备份并得到明确授权。
 
-### 管理员维护
-
-仅修改已有唯一管理员，不创建数据库、key 或用户；成功后旧会话即时失效。
-
-改名只改用户名，密码 hash 不变，同名请求会被拒绝：
+### API Key 维护
 
 ```sh
-docker exec -i veilink-master /usr/local/bin/veilink reset-admin-username -username new-admin
+# 列出所有 Key（仅显示前缀）
+docker exec veilink /usr/local/bin/veilink keys list
+
+# 创建新 Key（明文仅显示一次，请保存）
+docker exec veilink /usr/local/bin/veilink keys create my-key
+
+# 吊销 Key（最后一个 admin Key 受保护，不可删除）
+docker exec veilink /usr/local/bin/veilink keys revoke <id>
 ```
 
-改密保留用户名。先用安全方式准备权限 `0600`、包含 12–72 字节新密码的文件，再从 stdin 读取；不要在 shell 命令中直接写密码：
-
-```sh
-docker exec -i veilink-master /usr/local/bin/veilink reset-admin-password -password-stdin < /opt/docker/veilink-master/config/admin-password.txt
-```
-
-使用自定义数据库或 key 路径时，两种命令均需补充对应的 `-database`、`-deployment-key`。改名命令拒绝密码 flags；改密命令拒绝 `-username`。密码更新并验证登录后，妥善清理临时密码文件。无管理员时只能通过受限 Web 首次注册。
+使用自定义数据库路径时补充 `-database`、`-deployment-key` 参数。Key 吊销即时生效。
 
 ### 升级与回滚
 
@@ -469,7 +476,7 @@ docker exec veilink-master /usr/local/bin/veilink master --help
 | `tests/web` | 历史 Web 验收记录和截图 |
 | `tools` | 离线备份及节点验证工具 |
 
-Go 版本以 [go.mod](go.mod) 为准，当前为 `1.27.0`；前端发布构建使用 Node.js 22 和 npm 锁文件。前端 `npm run build` 输出到仓库根目录 `html/`，统一镜像将其放入 `/usr/local/html`，仅 Master 加载。
+Go 版本以 [go.mod](go.mod) 为准；前端发布构建使用 Node.js 22 和 npm 锁文件。前端 `npm run build` 输出到 `frontend/dist/`，通过 `web-v*` tag 独立发布；Master 在 `pull` 模式下自动拉取，仅 Master 加载。
 
 ### 检查命令
 
