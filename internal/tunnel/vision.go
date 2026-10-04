@@ -77,6 +77,8 @@ type visionConn struct {
 	padding bool
 	sentID  bool
 	filter  int
+	// firstBlock tracks whether we've sent the first block (xray: only first block uses long padding)
+	firstBlock bool
 
 	readMu        sync.Mutex
 	raw           []byte
@@ -95,7 +97,7 @@ type visionConn struct {
 func newVision(conn net.Conn, id [16]byte) *visionConn {
 	return &visionConn{
 		Conn: conn, uuid: append([]byte{}, id[:]...), padding: true, filter: 8,
-		remCmd: -1, remContent: -1, remPad: -1,
+		remCmd: -1, remContent: -1, remPad: -1, firstBlock: true,
 	}
 }
 
@@ -182,7 +184,9 @@ func (c *visionConn) Write(p []byte) (int, error) {
 }
 
 func (c *visionConn) writeBlock(content []byte, command byte) error {
-	padding := visionPadding(len(content))
+	// 对齐 xray：首块用长 padding，之后只用短 padding
+	padding := visionPadding(len(content), c.firstBlock)
+	c.firstBlock = false
 	var buf bytes.Buffer
 	if !c.sentID {
 		buf.Write(c.uuid)
@@ -198,9 +202,9 @@ func (c *visionConn) writeBlock(content []byte, command byte) error {
 	return writeAll(c.Conn, buf.Bytes())
 }
 
-func visionPadding(content int) int {
+func visionPadding(content int, longPadding bool) int {
 	var padding int
-	if content < 900 {
+	if content < 900 && longPadding {
 		padding = int(randBetween(0, 500)) + 900 - content
 	} else {
 		padding = int(randBetween(0, 256))

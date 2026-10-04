@@ -192,6 +192,12 @@ type Reality struct {
 	ServerNames string `json:"server_names"`
 	Fingerprint string `json:"fingerprint"`
 	MaxTimeDiff string `json:"max_time_diff"`
+	SpiderX     string `json:"spider_x,omitempty"`
+	SpiderY     string `json:"spider_y,omitempty"`
+	// ML-DSA-65 后量子证书额外验证公钥（base64，可选，对齐 Xray-core）
+	Mldsa65Verify string `json:"mldsa65_verify,omitempty"`
+	// ML-DSA-65 后量子种子（服务端签名用，base64，可选，对齐 Xray-core）
+	Mldsa65Seed string `json:"mldsa65_seed,omitempty"`
 }
 
 // Enabled reports whether any REALITY setting is present.
@@ -341,6 +347,9 @@ func DeriveClientTunnel(serverTunnel LocalTLS, serverNode Node) LocalTLS {
 			res.Reality.Fingerprint = "chrome"
 		}
 		res.Reality.MaxTimeDiff = r.MaxTimeDiff
+		res.Reality.SpiderX = r.SpiderX
+		res.Reality.SpiderY = r.SpiderY
+		res.Reality.Mldsa65Verify = r.Mldsa65Verify
 	}
 	// Trust is explicit: never promote the server's leaf certificate to a CA.
 	return res

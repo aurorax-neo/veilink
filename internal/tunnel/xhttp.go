@@ -49,14 +49,23 @@ func xhttpClientALPN(version string) []string {
 	return []string{"h2", "http/1.1"}
 }
 
-// Auto follows the reference's packet-up choice when REALITY is absent.
-// REALITY auto is rejected before runtime because its stream-one choice is
-// incompatible with the authenticated TLS streaming origin in this transport.
-func xhttpEffectiveMode(x model.XHTTP) string {
-	if x.Mode == "auto" {
-		return "packet-up"
+// xhttpEffectiveMode 对齐 Xray-core dialer.go:332-341 的 auto 协商逻辑：
+// auto/空 + 无 REALITY → packet-up
+// auto/空 + REALITY（无 downloadSettings）→ stream-one
+// auto/空 + REALITY（有 downloadSettings）→ stream-up
+// 纯客户端本地决定，无需服务端握手。
+func xhttpEffectiveMode(x model.XHTTP, realityEnabled bool) string {
+	mode := x.Mode
+	if mode == "" || mode == "auto" {
+		mode = "packet-up"
+		if realityEnabled {
+			mode = "stream-one"
+			if x.DownloadEndpointID != "" {
+				mode = "stream-up"
+			}
+		}
 	}
-	return x.Mode
+	return mode
 }
 
 func xhttpUplinkMethod(x model.XHTTP) string {
@@ -718,7 +727,7 @@ func (s *service) serveXHTTP(ln net.Listener) {
 		}
 		s.authenticate(c)
 	})
-	h.mode = xhttpEffectiveMode(s.local.XHTTP)
+	h.mode = xhttpEffectiveMode(s.local.XHTTP, s.local.Reality.Enabled())
 	h.settings = s.local.XHTTP
 	h.host = s.local.XHTTP.Host
 	h.headers, _ = s.local.XHTTP.Headers.Entries()
@@ -812,16 +821,16 @@ func dialXHTTPWithDownDialer(ctx context.Context, addr, serverName string, local
 	if err != nil {
 		return nil, err
 	}
-	if err := checkXHTTPMeta(local.XHTTP, xhttpEffectiveMode(local.XHTTP)); err != nil {
+	if err := checkXHTTPMeta(local.XHTTP, xhttpEffectiveMode(local.XHTTP, local.Reality.Enabled())); err != nil {
 		return nil, err
 	}
 	if err := checkXHTTPPadding(local.XHTTP); err != nil {
 		return nil, err
 	}
-	if err := checkXHTTPBuffer(local.XHTTP, xhttpEffectiveMode(local.XHTTP)); err != nil {
+	if err := checkXHTTPBuffer(local.XHTTP, xhttpEffectiveMode(local.XHTTP, local.Reality.Enabled())); err != nil {
 		return nil, err
 	}
-	if err := checkXHTTPData(local.XHTTP, xhttpEffectiveMode(local.XHTTP)); err != nil {
+	if err := checkXHTTPData(local.XHTTP, xhttpEffectiveMode(local.XHTTP, local.Reality.Enabled())); err != nil {
 		return nil, err
 	}
 	if err := checkXHTTPMux(local.XHTTP); err != nil {
@@ -911,7 +920,7 @@ func dialXHTTPWithDownDialer(ctx context.Context, addr, serverName string, local
 	if local.XHTTP.TLS {
 		downBase = "https://" + downAddrActual
 	}
-	if xhttpEffectiveMode(local.XHTTP) == "stream-one" || xhttpEffectiveMode(local.XHTTP) == "stream-up" {
+	if xhttpEffectiveMode(local.XHTTP, local.Reality.Enabled()) == "stream-one" || xhttpEffectiveMode(local.XHTTP, local.Reality.Enabled()) == "stream-up" {
 		return dialXHTTPStream(ctx, client, tr, base+local.XHTTP.Path, local.XHTTP, headers, cancel)
 	}
 	url := xhttpMetaPath(downBase+local.XHTTP.Path, local.XHTTP, id, "")

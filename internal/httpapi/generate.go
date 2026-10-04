@@ -55,6 +55,10 @@ func generate(w http.ResponseWriter, r *http.Request) {
 		var shortID string
 		shortID, err = generateShortID()
 		result = map[string]string{"short_id": shortID}
+	case "mldsa65":
+		var private, public string
+		private, public, err = tunnel.GenerateMldsa65()
+		result = map[string]string{"private_key": private, "public_key": public}
 	case "vless":
 		if in.Mode == "" {
 			in.Mode = "native"

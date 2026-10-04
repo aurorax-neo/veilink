@@ -332,7 +332,7 @@ docker run -itd \
 | 传输 | 安全要求与边界 |
 | --- | --- |
 | VLESS TCP + TLS | 校验证书及名称；可选 Encryption、Vision |
-| VLESS TCP + REALITY | 公私钥、Short ID、Server Name 匹配；可选 Encryption、Vision |
+| VLESS TCP + REALITY | 公私钥、Short ID、Server Name 匹配；可选 Encryption、Vision、ML-DSA-65 后量子验证、SpiderX/Y 伪装 |
 | VLESS TCP + plain | 必须启用 Encryption；禁止 Vision |
 | Hysteria2 | 独立 UDP/QUIC + TLS；需要证书、私钥和密码；不叠加 VLESS Encryption、REALITY、XHTTP、Vision |
 | XHTTP | Veilink 双端业务通道；HTTP 版本与模式须符合下表和能力矩阵 |
@@ -348,7 +348,7 @@ Vision 只用于 TCP + TLS/REALITY。只有独立已认证连接上的内层 TLS
 | `packet-up`（默认） | 分片上行，GET 流式下行 |
 | `stream-up` | 同会话流式上行与 GET 下行 |
 | `stream-one` | 单条双向请求，不使用会话 ID |
-| `auto` | 当前在非 REALITY 和 REALITY 下均选择 `packet-up`，不是完整参考实现的自动协商 |
+| `auto` | 自动协商（对齐 Xray-core）：无 REALITY 时选 `packet-up`；有 REALITY 时选 `stream-one`；有 REALITY 且配置下载端点时选 `stream-up` |
 
 - 显式 HTTP/1.1 仅支持 `packet-up`。HTTP/2、HTTP/3 流模式仅支持直连 HTTPS 与 TLS 回源。
 - h2c 仅限直连 HTTP、plain 回源且启用 VLESS Encryption 的 `packet-up`；显式版本不降级。普通 HTTP 链路或回源段必须启用 Encryption；REALITY 外层保护的 XHTTP 按独立安全组合校验。

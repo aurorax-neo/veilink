@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -17,14 +18,21 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"math/big"
 	"net"
+	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
 	"github.com/xtls/reality"
+	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	"golang.org/x/crypto/hkdf"
+	"golang.org/x/net/http2"
 
 	"veilink/internal/model"
 )
@@ -306,10 +314,22 @@ func newRealityConfig(r model.Reality, fallback string) (*reality.Config, error)
 	if err != nil {
 		return nil, err
 	}
+	// ML-DSA-65 后量子签名密钥（服务端）
+	var mldsa65Key []byte
+	if r.Mldsa65Seed != "" {
+		mldsa65Key, err = base64.RawURLEncoding.DecodeString(r.Mldsa65Seed)
+		if err != nil {
+			mldsa65Key, err = base64.StdEncoding.DecodeString(r.Mldsa65Seed)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
 	cfg := &reality.Config{
 		DialContext:            (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
 		Type:                   "tcp",
 		Dest:                   strings.TrimSpace(r.Dest),
+		Mldsa65Key:             mldsa65Key,
 		PrivateKey:             priv,
 		ServerNames:            map[string]bool{},
 		ShortIds:               map[[8]byte]bool{},
@@ -356,13 +376,20 @@ func dialReality(ctx context.Context, addr, serverName string, r model.Reality) 
 	gate := &recordBoundaryConn{Conn: raw}
 	verified := false
 	var authKey []byte
-	uconn := utls.UClient(gate, &utls.Config{
+	var uconn *utls.UConn
+	uconn = utls.UClient(gate, &utls.Config{
 		ServerName:             serverName,
 		InsecureSkipVerify:     true,
 		SessionTicketsDisabled: true,
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			if !realityCertificate(authKey, rawCerts) {
 				return errors.New("REALITY certificate authentication failed")
+			}
+			// 对齐 Xray-core：如配置了 mldsa65_verify，做后量子额外验证
+			if r.Mldsa65Verify != "" {
+				if !realityMldsa65Verify(authKey, rawCerts, r.Mldsa65Verify, uconn) {
+					return errors.New("REALITY ML-DSA-65 verification failed")
+				}
 			}
 			verified = true
 			return nil
@@ -399,7 +426,8 @@ func dialReality(ctx context.Context, addr, serverName string, r model.Reality) 
 		return nil, err
 	}
 	if !verified {
-		_ = uconn.Close()
+		// 对齐 Xray-core：验证失败时伪装成正常浏览器爬目标站（反探测），而非直接断开
+		camouflageBrowse(uconn, serverName, r.SpiderX, r.SpiderY)
 		return nil, errors.New("REALITY certificate was not authenticated")
 	}
 	return ownTLS(uconn, gate), nil
@@ -435,6 +463,7 @@ func sealSessionID(authKey []byte, hello *utls.PubClientHelloMsg, shortID [8]byt
 	// in SessionId and the AAD must be this raw hello with those bytes zeroed.
 	hello.SessionId = make([]byte, 32)
 	copy(hello.Raw[39:], hello.SessionId)
+	// SessionId[0:4] 留零：服务端不验证版本号，无需伪装
 	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(time.Now().Unix()))
 	copy(hello.SessionId[8:], shortID[:])
 	sealed := aead.Seal(hello.SessionId[:0], hello.Random[20:], hello.SessionId[:16], hello.Raw)
@@ -461,6 +490,205 @@ func realityCertificate(authKey []byte, rawCerts [][]byte) bool {
 	mac := hmac.New(sha512.New, authKey)
 	_, _ = mac.Write(pub)
 	return hmac.Equal(mac.Sum(nil), cert.Signature)
+}
+
+// realityMldsa65Verify 对齐 Xray-core 的 ML-DSA-65 后量子额外验证
+func realityMldsa65Verify(authKey []byte, rawCerts [][]byte, mldsa65VerifyB64 string, uconn *utls.UConn) bool {
+	if len(rawCerts) == 0 || mldsa65VerifyB64 == "" || uconn == nil {
+		return false
+	}
+	cert, err := x509.ParseCertificate(rawCerts[0])
+	if err != nil {
+		return false
+	}
+	pub, ok := cert.PublicKey.(ed25519.PublicKey)
+	if !ok {
+		return false
+	}
+	if len(cert.Extensions) == 0 {
+		return false
+	}
+	// 解码 ML-DSA-65 公钥
+	pubKeyBytes, err := base64.RawURLEncoding.DecodeString(mldsa65VerifyB64)
+	if err != nil {
+		// 尝试标准 base64
+		pubKeyBytes, err = base64.StdEncoding.DecodeString(mldsa65VerifyB64)
+		if err != nil {
+			return false
+		}
+	}
+	verifyKey, err := mldsa65.Scheme().UnmarshalBinaryPublicKey(pubKeyBytes)
+	if err != nil {
+		return false
+	}
+	// 构造待验证消息：HMAC(pub) + Hello.Raw + ServerHello.Raw
+	mac := hmac.New(sha512.New, authKey)
+	_, _ = mac.Write(pub)
+	h := mac.Sum(nil)
+	state := uconn.HandshakeState
+	if state.Hello == nil || state.ServerHello == nil {
+		return false
+	}
+	h = append(h, state.Hello.Raw...)
+	h = append(h, state.ServerHello.Raw...)
+	// 验证证书第一个扩展中的签名
+	return mldsa65.Verify(verifyKey.(*mldsa65.PublicKey), h, nil, cert.Extensions[0].Value)
+}
+
+// spiderPathCache 缓存每个目标站点的已发现路径（对齐 Xray-core maps）
+var spiderPathCache struct {
+	sync.Mutex
+	maps map[string]map[string]struct{}
+}
+
+var spiderHrefRe = regexp.MustCompile(`href="([/h].*?)"`)
+var spiderDot = []byte(".")
+
+func spiderGetPathLocked(paths map[string]struct{}) string {
+	if len(paths) == 0 {
+		return "/"
+	}
+	n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(paths))))
+	stopAt := int(n.Int64())
+	i := 0
+	for s := range paths {
+		if i == stopAt {
+			return s
+		}
+		i++
+	}
+	return "/"
+}
+
+func spiderRandBetween(min, max int64) int64 {
+	if max <= min {
+		return min
+	}
+	n, _ := rand.Int(rand.Reader, big.NewInt(max-min+1))
+	return min + n.Int64()
+}
+
+// parseSpiderY 解析 spider_y 配置（10 个整数），缺省用 Xray-core 常用值
+func parseSpiderY(s string) [10]int64 {
+	// 默认值：padding 32-64，并发 1-2，每路径请求 1-3，间隔 0-100ms，返回前等待 0-50ms
+	def := [10]int64{32, 64, 1, 2, 1, 3, 0, 100, 0, 50}
+	if strings.TrimSpace(s) == "" {
+		return def
+	}
+	parts := strings.Split(s, ",")
+	for i := 0; i < 10 && i < len(parts); i++ {
+		if v, err := strconv.ParseInt(strings.TrimSpace(parts[i]), 10, 64); err == nil {
+			def[i] = v
+		}
+	}
+	return def
+}
+
+// camouflageBrowse 对齐 Xray-core：证书验证失败时，像正常浏览器一样爬目标站
+// （反探测设计，缺失后失败连接模式更易被区分）
+// generateSpiderX 生成随机的伪装爬取起点路径（避免所有用户都用 "/" 形成指纹）
+func generateSpiderX() (string, error) {
+	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	for i := range b {
+		b[i] = chars[int(b[i])%len(chars)]
+	}
+	return "/" + string(b), nil
+}
+
+func camouflageBrowse(conn net.Conn, serverName, spiderX, spiderY string) {
+	spiderYVals := parseSpiderY(spiderY)
+	if spiderX == "" {
+		// 不固定用 "/"，随机生成避免指纹
+		var err error
+		spiderX, err = generateSpiderX()
+		if err != nil {
+			spiderX = "/"
+		}
+	}
+	go func() {
+		client := &http.Client{
+			Transport: &http2.Transport{
+				DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+					return conn, nil
+				},
+			},
+		}
+		prefix := []byte("https://" + serverName)
+		spiderPathCache.Lock()
+		if spiderPathCache.maps == nil {
+			spiderPathCache.maps = make(map[string]map[string]struct{})
+		}
+		paths := spiderPathCache.maps[serverName]
+		if paths == nil {
+			paths = make(map[string]struct{})
+			paths[spiderX] = struct{}{}
+			spiderPathCache.maps[serverName] = paths
+		}
+		firstURL := string(prefix) + spiderGetPathLocked(paths)
+		spiderPathCache.Unlock()
+		get := func(first bool) {
+			var req *http.Request
+			if first {
+				req, _ = http.NewRequest("GET", firstURL, nil)
+			} else {
+				spiderPathCache.Lock()
+				req, _ = http.NewRequest("GET", string(prefix)+spiderGetPathLocked(paths), nil)
+				spiderPathCache.Unlock()
+			}
+			if req == nil {
+				return
+			}
+			// 模拟浏览器默认头
+			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+			req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+			req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+			times := 1
+			if !first {
+				times = int(spiderRandBetween(spiderYVals[4], spiderYVals[5]))
+			}
+			for j := 0; j < times; j++ {
+				if !first && j == 0 {
+					req.Header.Set("Referer", firstURL)
+				}
+				req.AddCookie(&http.Cookie{Name: "padding", Value: strings.Repeat("0", int(spiderRandBetween(spiderYVals[0], spiderYVals[1])))})
+				resp, err := client.Do(req)
+				if err != nil {
+					break
+				}
+				func() {
+					defer resp.Body.Close()
+					req.Header.Set("Referer", req.URL.String())
+					body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+					if err != nil {
+						return
+					}
+					spiderPathCache.Lock()
+					for _, m := range spiderHrefRe.FindAllSubmatch(body, -1) {
+						m[1] = bytes.TrimPrefix(m[1], prefix)
+						if !bytes.Contains(m[1], spiderDot) {
+							paths[string(m[1])] = struct{}{}
+						}
+					}
+					req.URL.Path = spiderGetPathLocked(paths)
+					spiderPathCache.Unlock()
+				}()
+				if !first {
+					time.Sleep(time.Duration(spiderRandBetween(spiderYVals[6], spiderYVals[7])) * time.Millisecond)
+				}
+			}
+		}
+		get(true)
+		concurrency := int(spiderRandBetween(spiderYVals[2], spiderYVals[3]))
+		for i := 0; i < concurrency; i++ {
+			go get(false)
+		}
+		// 不关闭连接，留给对端
+	}()
+	time.Sleep(time.Duration(spiderRandBetween(spiderYVals[8], spiderYVals[9])) * time.Millisecond)
 }
 
 func decodeKey(s string) ([]byte, error) {
@@ -585,4 +813,21 @@ func GenerateX25519() (string, string, error) {
 		return "", "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(key.Bytes()), base64.RawURLEncoding.EncodeToString(key.PublicKey().Bytes()), nil
+}
+
+// GenerateMldsa65 生成 ML-DSA-65 后量子密钥对（对齐 Xray-core）
+func GenerateMldsa65() (string, string, error) {
+	pub, priv, err := mldsa65.GenerateKey(rand.Reader)
+	if err != nil {
+		return "", "", err
+	}
+	pubBytes, err := pub.MarshalBinary()
+	if err != nil {
+		return "", "", err
+	}
+	privBytes, err := priv.MarshalBinary()
+	if err != nil {
+		return "", "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(privBytes), base64.RawURLEncoding.EncodeToString(pubBytes), nil
 }

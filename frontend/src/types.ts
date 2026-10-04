@@ -7,6 +7,10 @@ export interface RealityConfig {
   server_names?: string
   fingerprint?: string
   max_time_diff?: string
+  spider_x?: string
+  spider_y?: string
+  mldsa65_verify?: string
+  mldsa65_seed?: string
 }
 
 export interface Hysteria2Config {

@@ -9,7 +9,7 @@ import SecretField from './SecretField.vue'
 const props = defineProps<{ role: 'server' | 'client'; saved: () => Promise<void>; defaultName?: string }>()
 const modal = ref<InstanceType<typeof Modal> | null>(null)
 const server = computed(() => props.role === 'server')
-const draft = reactive({ id: '', name: '', address: '', port: '443', listenPort: '443', protocol: 'vless' as 'vless' | 'hysteria2', transport: 'tcp' as 'tcp' | 'xhttp' | 'quic' | 'hysteria2', security: 'tls', flow: '', enc: '', cert: '', key: '', ca: '', listen: '', dest: '', privateKey: '', shortIDs: '', names: '', password: '', xhttpPath: '/veilink/', xhttpDownloadEndpoint: '', xhttpHost: '', xhttpHeaders: '', xhttpMode: 'packet-up' as 'packet-up' | 'stream-up' | 'stream-one' | 'auto', xhttpVersion: '' as '' | '1.1' | '2' | '3', xhttpTLS: true, xhttpPostBytes: 32768, xhttpPostBytesMax: 0, xhttpPostInterval: 0, xhttpPostIntervalMax: 0, xhttpMaxBufferedPosts: 0, xhttpMaxConcurrentPosts: 0, xhttpDataPlacement: 'body' as 'body' | 'header' | 'cookie', xhttpDataKey: '', xhttpChunkSize: 0, xhttpMuxConcurrency: 0, xhttpMuxConnections: 0, xhttpMuxReuse: 0, xhttpMuxRequests: 0, xhttpMuxSeconds: 0, xhttpMuxKeepAlive: 0, xhttpTimeout: 15, xhttpPadding: 100, xhttpPaddingMax: 1000, xhttpPaddingObfs: false, xhttpPaddingPlacement: 'query_in_header' as 'query_in_header' | 'query' | 'header' | 'cookie', xhttpPaddingKey: 'x_padding', xhttpPaddingHeader: 'Referer', xhttpPaddingMethod: 'repeat-x' as 'repeat-x' | 'tokenish', xhttpNoGRPCHeader: false, xhttpNoSSEHeader: false, xhttpMaxHeaderBytes: 8192, xhttpUplinkMethod: 'POST' as 'POST' | 'PUT', xhttpSessionPlacement: 'path' as MetaPlacement, xhttpSessionKey: '', xhttpSeqPlacement: 'path' as MetaPlacement, xhttpSeqKey: '', xhttpSessionTable: '', xhttpSessionLength: 0 })
+const draft = reactive({ id: '', name: '', address: '', port: '443', listenPort: '443', protocol: 'vless' as 'vless' | 'hysteria2', transport: 'tcp' as 'tcp' | 'xhttp' | 'quic' | 'hysteria2', security: 'tls', flow: '', enc: '', cert: '', key: '', ca: '', listen: '', dest: '', privateKey: '', shortIDs: '', names: '', password: '', spiderX: '', spiderY: '', mldsa65Verify: '', mldsa65Seed: '', xhttpPath: '/veilink/', xhttpDownloadEndpoint: '', xhttpHost: '', xhttpHeaders: '', xhttpMode: 'packet-up' as 'packet-up' | 'stream-up' | 'stream-one' | 'auto', xhttpVersion: '' as '' | '1.1' | '2' | '3', xhttpTLS: true, xhttpPostBytes: 32768, xhttpPostBytesMax: 0, xhttpPostInterval: 0, xhttpPostIntervalMax: 0, xhttpMaxBufferedPosts: 0, xhttpMaxConcurrentPosts: 0, xhttpDataPlacement: 'body' as 'body' | 'header' | 'cookie', xhttpDataKey: '', xhttpChunkSize: 0, xhttpMuxConcurrency: 0, xhttpMuxConnections: 0, xhttpMuxReuse: 0, xhttpMuxRequests: 0, xhttpMuxSeconds: 0, xhttpMuxKeepAlive: 0, xhttpTimeout: 15, xhttpPadding: 100, xhttpPaddingMax: 1000, xhttpPaddingObfs: false, xhttpPaddingPlacement: 'query_in_header' as 'query_in_header' | 'query' | 'header' | 'cookie', xhttpPaddingKey: 'x_padding', xhttpPaddingHeader: 'Referer', xhttpPaddingMethod: 'repeat-x' as 'repeat-x' | 'tokenish', xhttpNoGRPCHeader: false, xhttpNoSSEHeader: false, xhttpMaxHeaderBytes: 8192, xhttpUplinkMethod: 'POST' as 'POST' | 'PUT', xhttpSessionPlacement: 'path' as MetaPlacement, xhttpSessionKey: '', xhttpSeqPlacement: 'path' as MetaPlacement, xhttpSeqKey: '', xhttpSessionTable: '', xhttpSessionLength: 0 })
 const streamUpPeriod = reactive({ min: '' as number | '', max: '' as number | '' })
 type MetaPlacement = 'path' | 'query' | 'header' | 'cookie'
 type MetaField = 'session' | 'seq'
@@ -170,7 +170,7 @@ const uploads = reactive<Record<PEMField, { busy: boolean; error: string; status
 })
 const reading = computed(() => Object.values(uploads).some(state => state.busy))
 const uploadError = computed(() => pemFields.value.map(field => uploads[field].error).find(Boolean))
-type GenerateKind = 'reality' | 'short_id' | 'vless' | 'hysteria2' | 'certificate'
+type GenerateKind = 'reality' | 'short_id' | 'mldsa65' | 'vless' | 'hysteria2' | 'certificate'
 const generation = reactive({ busy: '' as GenerateKind | '', error: '', status: '', revision: 0 })
 const options = reactive({ mode: 'native', authentication: 'x25519', ttl: 30 })
 function clearUpload(field: PEMField) { Object.assign(uploads[field], { busy: false, error: '', status: '', revision: uploads[field].revision + 1 }) }
@@ -217,10 +217,11 @@ async function generate(kind: GenerateKind) {
     })
     if (revision !== generation.revision) return
     if (snapshot !== generationSnapshot()) { generation.status = '表单已变更，已丢弃过期生成结果。请重新生成。'; return }
-    const required = { reality: ['private_key', 'public_key', 'short_id'], short_id: ['short_id'], vless: ['decryption', 'encryption'], hysteria2: ['password'], certificate: ['cert_pem', 'key_pem', 'ca_pem', 'expires_at'] }[kind]
+    const required = { reality: ['private_key', 'public_key', 'short_id'], short_id: ['short_id'], mldsa65: ['private_key', 'public_key'], vless: ['decryption', 'encryption'], hysteria2: ['password'], certificate: ['cert_pem', 'key_pem', 'ca_pem', 'expires_at'] }[kind]
     if (!result || required.some(field => typeof result[field] !== 'string' || !result[field])) throw new Error('invalid response')
     if (kind === 'reality') { draft.privateKey = result.private_key!; draft.shortIDs = result.short_id! }
     if (kind === 'short_id') draft.shortIDs = result.short_id!
+    if (kind === 'mldsa65') { draft.mldsa65Verify = result.public_key!; draft.mldsa65Seed = result.private_key! }
     if (kind === 'vless') draft.enc = result.decryption!
     if (kind === 'hysteria2') draft.password = result.password!
     if (kind === 'certificate') {
@@ -251,7 +252,7 @@ function open(node?: Node) {
     security: t.protocol === 'hysteria2' || t.hysteria2?.password ? 'tls' : t.reality && Object.values(t.reality).some(Boolean) ? 'reality' : t.transport_security === 'plain' ? 'encryption' : 'tls',
     flow: t.flow || '', enc: t.decryption || '', cert: t.cert_pem || '', key: t.key_pem || '', ca: t.ca_pem || '', listen: node ? (t.listen_host || '') : '0.0.0.0',
     dest: t.reality?.dest || '', privateKey: t.reality?.private_key || '',
-    shortIDs: t.reality?.short_ids || '', names: t.reality?.server_names || '', password: t.hysteria2?.password || '',
+    shortIDs: t.reality?.short_ids || '', names: t.reality?.server_names || '', spiderX: t.reality?.spider_x || '', spiderY: t.reality?.spider_y || '', mldsa65Verify: t.reality?.mldsa65_verify || '', mldsa65Seed: t.reality?.mldsa65_seed || '', password: t.hysteria2?.password || '',
     xhttpPath: t.xhttp?.path || '/veilink/', xhttpDownloadEndpoint: t.xhttp?.download_endpoint_id || '', xhttpHost: t.xhttp?.host || '', xhttpHeaders: t.xhttp?.headers ? JSON.stringify(t.xhttp.headers) : '', xhttpMode: t.xhttp?.mode || 'packet-up', xhttpVersion: t.xhttp?.http_version || '', xhttpTLS: t.xhttp?.tls ?? true, xhttpPostBytes: t.xhttp?.max_each_post_bytes || 32768, xhttpPostBytesMax: t.xhttp?.post_bytes_max || 0, xhttpPostInterval: t.xhttp?.min_posts_interval_ms || 0, xhttpPostIntervalMax: t.xhttp?.max_posts_interval_ms || 0, xhttpTimeout: t.xhttp?.request_timeout_seconds || 15, xhttpPadding: t.xhttp?.padding_bytes || 100, xhttpPaddingMax: t.xhttp?.padding_max_bytes || (t.xhttp ? (t.xhttp.padding_bytes || 100) : 1000), xhttpPaddingObfs: t.xhttp?.padding_obfs_mode || false, xhttpPaddingPlacement: t.xhttp?.padding_placement || 'query_in_header', xhttpPaddingKey: t.xhttp?.padding_key || 'x_padding', xhttpPaddingHeader: t.xhttp?.padding_header || (t.xhttp?.padding_placement === 'header' ? 'X-Padding' : 'Referer'), xhttpPaddingMethod: t.xhttp?.padding_method || 'repeat-x', xhttpNoGRPCHeader: t.xhttp?.no_grpc_header || false, xhttpNoSSEHeader: t.xhttp?.no_sse_header || false, xhttpMaxHeaderBytes: t.xhttp?.server_max_header_bytes || 8192, xhttpUplinkMethod: t.xhttp?.uplink_http_method || 'POST', xhttpSessionPlacement: t.xhttp?.session_id_placement || 'path', xhttpSessionKey: t.xhttp?.session_id_key || '', xhttpSeqPlacement: t.xhttp?.seq_placement || 'path', xhttpSeqKey: t.xhttp?.seq_key || '', xhttpSessionTable: t.xhttp?.session_id_table || '', xhttpSessionLength: t.xhttp?.session_id_length || 0,
   })
   draft.xhttpMaxBufferedPosts = t.xhttp?.max_buffered_posts ?? 0
@@ -304,9 +305,8 @@ async function save() {
       if (httpHost && (httpHost.length > 253 || !httpHost.includes('.') || httpHost.split('.').some(label => !label || label.length > 63 || label.startsWith('-') || label.endsWith('-') || !/^[a-z0-9-]+$/.test(label)))) throw new Error('XHTTP Host 须为小写域名或 IPv4，不含端口。')
       if (['packet-up', 'auto'].includes(draft.xhttpMode) && draft.xhttpDownloadEndpoint && !downloadEndpoints.value.some(endpoint => endpoint.id === draft.xhttpDownloadEndpoint)) throw new Error('请选择当前启用的 XHTTP 分离下行入口。')
       if (!['packet-up', 'stream-up', 'stream-one', 'auto'].includes(draft.xhttpMode)) throw new Error('XHTTP 模式仅支持 packet-up、stream-up、stream-one 或 auto。')
-      if (draft.xhttpMode === 'auto' && draft.security === 'reality') throw new Error('XHTTP auto + REALITY 需要 stream-one，当前无法满足直连 HTTPS + TLS 回源安全约束。')
       if (!['', '1.1', '2', '3'].includes(draft.xhttpVersion)) throw new Error('XHTTP HTTP 版本无效。')
-      if (['stream-up', 'stream-one'].includes(draft.xhttpMode) && (draft.security !== 'tls' || !draft.xhttpTLS || draft.xhttpVersion === '1.1')) throw new Error('XHTTP 流模式仅支持直连 HTTPS + TLS 回源的 HTTP/2 或 HTTP/3。')
+      if (['stream-up', 'stream-one'].includes(draft.xhttpMode) && draft.security !== 'reality' && (draft.security !== 'tls' || !draft.xhttpTLS || draft.xhttpVersion === '1.1')) throw new Error('XHTTP 流模式仅支持直连 HTTPS + TLS 回源的 HTTP/2 或 HTTP/3（或 REALITY）。')
       if (draft.xhttpVersion === '3' && (draft.security !== 'tls' || !draft.xhttpTLS)) throw new Error('XHTTP HTTP/3 仅支持直连 HTTPS + TLS 回源。')
       if (draft.xhttpVersion === '2' && !draft.xhttpTLS && (['stream-up', 'stream-one'].includes(draft.xhttpMode) || draft.security !== 'encryption')) throw new Error('XHTTP h2c 仅允许 packet-up、直连 HTTP 与 Encryption 回源；必须启用 VLESS Encryption。')
       if (draft.security === 'reality' && draft.xhttpTLS) throw new Error('XHTTP + REALITY 时必须关闭连接 HTTPS；REALITY 已提供外层安全。')
@@ -360,7 +360,7 @@ async function save() {
       tunnel.cert_pem = draft.cert.trim(); tunnel.key_pem = draft.key.trim()
       if (draft.ca.trim()) tunnel.ca_pem = draft.ca.trim()
     } else if (draft.protocol === 'vless' && draft.security === 'reality') {
-      tunnel.reality = { ...original.reality, dest: draft.dest.trim(), private_key: draft.privateKey.trim(), short_ids: draft.shortIDs.trim(), server_names: draft.names.trim() }
+      tunnel.reality = { ...original.reality, dest: draft.dest.trim(), private_key: draft.privateKey.trim(), short_ids: draft.shortIDs.trim(), server_names: draft.names.trim(), ...(draft.spiderX.trim() ? { spider_x: draft.spiderX.trim() } : {}), ...(draft.spiderY.trim() ? { spider_y: draft.spiderY.trim() } : {}), ...(draft.mldsa65Verify.trim() ? { mldsa65_verify: draft.mldsa65Verify.trim() } : {}), ...(draft.mldsa65Seed.trim() ? { mldsa65_seed: draft.mldsa65Seed.trim() } : {}) }
       delete tunnel.reality.public_key
     }
     if (draft.protocol === 'vless' && draft.transport === 'tcp' && draft.security === 'encryption' && (!draft.enc.trim() || draft.enc.trim() === 'none')) throw new Error('plain 无 TLS：请输入 VLESS 解密配置，或点击生成配对配置；不能使用 none。')
@@ -407,7 +407,7 @@ defineExpose({ open })
         </div>
         <div><label for="node-transport">传输</label><select id="node-transport" v-model="draft.transport" :disabled="draft.protocol === 'hysteria2'"><option value="tcp">TCP</option><option v-if="draft.protocol === 'vless'" value="xhttp">XHTTP</option><option v-if="draft.protocol === 'hysteria2'" value="quic">QUIC</option></select></div>
         <template v-if="draft.protocol === 'vless' && draft.transport === 'xhttp'">
-          <label for="node-xhttp-mode">XHTTP 模式</label><select id="node-xhttp-mode" v-model="draft.xhttpMode"><option value="packet-up">packet-up（默认）</option><option value="stream-up">stream-up</option><option value="stream-one">stream-one</option><option value="auto">auto（非 REALITY 使用 packet-up）</option></select>
+          <label for="node-xhttp-mode">XHTTP 模式</label><select id="node-xhttp-mode" v-model="draft.xhttpMode"><option value="packet-up">packet-up（默认）</option><option value="stream-up">stream-up</option><option value="stream-one">stream-one</option><option value="auto">auto（自动：REALITY→stream-one，否则 packet-up）</option></select>
           <label for="node-xhttp-version">HTTP 版本</label><select id="node-xhttp-version" v-model="draft.xhttpVersion"><option value="">默认协商</option><option v-if="['packet-up', 'auto'].includes(draft.xhttpMode)" value="1.1">HTTP/1.1</option><option value="2">HTTP/2（HTTPS 或加密 h2c）</option><option value="3">HTTP/3（UDP 直连）</option></select>
           <label for="node-xhttp-uplink-method">上行 HTTP 方法</label><select id="node-xhttp-uplink-method" v-model="draft.xhttpUplinkMethod"><option value="POST">POST（默认）</option><option value="PUT">PUT</option></select>
           <label for="node-xhttp-path">XHTTP 路径</label><input id="node-xhttp-path" v-model="draft.xhttpPath" maxlength="256" placeholder="/veilink/" required />
@@ -474,6 +474,10 @@ defineExpose({ open })
           <SecretField id="node-private" v-model="draft.privateKey" label="REALITY 私钥"><button type="button" class="btn small" :disabled="!!generation.busy || reading" @click="generate('reality')">生成密钥对</button></SecretField>
           <label for="node-names">伪装域名</label><input id="node-names" v-model="draft.names" placeholder="逗号分隔" />
           <label for="node-short">Short IDs</label><div class="field-actions"><input id="node-short" v-model="draft.shortIDs" placeholder="逗号分隔" /><button type="button" class="btn small" :disabled="!!generation.busy || reading" @click="generate('short_id')">生成 Short ID</button></div>
+          <label for="node-spiderx">伪装爬取起点（SpiderX）</label><input id="node-spiderx" v-model="draft.spiderX" placeholder="留空则随机生成" />
+          <label for="node-spidery">伪装爬取参数（SpiderY）</label><input id="node-spidery" v-model="draft.spiderY" placeholder="10 个逗号分隔整数，留空用默认" />
+          <label for="node-mldsa65">ML-DSA-65 验证公钥</label><div class="field-actions"><input id="node-mldsa65" v-model="draft.mldsa65Verify" placeholder="后量子额外验证，可选" /><button type="button" class="btn small" :disabled="!!generation.busy || reading" @click="generate('mldsa65')">生成密钥对</button></div>
+          <label for="node-mldsa65-seed">ML-DSA-65 种子（服务端）</label><input id="node-mldsa65-seed" v-model="draft.mldsa65Seed" placeholder="服务端签名用，不下发客户端" />
         </template>
         <template v-if="draft.protocol === 'vless'">
           <SecretField id="node-encryption" v-model="draft.enc" label="VLESS 解密配置" :required="draft.security === 'encryption' || draft.transport === 'xhttp' && !draft.xhttpTLS"><button type="button" class="btn small" :disabled="!!generation.busy || reading" @click="generate('vless')">生成配对配置</button></SecretField>

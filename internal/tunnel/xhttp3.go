@@ -101,7 +101,7 @@ func (s *service) listenXHTTP3() error {
 		}
 		s.authenticate(c)
 	})
-	h.mode = xhttpEffectiveMode(s.local.XHTTP)
+	h.mode = xhttpEffectiveMode(s.local.XHTTP, s.local.Reality.Enabled())
 	h.settings = s.local.XHTTP
 	h.host = s.local.XHTTP.Host
 	h.headers, _ = s.local.XHTTP.Headers.Entries()

@@ -212,7 +212,7 @@ func DeriveClientTunnel(client, server model.LocalTLS, node model.Node) (model.L
 // ValidateClientTemplate validates public template fields without deriving,
 // merging or replacing them. Store pairing and runtime completeness are separate.
 func ValidateClientTemplate(result model.LocalTLS) error {
-	if result.CertPEM != "" || result.KeyPEM != "" || result.ListenHost != "" || result.Decryption != "" || result.Reality.PrivateKey != "" || result.Reality.Dest != "" || result.Reality.ShortIDs != "" {
+	if result.CertPEM != "" || result.KeyPEM != "" || result.ListenHost != "" || result.Decryption != "" || result.Reality.PrivateKey != "" || result.Reality.Dest != "" || result.Reality.ShortIDs != "" || result.Reality.Mldsa65Seed != "" {
 		return errors.New("client template contains server-only settings")
 	}
 	if err := CheckBootstrap("client", result); err != nil {

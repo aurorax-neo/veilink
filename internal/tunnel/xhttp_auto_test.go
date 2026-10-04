@@ -42,12 +42,32 @@ func TestXHTTPAutoAuthorizedRoundtrip(t *testing.T) {
 	}
 }
 
-func TestXHTTPAutoRealityUsesPacketUp(t *testing.T) {
+func TestXHTTPAutoRealityUsesStreamOne(t *testing.T) {
 	c := model.LocalTLS{XHTTP: model.XHTTP{Path: "/auto/", Mode: "auto"}, Reality: model.Reality{PublicKey: "present"}}
 	if err := checkTransportSecurity(c); err != nil && !strings.Contains(err.Error(), "public") {
 		t.Fatal(err)
 	}
-	if xhttpEffectiveMode(c.XHTTP) != "packet-up" {
-		t.Fatal("REALITY auto did not select packet-up")
+	// 对齐 Xray-core：auto + REALITY → stream-one
+	if xhttpEffectiveMode(c.XHTTP, c.Reality.Enabled()) != "stream-one" {
+		t.Fatal("REALITY auto did not select stream-one")
+	}
+}
+
+func TestXHTTPAutoRealityWithDownloadUsesStreamUp(t *testing.T) {
+	c := model.LocalTLS{
+		XHTTP:   model.XHTTP{Path: "/auto/", Mode: "auto", DownloadEndpointID: "ep1"},
+		Reality: model.Reality{PublicKey: "present"},
+	}
+	// 对齐 Xray-core：auto + REALITY + downloadSettings → stream-up
+	if xhttpEffectiveMode(c.XHTTP, c.Reality.Enabled()) != "stream-up" {
+		t.Fatal("REALITY auto with download did not select stream-up")
+	}
+}
+
+func TestXHTTPAutoNoRealityUsesPacketUp(t *testing.T) {
+	c := model.LocalTLS{XHTTP: model.XHTTP{Path: "/auto/", Mode: "auto"}}
+	// 对齐 Xray-core：auto + 无 REALITY → packet-up
+	if xhttpEffectiveMode(c.XHTTP, c.Reality.Enabled()) != "packet-up" {
+		t.Fatal("non-REALITY auto did not select packet-up")
 	}
 }
