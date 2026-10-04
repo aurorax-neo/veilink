@@ -52,11 +52,11 @@ Veilink 使用 Go 实现节点与隧道，Vue 3 提供管理界面。**一个 Do
 ### 快速启动（零配置）
 
 ```sh
-# Docker 一行启动（数据持久化可选）
-docker run -itd --restart unless-stopped --name veilink \
+# Docker 一行启动
+docker run -itd --restart unless-stopped --name veilink-master \
   -e TZ=Asia/Shanghai \
   --network host \
-  -v veilink-data:/data \
+  -v /opt/docker/veilink-master:/data \
   ghcr.io/aurorax-neo/veilink:latest master
 ```
 
@@ -67,7 +67,7 @@ docker run -itd --restart unless-stopped --name veilink \
 
 查看 API Key：
 ```sh
-docker logs veilink 2>&1 | grep "API Key"
+docker logs veilink-master 2>&1 | grep "API Key"
 ```
 
 ### 镜像与版本
@@ -107,9 +107,9 @@ irm https://get.veilink.dev/install.ps1 | iex
 
 ```sh
 docker run -itd \
-  --name veilink --restart unless-stopped --net host \
+  --name veilink-master --restart unless-stopped --net host \
   -e TZ=Asia/Shanghai \
-  -v veilink-data:/data \
+  -v /opt/docker/veilink-master:/data \
   ghcr.io/aurorax-neo/veilink:latest master
 ```
 
@@ -118,7 +118,7 @@ entrypoint 自动处理 `/data` 权限，无需手动 `mkdir`/`chown`。如需�
 ### 2. 获取 API Key
 
 ```sh
-docker logs veilink 2>&1 | grep "API Key"
+docker logs veilink-master 2>&1 | grep "API Key"
 ```
 
 在浏览器打开 `http://服务器IP:2545`，输入 Key 进入控制台。
@@ -219,7 +219,7 @@ openssl s_client -connect panel.example.com:8843 \
 
 ## 首次配置与映射
 
-1. **获取 API Key**：首次启动 Master 时自动生成管理员 API Key，日志中显示一次（`docker logs veilink 2>&1 | grep "API Key"`）。在 Web 登录页输入该 Key 即可进入控制台。
+1. **获取 API Key**：首次启动 Master 时自动生成管理员 API Key，日志中显示一次（`docker logs veilink-master 2>&1 | grep "API Key"`）。在 Web 登录页输入该 Key 即可进入控制台。
 2. **配置 Server**：使用内置 `default` 或创建独立 Server。在 Web 保存隧道、连接入口和本地监听配置；客户端模板由 Server 配置自动派生。
 3. **创建 Client**：获取节点 ID 和接入令牌，按下文或 Web「快捷接入」生成的命令启动。生成命令和手工命令二选一。
 4. **创建映射**：选择 Server、Client、TCP/UDP、Server 监听地址与端口、Client 可达的目标地址与端口，以及 Pool（`1–32`）。没有独立的公开绑定管理。
@@ -234,13 +234,13 @@ Web 控制台「设置」页可直接管理（列表/新建/撤销），或用 C
 
 ```sh
 # 查看现有 Key（仅显示前缀，不显示明文）
-docker exec veilink /usr/local/bin/veilink keys list
+docker exec veilink-master /usr/local/bin/veilink keys list
 
 # 创建新 Key（明文仅显示一次）
-docker exec veilink /usr/local/bin/veilink keys create my-key
+docker exec veilink-master /usr/local/bin/veilink keys create my-key
 
 # 吊销 Key
-docker exec veilink /usr/local/bin/veilink keys revoke <id>
+docker exec veilink-master /usr/local/bin/veilink keys revoke <id>
 ```
 
 旧版用户名密码用户升级：首次启动检测到旧 `admin` 表数据时自动生成 API Key 并在日志中提示，旧账号即刻失效。
@@ -419,13 +419,13 @@ Web 控制台「设置」页可直接管理，或用 CLI：
 
 ```sh
 # 列出所有 Key（仅显示前缀）
-docker exec veilink /usr/local/bin/veilink keys list
+docker exec veilink-master /usr/local/bin/veilink keys list
 
 # 创建新 Key（明文仅显示一次，请保存）
-docker exec veilink /usr/local/bin/veilink keys create my-key
+docker exec veilink-master /usr/local/bin/veilink keys create my-key
 
 # 吊销 Key（最后一个 admin Key 受保护，不可删除）
-docker exec veilink /usr/local/bin/veilink keys revoke <id>
+docker exec veilink-master /usr/local/bin/veilink keys revoke <id>
 ```
 
 使用自定义数据库路径时补充 `-database`、`-deployment-key` 参数。Key 吊销即时生效。
