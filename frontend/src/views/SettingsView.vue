@@ -272,7 +272,6 @@ onMounted(load)
         <button type="button" class="btn" @click="addMirror()">添加</button>
       </div>
       <div class="presets">
-        <span class="muted">快速添加：</span>
         <button
           v-for="p in builtinPresets"
           :key="p.value"
@@ -280,7 +279,7 @@ onMounted(load)
           class="chip"
           :title="p.desc"
           @click="addMirror(p.value)"
-        >{{ p.label }}</button>
+        ><span class="chip-plus" aria-hidden="true">+</span>{{ p.label }}</button>
       </div>
       <p v-if="mirrorError" class="hint bad">{{ mirrorError }}</p>
 
@@ -395,15 +394,25 @@ onMounted(load)
 .add-row input { flex: 1; }
 .presets { display: flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
 .chip {
-  border: 1px solid var(--line);
-  background: var(--surface-soft);
+  display: inline-flex; align-items: center; gap: 6px;
+  border: 1px dashed var(--line-strong);
+  background: transparent;
   border-radius: 20px;
-  padding: 5px 12px;
+  padding: 5px 12px 5px 8px;
   font-size: 12px;
+  color: var(--muted);
   cursor: pointer;
   transition: all 140ms ease;
 }
-.chip:hover { border-color: var(--accent); color: var(--accent-strong); }
+.chip:hover { border-color: var(--accent); color: var(--accent-strong); border-style: solid; }
+.chip-plus {
+  display: inline-grid; place-items: center;
+  width: 16px; height: 16px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-size: 12px; line-height: 1; font-weight: 700;
+}
 
 .probe-actions { margin-top: 16px; }
 .probe-list { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 8px; }
