@@ -28,10 +28,14 @@ jobs:
         run: |
           VERSION=${GITHUB_REF_NAME#web-v}
           tar -czf veilink-web-${VERSION}.tar.gz -C frontend/dist .
+          cp veilink-web-${VERSION}.tar.gz veilink-web-${GITHUB_REF_NAME}.tar.gz
+          cp veilink-web-${VERSION}.tar.gz veilink-web.tar.gz
           # 校验包内容
           tar -tzf veilink-web-${VERSION}.tar.gz | head -5
           # 生成校验文件
           sha256sum veilink-web-${VERSION}.tar.gz > veilink-web-${VERSION}.tar.gz.sha256
+          sha256sum veilink-web-${GITHUB_REF_NAME}.tar.gz > veilink-web-${GITHUB_REF_NAME}.tar.gz.sha256
+          sha256sum veilink-web.tar.gz > veilink-web.tar.gz.sha256
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
