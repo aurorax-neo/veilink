@@ -196,6 +196,8 @@ type Reality struct {
 	SpiderY     string `json:"spider_y,omitempty"`
 	// ML-DSA-65 后量子证书额外验证公钥（base64，可选，对齐 Xray-core）
 	Mldsa65Verify string `json:"mldsa65_verify,omitempty"`
+	// ML-DSA-65 后量子种子（服务端签名用，base64，可选，对齐 Xray-core）
+	Mldsa65Seed string `json:"mldsa65_seed,omitempty"`
 }
 
 // Enabled reports whether any REALITY setting is present.

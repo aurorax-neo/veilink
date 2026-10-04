@@ -10,6 +10,7 @@ export interface RealityConfig {
   spider_x?: string
   spider_y?: string
   mldsa65_verify?: string
+  mldsa65_seed?: string
 }
 
 export interface Hysteria2Config {

@@ -314,10 +314,22 @@ func newRealityConfig(r model.Reality, fallback string) (*reality.Config, error)
 	if err != nil {
 		return nil, err
 	}
+	// ML-DSA-65 后量子签名密钥（服务端）
+	var mldsa65Key []byte
+	if r.Mldsa65Seed != "" {
+		mldsa65Key, err = base64.RawURLEncoding.DecodeString(r.Mldsa65Seed)
+		if err != nil {
+			mldsa65Key, err = base64.StdEncoding.DecodeString(r.Mldsa65Seed)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
 	cfg := &reality.Config{
 		DialContext:            (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
 		Type:                   "tcp",
 		Dest:                   strings.TrimSpace(r.Dest),
+		Mldsa65Key:             mldsa65Key,
 		PrivateKey:             priv,
 		ServerNames:            map[string]bool{},
 		ShortIds:               map[[8]byte]bool{},
