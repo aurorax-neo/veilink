@@ -60,13 +60,12 @@ docker run -itd --restart unless-stopped --name veilink-master \
   -e TZ=Asia/Shanghai \
   --network host \
   -v /opt/docker/veilink-master/data:/data \
-  -v /opt/docker/veilink-master/web:/data/web \
   ghcr.io/aurorax-neo/veilink:latest master
 ```
 
 首次启动自动完成：
-- 生成管理员 API Key（日志中显示一次，请保存）
-- 拉取最新前端（`WEB_MODE=pull` 默认）
+- 生成管理员 API Key（日志中显示一次，请妥善保存）
+- 使用内置前端界面（支持在控制台热拉取或更新指定版本前端）
 - 数据目录自动初始化，无需手动 `mkdir`/`chown`
 
 查看 API Key：
@@ -76,10 +75,9 @@ docker logs veilink-master 2>&1 | grep "API Key"
 
 ### 镜像与版本
 
-前后端独立发布：
-- 后端：`ghcr.io/aurorax-neo/veilink-backend:v1.2.0`（tag `v*` 触发）
-- 前端：`ghcr.io/aurorax-neo/veilink-web:web-v1.0.0`（tag `web-v*` 触发）
-- 统一：`ghcr.io/aurorax-neo/veilink:latest`（手动组装，含预置前端）
+- **统一 Docker 镜像**：`ghcr.io/aurorax-neo/veilink:latest`（包含全功能二进制与预置 Web 前端，通过 `master|server|client` 子命令选择角色）
+- **前端静态资源包**：独立发布 tarball（tag `web-v*` 触发，供 Master 运行时热更新拉取或离线解包）
+- **原生二进制**：全平台独立发布（tag `v*` 触发）
 
 原生二进制（Linux/macOS/Windows）：
 ```sh
@@ -92,9 +90,9 @@ irm https://raw.githubusercontent.com/aurorax-neo/veilink/main/scripts/install.p
 
 ### 目录与网络
 
-- 容器 entrypoint 自动修复 `/data` 权限，无需手动 `mkdir`/`chown`
+- 容器 entrypoint 自动修复 `/data` 及其子目录权限，无需手动 `mkdir`/`chown`
 - Master、Server 使用 Host 网络承载动态入站端口，**不要添加 `-p`**；Client 使用默认 Bridge
-- 命名卷（`veilink-data`）推荐用于持久化，权限自动处理
+- 宿主机挂载统一以 `/opt/docker/<app_name>/data:/data` 为持久化根目录
 
 | 端口示例 | 用途 | 放行范围 |
 | --- | --- | --- |
@@ -114,11 +112,10 @@ docker run -itd \
   --name veilink-master --restart unless-stopped --network host \
   -e TZ=Asia/Shanghai \
   -v /opt/docker/veilink-master/data:/data \
-  -v /opt/docker/veilink-master/web:/data/web \
   ghcr.io/aurorax-neo/veilink:latest master
 ```
 
-entrypoint 自动处理 `/data` 与 `/data/web` 权限，无需手动 `mkdir`/`chown`。宿主机映射目录中 `/opt/docker/veilink-master/data` 保存 SQLite 数据库与凭据，`/opt/docker/veilink-master/web` 映射前端静态资源目录。
+entrypoint 自动处理 `/data` 权限，无需手动 `mkdir`/`chown`。宿主机映射目录 `/opt/docker/veilink-master/data` 保存 SQLite 数据库与凭据（`master.db`）。统一镜像已内置完整 Web 前端；在控制台在线更新或离线替换静态资源时，文件存放在 `/opt/docker/veilink-master/data/web` 下，无需单独挂载 web 目录。
 
 ### 2. 获取 API Key
 
