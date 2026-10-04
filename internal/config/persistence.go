@@ -19,7 +19,7 @@ import (
 )
 
 // UpdateWebConfig 更新 master_config 表中的前端拉取配置（设置页运行时调用）
-func UpdateWebConfig(dbPath, mirror, version string, updateVersion bool) error {
+func UpdateWebConfig(dbPath string, mirrors []string, version string, updateVersion bool, frontendURL *string) error {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return err
@@ -38,11 +38,20 @@ func UpdateWebConfig(dbPath, mirror, version string, updateVersion bool) error {
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return err
 	}
-	mirrorRaw, _ := json.Marshal(mirror)
-	doc["WebMirror"] = mirrorRaw
+	// mirrors 为 nil 时不覆盖（仅更新 frontendURL 的场景）
+	if mirrors != nil {
+		mirrorsRaw, _ := json.Marshal(mirrors)
+		doc["WebMirrors"] = mirrorsRaw
+	}
+	// 兼容旧单值字段：清理
+	delete(doc, "WebMirror")
 	if updateVersion {
 		versionRaw, _ := json.Marshal(version)
 		doc["WebVersion"] = versionRaw
+	}
+	if frontendURL != nil {
+		urlRaw, _ := json.Marshal(*frontendURL)
+		doc["FrontendURL"] = urlRaw
 	}
 	body, err := json.Marshal(doc)
 	if err != nil {

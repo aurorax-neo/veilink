@@ -24,15 +24,24 @@ var builtinMirrors = []string{
 }
 
 // LoadConfigFromEnv 从环境变量加载配置
-// DB 持久化的 WebMirror/WebVersion 由调用方在 NewWebManager 后通过 ApplyPersisted 覆盖
+// DB 持久化的 WebMirrors/WebVersion 由调用方在 NewWebManager 后通过 ApplyPersisted 覆盖
 func LoadConfigFromEnv() WebConfig {
+	var mirrors []string
+	if v := os.Getenv("WEB_GITHUB_MIRROR"); v != "" {
+		for _, part := range strings.Split(v, ",") {
+			if trimmed := strings.TrimSpace(part); trimmed != "" {
+				mirrors = append(mirrors, trimmed)
+			}
+		}
+	}
 	return WebConfig{
-		Mode:         WebMode(getenv("WEB_MODE", "pull")),
-		Version:      os.Getenv("WEB_VERSION"),
-		CacheDir:     getenv("WEB_CACHE_DIR", "/data/web"),
-		GithubMirror: os.Getenv("WEB_GITHUB_MIRROR"),
-		Repo:         getenv("WEB_REPO", "aurorax-neo/veilink"),
-		EnableCORS:   getenv("WEB_CORS", "true") == "true",
+		Mode:          WebMode(getenv("WEB_MODE", "pull")),
+		Version:       os.Getenv("WEB_VERSION"),
+		CacheDir:      getenv("WEB_CACHE_DIR", "/data/web"),
+		GithubMirrors: mirrors,
+		FrontendURL:   strings.TrimSpace(os.Getenv("FRONTEND_URL")),
+		Repo:          getenv("WEB_REPO", "aurorax-neo/veilink"),
+		EnableCORS:    getenv("WEB_CORS", "true") == "true",
 	}
 }
 
@@ -60,11 +69,15 @@ type WebConfig struct {
 	// pull 模式：缓存目录
 	CacheDir string `env:"WEB_CACHE_DIR" default:"/data/web"`
 
-	// pull 模式：GitHub 加速地址
+	// CPA 式自定义前端地址：设置后 / 重定向到该地址（前后端分离部署）
+	// 示例：https://veilink.example.com
+	FrontendURL string `env:"FRONTEND_URL" default:""`
+
+	// pull 模式：GitHub 加速地址列表（按顺序尝试）
 	// 为空 = 直连 github.com
-	// 示例：https://gh-proxy.com/https://github.com
-	//       https://mirror.ghproxy.com/
-	GithubMirror string `env:"WEB_GITHUB_MIRROR" default:""`
+	// 示例：https://ghfast.top
+	//       https://ghproxy.com/https://github.com
+	GithubMirrors []string `env:"WEB_GITHUB_MIRROR" default:""`
 
 	// 仓库
 	Repo string `env:"WEB_REPO" default:"aurorax-neo/veilink"`
@@ -81,7 +94,7 @@ type WebManager struct {
 	ver    string
 	client *http.Client
 	// persist 将配置变更写回 DB（由 httpapi 注入）
-	persist func(mirror, version string) error
+	persist func(mirrors []string, version string, frontendURL *string) error
 }
 
 func NewWebManager(cfg WebConfig) *WebManager {
@@ -92,22 +105,25 @@ func NewWebManager(cfg WebConfig) *WebManager {
 }
 
 // SetPersist 设置配置持久化回调（master 将 DB 写回函数注入进来）
-func (m *WebManager) SetPersist(fn func(mirror, version string) error) {
+func (m *WebManager) SetPersist(fn func(mirrors []string, version string, frontendURL *string) error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.persist = fn
 }
 
 // ApplyPersisted 用 DB 中持久化的值覆盖环境变量（master 启动时调用）
-func (m *WebManager) ApplyPersisted(mirror, version string) {
+func (m *WebManager) ApplyPersisted(mirrors []string, version string, frontendURL string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	// DB 有值才覆盖：环境变量优先于空 DB 值
-	if mirror != "" {
-		m.cfg.GithubMirror = mirror
+	if len(mirrors) > 0 {
+		m.cfg.GithubMirrors = mirrors
 	}
 	if version != "" {
 		m.cfg.Version = version
+	}
+	if frontendURL != "" {
+		m.cfg.FrontendURL = frontendURL
 	}
 }
 
@@ -158,13 +174,18 @@ func (m *WebManager) ensurePulled() (string, error) {
 	return dir, nil
 }
 
-// downloadURL 拼接下载地址，支持加速镜像
+// downloadURL 拼接下载地址（首选镜像）
 func (m *WebManager) downloadURL(version string) string {
-	return buildDownloadURL(m.cfg.Repo, version, m.cfg.GithubMirror)
+	mirrors := m.cfg.GithubMirrors
+	var first string
+	if len(mirrors) > 0 {
+		first = mirrors[0]
+	}
+	return buildDownloadURL(m.cfg.Repo, version, first)
 }
 
 // downloadCandidates 返回按优先级排序的下载地址：
-// 1. 配置的镜像（或直连）；2. 直连（如果配置了镜像）；3. 内置公共镜像
+// 1. 配置的镜像列表（按顺序）；2. 直连；3. 内置公共镜像
 func (m *WebManager) downloadCandidates(version string) []string {
 	var urls []string
 	seen := map[string]bool{}
@@ -174,14 +195,16 @@ func (m *WebManager) downloadCandidates(version string) []string {
 			urls = append(urls, u)
 		}
 	}
-	mirror := strings.TrimSpace(m.cfg.GithubMirror)
-	add(buildDownloadURL(m.cfg.Repo, version, mirror))
-	if mirror != "" {
-		add(buildDownloadURL(m.cfg.Repo, version, ""))
+	for _, mirror := range m.cfg.GithubMirrors {
+		add(buildDownloadURL(m.cfg.Repo, version, mirror))
+	}
+	add(buildDownloadURL(m.cfg.Repo, version, ""))
+	configured := map[string]bool{}
+	for _, mirror := range m.cfg.GithubMirrors {
+		configured[normalizeMirror(mirror)] = true
 	}
 	for _, b := range builtinMirrors {
-		// 跳过与已配置镜像等价的内置项
-		if normalizeMirror(b) == normalizeMirror(mirror) {
+		if configured[normalizeMirror(b)] {
 			continue
 		}
 		add(buildDownloadURL(m.cfg.Repo, version, b))
@@ -224,7 +247,7 @@ func (m *WebManager) pull(version, dir string) error {
 			lastErr = err
 			continue
 		}
-		if url != buildDownloadURL(m.cfg.Repo, version, m.cfg.GithubMirror) {
+		if url != m.downloadURL(version) {
 			slog.Info("前端经备用地址下载成功", "url", redactURL(url))
 		}
 		return nil
@@ -282,7 +305,7 @@ func (m *WebManager) Update(version string) error {
 		persist := m.persist
 		m.mu.Unlock()
 		if persist != nil {
-			if err := persist(m.cfg.GithubMirror, version); err != nil {
+			if err := persist(m.cfg.GithubMirrors, version, nil); err != nil {
 				slog.Warn("保存前端配置失败", "err", err)
 			}
 		}
@@ -296,14 +319,15 @@ func (m *WebManager) Update(version string) error {
 
 // WebStatus 前端状态（供设置页展示）
 type WebStatus struct {
-	Mode         string `json:"mode"`
-	WantVersion  string `json:"want_version"`
-	ActiveVer    string `json:"active_version"`
-	Mirror       string `json:"mirror"`
-	Repo         string `json:"repo"`
-	Root         string `json:"-"`
-	Serving      bool   `json:"serving"`
-	Prebundled   bool   `json:"prebundled"`
+	Mode         string   `json:"mode"`
+	WantVersion  string   `json:"want_version"`
+	ActiveVer    string   `json:"active_version"`
+	Mirrors      []string `json:"mirrors"`
+	FrontendURL  string   `json:"frontend_url"`
+	Repo         string   `json:"repo"`
+	Root         string   `json:"-"`
+	Serving      bool     `json:"serving"`
+	Prebundled   bool     `json:"prebundled"`
 }
 
 // Status 返回当前前端配置与状态
@@ -314,7 +338,8 @@ func (m *WebManager) Status() WebStatus {
 		Mode:        string(m.cfg.Mode),
 		WantVersion: m.cfg.Version,
 		ActiveVer:   m.ver,
-		Mirror:      m.cfg.GithubMirror,
+		Mirrors:     append([]string{}, m.cfg.GithubMirrors...),
+		FrontendURL: m.cfg.FrontendURL,
 		Repo:        m.cfg.Repo,
 		Root:        m.root,
 		Serving:     m.root != "",
@@ -322,16 +347,47 @@ func (m *WebManager) Status() WebStatus {
 	}
 }
 
-// SetMirror 更新加速镜像并持久化到 DB（空字符串 = 直连）
-func (m *WebManager) SetMirror(mirror string) error {
-	mirror = strings.TrimSpace(mirror)
+// FrontendRedirect 返回 CPA 重定向地址（未配置返回空）
+func (m *WebManager) FrontendRedirect() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.cfg.FrontendURL
+}
+
+// SetFrontendURL 更新自定义前端地址并持久化（空 = 取消）
+func (m *WebManager) SetFrontendURL(url string) error {
+	url = strings.TrimSpace(url)
 	m.mu.Lock()
-	m.cfg.GithubMirror = mirror
+	m.cfg.FrontendURL = url
+	persist := m.persist
+	mirrors := append([]string{}, m.cfg.GithubMirrors...)
+	version := m.cfg.Version
+	m.mu.Unlock()
+	if persist != nil {
+		return persist(mirrors, version, &url)
+	}
+	return nil
+}
+
+// SetMirrors 更新加速镜像列表并持久化到 DB（空列表 = 直连）
+func (m *WebManager) SetMirrors(mirrors []string) error {
+	cleaned := make([]string, 0, len(mirrors))
+	seen := map[string]bool{}
+	for _, mirror := range mirrors {
+		mirror = strings.TrimSpace(mirror)
+		if mirror == "" || seen[normalizeMirror(mirror)] {
+			continue
+		}
+		seen[normalizeMirror(mirror)] = true
+		cleaned = append(cleaned, mirror)
+	}
+	m.mu.Lock()
+	m.cfg.GithubMirrors = cleaned
 	persist := m.persist
 	version := m.cfg.Version
 	m.mu.Unlock()
 	if persist != nil {
-		return persist(mirror, version)
+		return persist(cleaned, version, nil)
 	}
 	return nil
 }

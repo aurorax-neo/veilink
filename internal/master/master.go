@@ -65,9 +65,10 @@ func Run(ctx context.Context, c config.Config) error {
 
 	insecure := mode == "http"
 	panel := httpapi.New(s, insecure, ring, httpapi.WebPersistConfig{
-		Mirror:  c.WebMirror,
-		Version: c.WebVersion,
-		DBPath:  c.Database,
+		Mirrors:     c.WebMirrors,
+		Version:     c.WebVersion,
+		FrontendURL: c.FrontendURL,
+		DBPath:      c.Database,
 	})
 
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

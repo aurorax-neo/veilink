@@ -32,9 +32,10 @@ type API struct {
 
 // WebPersistConfig 前端配置的 DB 持久化参数（master_config 表）
 type WebPersistConfig struct {
-	Mirror  string
-	Version string
-	DBPath  string
+	Mirrors     []string
+	Version     string
+	FrontendURL string
+	DBPath      string
 }
 
 // New 创建 Master 的 HTTP API 处理器。
@@ -63,12 +64,12 @@ func New(s *store.Store, insecureLoopback bool, ring *logring.Ring, webPersist W
 	webCfg := web.LoadConfigFromEnv()
 	wm := web.NewWebManager(webCfg)
 	// DB 持久化的配置覆盖环境变量（设置页/CLI 保存的值优先）
-	wm.ApplyPersisted(webPersist.Mirror, webPersist.Version)
+	wm.ApplyPersisted(webPersist.Mirrors, webPersist.Version, webPersist.FrontendURL)
 	// 设置页的保存写回 DB 的 master_config 表
 	if webPersist.DBPath != "" {
 		dbPath := webPersist.DBPath
-		wm.SetPersist(func(mirror, version string) error {
-			return config.UpdateWebConfig(dbPath, mirror, version, true)
+		wm.SetPersist(func(mirrors []string, version string, frontendURL *string) error {
+			return config.UpdateWebConfig(dbPath, mirrors, version, true, frontendURL)
 		})
 	}
 	if _, err := wm.Ensure(); err != nil {
@@ -277,14 +278,33 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		case http.MethodPost:
 			var req struct {
+				Mirrors []string `json:"mirrors"`
+				// 兼容旧单值字段
 				Mirror *string `json:"mirror"`
+				// CPA 自定义前端地址（null=不改，""=清空）
+				FrontendURL *string `json:"frontend_url"`
 			}
 			if !decode(w, r, &req) {
 				return
 			}
-			if req.Mirror != nil {
-				if err := a.webManager.SetMirror(*req.Mirror); err != nil {
+			mirrors := req.Mirrors
+			if mirrors == nil && req.Mirror != nil {
+				if *req.Mirror != "" {
+					mirrors = []string{*req.Mirror}
+				} else {
+					mirrors = []string{}
+				}
+			}
+			if mirrors != nil {
+				if err := a.webManager.SetMirrors(mirrors); err != nil {
 					slog.Error("web config save failed", "err", err)
+					failure(w, 500)
+					return
+				}
+			}
+			if req.FrontendURL != nil {
+				if err := a.webManager.SetFrontendURL(*req.FrontendURL); err != nil {
+					slog.Error("frontend url save failed", "err", err)
 					failure(w, 500)
 					return
 				}
@@ -317,7 +337,23 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 10. 前端静态资源
+	// 10. CPA 自定义前端地址：重定向到分离部署的前端
+	if redirect := a.webManager.FrontendRedirect(); redirect != "" {
+		// 只重定向页面请求，API 请求不受影响（前面已处理）
+		if r.URL.Path == "/" || !strings.HasPrefix(r.URL.Path, "/api/") {
+			target := strings.TrimRight(redirect, "/")
+			if r.URL.Path != "/" {
+				target += r.URL.Path
+			}
+			if r.URL.RawQuery != "" {
+				target += "?" + r.URL.RawQuery
+			}
+			http.Redirect(w, r, target, http.StatusFound)
+			return
+		}
+	}
+
+	// 11. 前端静态资源
 	if root := a.webManager.Root(); root != "" {
 		p := filepath.Join(root, filepath.Clean(r.URL.Path))
 		if info, err := os.Stat(p); os.IsNotExist(err) || info.IsDir() {

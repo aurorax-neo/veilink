@@ -46,7 +46,7 @@ func TestDownloadCandidatesFallback(t *testing.T) {
 	}
 
 	// 配置了 ghfast.top：不再重复，且直连作为第二候选
-	m2 := NewWebManager(WebConfig{Repo: "aurorax-neo/veilink", GithubMirror: "https://ghfast.top"})
+	m2 := NewWebManager(WebConfig{Repo: "aurorax-neo/veilink", GithubMirrors: []string{"https://ghfast.top"}})
 	urls2 := m2.downloadCandidates("latest")
 	if urls2[0] != "https://ghfast.top/aurorax-neo/veilink/releases/latest/download/veilink-web.tar.gz" {
 		t.Errorf("first candidate should be configured mirror, got %q", urls2[0])
@@ -68,36 +68,66 @@ func TestDownloadCandidatesFallback(t *testing.T) {
 func TestMirrorApplyAndSet(t *testing.T) {
 	m := NewWebManager(WebConfig{Repo: "aurorax-neo/veilink"})
 	// ApplyPersisted: DB 有值才覆盖
-	m.ApplyPersisted("https://ghfast.top", "web-v1.0.0")
-	if m.cfg.GithubMirror != "https://ghfast.top" {
-		t.Errorf("mirror = %q, want ghfast.top", m.cfg.GithubMirror)
+	m.ApplyPersisted([]string{"https://ghfast.top"}, "web-v1.0.0", "https://ui.example.com")
+	if len(m.cfg.GithubMirrors) != 1 || m.cfg.GithubMirrors[0] != "https://ghfast.top" {
+		t.Errorf("mirrors = %v, want [ghfast.top]", m.cfg.GithubMirrors)
 	}
 	if m.cfg.Version != "web-v1.0.0" {
 		t.Errorf("version = %q", m.cfg.Version)
 	}
+	if m.cfg.FrontendURL != "https://ui.example.com" {
+		t.Errorf("frontend_url = %q", m.cfg.FrontendURL)
+	}
 	// 空值不覆盖已有
-	m.ApplyPersisted("", "")
-	if m.cfg.GithubMirror != "https://ghfast.top" {
-		t.Errorf("empty ApplyPersisted should not overwrite, got %q", m.cfg.GithubMirror)
+	m.ApplyPersisted(nil, "", "")
+	if len(m.cfg.GithubMirrors) != 1 || m.cfg.FrontendURL != "https://ui.example.com" {
+		t.Errorf("empty ApplyPersisted should not overwrite, got %v / %q", m.cfg.GithubMirrors, m.cfg.FrontendURL)
+	}
+	if got := m.FrontendRedirect(); got != "https://ui.example.com" {
+		t.Errorf("FrontendRedirect = %q", got)
 	}
 
-	// SetMirror 触发 persist 回调
-	var gotMirror, gotVersion string
-	m.SetPersist(func(mirror, version string) error {
-		gotMirror, gotVersion = mirror, version
+	// SetMirrors 触发 persist 回调，去重+清理
+	var gotMirrors []string
+	var gotVersion string
+	var gotURL *string
+	m.SetPersist(func(mirrors []string, version string, frontendURL *string) error {
+		gotMirrors, gotVersion, gotURL = mirrors, version, frontendURL
 		return nil
 	})
-	if err := m.SetMirror("https://ghproxy.com/https://github.com"); err != nil {
-		t.Fatalf("SetMirror: %v", err)
+	if err := m.SetMirrors([]string{
+		"https://ghfast.top",
+		" https://ghfast.top/ ", // 重复（归一化后相同）
+		"",
+		"https://ghproxy.com/https://github.com",
+	}); err != nil {
+		t.Fatalf("SetMirrors: %v", err)
 	}
-	if gotMirror != "https://ghproxy.com/https://github.com" || gotVersion != "web-v1.0.0" {
-		t.Errorf("persist got (%q, %q)", gotMirror, gotVersion)
+	if len(gotMirrors) != 2 || gotMirrors[0] != "https://ghfast.top" {
+		t.Errorf("persist mirrors = %v, want 2 deduped", gotMirrors)
 	}
-	// 清空也触发
-	if err := m.SetMirror(""); err != nil {
-		t.Fatalf("SetMirror empty: %v", err)
+	if gotVersion != "web-v1.0.0" {
+		t.Errorf("persist version = %q", gotVersion)
 	}
-	if gotMirror != "" {
-		t.Errorf("persist after clear = %q, want empty", gotMirror)
+	if gotURL != nil {
+		t.Errorf("SetMirrors should pass nil frontendURL, got %v", gotURL)
+	}
+
+	// SetFrontendURL
+	if err := m.SetFrontendURL("https://cdn.example.com/veilink/"); err != nil {
+		t.Fatalf("SetFrontendURL: %v", err)
+	}
+	if gotURL == nil || *gotURL != "https://cdn.example.com/veilink/" {
+		t.Errorf("persist frontendURL = %v", gotURL)
+	}
+	if m.FrontendRedirect() != "https://cdn.example.com/veilink/" {
+		t.Errorf("FrontendRedirect after set = %q", m.FrontendRedirect())
+	}
+	// 清空
+	if err := m.SetMirrors(nil); err != nil {
+		t.Fatalf("SetMirrors empty: %v", err)
+	}
+	if len(gotMirrors) != 0 {
+		t.Errorf("persist after clear = %v, want empty", gotMirrors)
 	}
 }

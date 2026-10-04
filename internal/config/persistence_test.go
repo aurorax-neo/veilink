@@ -156,11 +156,11 @@ func TestUpdateWebConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 初始为空
-	if c.WebMirror != "" || c.WebVersion != "" {
-		t.Fatalf("initial web config = (%q, %q), want empty", c.WebMirror, c.WebVersion)
+	if len(c.WebMirrors) != 0 || c.WebVersion != "" || c.FrontendURL != "" {
+		t.Fatalf("initial web config = (%v, %q, %q), want empty", c.WebMirrors, c.WebVersion, c.FrontendURL)
 	}
-	// 更新镜像
-	if err := UpdateWebConfig(database, "https://ghfast.top", "", false); err != nil {
+	// 更新镜像列表
+	if err := UpdateWebConfig(database, []string{"https://ghfast.top", "https://ghproxy.com"}, "", false, nil); err != nil {
 		t.Fatal(err)
 	}
 	c2, err := ParseFlags("master", bootstrap)
@@ -171,11 +171,11 @@ func TestUpdateWebConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c2.WebMirror != "https://ghfast.top" {
-		t.Errorf("WebMirror = %q, want ghfast.top", c2.WebMirror)
+	if len(c2.WebMirrors) != 2 || c2.WebMirrors[0] != "https://ghfast.top" {
+		t.Errorf("WebMirrors = %v, want 2", c2.WebMirrors)
 	}
 	// CLI 显式标志优先于 DB
-	c3, err := ParseFlags("master", append(bootstrap, "-web-mirror=https://example.com"))
+	c3, err := ParseFlags("master", append(bootstrap, "-web-mirror=https://example.com", "-web-mirror=https://example2.com"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,11 +183,12 @@ func TestUpdateWebConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c3.WebMirror != "https://example.com" {
-		t.Errorf("explicit flag should win, got %q", c3.WebMirror)
+	if len(c3.WebMirrors) != 2 || c3.WebMirrors[0] != "https://example.com" {
+		t.Errorf("explicit flag should win, got %v", c3.WebMirrors)
 	}
-	// 清空镜像
-	if err := UpdateWebConfig(database, "", "web-v1.0.0", true); err != nil {
+	// 设置前端地址
+	frontendURL := "https://ui.example.com"
+	if err := UpdateWebConfig(database, nil, "", false, &frontendURL); err != nil {
 		t.Fatal(err)
 	}
 	c4, err := ParseFlags("master", bootstrap)
@@ -198,7 +199,27 @@ func TestUpdateWebConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c4.WebMirror != "" || c4.WebVersion != "web-v1.0.0" {
-		t.Errorf("after clear = (%q, %q)", c4.WebMirror, c4.WebVersion)
+	if c4.FrontendURL != "https://ui.example.com" {
+		t.Errorf("FrontendURL = %q", c4.FrontendURL)
+	}
+	// 镜像列表保持不变（nil 不覆盖）
+	if len(c4.WebMirrors) != 2 {
+		t.Errorf("mirrors should persist, got %v", c4.WebMirrors)
+	}
+	// 清空镜像和前端地址
+	empty := ""
+	if err := UpdateWebConfig(database, []string{}, "web-v1.0.0", true, &empty); err != nil {
+		t.Fatal(err)
+	}
+	c5, err := ParseFlags("master", bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c5, _, err = ResolveMaster(c5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c5.WebMirrors) != 0 || c5.WebVersion != "web-v1.0.0" || c5.FrontendURL != "" {
+		t.Errorf("after clear = (%v, %q, %q)", c5.WebMirrors, c5.WebVersion, c5.FrontendURL)
 	}
 }
