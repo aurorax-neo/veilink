@@ -22,6 +22,7 @@ import (
 // sing-mux codecs and Service; it neither copies nor patches dependency code.
 type singH2Client struct {
 	pool     *singPool
+	dial     func(context.Context, string, M.Socksaddr) (net.Conn, error)
 	mu       sync.Mutex
 	sessions []*http2.ClientConn
 	closed   bool
@@ -48,13 +49,13 @@ func (c *singH2Client) session(ctx context.Context) (*http2.ClientConn, error) {
 			best = s
 		}
 	}
-	if best != nil && (len(live) >= c.pool.limit || best.State().StreamsActive < 8) {
+	if best != nil {
 		return best, nil
 	}
-	if len(live) >= c.pool.limit {
+	if len(live) >= 1 {
 		return nil, errors.New("h2mux connection limit")
 	}
-	conn, err := c.pool.DialContext(ctx, "tcp", mux.Destination)
+	conn, err := c.dial(ctx, "tcp", mux.Destination)
 	if err != nil {
 		return nil, err
 	}

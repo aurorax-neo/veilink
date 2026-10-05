@@ -9,7 +9,7 @@ import (
 	"veilink/internal/model"
 )
 
-func TestOptionalMuxTCPAndRebuild(t *testing.T) {
+func TestOptionalMuxTCPAndReconcile(t *testing.T) {
 	for _, flow := range []string{"", flowVision} {
 		for _, kind := range singKinds {
 			t.Run(fmt.Sprintf("flow=%s/type=%s", flow, kind), func(t *testing.T) {
@@ -33,8 +33,8 @@ func TestOptionalMuxTCPAndRebuild(t *testing.T) {
 					if err := client.Apply(c); err != nil {
 						t.Fatal(err)
 					}
-					if i > 0 && (testBindingService(server.instance, s.Bindings[0].ID) == oldServer || testBindingService(client.instance, c.Bindings[0].ID) == oldClient) {
-						t.Fatal("mux change did not rebuild the affected binding")
+					if testBindingService(server.instance, s.Bindings[0].ID) != oldServer || testBindingService(client.instance, c.Bindings[0].ID) != oldClient {
+						t.Fatal("mux change replaced the shared binding")
 					}
 					port := s.Mappings[0].ListenPort
 					awaitEcho(t, port)

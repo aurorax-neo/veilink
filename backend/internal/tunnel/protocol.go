@@ -131,7 +131,20 @@ func (s *service) serveAuthorized(conn net.Conn, id [16]byte, binding model.Bind
 	}
 	conn.SetDeadline(time.Time{})
 	sess := newSession(conn)
-	s.addSession(binding.ID, sess)
+	s.mu.Lock()
+	count := 0
+	for _, existing := range s.sessions[binding.ID] {
+		if existing.available() {
+			count++
+		}
+	}
+	if count >= bindingPool(s.policy.Load().Mappings, binding.ID) {
+		s.mu.Unlock()
+		sess.close()
+		return
+	}
+	s.sessions[binding.ID] = append(s.sessions[binding.ID], sess)
+	s.mu.Unlock()
 	sess.readLoop(nil)
 	s.removeSession(binding.ID, sess)
 }

@@ -27,14 +27,17 @@ type applicationRequest struct {
 	done     chan struct{}
 	deadline time.Time
 }
-type applicationSlot struct{ request chan applicationRequest }
+type applicationSlot struct {
+	request chan applicationRequest
+	conn    net.Conn
+}
 
 func (s *service) acceptApplication(conn net.Conn, id [16]byte, binding model.Binding) {
 	magic := make([]byte, len(applicationMagic))
 	if _, err := io.ReadFull(conn, magic); err != nil || !bytes.Equal(magic, applicationMagic) {
 		return
 	}
-	slot := &applicationSlot{request: make(chan applicationRequest, 1)}
+	slot := &applicationSlot{request: make(chan applicationRequest, 1), conn: conn}
 	s.mu.Lock()
 	if s.ctx.Err() != nil || len(s.applications[binding.ID]) >= bindingPool(s.policy.Load().Mappings, binding.ID) {
 		s.mu.Unlock()
@@ -184,13 +187,17 @@ func (s *service) openApplication(conn net.Conn, m model.Mapping) {
 	}
 }
 
-func (s *service) maintainApplication(b model.Binding, gateway model.Node, peer *clientGateway) {
+func (s *service) maintainApplication(b model.Binding, gateway model.Node, peer *clientGateway, worker *poolWorker) {
 	id, err := parseUUID(b.UUID)
 	if err != nil {
 		return
 	}
 	attempt := 1
 	for s.ctx.Err() == nil {
+		ctx := worker.ready(s.ctx)
+		if ctx.Err() != nil {
+			return
+		}
 		if s.dialLog != nil {
 			s.dialLog.noteAttempt(b.ID, attempt)
 		}
@@ -198,9 +205,9 @@ func (s *service) maintainApplication(b model.Binding, gateway model.Node, peer 
 		conn, err := s.dialProtocol(gateway, peer, b, applicationPort)
 		if err != nil {
 			var ok bool
-			attempt, ok = s.afterShort(b, gateway, started, attempt)
+			attempt, ok = s.afterShortContext(ctx, b, gateway, started, attempt)
 			if !ok {
-				return
+				continue
 			}
 			continue
 		}
@@ -208,12 +215,20 @@ func (s *service) maintainApplication(b model.Binding, gateway model.Node, peer 
 		// Track before Encryption/VLESS/idle reads so cancellation interrupts all
 		// authenticated and unauthenticated stages, including consumed slots.
 		tracked := conn
+		if !worker.assign(ctx, tracked) {
+			tracked.Close()
+			continue
+		}
 		if !s.track(tracked) {
+			worker.release(tracked)
 			conn.Close()
 			return
 		}
 		_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
 		if err == nil {
+			// Once advertised, only the gateway knows whether assignment has
+			// started; worker retirement must no longer interrupt this transport.
+			worker.release(tracked)
 			err = writeAll(conn, applicationMagic)
 		}
 		if err == nil {
@@ -234,6 +249,7 @@ func (s *service) maintainApplication(b model.Binding, gateway model.Node, peer 
 						} else {
 							// The idle slot has been consumed. Replenish immediately,
 							// while this independently tracked connection serves one TCP flow.
+							worker.release(tracked)
 							go s.serveApplication(conn, tracked, id, b.ID, host, port, peer.flow)
 							continue
 						}
@@ -242,11 +258,12 @@ func (s *service) maintainApplication(b model.Binding, gateway model.Node, peer 
 			}
 		}
 		tracked.Close()
+		worker.release(tracked)
 		s.untrack(tracked)
 		var ok bool
-		attempt, ok = s.afterShort(b, gateway, started, attempt)
+		attempt, ok = s.afterShortContext(ctx, b, gateway, started, attempt)
 		if !ok {
-			return
+			continue
 		}
 	}
 }

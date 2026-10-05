@@ -55,20 +55,11 @@ func bindingSnapshot(s model.Snapshot, b model.Binding) model.Snapshot {
 	return out
 }
 
-// Shared pool sizing and wire handshakes are binding-wide. Ordinary mapping
-// edits do not replace those sessions, including when targets are withdrawn.
+// Only wire handshakes and peer identity require a replacement. Mapping pool
+// sizes and modes are reconciled without discarding unrelated active streams.
 func sameBindingTransport(a, b model.Snapshot) bool {
 	if len(a.Bindings) != 1 || len(b.Bindings) != 1 || a.Bindings[0] != b.Bindings[0] {
 		return false
-	}
-	id := a.Bindings[0].ID
-	if bindingPool(a.Mappings, id) != bindingPool(b.Mappings, id) || bindingDedicated(a.Mappings, id) != bindingDedicated(b.Mappings, id) {
-		return false
-	}
-	for _, kind := range singKinds {
-		if singPoolSize(a.Mappings, id, kind) != singPoolSize(b.Mappings, id, kind) {
-			return false
-		}
 	}
 	a.Mappings, b.Mappings = nil, nil
 	return sameConfiguration(a, b)
@@ -196,6 +187,7 @@ func (s *service) reconcile(next model.Snapshot) error {
 
 func sameMapping(a, b model.Mapping) bool {
 	a.Name, b.Name = "", ""
+	a.Pool, b.Pool = 0, 0
 	return reflect.DeepEqual(a, b)
 }
 
@@ -268,6 +260,10 @@ func (s *service) reconcileMappings(next model.Snapshot) error {
 		for id, l := range created {
 			s.mappingListeners[id] = l
 		}
+		for id, m := range wanted {
+			m := m
+			s.mappingListeners[id].mapping.Store(&m)
+		}
 	}
 	// Publication and target admission share the same lock. A stale peer cannot
 	// race withdrawal by opening a newly unauthorized target after this point.
@@ -284,6 +280,7 @@ func (s *service) reconcileMappings(next model.Snapshot) error {
 	for _, conn := range withdrawn {
 		_ = conn.Close()
 	}
+	s.resizePools(next)
 	return nil
 }
 

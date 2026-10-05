@@ -207,6 +207,7 @@ func TestMappingPoolAndRuntimeUpdate(t *testing.T) {
 			t.Fatal("invalid pool accepted")
 		}
 	}
+	s.Mappings[0].Pool = 2
 	server := run(t, s, files)
 	c.Mappings[0].Pool = 2
 	client := run(t, c, files)
@@ -219,11 +220,16 @@ func TestMappingPoolAndRuntimeUpdate(t *testing.T) {
 		t.Fatal("pool changed under same revision")
 	}
 	c.Revision++
+	s.Revision++
+	s.Mappings[0].Pool = 3
+	if err := server.Apply(s); err != nil {
+		t.Fatal(err)
+	}
 	if err := client.Apply(c); err != nil {
 		t.Fatal(err)
 	}
-	if testBindingService(client.instance, s.Bindings[0].ID) == old {
-		t.Fatal("pool update ignored")
+	if testBindingService(client.instance, s.Bindings[0].ID) != old {
+		t.Fatal("pool update replaced binding")
 	}
 	awaitSessions(t, server.instance, s.Bindings[0].ID, 3)
 }

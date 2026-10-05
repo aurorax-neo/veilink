@@ -156,7 +156,7 @@ func TestBindingReconcilePreservesOtherClient(t *testing.T) {
 	awaitEcho(t, m.ListenPort)
 	conn := persistentEcho(t, m.ListenPort)
 	unchanged := testBindingService(server.instance, "two")
-	// Shared pool changes may replace only this binding, never the other client.
+	// Pool changes preserve both this binding and the other client.
 	s.Revision++
 	s.Mappings[0].Pool = 2
 	if err := server.Apply(s); err != nil {

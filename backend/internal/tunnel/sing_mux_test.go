@@ -101,7 +101,15 @@ func TestSingMuxRejectWireTargetsAndUDP(t *testing.T) {
 				}
 				return
 			}
-			packet, err := pool.client.(*mux.Client).ListenPacket(ctx, M.ParseSocksaddrHostPort(s.Mappings[0].TargetHost, uint16(s.Mappings[0].TargetPort)))
+			if _, e := pool.ListenPacket(ctx, M.ParseSocksaddrHostPort(s.Mappings[0].TargetHost, uint16(s.Mappings[0].TargetPort))); e == nil {
+				t.Fatal("UDP accepted")
+			}
+			// Also exercise the upstream wire request, bypassing the public
+			// scheduler's TCP-only guard. The receiving handler must reject it.
+			pool.mu.Lock()
+			upstream := pool.lanes[0].client.(*mux.Client)
+			pool.mu.Unlock()
+			packet, err := upstream.ListenPacket(ctx, M.ParseSocksaddrHostPort(s.Mappings[0].TargetHost, uint16(s.Mappings[0].TargetPort)))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -110,7 +118,7 @@ func TestSingMuxRejectWireTargetsAndUDP(t *testing.T) {
 			packet.WriteTo([]byte("denied"), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: s.Mappings[0].TargetPort})
 			var b [32]byte
 			if _, _, e := packet.ReadFrom(b[:]); e == nil {
-				t.Fatal("UDP accepted")
+				t.Fatal("wire UDP accepted")
 			}
 		})
 	}
@@ -181,8 +189,8 @@ func TestSingMuxDisconnectRebuildAndCancel(t *testing.T) {
 			if e := client.Apply(c); e != nil {
 				t.Fatal(e)
 			}
-			if old.ctx.Err() == nil {
-				t.Fatal("old service not canceled")
+			if old.ctx.Err() != nil {
+				t.Fatal("pool resize canceled service")
 			}
 			awaitEcho(t, s.Mappings[0].ListenPort)
 			done := make(chan struct{})

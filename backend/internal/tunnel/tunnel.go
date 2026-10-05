@@ -443,6 +443,8 @@ type service struct {
 	applicationWaiting map[string]int
 	applications       map[string][]*applicationSlot
 	singPools          map[string]*singPool
+	poolWorkers        map[string][]*poolWorker
+	updateClientPools  func(model.Snapshot)
 	dialLog            *dialDiagnostics
 	children           atomic.Pointer[bindingServices]
 	userOwners         atomic.Pointer[map[string]*service]
@@ -471,7 +473,7 @@ func startService(s model.Snapshot, local model.LocalTLS, diagnostics *dialDiagn
 		sessions: map[string][]*session{}, conns: map[net.Conn]struct{}{},
 		applications:       map[string][]*applicationSlot{},
 		applicationChanged: make(chan struct{}), applicationWaiting: map[string]int{},
-		singPools: map[string]*singPool{}, dialLog: diagnostics,
+		singPools: map[string]*singPool{}, poolWorkers: map[string][]*poolWorker{}, dialLog: diagnostics,
 		mappingListeners: map[string]*mappingListener{}, mappingConns: map[string]map[net.Conn]struct{}{}, targetConns: map[net.Conn]targetPolicy{},
 	}
 	svc.policy.Store(&svc.snapshot)
@@ -556,17 +558,18 @@ func startService(s model.Snapshot, local model.LocalTLS, diagnostics *dialDiagn
 				err = selectErr
 				return nil, err
 			}
-			for _, kind := range singKinds {
-				for range singPoolSize(s.Mappings, b.ID, kind) {
-					go svc.maintainSingMux(b, gateway, peer, kind)
+			svc.updateClientPools = func(next model.Snapshot) {
+				for _, kind := range singKinds {
+					svc.resizeWorkers(kind, singPoolSize(next.Mappings, b.ID, kind), func(w *poolWorker) { svc.maintainSingMux(b, gateway, peer, kind, w) })
 				}
-			}
-			for range bindingPool(s.Mappings, b.ID) {
-				go svc.maintain(b, gateway, peer)
-				if bindingDedicated(s.Mappings, b.ID) {
-					go svc.maintainApplication(b, gateway, peer)
+				svc.resizeWorkers("control", bindingPool(next.Mappings, b.ID), func(w *poolWorker) { svc.maintain(b, gateway, peer, w) })
+				n := 0
+				if bindingDedicated(next.Mappings, b.ID) {
+					n = bindingPool(next.Mappings, b.ID)
 				}
+				svc.resizeWorkers("application", n, func(w *poolWorker) { svc.maintainApplication(b, gateway, peer, w) })
 			}
+			svc.updateClientPools(s)
 		}
 	}
 	return svc, err
@@ -754,13 +757,14 @@ func (s *service) openPublic(conn net.Conn, m model.Mapping) {
 	s.openSingMux(public, m)
 }
 
-func (s *service) maintain(b model.Binding, gateway model.Node, peer *clientGateway) {
+func (s *service) maintain(b model.Binding, gateway model.Node, peer *clientGateway, worker *poolWorker) {
 	user, err := parseUUID(b.UUID)
 	if err != nil {
 		return
 	}
 	attempt := 1
 	for {
+		ctx := worker.ready(s.ctx)
 		if s.ctx.Err() != nil {
 			return
 		}
@@ -786,50 +790,64 @@ func (s *service) maintain(b model.Binding, gateway model.Node, peer *clientGate
 				_ = conn.Close()
 			}
 			var ok bool
-			attempt, ok = s.afterShort(b, gateway, started, attempt)
+			attempt, ok = s.afterShortContext(ctx, b, gateway, started, attempt)
 			if !ok {
-				return
+				continue
 			}
 			continue
 		}
 		attempt = 1
+		if ctx.Err() != nil {
+			conn.Close()
+			continue
+		}
 		if !s.track(conn) {
 			_ = conn.Close()
 			return
 		}
 		sess := newSession(conn)
 		s.addSession(b.ID, sess)
-		sess.readLoop(func(host string, port int, udp bool) (net.Conn, error) {
-			if !udp || !s.targetAllowed(b.ID, host, port, "udp", false, "") {
-				return nil, errors.New("target is not authorized")
-			}
-			dialer := net.Dialer{Timeout: 5 * time.Second}
-			network := "tcp"
-			if udp {
-				network = "udp"
-			}
-			conn, err := dialer.DialContext(s.ctx, network, net.JoinHostPort(host, strconv.Itoa(port)))
-			if err != nil || !udp {
-				return conn, err
-			}
-			uc, ok := conn.(*net.UDPConn)
-			if !ok {
-				_ = conn.Close()
-				return nil, errors.New("udp dial failed")
-			}
-			wrapped := newClientUDP(uc, host, port)
-			if !s.trackTarget(wrapped, targetPolicy{binding: b.ID, host: host, port: port, network: "udp"}) {
-				wrapped.Close()
-				return nil, errors.New("target is not authorized")
-			}
-			return &policyConn{Conn: wrapped, service: s}, nil
-		})
-		s.removeSession(b.ID, sess)
-		s.untrack(conn)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			defer s.removeSession(b.ID, sess)
+			defer s.untrack(conn)
+			sess.readLoop(func(host string, port int, udp bool) (net.Conn, error) {
+				if !udp || !s.targetAllowed(b.ID, host, port, "udp", false, "") {
+					return nil, errors.New("target is not authorized")
+				}
+				dialer := net.Dialer{Timeout: 5 * time.Second}
+				network := "tcp"
+				if udp {
+					network = "udp"
+				}
+				conn, err := dialer.DialContext(s.ctx, network, net.JoinHostPort(host, strconv.Itoa(port)))
+				if err != nil || !udp {
+					return conn, err
+				}
+				uc, ok := conn.(*net.UDPConn)
+				if !ok {
+					_ = conn.Close()
+					return nil, errors.New("udp dial failed")
+				}
+				wrapped := newClientUDP(uc, host, port)
+				if !s.trackTarget(wrapped, targetPolicy{binding: b.ID, host: host, port: port, network: "udp"}) {
+					wrapped.Close()
+					return nil, errors.New("target is not authorized")
+				}
+				return &policyConn{Conn: wrapped, service: s}, nil
+			})
+		}()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			// A retired slot stops replenishment independently of its active
+			// transport, whose lifetime remains owned by the service.
+		}
 		var ok bool
-		attempt, ok = s.afterShort(b, gateway, started, attempt)
+		attempt, ok = s.afterShortContext(ctx, b, gateway, started, attempt)
 		if !ok {
-			return
+			continue
 		}
 	}
 }
@@ -855,14 +873,14 @@ func (s *service) noteMapping(event string, m model.Mapping, remote string) {
 	s.dialLog.logger.Info("mapping connection "+event, "role", "server", "event", event, "id", m.ID, "network", mappingNet(m.Network), "listen", m.ListenPort, "target", net.JoinHostPort(m.TargetHost, strconv.Itoa(m.TargetPort)), "remote", remote)
 }
 
-func (s *service) afterShort(b model.Binding, gateway model.Node, started time.Time, attempt int) (int, bool) {
+func (s *service) afterShortContext(ctx context.Context, b model.Binding, gateway model.Node, started time.Time, attempt int) (int, bool) {
 	if time.Since(started) >= 5*time.Second {
 		attempt = 1
 	}
 	if attempt >= 3 && s.dialLog != nil {
 		s.dialLog.warnLimited(b.ID+"-backoff", "client tunnel backing off after repeated short connections", "role", "client", "id", b.ID, "node_id", gateway.ID, "attempt", attempt)
 	}
-	ok := retryWait(s.ctx, attempt)
+	ok := retryWait(ctx, attempt)
 	if attempt < 5 {
 		attempt++
 	}
@@ -925,7 +943,7 @@ func (s *service) pick(binding string) *session {
 	list := s.sessions[binding]
 	for i := 0; i < len(list); i++ {
 		index := int((atomic.AddUint32(&s.next, 1) - 1) % uint32(len(list)))
-		if list[index].alive() {
+		if list[index].available() {
 			return list[index]
 		}
 	}
@@ -960,6 +978,7 @@ type session struct {
 	next     uint32
 	done     chan struct{}
 	once     sync.Once
+	draining bool
 }
 
 func newSession(conn net.Conn) *session {
@@ -974,6 +993,22 @@ func (s *session) alive() bool {
 		return false
 	default:
 		return true
+	}
+}
+
+func (s *session) available() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.draining && s.streams != nil
+}
+
+func (s *session) drain() {
+	s.mu.Lock()
+	s.draining = true
+	idle := len(s.streams) == 0
+	s.mu.Unlock()
+	if idle {
+		s.close()
 	}
 }
 
@@ -1011,7 +1046,7 @@ func (s *session) keepalive() {
 func (s *session) track(st *stream) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.streams == nil || len(s.streams) >= maxStreams {
+	if s.streams == nil || s.draining || len(s.streams) >= maxStreams {
 		return false
 	}
 	if st.in == nil {
@@ -1107,16 +1142,22 @@ func (s *session) markWrite(id uint32) {
 
 func (s *session) forget(id uint32) *stream {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.streams == nil {
+		s.mu.Unlock()
 		return nil
 	}
 	st := s.streams[id]
 	if st == nil {
+		s.mu.Unlock()
 		return nil
 	}
 	delete(s.streams, id)
 	st.halt()
+	idle := s.draining && len(s.streams) == 0
+	s.mu.Unlock()
+	if idle {
+		s.close()
+	}
 	return st
 }
 
