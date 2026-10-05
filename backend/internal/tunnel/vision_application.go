@@ -36,7 +36,7 @@ func (s *service) acceptApplication(conn net.Conn, id [16]byte, binding model.Bi
 	}
 	slot := &applicationSlot{request: make(chan applicationRequest, 1)}
 	s.mu.Lock()
-	if s.ctx.Err() != nil || len(s.applications[binding.ID]) >= bindingPool(s.snapshot.Mappings, binding.ID) {
+	if s.ctx.Err() != nil || len(s.applications[binding.ID]) >= bindingPool(s.policy.Load().Mappings, binding.ID) {
 		s.mu.Unlock()
 		return
 	}
@@ -91,7 +91,7 @@ func (s *service) acceptApplication(conn net.Conn, id [16]byte, binding model.Bi
 		return
 	}
 	m := req.mapping
-	if m.BindingID != binding.ID || !s.allowed[binding.ID]["tcp\n"+m.TargetHost+"\n"+strconv.Itoa(m.TargetPort)] {
+	if m.BindingID != binding.ID || !s.targetAllowed(binding.ID, m.TargetHost, m.TargetPort, "tcp", false, "") {
 		return
 	}
 	_ = conn.SetDeadline(req.deadline)
@@ -234,7 +234,7 @@ func (s *service) maintainApplication(b model.Binding, gateway model.Node, peer 
 						} else {
 							// The idle slot has been consumed. Replenish immediately,
 							// while this independently tracked connection serves one TCP flow.
-							go s.serveApplication(conn, tracked, id, host, port, peer.flow)
+							go s.serveApplication(conn, tracked, id, b.ID, host, port, peer.flow)
 							continue
 						}
 					}
@@ -251,7 +251,7 @@ func (s *service) maintainApplication(b model.Binding, gateway model.Node, peer 
 	}
 }
 
-func (s *service) serveApplication(conn, tracked net.Conn, id [16]byte, host string, port int, flow string) {
+func (s *service) serveApplication(conn, tracked net.Conn, id [16]byte, binding, host string, port int, flow string) {
 	defer tracked.Close()
 	defer s.untrack(tracked)
 	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
@@ -260,7 +260,7 @@ func (s *service) serveApplication(conn, tracked net.Conn, id [16]byte, host str
 		return
 	}
 	defer target.Close()
-	if !s.track(target) {
+	if !s.trackTarget(target, targetPolicy{binding: binding, host: host, port: port, network: "tcp"}) {
 		return
 	}
 	defer s.untrack(target)

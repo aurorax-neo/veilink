@@ -126,10 +126,11 @@ func perfSetup(t *testing.T, tc perfCase, target, pool int, network string) (int
 	sr := run(t, server, local)
 	run(t, client, model.LocalTLS{})
 	until := time.Now().Add(10 * time.Second)
+	binding := testBindingService(sr.instance, "one")
 	for {
-		sr.instance.mu.Lock()
-		ready := len(sr.instance.sessions["one"]) >= pool
-		sr.instance.mu.Unlock()
+		binding.mu.Lock()
+		ready := len(binding.sessions["one"]) >= pool
+		binding.mu.Unlock()
 		if ready {
 			break
 		}

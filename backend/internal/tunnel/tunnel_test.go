@@ -26,6 +26,13 @@ import (
 
 type object = map[string]any
 
+func testBindingService(s *service, id string) *service {
+	if children := s.children.Load(); children != nil {
+		return (*children)[id]
+	}
+	return s
+}
+
 func tlsFiles(t *testing.T) model.LocalTLS {
 	t.Helper()
 	dir := t.TempDir()

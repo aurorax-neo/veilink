@@ -120,3 +120,40 @@ func TestXHTTPBufferedRuntimeHTTP2(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestXHTTPDataRuntimeHeaderBudget(t *testing.T) {
+	for _, version := range []string{"1.1", "2", "3"} {
+		for _, placement := range []string{"header", "cookie"} {
+			for _, buffered := range []bool{false, true} {
+				for _, chunk := range []int{0, 64} {
+					t.Run(version+"/"+placement+"/buffer="+strconv.FormatBool(buffered)+"/chunk="+strconv.Itoa(chunk), func(t *testing.T) {
+						s, c := fixtures(t, echoServer(t))
+						local := tlsFiles(t)
+						local.ListenHost, local.ListenPort = "127.0.0.1", s.Node.Port
+						if version == "3" {
+							local.ListenPort = freeUDPPort(t)
+							s.Node.Port = local.ListenPort
+						}
+						local.XHTTP = model.XHTTP{Path: "/data/", Mode: "packet-up", TLS: true, HTTPVersion: version, UplinkDataPlacement: placement, UplinkChunkSize: chunk, PaddingBytes: 100, PaddingMaxBytes: 1000, MaxEachPostBytes: 16384, PostBytesMax: 32768, Xmux: model.XHTTPXmux{MaxConcurrency: 4, MaxConnections: 2, CMaxReuseTimes: 2, HMaxRequestTimes: 3, KeepAlivePeriod: 1}}
+						if buffered {
+							local.XHTTP.MaxBufferedPosts, local.XHTTP.MaxConcurrentPosts = 4, 4
+						}
+						s.Node.Tunnel = local
+						public, err := PublicPeerTunnel(local, s.Node)
+						if err != nil {
+							t.Fatal(err)
+						}
+						c.Nodes[0] = s.Node
+						c.Nodes[0].Tunnel = public
+						run(t, s, model.LocalTLS{})
+						run(t, c, model.LocalTLS{})
+						awaitEcho(t, s.Mappings[0].ListenPort)
+						if err := exchange(s.Mappings[0].ListenPort, bytes.Repeat([]byte{0, 255, 32, 42}, 32768), true); err != nil {
+							t.Fatal(err)
+						}
+					})
+				}
+			}
+		}
+	}
+}

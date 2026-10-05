@@ -4,7 +4,9 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -12,6 +14,9 @@ import (
 )
 
 const xhttpMaxDataChunks = 32
+
+var xhttpDataHeaderName = regexp.MustCompile(`^X-Veilink-[A-Za-z0-9-]{1,48}$`)
+var xhttpDataCookieName = regexp.MustCompile(`^x_[a-z0-9_]{1,48}$`)
 
 func xhttpDataPlacement(x model.XHTTP) string {
 	if x.UplinkDataPlacement == "" {
@@ -52,7 +57,7 @@ func checkXHTTPData(x model.XHTTP, mode string) error {
 		if key == "" {
 			key = "X-Veilink-Data"
 		}
-		if !strings.HasPrefix(key, "X-Veilink-") || strings.ContainsAny(key, " \t\r\n") || strings.EqualFold(key, "X-Veilink-EOF") {
+		if !xhttpDataHeaderName.MatchString(key) || strings.EqualFold(key, "X-Veilink-EOF") {
 			return errors.New("xhttp header uplink data key must be a private X-Veilink header")
 		}
 	}
@@ -60,14 +65,85 @@ func checkXHTTPData(x model.XHTTP, mode string) error {
 		if key == "" {
 			key = "x_data"
 		}
-		if !strings.HasPrefix(key, "x_") || strings.ContainsAny(key, " \t\r\n;=") {
+		if !xhttpDataCookieName.MatchString(key) {
 			return errors.New("xhttp cookie uplink data key must use private x_ name")
 		}
 	}
 	if x.UplinkChunkSize != 0 && (x.UplinkChunkSize < 64 || x.UplinkChunkSize > 8192) {
 		return errors.New("xhttp uplink_chunk_size must be 64-8192")
 	}
+	if p == "body" && (key != "" || x.UplinkChunkSize != 0) {
+		return errors.New("xhttp body placement cannot configure a data key or chunk size")
+	}
+	if p == "header" || p == "cookie" {
+		prefix := xhttpDataKey(x) + "_"
+		if p == "header" {
+			prefix = strings.ToLower(xhttpDataKey(x) + "-")
+		}
+		for _, field := range []struct{ placement, key string }{
+			{xhttpMetaPlacement(x.SessionIDPlacement), xhttpSessionKey(x)},
+			{xhttpMetaPlacement(x.SeqPlacement), xhttpSequenceKey(x)},
+			{"header", "X-Veilink-EOF"}, {"header", "X-Veilink-Upload-Complete"},
+		} {
+			name := field.key
+			if p == "header" {
+				name = strings.ToLower(name)
+			}
+			if field.placement == p && strings.HasPrefix(name, prefix) {
+				return errors.New("xhttp data chunk keys collide with metadata")
+			}
+		}
+		if p == "cookie" && x.PaddingObfsMode && xhttpPaddingPlacement(x) == "cookie" && strings.HasPrefix(xhttpPaddingKey(x), prefix) {
+			return errors.New("xhttp data chunk keys collide with padding")
+		}
+	}
+	if p != "body" && xhttpUploadLimit(x) == 0 {
+		return errors.New("xhttp uplink data has no room within the request header budget")
+	}
 	return nil
+}
+
+// Reserve space for the URL, session/sequence metadata, padding and HTTP/2
+// field overhead. Bound each POST by both the header budget and chunk count.
+func xhttpUploadLimit(x model.XHTTP) int {
+	if xhttpDataPlacement(x) == "body" {
+		return xhttpPostMaximum(x)
+	}
+	budget := xhttpServerHeaderLimit(x) - 2048 - xhttpPaddingMaximum(x)
+	headers, _ := x.Headers.Entries()
+	for key, values := range headers {
+		for _, value := range values {
+			budget -= len(key) + len(value) + 36
+		}
+	}
+	size := xhttpDataChunkSize(x)
+	if size <= 0 || budget <= 0 {
+		return 0
+	}
+	low, high := 0, xhttpPostMaximum(x)
+	for low < high {
+		n := low + (high-low+1)/2
+		encoded := base64.RawURLEncoding.EncodedLen(n)
+		chunks := (encoded + size - 1) / size
+		cost := encoded + chunks*(len(xhttpDataKey(x))+40)
+		if chunks <= xhttpMaxDataChunks && cost <= budget {
+			low = n
+		} else {
+			high = n - 1
+		}
+	}
+	return low
+}
+
+func xhttpReadData(req *http.Request, x model.XHTTP, max int) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(req.Body, int64(max)+1))
+	if err != nil || xhttpDataPlacement(x) == "body" {
+		return body, err
+	}
+	if len(body) != 0 || req.ContentLength > 0 {
+		return nil, errors.New("xhttp data body must be empty")
+	}
+	return xhttpDecodeData(req, x, max)
 }
 func xhttpDataHeaderKey(x model.XHTTP, n int) string { return xhttpDataKey(x) + "-" + strconv.Itoa(n) }
 func xhttpDataCookieKey(x model.XHTTP, n int) string { return xhttpDataKey(x) + "_" + strconv.Itoa(n) }
@@ -107,65 +183,45 @@ func xhttpDecodeData(req *http.Request, x model.XHTTP, max int) ([]byte, error) 
 	if xhttpDataPlacement(x) == "body" {
 		return nil, nil
 	}
-	var parts []string
-	for i := 0; i < xhttpMaxDataChunks; i++ {
-		var v string
-		if xhttpDataPlacement(x) == "header" {
-			vs := req.Header.Values(xhttpDataHeaderKey(x, i))
-			if len(vs) > 1 {
-				return nil, errors.New("duplicate xhttp data header")
-			}
-			if len(vs) == 1 {
-				v = vs[0]
-			}
-		} else {
-			for _, c := range req.Cookies() {
-				if c.Name == xhttpDataCookieKey(x, i) {
-					if v != "" {
-						return nil, errors.New("duplicate xhttp data cookie")
-					}
-					v = c.Value
-				}
-			}
+	chunks := make(map[int]string)
+	add := func(index, value string) error {
+		n, err := strconv.Atoi(index)
+		if err != nil || n < 0 || n >= xhttpMaxDataChunks || strconv.Itoa(n) != index {
+			return errors.New("invalid xhttp data chunk index")
 		}
-		if v == "" {
-			break
+		if _, exists := chunks[n]; exists || value == "" || len(value) > xhttpDataChunkSize(x) {
+			return errors.New("duplicate, empty or oversized xhttp data chunk")
 		}
-		parts = append(parts, v)
-	}
-	if len(parts) == 0 {
-		if xhttpDataPlacement(x) == "header" {
-			for i := 1; i < xhttpMaxDataChunks; i++ {
-				if len(req.Header.Values(xhttpDataHeaderKey(x, i))) > 0 {
-					return nil, errors.New("non-contiguous xhttp data headers")
-				}
-			}
-		} else {
-			for _, c := range req.Cookies() {
-				if strings.HasPrefix(c.Name, xhttpDataKey(x)+"_") {
-					return nil, errors.New("non-contiguous xhttp data cookies")
-				}
-			}
-		}
-		return nil, nil
-	}
-	if len(parts) == xhttpMaxDataChunks {
-		return nil, errors.New("too many xhttp data chunks")
+		chunks[n] = value
+		return nil
 	}
 	if xhttpDataPlacement(x) == "header" {
-		for i := len(parts); i < xhttpMaxDataChunks; i++ {
-			if len(req.Header.Values(xhttpDataHeaderKey(x, i))) > 0 {
-				return nil, errors.New("non-contiguous xhttp data headers")
+		prefix := strings.ToLower(xhttpDataKey(x) + "-")
+		for key, values := range req.Header {
+			if strings.HasPrefix(strings.ToLower(key), prefix) {
+				for _, value := range values {
+					if err := add(key[len(prefix):], value); err != nil {
+						return nil, err
+					}
+				}
 			}
 		}
 	} else {
-		for _, c := range req.Cookies() {
-			if strings.HasPrefix(c.Name, xhttpDataKey(x)+"_") {
-				n, err := strconv.Atoi(strings.TrimPrefix(c.Name, xhttpDataKey(x)+"_"))
-				if err != nil || n < 0 || n >= len(parts) {
-					return nil, errors.New("non-contiguous xhttp data cookies")
+		prefix := xhttpDataKey(x) + "_"
+		for _, cookie := range req.Cookies() {
+			if strings.HasPrefix(cookie.Name, prefix) {
+				if err := add(cookie.Name[len(prefix):], cookie.Value); err != nil {
+					return nil, err
 				}
 			}
+		}
+	}
+	parts := make([]string, len(chunks))
+	for n := range parts {
+		var exists bool
+		parts[n], exists = chunks[n]
+		if !exists {
+			return nil, errors.New("non-contiguous xhttp data chunks")
 		}
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(strings.Join(parts, ""))

@@ -210,9 +210,10 @@ func TestMappingPoolAndRuntimeUpdate(t *testing.T) {
 	server := run(t, s, files)
 	c.Mappings[0].Pool = 2
 	client := run(t, c, files)
+	c.Nodes = clone(*client.good).Nodes
 	awaitEcho(t, s.Mappings[0].ListenPort)
 	awaitSessions(t, server.instance, s.Bindings[0].ID, 2)
-	old := client.instance
+	old := testBindingService(client.instance, s.Bindings[0].ID)
 	c.Mappings[0].Pool = 3
 	if err := client.Apply(c); err == nil {
 		t.Fatal("pool changed under same revision")
@@ -221,7 +222,7 @@ func TestMappingPoolAndRuntimeUpdate(t *testing.T) {
 	if err := client.Apply(c); err != nil {
 		t.Fatal(err)
 	}
-	if client.instance == old {
+	if testBindingService(client.instance, s.Bindings[0].ID) == old {
 		t.Fatal("pool update ignored")
 	}
 	awaitSessions(t, server.instance, s.Bindings[0].ID, 3)
@@ -229,6 +230,7 @@ func TestMappingPoolAndRuntimeUpdate(t *testing.T) {
 
 func awaitSessions(t *testing.T, s *service, binding string, n int) {
 	t.Helper()
+	s = testBindingService(s, binding)
 	until := time.Now().Add(5 * time.Second)
 	for time.Now().Before(until) {
 		s.mu.Lock()
@@ -397,7 +399,7 @@ func TestRuntimeEncryptionUpdate(t *testing.T) {
 	server := run(t, s, model.LocalTLS{})
 	client := run(t, c, model.LocalTLS{})
 	awaitEcho(t, s.Mappings[0].ListenPort)
-	oldServer, oldClient := server.instance, client.instance
+	oldServer, oldClient := server.instance, testBindingService(client.instance, c.Bindings[0].ID)
 	dec, enc, _, _, err = GenerateVLESSEnc()
 	if err != nil {
 		t.Fatal(err)
@@ -414,7 +416,7 @@ func TestRuntimeEncryptionUpdate(t *testing.T) {
 	if err := client.Apply(c); err != nil {
 		t.Fatal(err)
 	}
-	if server.instance == oldServer || client.instance == oldClient {
+	if server.instance == oldServer || testBindingService(client.instance, c.Bindings[0].ID) == oldClient {
 		t.Fatal("key rotation did not replace runtime")
 	}
 	awaitEcho(t, s.Mappings[0].ListenPort)

@@ -112,7 +112,7 @@ func checkXHTTPMeta(x model.XHTTP, mode string) error {
 	if mode != "packet-up" && (x.SeqPlacement != "" || x.SeqKey != "") {
 		return errors.New("xhttp sequence metadata requires packet-up")
 	}
-	if x.Mode == "stream-one" && (x.SessionIDPlacement != "" || x.SessionIDKey != "" || x.SessionIDTable != "" || x.SessionIDLength != 0) {
+	if mode == "stream-one" && (x.SessionIDPlacement != "" || x.SessionIDKey != "" || x.SessionIDTable != "" || x.SessionIDLength != 0) {
 		return errors.New("xhttp stream-one has no session ID metadata")
 	}
 	if xhttpMetaPlacement(x.SessionIDPlacement) == xhttpMetaPlacement(x.SeqPlacement) && xhttpMetaPlacement(x.SessionIDPlacement) != "path" {

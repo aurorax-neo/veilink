@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	mrand "math/rand/v2"
 	"net"
 	"net/http"
@@ -58,13 +57,7 @@ func (h *xhttpHandler) bufferedUpload(w http.ResponseWriter, r *http.Request, s 
 		return
 	}
 	defer rc.SetReadDeadline(time.Time{})
-	body, err := io.ReadAll(io.LimitReader(r.Body, int64(h.maxPost)+1))
-	if xhttpDataPlacement(h.settings) != "body" {
-		body, err = xhttpDecodeData(r, h.settings, h.maxPost)
-		if err == nil && r.ContentLength > 0 {
-			err = errors.New("xhttp data body must be empty")
-		}
-	}
+	body, err := xhttpReadData(r, h.settings, h.maxPost)
 	if err != nil {
 		http.Error(w, "invalid body", 400)
 		return
@@ -244,8 +237,8 @@ func (c *xhttpBufferedClient) Write(p []byte) (int, error) {
 		sizes := make([]int, 0, concurrency)
 		deadline := c.writeDeadline()
 		for i := 0; i < concurrency && len(p) > 0; i++ {
-			n := xhttpPostSize(c.settings)
-			if max := xhttpPostMaximum(c.settings); max > n {
+			n := c.postSize
+			if max := c.postMax; max > n {
 				n += mrand.IntN(max - n + 1)
 			}
 			if n > len(p) {

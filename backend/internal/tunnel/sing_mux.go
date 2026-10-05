@@ -294,7 +294,7 @@ func (h *singHandler) NewConnection(ctx context.Context, c net.Conn, metadata M.
 		return err
 	}
 	defer target.Close()
-	if !h.s.track(target) {
+	if !h.s.trackTarget(target, targetPolicy{binding: h.binding, host: metadata.Destination.AddrString(), port: int(metadata.Destination.Port), network: "tcp", mux: true, kind: h.kind}) {
 		return context.Canceled
 	}
 	defer h.s.untrack(target)
@@ -310,11 +310,5 @@ func (h *singHandler) NewPacketConnection(_ context.Context, c N.PacketConn, _ M
 	return errors.New("TCP mux only")
 }
 func (s *service) singTargetAllowed(binding, kind, host string, port int) bool {
-	for _, m := range s.snapshot.Mappings {
-		k, e := m.EffectiveMuxType()
-		if e == nil && m.Enabled && m.Mux && mappingNet(m.Network) == "tcp" && m.BindingID == binding && k == kind && m.TargetHost == host && m.TargetPort == port {
-			return true
-		}
-	}
-	return false
+	return s.targetAllowed(binding, host, port, "tcp", true, kind)
 }

@@ -9,7 +9,8 @@
   --line-strong: #385064;
   --text: #e8f0f5;
   --muted: #9aabb8;
-  --faint: #718492;
+  --faint: #9aabb8;
+  --input-bg: #080d13;
   --accent: #55b7c7;
   --accent-strong: #79d5df;
   --accent-soft: rgba(85, 183, 199, .14);
@@ -73,6 +74,10 @@ button:disabled, input:disabled, select:disabled { opacity: .5; cursor: not-allo
 .login-submit { width: 100%; margin-top: 24px; display: flex; justify-content: space-between; }
 label, .field-label { display: block; margin: 13px 0 5px; font-size: 12px; font-weight: 650; color: #c3d0d8; }
 input, select, textarea { min-width: 0; width: 100%; border: 1px solid var(--line); background: var(--bg-deep); border-radius: 7px; padding: 9px 10px; }
+select { color-scheme: dark; }
+option, optgroup { color: var(--text); background: var(--input-bg); }
+option:disabled { color: var(--muted); }
+input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
 input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(85, 183, 199, .12); outline: 0; }
 textarea { resize: vertical; }
 input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); }

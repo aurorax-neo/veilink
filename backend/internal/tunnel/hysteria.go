@@ -131,11 +131,9 @@ func (s *service) serveHysteria(conn *quic.Conn) {
 			port, portErr := strconv.ParseUint(portText, 10, 16)
 			var binding model.Binding
 			known := false
-			for _, candidate := range s.byUser {
-				if candidate.ID == authenticated.ID && candidate.Domain == host {
-					binding, known = candidate, true
-					break
-				}
+			owner, candidate, valid := s.bindingOwner(userKey(authenticated.UUID))
+			if valid && candidate.ID == authenticated.ID && candidate.Domain == host {
+				binding, known = candidate, true
 			}
 			if requestErr != nil || splitErr != nil || portErr != nil || !known || (port != 0 && port != applicationPort && port != singMuxPort) {
 				_ = stream.Close()
@@ -152,7 +150,11 @@ func (s *service) serveHysteria(conn *quic.Conn) {
 			}
 			defer s.untrack(wrapped)
 			id, _ := parseUUID(binding.UUID)
-			s.serveAuthorized(wrapped, id, binding, uint16(port))
+			if !owner.track(wrapped) {
+				return
+			}
+			defer owner.untrack(wrapped)
+			owner.serveAuthorized(wrapped, id, binding, uint16(port))
 			return
 		default:
 			_ = stream.Close()
@@ -174,7 +176,18 @@ func (s *service) hysteriaAuth(stream *quic.Stream) (model.Binding, bool, error)
 	ok := fields != nil && fields[":authority"] == "hysteria" && fields[":scheme"] == "https" && fields[":path"] == "/auth" && fields[":method"] == "POST"
 	var binding model.Binding
 	if ok {
-		for _, candidate := range s.byUser {
+		bindings := s.byUser
+		if children := s.children.Load(); children != nil {
+			bindings = map[string]model.Binding{}
+			for _, child := range *children {
+				if child.ctx.Err() == nil {
+					for user, candidate := range child.byUser {
+						bindings[user] = candidate
+					}
+				}
+			}
+		}
+		for _, candidate := range bindings {
 			if subtle.ConstantTimeCompare([]byte(fields["hysteria-auth"]), []byte(candidate.UUID)) == 1 {
 				binding = candidate
 				break

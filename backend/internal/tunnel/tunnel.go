@@ -135,8 +135,8 @@ func Build(s model.Snapshot, local model.LocalTLS) ([]byte, error) {
 	return json.Marshal(doc)
 }
 
-// Runtime serializes configuration replacement. A replacement interrupts flows
-// on that node. Revision is -1 when nothing is running. Do not copy a Runtime.
+// Runtime serializes configuration replacement and preserves unchanged bindings
+// and mapping listeners. Revision is -1 when nothing is running. Do not copy it.
 type Runtime struct {
 	mu        sync.Mutex
 	local     model.LocalTLS
@@ -173,17 +173,7 @@ func (r *Runtime) LinkedBindings() []string {
 	if svc == nil {
 		return nil
 	}
-	svc.mu.Lock()
-	defer svc.mu.Unlock()
-	ids := make([]string, 0, len(svc.sessions))
-	for id, list := range svc.sessions {
-		for _, sess := range list {
-			if sess.alive() {
-				ids = append(ids, id)
-				break
-			}
-		}
-	}
+	ids := svc.linkedBindings()
 	sort.Strings(ids)
 	return ids
 }
@@ -230,6 +220,22 @@ func (r *Runtime) Apply(s model.Snapshot) error {
 		return nil
 	}
 	oldRevision := r.revision
+	if r.instance != nil && r.good != nil && r.goodLocal == effective && sameRuntimeNode(r.good.Node, s.Node) && (s.Node.Role == "client" || (len(r.good.Bindings) > 0) == (len(s.Bindings) > 0)) {
+		r.traffic.prepareActive(s.Mappings, s.Node.Role == "server")
+		if err := r.instance.reconcile(s); err != nil {
+			r.traffic.setActive(r.good.Mappings, r.good.Node.Role == "server")
+			if errors.Is(err, errRollbackFailed) {
+				r.instance.stop()
+				r.instance, r.revision = nil, -1
+				return fmt.Errorf("start failed: %w", err)
+			}
+			return fmt.Errorf("start failed (restored revision %d): %w", oldRevision, err)
+		}
+		r.traffic.setActive(s.Mappings, s.Node.Role == "server")
+		saved := cloneSnapshot(s)
+		r.good, r.document, r.revision, r.highWater = &saved, document, s.Revision, s.Revision
+		return nil
+	}
 	if r.instance != nil {
 		r.instance.stop()
 		r.instance = nil
@@ -438,6 +444,11 @@ type service struct {
 	applications       map[string][]*applicationSlot
 	singPools          map[string]*singPool
 	dialLog            *dialDiagnostics
+	children           atomic.Pointer[bindingServices]
+	policy             atomic.Pointer[model.Snapshot]
+	mappingListeners   map[string]*mappingListener
+	mappingConns       map[string]map[net.Conn]struct{}
+	targetConns        map[net.Conn]targetPolicy
 }
 
 func start(s model.Snapshot, local model.LocalTLS, traffic ...*Traffic) (*service, error) {
@@ -445,6 +456,10 @@ func start(s model.Snapshot, local model.LocalTLS, traffic ...*Traffic) (*servic
 }
 
 func startWithDiagnostics(s model.Snapshot, local model.LocalTLS, diagnostics *dialDiagnostics, traffic ...*Traffic) (*service, error) {
+	return startService(s, local, diagnostics, false, traffic...)
+}
+
+func startService(s model.Snapshot, local model.LocalTLS, diagnostics *dialDiagnostics, bindingOnly bool, traffic ...*Traffic) (*service, error) {
 	if err := validate(s, local); err != nil {
 		return nil, err
 	}
@@ -456,7 +471,9 @@ func startWithDiagnostics(s model.Snapshot, local model.LocalTLS, diagnostics *d
 		applications:       map[string][]*applicationSlot{},
 		applicationChanged: make(chan struct{}), applicationWaiting: map[string]int{},
 		singPools: map[string]*singPool{}, dialLog: diagnostics,
+		mappingListeners: map[string]*mappingListener{}, mappingConns: map[string]map[net.Conn]struct{}{}, targetConns: map[net.Conn]targetPolicy{},
 	}
+	svc.policy.Store(&svc.snapshot)
 	if len(traffic) > 0 {
 		svc.traffic = traffic[0]
 	}
@@ -466,6 +483,31 @@ func startWithDiagnostics(s model.Snapshot, local model.LocalTLS, diagnostics *d
 			svc.stop()
 		}
 	}()
+	if !bindingOnly {
+		children := bindingServices{}
+		for _, b := range s.Bindings {
+			child, childErr := startService(bindingSnapshot(s, b), local, diagnostics, true, traffic...)
+			if childErr != nil {
+				err = childErr
+				for _, started := range children {
+					started.stop()
+				}
+				return nil, err
+			}
+			children[b.ID] = child
+		}
+		svc.children.Store(&children)
+		if s.Node.Role == "server" {
+			if err = svc.prepareReality(); err != nil {
+				return nil, err
+			}
+			if err = svc.prepareCrypto(); err != nil {
+				return nil, err
+			}
+			err = svc.listenServer()
+		}
+		return svc, err
+	}
 	gateways := map[string]model.Node{}
 	for _, n := range s.Nodes {
 		gateways[n.ID] = n
@@ -483,16 +525,20 @@ func startWithDiagnostics(s model.Snapshot, local model.LocalTLS, diagnostics *d
 		}
 	}
 	svc.initSingPools()
-	if err = svc.prepareReality(); err != nil {
-		return nil, err
+	if s.Node.Role == "server" {
+		svc.flow, _ = normalizeFlow(local.Flow)
 	}
 	if s.Node.Role == "server" {
-		if err = svc.prepareCrypto(); err != nil {
-			return nil, err
+		for _, m := range s.Mappings {
+			if m.Enabled {
+				var listener *mappingListener
+				listener, err = svc.newMappingListener(m)
+				if err != nil {
+					return nil, err
+				}
+				svc.mappingListeners[m.ID] = listener
+			}
 		}
-	}
-	if s.Node.Role == "server" {
-		err = svc.listenServer()
 	} else {
 		peers := map[string]*clientGateway{}
 		for _, b := range s.Bindings {
@@ -537,6 +583,14 @@ func (s *service) stop() {
 			_ = s.quic.Close()
 		}
 		s.cancel()
+		if children := s.children.Load(); children != nil {
+			for _, child := range *children {
+				child.stop()
+			}
+		}
+		for _, listener := range s.mappingListeners {
+			listener.close()
+		}
 		if s.xhttpClose != nil {
 			s.xhttpClose()
 		}
@@ -592,7 +646,9 @@ func (s *service) listenServer() error {
 			}
 			s.listeners = append(s.listeners, ln)
 			if s.reality != nil && s.local.XHTTP.Enabled() {
-				ln = reality.NewListener(ln, s.reality)
+				ln = newRealityListener(s.ctx, ln, func(ctx context.Context, conn net.Conn) (net.Conn, error) {
+					return reality.Server(ctx, conn, s.reality)
+				})
 			}
 			if s.local.XHTTP.Enabled() {
 				s.serveXHTTP(ln)
@@ -602,26 +658,6 @@ func (s *service) listenServer() error {
 		}
 	}
 
-	for _, m := range s.snapshot.Mappings {
-		if !m.Enabled {
-			continue
-		}
-		if mappingNet(m.Network) == "udp" {
-			pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP(listenHost(m.ListenHost)), Port: m.ListenPort})
-			if err != nil {
-				return err
-			}
-			s.packets = append(s.packets, pc)
-			go s.serveUDP(pc, m)
-			continue
-		}
-		ln, err := net.Listen("tcp", net.JoinHostPort(listenHost(m.ListenHost), strconv.Itoa(m.ListenPort)))
-		if err != nil {
-			return err
-		}
-		s.listeners = append(s.listeners, ln)
-		go s.acceptMapping(ln, m)
-	}
 	if s.dialLog != nil && s.dialLog.logger != nil && len(s.snapshot.Bindings) > 0 {
 		s.dialLog.logger.Info("server tunnel listening", "role", "server", "id", s.snapshot.Node.ID, "addr", listenHost(s.local.ListenHost), "port", s.local.ListenPort)
 	}
@@ -642,13 +678,14 @@ func (s *service) acceptTransport(ln net.Listener) {
 	}
 }
 
-func (s *service) acceptMapping(ln net.Listener, m model.Mapping) {
+func (s *service) acceptMapping(ln net.Listener, listener *mappingListener) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		if !s.track(conn) {
+		m := *listener.mapping.Load()
+		if !s.trackMapping(conn, m, listener) {
 			_ = conn.Close()
 			continue
 		}
@@ -684,7 +721,7 @@ func (s *service) authenticate(conn net.Conn) {
 		return
 	}
 	got, flowErr := normalizeFlow(flow)
-	binding, ok := s.byUser[hex.EncodeToString(id[:])]
+	owner, binding, ok := s.bindingOwner(hex.EncodeToString(id[:]))
 	if flowErr != nil || got != s.flow || !ok || (port != 0 && port != applicationPort && port != singMuxPort) || !strings.EqualFold(host, binding.Domain) {
 		s.noteServer("authentication")
 		return
@@ -692,11 +729,16 @@ func (s *service) authenticate(conn net.Conn) {
 	if err = writeVLESSResponse(conn); err != nil {
 		return
 	}
-	s.serveAuthorized(conn, id, binding, port)
+	if !owner.track(conn) {
+		return
+	}
+	defer owner.untrack(conn)
+	owner.serveAuthorized(conn, id, binding, port)
 }
 
 func (s *service) openPublic(conn net.Conn, m model.Mapping) {
 	defer s.untrack(conn)
+	defer s.untrackMapping(conn, m.ID)
 	remote := ""
 	if conn.RemoteAddr() != nil {
 		remote = conn.RemoteAddr().String()
@@ -757,7 +799,7 @@ func (s *service) maintain(b model.Binding, gateway model.Node, peer *clientGate
 		sess := newSession(conn)
 		s.addSession(b.ID, sess)
 		sess.readLoop(func(host string, port int, udp bool) (net.Conn, error) {
-			if !udp || !s.allowed[b.ID]["udp\n"+host+"\n"+strconv.Itoa(port)] {
+			if !udp || !s.targetAllowed(b.ID, host, port, "udp", false, "") {
 				return nil, errors.New("target is not authorized")
 			}
 			dialer := net.Dialer{Timeout: 5 * time.Second}
@@ -774,7 +816,12 @@ func (s *service) maintain(b model.Binding, gateway model.Node, peer *clientGate
 				_ = conn.Close()
 				return nil, errors.New("udp dial failed")
 			}
-			return newClientUDP(uc, host, port), nil
+			wrapped := newClientUDP(uc, host, port)
+			if !s.trackTarget(wrapped, targetPolicy{binding: b.ID, host: host, port: port, network: "udp"}) {
+				wrapped.Close()
+				return nil, errors.New("target is not authorized")
+			}
+			return &policyConn{Conn: wrapped, service: s}, nil
 		})
 		s.removeSession(b.ID, sess)
 		s.untrack(conn)
@@ -846,6 +893,7 @@ func (s *service) untrack(conn net.Conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.conns, conn)
+	delete(s.targetConns, conn)
 }
 
 func (s *service) addSession(binding string, sess *session) {

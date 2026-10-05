@@ -546,8 +546,7 @@ onMounted(() => {
               <option value="readonly">readonly（只读）</option>
             </select>
           </label>
-          <div class="field">
-            <span>&nbsp;</span>
+          <div class="key-create">
             <button type="button" class="btn primary" :disabled="creatingKey" @click="createKey">
               {{ creatingKey ? '创建中…' : '创建' }}
             </button>
@@ -560,12 +559,14 @@ onMounted(() => {
         </div>
         <ul v-if="keys.length" class="key-list">
           <li v-for="k in keys" :key="k.id" class="key-item">
-            <div class="key-meta">
-              <strong>{{ k.name }}</strong>
-              <span class="tag" :class="k.role === 'admin' ? 'admin' : 'ro'">{{ k.role }}</span>
-              <span class="muted mono">{{ k.prefix }}…</span>
+            <div class="key-details">
+              <div class="key-meta">
+                <strong>{{ k.name }}</strong>
+                <span class="tag" :class="k.role === 'admin' ? 'admin' : 'ro'">{{ k.role }}</span>
+                <span class="muted mono">{{ k.prefix }}…</span>
+              </div>
+              <div class="key-sub muted">{{ k.created_at }}</div>
             </div>
-            <div class="key-sub muted">{{ k.created_at }}</div>
             <button
               type="button"
               class="btn danger small"
@@ -690,11 +691,11 @@ onMounted(() => {
 }
 .probe-summary-badge.good {
   background: rgba(34, 197, 94, 0.15);
-  color: #22c55e;
+  color: var(--good);
 }
 .probe-summary-badge.bad {
   background: rgba(239, 68, 68, 0.15);
-  color: #ef4444;
+  color: var(--danger);
 }
 .probe-cards {
   list-style: none;
@@ -765,11 +766,11 @@ onMounted(() => {
 }
 .status-badge.good {
   background: rgba(34, 197, 94, 0.12);
-  color: #22c55e;
+  color: var(--good);
 }
 .status-badge.bad {
   background: rgba(239, 68, 68, 0.12);
-  color: #ef4444;
+  color: var(--danger);
 }
 .probe-target-url {
   font-size: 11px;
@@ -793,15 +794,15 @@ onMounted(() => {
 }
 .probe-latency.fast {
   background: rgba(34, 197, 94, 0.12);
-  color: #22c55e;
+  color: var(--good);
 }
 .probe-latency.medium {
   background: rgba(245, 158, 11, 0.12);
-  color: #f59e0b;
+  color: var(--warn);
 }
 .probe-latency.slow {
   background: rgba(239, 68, 68, 0.12);
-  color: #ef4444;
+  color: var(--danger);
 }
 .probe-error {
   font-size: 11px;
@@ -830,10 +831,12 @@ onMounted(() => {
 
 .form-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
   gap: 12px;
 }
 .field {
+  min-width: 0;
+  margin: 0;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -875,18 +878,28 @@ onMounted(() => {
 }
 .tag.warn {
   background: rgba(245, 158, 11, 0.15);
-  color: #f59e0b;
+  color: var(--warn);
 }
 .tag.admin {
   background: rgba(239, 68, 68, 0.12);
-  color: #ef4444;
+  color: var(--danger);
 }
 .tag.ro {
   background: rgba(59, 130, 246, 0.12);
-  color: #3b82f6;
+  color: #9fc5ff;
 }
 .mono { font-family: ui-monospace, monospace; font-size: 12px; }
-.key-form { margin-bottom: 12px; }
+.key-form { margin-bottom: 12px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; align-items: end; }
+.key-create .btn { min-height: 40px; }
+.key-details { min-width: 0; flex: 1; }
+.key-item > .btn { flex: none; }
+.key-meta strong, .key-sub { overflow-wrap: anywhere; }
+@media (max-width: 640px) {
+  .key-form { grid-template-columns: minmax(0, 1fr); }
+  .key-create .btn { width: 100%; }
+  .panel-head > div { min-width: 0; }
+  .panel-head > .btn { flex: none; }
+}
 .key-list {
   list-style: none;
   margin: 12px 0 0;
@@ -936,11 +949,11 @@ onMounted(() => {
 }
 .btn.danger {
   border-color: rgba(239, 68, 68, 0.4);
-  color: #ef4444;
+  color: var(--danger);
 }
 .btn.danger:hover:not(:disabled) {
   background: rgba(239, 68, 68, 0.1);
 }
 .btn.small { padding: 5px 10px; font-size: 12px; }
-.hint.good { color: #22c55e; }
+.hint.good { color: var(--good); }
 </style>

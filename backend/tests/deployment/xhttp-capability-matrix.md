@@ -1,4 +1,4 @@
-# Veilink XHTTP 能力边界（v0.3.0 候选）
+# Veilink XHTTP 能力边界
 
 对照 `ref/Xray-core/transport/internet/splithttp/config.proto`。这是 **Veilink 双端原生协议**，不是与 Xray 对端互通的声明；未列为可配置的参考字段不能通过 Veilink JSON 偷渡：严格 JSON 会拒绝未知字段。Server 是唯一配置权威，Client 只接收派生模板。
 
@@ -21,12 +21,21 @@
 | `xmux.hMaxRequestTimes` | `h_max_request_times` 默认 0（无限）；按实际 RoundTrip 计数，达到次数后 transport 退役，活动请求完成后关闭。范围 1–100000。 |
 | `xmux.hMaxReusableSecs` | `h_max_reusable_secs` 默认 0（无限）；从 transport 创建时计时，达到时长后退役，活动请求完成后关闭。范围 1–86400 秒。 |
 | `xmux.hKeepAlivePeriod` | `keep_alive_period` 默认 0（关闭）；显式 1–3600 秒。H1/H2 使用授权拨号器并启用 HTTP/2 Ping，H3 使用 QUIC KeepAlive；REALITY 等自定义拨号链不被 xmux 绕过；底层 transport 由共享池 lease 生命周期管理。 |
-| `downloadSettings` | `download_endpoint_id` 仅接受 Server 已启用连接入口 ID，保存/应用/绑定校验拒绝不存在或禁用入口、流模式和任意目的地；packet-up/auto 的 GET/下行使用独立授权 transport，POST/PUT/上行继续使用主入口；主/下行入口和 xmux 池隔离，入口或拨号器失败 fail closed。见 `xhttp_downlink_test.go`、XHTTP runtime、Store/API/前端测试。 |
+| `downloadSettings` | `download_endpoint_id` 仅接受 Server 已启用连接入口 ID，保存/应用/绑定校验拒绝不存在或禁用入口、stream-one 和任意目的地；packet-up、stream-up 及协商为这两者的 auto，其 GET/下行使用独立授权 transport，POST/PUT/上行继续使用主入口；主/下行入口和 xmux 池隔离，入口或拨号器失败 fail closed。见 `xhttp_downlink_test.go`、XHTTP runtime、Store/API/前端测试。 |
 | `xPaddingObfsMode`, `xPaddingKey`, `xPaddingHeader`, `xPaddingPlacement`, `xPaddingMethod` | `padding_obfs_mode` 启用后支持 `query_in_header`、`query`、`header`、私有 `x_` Cookie 四种请求位置，默认 `query_in_header` / `x_padding`；头仅允许 Referer（query_in_header）、X-Padding 或 X-Custom-*，与元数据/请求头配置碰撞拒绝。`repeat-x` 按原始字节区间生成；`tokenish` 使用无偏随机 base62，并按 HPACK Huffman 编码长度落在目标 ±2 字节。响应以配置头、X-Padding（query）或 Set-Cookie 携带填充并由 Client 校验；不是跨请求 Cookie 会话。未启用时保留旧 Referer 查询与响应 X-Padding，拒绝附加混淆字段。见 `xhttp_padding_test.go`、`xhttp_h2c_test.go`、`xhttp3_test.go`、Store/API/前端测试。 |
 | `uplinkHTTPMethod` | `uplink_http_method` 默认 POST；显式仅允许 POST 或 PUT，三种模式均一致；下行 GET 不变。GET/HEAD/DELETE 等与下行或请求体语义冲突的方法在保存时拒绝。使用 PUT 时前置代理须允许 PUT 且禁用请求缓冲；不宣称任意 CDN 支持。 |
 | `sessionIDPlacement`, `sessionIDKey`, `seqPlacement`, `seqKey` | 空值沿用规范 UUID/十进制序号的路径位置；显式 `path`、`query`、`header`、`cookie` 双端生效。query 键限 1–40 位小写 ASCII/数字/下划线，header 键限 `X-Veilink-*` 且不能覆盖 EOF/上传确认；Cookie 键必须是私有 `x_` 前缀，服务端拒绝重复、额外或畸形 Cookie，不与 Master Web 的 Cookie 认证混用。服务端还拒绝多值及多余路径/查询；序号字段仅 packet-up/auto，stream-one 无会话 ID。见 `xhttp_meta_test.go`、`xhttp3_test.go`、`xhttp_runtime_test.go`、存储/API/前端测试。 |
-| `uplinkDataPlacement`, `uplinkDataKey`, `uplinkChunkSize` | `uplink_data_placement` 默认 body；packet-up/auto 的请求体仍为默认。显式 header 使用连续 `X-Veilink-Data-N` 私有头，显式 cookie 使用连续 `x_data_N` 私有 Cookie；内容为无填充 Base64URL，默认编码块分别为 4096/3072 字节，显式 `uplink_chunk_size` 为 64–8192。最多 32 块，总解码数据受单片上限约束；缺块、重复、非法编码、混合请求体、保留/非私有键和流模式配置均在保存或应用前拒绝。Client 与 Server 实际双端生效，HTTP/1.1/HTTPS 反代、缓冲并发、EOF/授权快照均有回归。 |
+| `uplinkDataPlacement`, `uplinkDataKey`, `uplinkChunkSize` | `uplink_data_placement` 默认 body；packet-up 及协商为 packet-up 的 auto，其请求体仍为默认。显式 header 使用连续 `X-Veilink-Data-N` 私有头，显式 cookie 使用连续 `x_data_N` 私有 Cookie；内容为无填充 Base64URL，默认编码块分别为 4096/3072 字节，显式 `uplink_chunk_size` 为 64–8192。最多 32 块（含正好 32 块），Client 根据 Base64 编码开销、块数、填充及请求头预算自动缩小实际分片。配置阶段拒绝保留/非私有键、元数据/填充键冲突及流模式数据字段；接收阶段拒绝缺块、重复、非法编号/编码及混合请求体（包括未知长度请求体）。HTTP/1.1/2/3、缓冲并发、EOF/授权快照均有回归。 |
 | `serverMaxHeaderBytes` | `server_max_header_bytes` 配置服务端请求头预算，0 默认 8192，显式仅允许 8192–32768；HTTP/1.1、HTTP/2、HTTP/3 监听器共用设置。Client 的响应头上限仍固定 8192，不随之放宽。 |
 | `sessionIDTable`, `sessionIDLength` | 默认仍为规范 UUID v4；自定义可设 `hex`、`base62` 或 16–64 个互异 URL-safe ASCII 字符，长度 24–64 且须提供至少 128 位熵，使用无偏随机采样。stream-one 无会话 ID，不接受这些设置；低熵、非法字符和重复字符在保存/应用前拒绝。见 `xhttp_meta_test.go` 与存储/API/前端测试。 |
 
-额外 Veilink 配置 `http_version`：空值保持旧协商；显式 `1.1` 仅 packet-up；显式 `2` 默认要求 HTTPS，或在 `packet-up`、直连 HTTP、plain 回源且强制 VLESS Encryption 时使用 h2c prior-knowledge（不回退 HTTP/1.1）；显式 `3` 要求 UDP 直连 HTTPS、TLS 回源且不能使用 REALITY。流模式仅允许直连 HTTPS + TLS 回源的 HTTP/2 或 HTTP/3；不保证 CDN 流式支持。`packet-up` 的 EOF 头和 `stream-up` 的上传完成 trailer 是 Veilink 私有扩展。健康/心跳/已应用确认不代表目标业务可达。
+额外 Veilink 配置 `http_version`：显式 `1.1` 仅 packet-up；显式 `2` 支持 HTTPS、REALITY，以及 packet-up + 直连 HTTP + plain 回源 + VLESS Encryption 的 h2c prior-knowledge（不回退 HTTP/1.1）。REALITY 内的 HTTP/2 使用已经认证和加密的 REALITY 连接，不额外套 TLS，也不以明文传输。显式 `3` 要求 UDP 直连 HTTPS、TLS 回源且不能使用 REALITY。流模式支持 TLS 的 HTTP/2/3 和 REALITY 的 HTTP/2；REALITY 流模式缺省版本使用 HTTP/2，packet-up 缺省版本保持 HTTP/1.1。不保证 CDN 流式支持。`packet-up` 的 EOF 头和 `stream-up` 的上传完成 trailer 是 Veilink 私有扩展。健康/心跳/已应用确认不代表目标业务可达。
+
+## 自动化覆盖
+
+- `xhttp_matrix_test.go`：350 组有效组合，覆盖 TLS/plain/REALITY、默认及 HTTP/1.1/2/3、四种模式、Encryption 开关、REALITY ML-DSA-65 开关、TCP 无 mux/smux/yamux/h2mux 和 UDP；每组执行实际授权反向隧道往返、两个并发连接及 TCP 半关闭。另有 17 组不支持的组合明确拒绝。
+- `xhttp_runtime_test.go`：24 组 header/cookie 大数据预算组合，覆盖 HTTP/1.1/2/3、缓冲开关和默认/64 字节编码块，传输 128 KiB。
+- `xhttp_downlink_test.go`：8 组 TLS/plain/REALITY 分离下行往返，以及强制 GET 走下行、POST 走上行的双入口回归。
+- `internal/store/xhttp_test.go`：REALITY + ML-DSA-65 四模式保存、数据库重开及授权快照派生，客户端快照不含服务端私钥/种子。
+- `reality_listener_test.go`：REALITY 监听器并发关闭及父上下文取消，未完成握手的连接必须关闭，连接交接不能与关闭产生数据竞争。
+- 其他 XHTTP 测试覆盖请求头、填充、元数据、PUT、乱序、取消、EOF、连接池生命周期、HTTP/3 及恶意输入。主矩阵不是所有配置字段的笛卡尔积，不构成任意 CDN 或 Xray 对端互通验证。

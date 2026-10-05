@@ -28,7 +28,7 @@ func TestXHTTPStreamUpRejectedGETClosesTransport(t *testing.T) {
 	tr := new(xhttpFailingTransport)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	c, err := dialXHTTPStream(ctx, &http.Client{Transport: tr}, tr, "https://example.test/packet/", model.XHTTP{Path: "/packet/", Mode: "stream-up", TLS: true}, false, nil, cancel)
+	c, err := dialXHTTPStream(ctx, &http.Client{Transport: tr}, &http.Client{Transport: tr}, tr, "https://example.test/packet/", "https://example.test/packet/", model.XHTTP{Path: "/packet/", Mode: "stream-up", TLS: true}, false, nil, cancel)
 	if c != nil || err == nil || !tr.closed.Load() {
 		t.Fatalf("conn=%v err=%v transport closed=%t", c, err, tr.closed.Load())
 	}

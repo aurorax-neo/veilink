@@ -57,10 +57,11 @@ func TestVisionPoolOneBurstAndRestart(t *testing.T) {
 	cr.Close()
 	// The old idle reader must detect EOF, not wait for its 45 second lease.
 	deadline := time.Now().Add(2 * time.Second)
+	binding := testBindingService(sr.instance, "one")
 	for {
-		sr.instance.mu.Lock()
-		n := len(sr.instance.applications["one"])
-		sr.instance.mu.Unlock()
+		binding.mu.Lock()
+		n := len(binding.applications["one"])
+		binding.mu.Unlock()
 		if n == 0 {
 			break
 		}
@@ -74,9 +75,9 @@ func TestVisionPoolOneBurstAndRestart(t *testing.T) {
 	go func() { result <- exchange(server.Mappings[0].ListenPort, []byte("first-after-restart"), false) }()
 	deadline = time.Now().Add(time.Second)
 	for {
-		sr.instance.mu.Lock()
-		n := sr.instance.applicationWaiting["one"]
-		sr.instance.mu.Unlock()
+		binding.mu.Lock()
+		n := binding.applicationWaiting["one"]
+		binding.mu.Unlock()
 		if n > 0 {
 			break
 		}

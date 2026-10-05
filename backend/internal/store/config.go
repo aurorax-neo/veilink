@@ -131,7 +131,7 @@ func clientTemplate(server model.Node) (*model.LocalTLS, error) {
 	}
 	if server.Tunnel.XHTTP.DownloadEndpointID != "" {
 		mode := server.Tunnel.XHTTP.Mode
-		if mode != "" && mode != "packet-up" && mode != "auto" {
+		if mode != "" && mode != "packet-up" && mode != "auto" && mode != "stream-up" {
 			return nil, ErrInvalid
 		}
 		if !validEndpointSelection(server, server.Tunnel.XHTTP.DownloadEndpointID) {

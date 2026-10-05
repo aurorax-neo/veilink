@@ -89,7 +89,7 @@ func TestXHTTPStreamAutoRealityDownloadUsesStreamUp(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	settings := model.XHTTP{Path: "/packet/", Mode: "auto", DownloadEndpointID: "download", TLS: true, RequestTimeoutSeconds: 1}
-	conn, err := dialXHTTPStream(ctx, client, tr, "https://"+u.Host+settings.Path, settings, true, nil, cancel)
+	conn, err := dialXHTTPStream(ctx, client, client, tr, "https://"+u.Host+settings.Path, "https://"+u.Host+settings.Path, settings, true, nil, cancel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +194,7 @@ func TestXHTTPStreamUpSetupTimeout(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	start := time.Now()
-	_, err := dialXHTTPStream(ctx, client, tr, s.URL+"/packet/", model.XHTTP{Mode: "stream-up", RequestTimeoutSeconds: 1}, false, nil, cancel)
+	_, err := dialXHTTPStream(ctx, client, client, tr, s.URL+"/packet/", s.URL+"/packet/", model.XHTTP{Mode: "stream-up", RequestTimeoutSeconds: 1}, false, nil, cancel)
 	if err == nil || time.Since(start) > 3*time.Second {
 		t.Fatalf("stalled GET did not time out: %v (%v)", err, time.Since(start))
 	}

@@ -49,6 +49,13 @@ func xhttpClientALPN(version string) []string {
 	return []string{"h2", "http/1.1"}
 }
 
+// REALITY dialers/listeners already provide authenticated TLS connections.
+// Use HTTP/2 prior knowledge inside them without adding a second TLS layer.
+func xhttpPriorHTTP2(local model.LocalTLS) bool {
+	return !local.XHTTP.TLS && (local.XHTTP.HTTPVersion == "2" ||
+		(local.Reality.Enabled() && xhttpEffectiveMode(local.XHTTP, true) != "packet-up"))
+}
+
 // xhttpEffectiveMode 对齐 Xray-core dialer.go:332-341 的 auto 协商逻辑：
 // auto/空 + 无 REALITY → packet-up
 // auto/空 + REALITY（无 downloadSettings）→ stream-one
@@ -586,13 +593,7 @@ func (h *xhttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer rc.SetReadDeadline(time.Time{})
-	body, err := io.ReadAll(io.LimitReader(r.Body, int64(h.maxPost)+1))
-	if xhttpDataPlacement(h.settings) != "body" {
-		body, err = xhttpDecodeData(r, h.settings, h.maxPost)
-		if err == nil && r.ContentLength > 0 {
-			err = errors.New("xhttp data body must be empty")
-		}
-	}
+	body, err := xhttpReadData(r, h.settings, h.maxPost)
 	if err != nil {
 		http.Error(w, "invalid body", 400)
 		return
@@ -602,7 +603,7 @@ func (h *xhttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	eof := r.Header.Get("X-Veilink-EOF")
-	if (eof != "" && eof != "1") || (eof == "1" && len(body) != 0) || (eof == "" && len(body) == 0) {
+	if len(r.Header.Values("X-Veilink-EOF")) > 1 || (eof != "" && eof != "1") || (eof == "1" && len(body) != 0) || (eof == "" && len(body) == 0) {
 		http.Error(w, "invalid EOF", 400)
 		return
 	}
@@ -738,7 +739,7 @@ func (s *service) serveXHTTP(ln net.Listener) {
 	h.padding, h.paddingMax = xhttpPaddingMinimum(s.local.XHTTP), xhttpPaddingMaximum(s.local.XHTTP)
 	h.maxPost = xhttpPostMaximum(s.local.XHTTP)
 	server := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: xhttpServerHeaderLimit(s.local.XHTTP), BaseContext: func(net.Listener) context.Context { return s.ctx }}
-	if s.local.XHTTP.HTTPVersion == "2" && !s.local.XHTTP.TLS {
+	if xhttpPriorHTTP2(s.local) {
 		protocols := new(http.Protocols)
 		protocols.SetUnencryptedHTTP2(true)
 		server.Protocols = protocols // prior knowledge only; no implicit HTTP/1.1 fallback
@@ -851,7 +852,7 @@ func dialXHTTPWithDownDialer(ctx context.Context, addr, serverName string, local
 		if local.XHTTP.HTTPVersion == "3" {
 			return newXHTTP3ClientTransport(pool, tlsName, time.Duration(local.XHTTP.Xmux.KeepAlivePeriod)*time.Second), nil
 		}
-		if local.XHTTP.HTTPVersion == "2" && !local.XHTTP.TLS {
+		if xhttpPriorHTTP2(local) {
 			protocols := new(http.Protocols)
 			protocols.SetUnencryptedHTTP2(true)
 			return &http.Transport{Proxy: nil, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) { return dialer(ctx) }, Protocols: protocols, HTTP2: xhttpHTTP2Config(local.XHTTP.Xmux.KeepAlivePeriod), MaxIdleConnsPerHost: 8, IdleConnTimeout: 30 * time.Second, ResponseHeaderTimeout: timeout, MaxResponseHeaderBytes: 8 << 10, DisableCompression: true}, nil
@@ -924,7 +925,7 @@ func dialXHTTPWithDownDialer(ctx context.Context, addr, serverName string, local
 		downBase = "https://" + downAddrActual
 	}
 	if xhttpEffectiveMode(local.XHTTP, local.Reality.Enabled()) == "stream-one" || xhttpEffectiveMode(local.XHTTP, local.Reality.Enabled()) == "stream-up" {
-		return dialXHTTPStream(ctx, client, tr, base+local.XHTTP.Path, local.XHTTP, local.Reality.Enabled(), headers, cancel)
+		return dialXHTTPStream(ctx, client, downClient, &xhttpTransportPair{up: tr, down: downTr}, base+local.XHTTP.Path, downBase+local.XHTTP.Path, local.XHTTP, local.Reality.Enabled(), headers, cancel)
 	}
 	url := xhttpMetaPath(downBase+local.XHTTP.Path, local.XHTTP, id, "")
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -956,7 +957,9 @@ func dialXHTTPWithDownDialer(ctx context.Context, addr, serverName string, local
 	}
 	app, wire := xhttpPair()
 	ack, ackWriter := net.Pipe()
-	c := &xhttpClientConn{xhttpStream: app, cancel: cancel, transport: &xhttpTransportPair{up: tr, down: downTr}, ack: ack, postSize: xhttpPostSize(local.XHTTP), postMax: xhttpPostMaximum(local.XHTTP)}
+	postMax := xhttpUploadLimit(local.XHTTP)
+	postSize := min(xhttpPostSize(local.XHTTP), postMax)
+	c := &xhttpClientConn{xhttpStream: app, cancel: cancel, transport: &xhttpTransportPair{up: tr, down: downTr}, ack: ack, postSize: postSize, postMax: postMax}
 	context.AfterFunc(ctx, func() {
 		_ = ack.Close()
 		_ = ackWriter.Close()
@@ -984,7 +987,7 @@ func dialXHTTPWithDownDialer(ctx context.Context, addr, serverName string, local
 		defer ackWriter.Close()
 		var seq uint64
 		var lastPost time.Time
-		buf := make([]byte, xhttpPostMaximum(local.XHTTP))
+		buf := make([]byte, postMax)
 		for {
 			n, readErr := wire.Read(buf)
 			if readErr != nil && readErr != io.EOF {
@@ -1013,7 +1016,7 @@ func dialXHTTPWithDownDialer(ctx context.Context, addr, serverName string, local
 			seqText := strconv.FormatUint(seq, 10)
 			req, e := http.NewRequestWithContext(postCtx, xhttpUplinkMethod(local.XHTTP), xhttpMetaPath(base+local.XHTTP.Path, local.XHTTP, id, seqText), bytes.NewReader(buf[:n]))
 			if e == nil {
-				if e == nil && xhttpDataPlacement(local.XHTTP) != "body" {
+				if xhttpDataPlacement(local.XHTTP) != "body" {
 					e = xhttpEncodeData(req, buf[:n], local.XHTTP)
 				}
 				if local.XHTTP.Host != "" {
@@ -1021,7 +1024,9 @@ func dialXHTTPWithDownDialer(ctx context.Context, addr, serverName string, local
 				}
 				xhttpApplyHeaders(req, headers)
 				xhttpSetMeta(req, local.XHTTP, id, seqText)
-				e = xhttpSetPadding(req, local.XHTTP)
+				if e == nil {
+					e = xhttpSetPadding(req, local.XHTTP)
+				}
 			}
 			if e == nil {
 				if readErr == io.EOF {

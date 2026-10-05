@@ -26,15 +26,15 @@ func TestOptionalMuxTCPAndRebuild(t *testing.T) {
 						s.Mappings[0].MuxType, c.Mappings[0].MuxType = kind, kind
 					}
 					s.Revision, c.Revision = int64(i+1), int64(i+1)
-					oldServer, oldClient := server.instance, client.instance
+					oldServer, oldClient := testBindingService(server.instance, s.Bindings[0].ID), testBindingService(client.instance, c.Bindings[0].ID)
 					if err := server.Apply(s); err != nil {
 						t.Fatal(err)
 					}
 					if err := client.Apply(c); err != nil {
 						t.Fatal(err)
 					}
-					if i > 0 && (server.instance == oldServer || client.instance == oldClient) {
-						t.Fatal("mux change did not rebuild both runtimes")
+					if i > 0 && (testBindingService(server.instance, s.Bindings[0].ID) == oldServer || testBindingService(client.instance, c.Bindings[0].ID) == oldClient) {
+						t.Fatal("mux change did not rebuild the affected binding")
 					}
 					port := s.Mappings[0].ListenPort
 					awaitEcho(t, port)

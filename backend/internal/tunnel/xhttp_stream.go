@@ -164,7 +164,7 @@ func (h *xhttpHandler) streamResponse(w http.ResponseWriter, r *http.Request, ap
 	}
 }
 
-func dialXHTTPStream(parent context.Context, client *http.Client, transport xhttpCloser, base string, settings model.XHTTP, realityEnabled bool, headers http.Header, cancel context.CancelFunc) (net.Conn, error) {
+func dialXHTTPStream(parent context.Context, client, downClient *http.Client, transport xhttpCloser, base, downBase string, settings model.XHTTP, realityEnabled bool, headers http.Header, cancel context.CancelFunc) (net.Conn, error) {
 	mode := xhttpEffectiveMode(settings, realityEnabled)
 	ctx, stop := context.WithTimeout(parent, xhttpRequestTimeout(settings))
 	defer stop()
@@ -184,7 +184,7 @@ func dialXHTTPStream(parent context.Context, client *http.Client, transport xhtt
 	var down *http.Response
 	if mode == "stream-up" {
 		var get *http.Request
-		get, err = http.NewRequestWithContext(parent, http.MethodGet, url, nil)
+		get, err = http.NewRequestWithContext(parent, http.MethodGet, xhttpMetaPath(downBase, settings, id, ""), nil)
 		if err == nil {
 			if settings.Host != "" {
 				get.Host = settings.Host
@@ -192,7 +192,7 @@ func dialXHTTPStream(parent context.Context, client *http.Client, transport xhtt
 			xhttpApplyHeaders(get, headers)
 			xhttpSetMeta(get, settings, id, "")
 			if err = xhttpSetPadding(get, settings); err == nil {
-				down, err = client.Do(get)
+				down, err = downClient.Do(get)
 			}
 		}
 		if err == nil && (down.StatusCode != http.StatusOK || !xhttpCheckResponsePadding(down, settings) || down.ProtoMajor != xhttpExpectedStreamMajor(settings)) {

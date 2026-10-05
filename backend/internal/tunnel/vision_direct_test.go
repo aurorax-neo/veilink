@@ -14,6 +14,7 @@ import (
 
 func awaitApplication(t *testing.T, s *service, binding string) {
 	t.Helper()
+	s = testBindingService(s, binding)
 	until := time.Now().Add(10 * time.Second)
 	for time.Now().Before(until) {
 		s.mu.Lock()
@@ -28,6 +29,13 @@ func awaitApplication(t *testing.T, s *service, binding string) {
 }
 
 func applicationCounters(s *service) (reads, writes, rawReads, rawWrites uint64) {
+	if children := s.children.Load(); children != nil {
+		for _, child := range *children {
+			r, w, rr, rw := applicationCounters(child)
+			reads, writes, rawReads, rawWrites = reads+r, writes+w, rawReads+rr, rawWrites+rw
+		}
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for conn := range s.conns {
@@ -141,14 +149,15 @@ func TestVisionApplicationRuntime(t *testing.T) {
 			} else if r != 0 || w != 0 || rr != 0 || rw != 0 {
 				t.Fatal("fallback bypassed encryption")
 			}
-			sr.instance.mu.Lock()
-			for _, sess := range sr.instance.sessions["one"] {
+			binding := testBindingService(sr.instance, "one")
+			binding.mu.Lock()
+			for _, sess := range binding.sessions["one"] {
 				v, ok := sess.conn.(*visionConn)
 				if !ok || v.direct != nil {
 					t.Error("mux acquired direct-copy capability")
 				}
 			}
-			sr.instance.mu.Unlock()
+			binding.mu.Unlock()
 			// Revocation/cancellation must close active dedicated connections as
 			// well as idle slots and the target sockets on the reverse client.
 			cr.Close()
@@ -381,9 +390,10 @@ func TestVisionDedicatedRejectsBindingMismatch(t *testing.T) {
 		}
 		c.Close()
 	}
-	sr.instance.mu.Lock()
-	defer sr.instance.mu.Unlock()
-	if len(sr.instance.applications["one"]) != 0 {
+	binding := testBindingService(sr.instance, "one")
+	binding.mu.Lock()
+	defer binding.mu.Unlock()
+	if len(binding.applications["one"]) != 0 {
 		t.Fatal("unauthorized pool insertion")
 	}
 }

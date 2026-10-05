@@ -77,7 +77,7 @@ func TestSingMuxRejectWireTargetsAndUDP(t *testing.T) {
 			server := run(t, s, local)
 			run(t, c, local)
 			awaitEcho(t, s.Mappings[0].ListenPort)
-			pool := server.instance.singPools[singKey(s.Bindings[0].ID, kind)]
+			pool := testBindingService(server.instance, s.Bindings[0].ID).singPools[singKey(s.Bindings[0].ID, kind)]
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			stream, err := pool.client.DialContext(ctx, "tcp", M.ParseSocksaddrHostPort("127.0.0.1", 1))
@@ -163,8 +163,9 @@ func TestSingMuxDisconnectRebuildAndCancel(t *testing.T) {
 			c.Mappings = append([]model.Mapping(nil), s.Mappings...)
 			server := run(t, s, local)
 			client := run(t, c, local)
+			c.Nodes = clone(*client.good).Nodes
 			awaitEcho(t, s.Mappings[0].ListenPort)
-			old := client.instance
+			old := testBindingService(client.instance, s.Bindings[0].ID)
 			old.mu.Lock()
 			conns := make([]net.Conn, 0, len(old.conns))
 			for conn := range old.conns {

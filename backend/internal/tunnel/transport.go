@@ -44,8 +44,8 @@ func checkTransportSecurity(local model.LocalTLS) error {
 		if err := checkXHTTPMux(x); err != nil {
 			return err
 		}
-		if x.DownloadEndpointID != "" && mode != "packet-up" {
-			return errors.New("xhttp download_endpoint_id requires packet-up or auto")
+		if x.DownloadEndpointID != "" && mode == "stream-one" {
+			return errors.New("xhttp download_endpoint_id requires packet-up or stream-up")
 		}
 		if err := checkXHTTPStreamPolicy(x, mode); err != nil {
 			return err
@@ -68,7 +68,7 @@ func checkTransportSecurity(local model.LocalTLS) error {
 		if mode != "packet-up" && x.HTTPVersion == "1.1" {
 			return errors.New("xhttp streaming requires HTTP/2 or HTTP/3")
 		}
-		if x.HTTPVersion == "2" && !x.TLS && (mode != "packet-up" || local.Reality.Enabled() || local.TransportSecurity != "plain") {
+		if x.HTTPVersion == "2" && !x.TLS && !local.Reality.Enabled() && (mode != "packet-up" || local.TransportSecurity != "plain") {
 			return errors.New("xhttp h2c requires packet-up, direct HTTP and plain origin with VLESS encryption")
 		}
 		if mode != "packet-up" && !local.Reality.Enabled() && (!x.TLS || local.TransportSecurity != "tls") {

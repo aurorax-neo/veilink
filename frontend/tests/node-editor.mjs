@@ -608,7 +608,9 @@ test('XHTTP restores HTTP options and rejects invalid paths and insecure HTTP', 
 
 test('XHTTP mode selector defaults safely, restores saved modes, and sends only selected modes', async () => {
   assert.match(editorSource, /id="node-xhttp-mode" v-model="draft.xhttpMode"/)
-  for (const mode of ['packet-up', 'stream-up', 'stream-one', 'auto']) assert.match(editorSource, new RegExp(`value="${mode}"`))
+  const modeSelector = editorSource.match(/<select id="node-xhttp-mode"[^>]*>(.*?)<\/select>/s)?.[1]
+  assert.ok(modeSelector)
+  for (const mode of ['packet-up', 'stream-up', 'stream-one', 'auto']) assert.match(modeSelector, new RegExp(`<option value="${mode}">${mode}</option>`))
   const e = setup()
   assert.equal(e.draft.xhttpMode, 'packet-up')
   e.draft.transport = 'xhttp'
@@ -647,7 +649,7 @@ test('XHTTP stream modes reject insecure or unsupported transport and invalid mo
     e.draft.security = 'tls'
     e.draft.xhttpTLS = true
     e.draft.xhttpVersion = '1.1'
-    await assert.rejects(e.save(), /流模式仅支持直连 HTTPS/)
+    await assert.rejects(e.save(), /流模式需要 HTTP\/2/)
     e.draft.xhttpVersion = ''
     assert.equal(e.requests.length, 0)
     e.draft.security = 'tls'
@@ -663,7 +665,7 @@ test('XHTTP stream modes reject insecure or unsupported transport and invalid mo
     await assert.rejects(e.save(), /XHTTP 模式仅支持/)
     assert.equal(e.requests.length, 2)
   }
-  assert.match(editorSource, /仅支持直连 HTTPS 的 HTTP\/2 或 HTTP\/3/)
+  assert.match(editorSource, /支持 TLS 的 HTTP\/2 或 HTTP\/3，以及 REALITY 内的 HTTP\/2/)
   assert.match(editorSource, /不连接 Xray 对端/)
 })
 
@@ -804,7 +806,9 @@ test('XHTTP explicit h2c accepts only encrypted packet-up and never silently cha
   e.draft.cert = cert; e.draft.key = key
   await assert.rejects(e.save(), /h2c/)
   e.draft.security = 'reality'
-  await assert.rejects(e.save(), /h2c|REALITY/)
+  await e.save()
+  assert.equal(payload(e).xhttp.http_version, '2')
+  assert.equal(payload(e).xhttp.tls, false)
   e.draft.security = 'encryption'
   e.draft.xhttpMode = 'stream-up'
   await assert.rejects(e.save(), /流模式/)
@@ -1075,7 +1079,7 @@ test('XHTTP buffered and concurrent posts default safely and roundtrip in packet
   assert.equal(e.draft.xhttpMaxBufferedPosts, 0)
   assert.equal(e.draft.xhttpMaxConcurrentPosts, 0)
   const controls = editorSource.split('\n').find(line => line.includes('<div v-if=') && line.includes('node-xhttp-max-buffered-posts'))
-  assert.match(controls, /v-if="\['packet-up', 'auto'\].includes\(draft.xhttpMode\)"/)
+  assert.match(controls, /v-if="xhttpEffectiveMode === 'packet-up'"/)
   assert.match(controls, /id="node-xhttp-max-buffered-posts" v-model.number="draft.xhttpMaxBufferedPosts"[^>]+max="32"[^>]+step="1"/)
   assert.match(controls, /id="node-xhttp-max-concurrent-posts" v-model.number="draft.xhttpMaxConcurrentPosts"[^>]+:max="Math.min\(8, draft.xhttpMaxBufferedPosts \+ 1\)"[^>]+step="1"/)
 })
@@ -1153,7 +1157,7 @@ test('XHTTP stream-up server padding periods default, restore and save fixed or 
   assert.equal(e.streamUpPeriod.min, '')
   assert.equal(e.streamUpPeriod.max, '')
   const controls = editorSource.split('\n').find(line => line.includes('<div v-if=') && line.includes('node-xhttp-stream-up-server-secs'))
-  assert.match(controls, /v-if="draft.xhttpMode === 'stream-up'"/)
+  assert.match(controls, /v-if="xhttpEffectiveMode === 'stream-up'"/)
   for (const id of ['node-xhttp-stream-up-server-secs', 'node-xhttp-stream-up-server-max-secs']) {
     assert.match(controls, new RegExp(`id="${id}"[^>]+type="number"[^>]+min="0"[^>]+max="300"[^>]+step="1"[^>]+placeholder="默认"`))
   }
@@ -1226,6 +1230,9 @@ test('XHTTP download endpoint uses enabled endpoint selector, rejects stale IDs,
   e.endpoints[1].enabled = true
   e.draft.xhttpMode = 'stream-up'
   await e.save()
+  assert.equal(payload(e).xhttp.download_endpoint_id, 'down')
+  e.draft.xhttpMode = 'stream-one'
+  await e.save()
   assert.equal(payload(e).xhttp.download_endpoint_id, undefined)
   e.draft.xhttpMode = 'packet-up'
   e.draft.xhttpDownloadEndpoint = 'unknown'
@@ -1234,4 +1241,52 @@ test('XHTTP download endpoint uses enabled endpoint selector, rejects stale IDs,
   c.open({ id: 'client', name: 'Client', tunnel: { xhttp: { path: '/cdn/', download_endpoint_id: 'down' } } })
   await c.save()
   assert.equal('tunnel' in body(c), false)
+})
+
+test('XHTTP REALITY auto serializes effective stream mode and keeps inactive packet edits', async () => {
+  assert.match(editorSource, /:required="draft.security === 'encryption' \|\| draft.transport === 'xhttp' && !draft.xhttpTLS && draft.security !== 'reality'"/)
+  const e = setup()
+  Object.assign(e.draft, { transport: 'xhttp', security: 'reality', xhttpMode: 'auto', xhttpVersion: '2', xhttpDataPlacement: 'header', xhttpChunkSize: 64, xhttpMaxBufferedPosts: 4, xhttpMaxConcurrentPosts: 4, xhttpSessionPlacement: 'query', xhttpSessionKey: 'sid', xhttpSeqPlacement: 'query', xhttpSeqKey: 'seq', xhttpNoGRPCHeader: true })
+  await e.save()
+  const x = payload(e).xhttp
+  assert.equal(x.mode, 'auto')
+  assert.equal(x.tls, false)
+  assert.equal(x.no_grpc_header, true)
+  for (const field of ['max_each_post_bytes', 'uplink_data_placement', 'uplink_chunk_size', 'max_buffered_posts', 'max_concurrent_posts', 'session_id_placement', 'session_id_key', 'seq_placement', 'seq_key']) assert.equal(x[field], undefined)
+  e.addEndpoint('download.example.com', 443)
+  e.endpoints[1].id = 'down'
+  e.draft.xhttpDownloadEndpoint = 'down'
+  Object.assign(e.streamUpPeriod, { min: 1, max: 2 })
+  await e.save()
+  assert.equal(payload(e).xhttp.download_endpoint_id, 'down')
+  assert.equal(payload(e).xhttp.session_id_key, 'sid')
+  assert.equal(payload(e).xhttp.seq_key, undefined)
+  assert.equal(payload(e).xhttp.stream_up_server_secs, 1)
+  e.endpoints[1].enabled = false
+  await assert.rejects(e.save(), /当前启用/)
+  e.draft.xhttpDownloadEndpoint = ''
+  e.draft.xhttpVersion = '1.1'
+  await assert.rejects(e.save(), /HTTP\/2/)
+  Object.assign(e.draft, { security: 'tls', xhttpTLS: true, xhttpVersion: '2' })
+  await e.save()
+  assert.equal(payload(e).xhttp.max_buffered_posts, 4)
+  assert.equal(payload(e).xhttp.uplink_chunk_size, 64)
+  assert.equal(payload(e).xhttp.no_grpc_header, undefined)
+})
+
+test('XHTTP data keys reject session, sequence and padding collisions before API', async () => {
+  for (const placement of ['header', 'cookie']) {
+    for (const field of ['session', 'seq', 'padding']) {
+      if (field === 'padding' && placement === 'header') continue
+      const e = setup()
+      Object.assign(e.draft, { transport: 'xhttp', xhttpDataPlacement: placement })
+      const key = placement === 'header' ? 'X-Veilink-DATA-0' : 'x_data_0'
+      if (field === 'padding') Object.assign(e.draft, { xhttpPaddingObfs: true, xhttpPaddingPlacement: 'cookie', xhttpPaddingKey: key })
+      else { e.draft[field === 'session' ? 'xhttpSessionPlacement' : 'xhttpSeqPlacement'] = placement; e.draft[field === 'session' ? 'xhttpSessionKey' : 'xhttpSeqKey'] = key }
+      await assert.rejects(e.save(), /不能与会话、序号或填充键冲突/)
+      assert.equal(e.requests.length, 0)
+    }
+  }
+  assert.match(editorSource, /<template v-if="xhttpEffectiveMode !== 'stream-one'">/)
+  assert.match(editorSource, /<div v-if="draft.xhttpMode !== 'stream-one'"><label for="node-xhttp-download-endpoint">/)
 })

@@ -164,7 +164,7 @@ type XHTTP struct {
 	MaxConcurrentPosts    int          `json:"max_concurrent_posts,omitempty"`      // 0 = one request; 1-8, bounded by buffering
 	StreamUpServerSecs    int          `json:"stream_up_server_secs,omitempty"`     // 0 = random 20-80 s; stream-up response padding
 	StreamUpServerMaxSecs int          `json:"stream_up_server_max_secs,omitempty"` // 0 = fixed at explicit minimum
-	DownloadEndpointID    string       `json:"download_endpoint_id,omitempty"`      // authorized Server endpoint for packet-up downlink
+	DownloadEndpointID    string       `json:"download_endpoint_id,omitempty"`      // authorized Server endpoint for packet-up/stream-up downlink
 	UplinkDataPlacement   string       `json:"uplink_data_placement,omitempty"`     // body (default), header or cookie
 	UplinkDataKey         string       `json:"uplink_data_key,omitempty"`           // private header/cookie base name
 	UplinkChunkSize       int          `json:"uplink_chunk_size,omitempty"`         // encoded block size, 64-8192

@@ -235,6 +235,63 @@ func TestXHTTPStreamingModesPersistAndDerive(t *testing.T) {
 	}
 }
 
+func TestXHTTPRealityMLDSAConfigurationPersistsAndDerives(t *testing.T) {
+	for _, mode := range []string{"packet-up", "auto", "stream-up", "stream-one"} {
+		for _, downlink := range []bool{false, true} {
+			if mode == "stream-one" && downlink {
+				continue
+			}
+			name := mode
+			if downlink {
+				name += "/downlink"
+			}
+			t.Run(name, func(t *testing.T) {
+				s, db, key := testStore(t)
+				server := testNode(t, s, "server", "server")
+				client := testNode(t, s, "client", "client")
+				credential := testCredential(t, s, client.ID)
+				private, public, err := tunnel.GenerateX25519()
+				if err != nil {
+					t.Fatal(err)
+				}
+				seed, verify, err := tunnel.GenerateMldsa65()
+				if err != nil {
+					t.Fatal(err)
+				}
+				server.Tunnel = model.LocalTLS{ListenHost: "127.0.0.1", ListenPort: 8444, Reality: model.Reality{PrivateKey: private, Dest: "cover.example:443", ShortIDs: "aa", ServerNames: "cover.example", Mldsa65Seed: seed, Mldsa65Verify: verify}, XHTTP: model.XHTTP{Path: "/cdn/", Mode: mode, HTTPVersion: "2"}}
+				server.ConnectEndpoints = []model.ConnectEndpoint{{ID: "up", Name: "Upload", Host: "127.0.0.1", Port: 8444, Enabled: true}, {ID: "down", Name: "Download", Host: "127.0.0.1", Port: 9444, Enabled: true}}
+				if downlink {
+					server.Tunnel.XHTTP.DownloadEndpointID = "down"
+				}
+				server.ClientTunnel = nil
+				server, err = s.SaveNode(server)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err = s.SaveMapping(testMapping(server.ID, client.ID, 8080)); err != nil {
+					t.Fatal(err)
+				}
+				if err = s.Close(); err != nil {
+					t.Fatal(err)
+				}
+				s, err = Open(db, key)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer s.Close()
+				snap, err := s.Snapshot(client.ID, credential)
+				if err != nil || len(snap.Nodes) != 1 {
+					t.Fatal("snapshot", err)
+				}
+				peer := snap.Nodes[0].Tunnel
+				if peer.XHTTP != server.Tunnel.XHTTP || peer.Reality.PublicKey != public || peer.Reality.Mldsa65Verify != verify || peer.Reality.Mldsa65Seed != "" || peer.Reality.PrivateKey != "" || peer.KeyPEM != "" || peer.Decryption != "" {
+					t.Fatal("invalid public REALITY template")
+				}
+			})
+		}
+	}
+}
+
 func TestXHTTP3PersistenceAndDerivation(t *testing.T) {
 	for _, mode := range []string{"packet-up", "stream-up", "stream-one", "auto"} {
 		t.Run(mode, func(t *testing.T) {
