@@ -7,7 +7,6 @@ package tunnel
 // This is not an Xray interoperability guarantee.
 // Reverse proxies must stream responses, disable buffering, and preserve paths.
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -759,51 +758,11 @@ type xhttpClientConn struct {
 	cancel            context.CancelFunc
 	transport         xhttpCloser
 	writeMu           sync.Mutex
-	ack               net.Conn
 	postSize, postMax int
 }
 
-// A successful Write acknowledges delivery, not merely staging in a pipe;
-// callers may immediately Close after their final response.
-func (c *xhttpClientConn) Write(p []byte) (int, error) {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	total := 0
-	for len(p) > 0 {
-		limit := c.postSize
-		if limit == 0 {
-			limit = xhttpChunk
-		}
-		if c.postMax > limit {
-			limit += mrand.IntN(c.postMax - limit + 1)
-		}
-		n := len(p)
-		if n > limit {
-			n = limit
-		}
-		if _, err := c.xhttpStream.Write(p[:n]); err != nil {
-			return total, err
-		}
-		var ack [1]byte
-		if _, err := io.ReadFull(c.ack, ack[:]); err != nil {
-			return total, err
-		}
-		total += n
-		p = p[n:]
-	}
-	return total, nil
-}
-func (c *xhttpClientConn) SetWriteDeadline(t time.Time) error {
-	_ = c.ack.SetReadDeadline(t)
-	return c.xhttpStream.SetWriteDeadline(t)
-}
-func (c *xhttpClientConn) SetDeadline(t time.Time) error {
-	_ = c.SetReadDeadline(t)
-	return c.SetWriteDeadline(t)
-}
 func (c *xhttpClientConn) Close() error {
 	c.cancel()
-	_ = c.ack.Close()
 	closeXHTTPTransport(c.transport)
 	return c.xhttpStream.Close()
 }
@@ -956,13 +915,10 @@ func dialXHTTPWithDownDialer(ctx context.Context, addr, serverName string, local
 		return fail(context.DeadlineExceeded)
 	}
 	app, wire := xhttpPair()
-	ack, ackWriter := net.Pipe()
 	postMax := xhttpUploadLimit(local.XHTTP)
 	postSize := min(xhttpPostSize(local.XHTTP), postMax)
-	c := &xhttpClientConn{xhttpStream: app, cancel: cancel, transport: &xhttpTransportPair{up: tr, down: downTr}, ack: ack, postSize: postSize, postMax: postMax}
+	c := &xhttpClientConn{xhttpStream: app, cancel: cancel, transport: &xhttpTransportPair{up: tr, down: downTr}, postSize: postSize, postMax: postMax}
 	context.AfterFunc(ctx, func() {
-		_ = ack.Close()
-		_ = ackWriter.Close()
 		_ = app.Close()
 		_ = wire.Close()
 		_ = resp.Body.Close()
@@ -977,83 +933,9 @@ func dialXHTTPWithDownDialer(ctx context.Context, addr, serverName string, local
 			_ = wire.CloseWrite()
 		}
 	}()
-	if local.XHTTP.MaxBufferedPosts != 0 || local.XHTTP.MaxConcurrentPosts != 0 {
-		_ = ackWriter.Close()
-		_ = wire.r.Close()
-		return &xhttpBufferedClient{xhttpClientConn: c, client: client, ctx: ctx, base: base + local.XHTTP.Path, id: id, settings: local.XHTTP, headers: headers}, nil
-	}
-	go func() {
-		defer wire.r.Close()
-		defer ackWriter.Close()
-		var seq uint64
-		var lastPost time.Time
-		buf := make([]byte, postMax)
-		for {
-			n, readErr := wire.Read(buf)
-			if readErr != nil && readErr != io.EOF {
-				return
-			}
-			if n == 0 && readErr == nil {
-				continue
-			}
-			if !lastPost.IsZero() && local.XHTTP.MinPostsIntervalMs > 0 {
-				interval := local.XHTTP.MinPostsIntervalMs
-				if local.XHTTP.MaxPostsIntervalMs > interval {
-					interval += mrand.IntN(local.XHTTP.MaxPostsIntervalMs - interval + 1)
-				}
-				if delay := time.Until(lastPost.Add(time.Duration(interval) * time.Millisecond)); delay > 0 {
-					timer := time.NewTimer(delay)
-					select {
-					case <-timer.C:
-					case <-ctx.Done():
-						timer.Stop()
-						return
-					}
-				}
-			}
-			lastPost = time.Now()
-			postCtx, postCancel := context.WithTimeout(ctx, timeout)
-			seqText := strconv.FormatUint(seq, 10)
-			req, e := http.NewRequestWithContext(postCtx, xhttpUplinkMethod(local.XHTTP), xhttpMetaPath(base+local.XHTTP.Path, local.XHTTP, id, seqText), bytes.NewReader(buf[:n]))
-			if e == nil {
-				if xhttpDataPlacement(local.XHTTP) != "body" {
-					e = xhttpEncodeData(req, buf[:n], local.XHTTP)
-				}
-				if local.XHTTP.Host != "" {
-					req.Host = local.XHTTP.Host
-				}
-				xhttpApplyHeaders(req, headers)
-				xhttpSetMeta(req, local.XHTTP, id, seqText)
-				if e == nil {
-					e = xhttpSetPadding(req, local.XHTTP)
-				}
-			}
-			if e == nil {
-				if readErr == io.EOF {
-					req.Header.Set("X-Veilink-EOF", "1")
-				}
-				var reply *http.Response
-				reply, e = client.Do(req)
-				if e == nil {
-					if reply.StatusCode != http.StatusOK || !xhttpCheckResponsePadding(reply, local.XHTTP) {
-						e = fmt.Errorf("xhttp POST status %d", reply.StatusCode)
-					}
-					_ = reply.Body.Close()
-				}
-			}
-			postCancel()
-			if e != nil {
-				_ = c.Close()
-				return
-			}
-			seq++
-			if readErr == io.EOF {
-				return
-			}
-			if _, err := ackWriter.Write([]byte{1}); err != nil {
-				return
-			}
-		}
-	}()
-	return c, nil
+	// Packet uploads write directly to HTTP, retaining remote acknowledgement
+	// for both serial and explicitly configured concurrent paths.
+	_ = app.w.Close()
+	_ = wire.r.Close()
+	return &xhttpBufferedClient{xhttpClientConn: c, client: client, ctx: ctx, base: base + local.XHTTP.Path, id: id, settings: local.XHTTP, headers: headers}, nil
 }

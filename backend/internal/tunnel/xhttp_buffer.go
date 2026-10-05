@@ -145,32 +145,75 @@ type xhttpBufferedClient struct {
 	lastPost    time.Time
 	deadline    time.Time
 	deadlineMu  sync.Mutex
+	writeCtx    context.Context
+	writeCancel context.CancelFunc
+	writeTimer  *time.Timer
 	closedWrite bool
 }
 
 func (c *xhttpBufferedClient) SetWriteDeadline(t time.Time) error {
 	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
 	c.deadline = t
-	c.deadlineMu.Unlock()
+	c.armWriteDeadline()
 	return nil
 }
-func (c *xhttpBufferedClient) writeDeadline() time.Time {
+
+// Deadlines remain mutable while an HTTP request or pacing wait is blocked.
+func (c *xhttpBufferedClient) armWriteDeadline() {
+	if c.writeTimer != nil {
+		c.writeTimer.Stop()
+		c.writeTimer = nil
+	}
+	if c.writeCancel == nil || c.deadline.IsZero() {
+		return
+	}
+	if !time.Now().Before(c.deadline) {
+		c.writeCancel()
+		return
+	}
+	ctx := c.writeCtx
+	c.writeTimer = time.AfterFunc(time.Until(c.deadline), func() {
+		c.deadlineMu.Lock()
+		defer c.deadlineMu.Unlock()
+		if c.writeCtx == ctx && !c.deadline.IsZero() && !time.Now().Before(c.deadline) {
+			c.writeCancel()
+		}
+	})
+}
+func (c *xhttpBufferedClient) beginWrite() (context.Context, func()) {
 	c.deadlineMu.Lock()
-	defer c.deadlineMu.Unlock()
-	return c.deadline
+	ctx, cancel := context.WithCancel(c.ctx)
+	c.writeCtx, c.writeCancel = ctx, cancel
+	c.armWriteDeadline()
+	c.deadlineMu.Unlock()
+	return ctx, func() {
+		c.deadlineMu.Lock()
+		if c.writeTimer != nil {
+			c.writeTimer.Stop()
+			c.writeTimer = nil
+		}
+		c.writeCtx, c.writeCancel = nil, nil
+		c.deadlineMu.Unlock()
+		cancel()
+	}
+}
+func (c *xhttpBufferedClient) writeError(err error) error {
+	c.deadlineMu.Lock()
+	expired := !c.deadline.IsZero() && !time.Now().Before(c.deadline)
+	c.deadlineMu.Unlock()
+	if expired {
+		return context.DeadlineExceeded
+	}
+	return err
 }
 func (c *xhttpBufferedClient) SetDeadline(t time.Time) error {
 	_ = c.SetReadDeadline(t)
 	return c.SetWriteDeadline(t)
 }
-func (c *xhttpBufferedClient) post(body []byte, seq uint64, eof bool, deadline time.Time) error {
-	ctx, cancel := context.WithTimeout(c.ctx, xhttpRequestTimeout(c.settings))
+func (c *xhttpBufferedClient) post(parent context.Context, body []byte, seq uint64, eof bool) error {
+	ctx, cancel := context.WithTimeout(parent, xhttpRequestTimeout(c.settings))
 	defer cancel()
-	if !deadline.IsZero() {
-		var stop context.CancelFunc
-		ctx, stop = context.WithDeadline(ctx, deadline)
-		defer stop()
-	}
 	text := strconv.FormatUint(seq, 10)
 	req, err := http.NewRequestWithContext(ctx, xhttpUplinkMethod(c.settings), xhttpMetaPath(c.base, c.settings, c.id, text), bytes.NewReader(body))
 	if err != nil {
@@ -200,7 +243,10 @@ func (c *xhttpBufferedClient) post(body []byte, seq uint64, eof bool, deadline t
 	}
 	return nil
 }
-func (c *xhttpBufferedClient) pace() error {
+func (c *xhttpBufferedClient) pace(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	interval := c.settings.MinPostsIntervalMs
 	if c.settings.MaxPostsIntervalMs > interval {
 		interval += mrand.IntN(c.settings.MaxPostsIntervalMs - interval + 1)
@@ -212,8 +258,8 @@ func (c *xhttpBufferedClient) pace() error {
 			defer timer.Stop()
 			select {
 			case <-timer.C:
-			case <-c.ctx.Done():
-				return c.ctx.Err()
+			case <-ctx.Done():
+				return ctx.Err()
 			}
 		}
 	}
@@ -226,52 +272,83 @@ func (c *xhttpBufferedClient) Write(p []byte) (int, error) {
 	if c.closedWrite {
 		return 0, net.ErrClosed
 	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	ctx, finish := c.beginWrite()
+	defer finish()
 	concurrency := c.settings.MaxConcurrentPosts
 	if concurrency == 0 {
 		concurrency = 1
 	}
+	nextSize := func() int {
+		n := c.postSize
+		if max := c.postMax; max > n {
+			n += mrand.IntN(max - n + 1)
+		}
+		return min(n, len(p))
+	}
 	total := 0
-	for len(p) > 0 {
-		var wg sync.WaitGroup
-		results := make([]error, concurrency)
-		sizes := make([]int, 0, concurrency)
-		deadline := c.writeDeadline()
-		for i := 0; i < concurrency && len(p) > 0; i++ {
-			n := c.postSize
-			if max := c.postMax; max > n {
-				n += mrand.IntN(max - n + 1)
+	// Serial uploads need no helper goroutine or local pipe acknowledgement.
+	if concurrency == 1 {
+		for len(p) > 0 {
+			n := nextSize()
+			err := c.pace(ctx)
+			if err == nil {
+				err = c.post(ctx, p[:n], c.seq, false)
 			}
-			if n > len(p) {
-				n = len(p)
-			}
-			if err := c.pace(); err != nil {
+			if err != nil {
 				_ = c.Close()
-				wg.Wait()
-				return total, err
+				return total, c.writeError(err)
 			}
-			body := p[:n]
-			p = p[n:]
-			seq := c.seq
 			c.seq++
-			sizes = append(sizes, n)
-			index := len(sizes) - 1
+			total += n
+			p = p[n:]
+		}
+		return total, nil
+	}
+	type pendingPost struct {
+		size int
+		done chan error
+	}
+	window := make([]pendingPost, concurrency)
+	head, count := 0, 0
+	var wg sync.WaitGroup
+	// Workers must stop before returning: callers may immediately reuse p.
+	defer wg.Wait()
+	for len(p) > 0 || count > 0 {
+		for len(p) > 0 && count < concurrency {
+			if err := c.pace(ctx); err != nil {
+				_ = c.Close()
+				return total, c.writeError(err)
+			}
+			n := nextSize()
+			body, seq := p[:n], c.seq
+			p = p[n:]
+			c.seq++
+			done := make(chan error, 1)
+			window[(head+count)%concurrency] = pendingPost{n, done}
+			count++
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				results[index] = c.post(body, seq, false, deadline)
-				if results[index] != nil {
+				err := c.post(ctx, body, seq, false)
+				if err != nil {
 					_ = c.Close()
 				}
+				done <- err
 			}()
 		}
-		wg.Wait()
-		for i, err := range results[:len(sizes)] {
-			if err != nil {
-				_ = c.Close()
-				return total, err
-			}
-			total += sizes[i]
+		// Reap in sequence order so the outstanding sequence window stays bounded
+		// and Write only reports a contiguous, remotely acknowledged prefix.
+		post := window[head]
+		if err := <-post.done; err != nil {
+			_ = c.Close()
+			return total, c.writeError(err)
 		}
+		total += post.size
+		head = (head + 1) % concurrency
+		count--
 	}
 	return total, nil
 }
@@ -282,13 +359,16 @@ func (c *xhttpBufferedClient) CloseWrite() error {
 		return nil
 	}
 	c.closedWrite = true
-	if err := c.pace(); err != nil {
+	ctx, finish := c.beginWrite()
+	defer finish()
+	if err := c.pace(ctx); err != nil {
 		_ = c.Close()
-		return err
+		return c.writeError(err)
 	}
-	err := c.post(nil, c.seq, true, c.writeDeadline())
+	err := c.post(ctx, nil, c.seq, true)
 	if err != nil {
 		_ = c.Close()
+		return c.writeError(err)
 	}
 	return err
 }

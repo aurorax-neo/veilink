@@ -59,7 +59,7 @@ func TestQUICStreamsPerformance(t *testing.T) {
 				}
 				enableHysteriaBBR(c)
 				defer func() { cancel(); c.CloseWithError(0, ""); <-serverDone }()
-				payload := bytes.Repeat([]byte("veilink-perf-data"), 4096)
+				payload := perfPayloadBlock()
 				var streams []*quic.Stream
 				for i := 0; i < count; i++ {
 					s, err := c.OpenStreamSync(ctx)

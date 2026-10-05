@@ -445,6 +445,7 @@ type service struct {
 	singPools          map[string]*singPool
 	dialLog            *dialDiagnostics
 	children           atomic.Pointer[bindingServices]
+	userOwners         atomic.Pointer[map[string]*service]
 	policy             atomic.Pointer[model.Snapshot]
 	mappingListeners   map[string]*mappingListener
 	mappingConns       map[string]map[net.Conn]struct{}
@@ -496,7 +497,7 @@ func startService(s model.Snapshot, local model.LocalTLS, diagnostics *dialDiagn
 			}
 			children[b.ID] = child
 		}
-		svc.children.Store(&children)
+		svc.publishChildren(children)
 		if s.Node.Role == "server" {
 			if err = svc.prepareReality(); err != nil {
 				return nil, err

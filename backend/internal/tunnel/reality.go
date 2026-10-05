@@ -447,7 +447,10 @@ func dialReality(ctx context.Context, addr, serverName string, r model.Reality) 
 		_ = raw.Close()
 		return nil, err
 	}
-	if err = uconn.HandshakeContext(ctx); err != nil {
+	handshakeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	err = uconn.HandshakeContext(handshakeCtx)
+	cancel()
+	if err != nil {
 		_ = raw.Close()
 		return nil, err
 	}

@@ -50,6 +50,10 @@ func applicationCounters(s *service) (reads, writes, rawReads, rawWrites uint64)
 }
 
 func tlsApplicationTarget(t *testing.T, files model.LocalTLS, version uint16) int {
+	return tlsApplicationTargetTimeout(t, files, version, 15*time.Second)
+}
+
+func tlsApplicationTargetTimeout(t *testing.T, files model.LocalTLS, version uint16, timeout time.Duration) int {
 	t.Helper()
 	cert, err := tls.X509KeyPair([]byte(files.CertPEM), []byte(files.KeyPEM))
 	if err != nil {
@@ -66,7 +70,7 @@ func tlsApplicationTarget(t *testing.T, files model.LocalTLS, version uint16) in
 			if err != nil {
 				return
 			}
-			go func() { defer c.Close(); c.SetDeadline(time.Now().Add(15 * time.Second)); io.Copy(c, c) }()
+			go func() { defer c.Close(); c.SetDeadline(time.Now().Add(timeout)); io.Copy(c, c) }()
 		}
 	}()
 	return ln.Addr().(*net.TCPAddr).Port

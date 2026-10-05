@@ -63,6 +63,7 @@ func (p *xhttpMuxPool) acquire(ctx context.Context, key [32]byte, x model.XHTTP,
 		}
 		alive = append(alive, e)
 	}
+	clear(list[len(alive):])
 	list = alive
 	var chosen *xhttpMuxEntry
 	// Reference maxConnections is an expansion target, not a hard limit:
@@ -83,7 +84,11 @@ func (p *xhttpMuxPool) acquire(ctx context.Context, key [32]byte, x model.XHTTP,
 		}
 		tr, err := create()
 		if err != nil {
-			p.entries[key] = list
+			if len(list) == 0 {
+				delete(p.entries, key)
+			} else {
+				p.entries[key] = list
+			}
 			return nil, err
 		}
 		chosen = &xhttpMuxEntry{transport: tr, created: now}
@@ -92,11 +97,12 @@ func (p *xhttpMuxPool) acquire(ctx context.Context, key [32]byte, x model.XHTTP,
 	chosen.running++
 	chosen.uses++
 	p.entries[key] = list
-	return &xhttpMuxLease{pool: p, entry: chosen}, nil
+	return &xhttpMuxLease{pool: p, key: key, entry: chosen}, nil
 }
 
 type xhttpMuxLease struct {
 	pool  *xhttpMuxPool
+	key   [32]byte
 	entry *xhttpMuxEntry
 	once  sync.Once
 }
@@ -112,10 +118,31 @@ func (l *xhttpMuxLease) CloseIdleConnections() { /* A lease must not close anoth
 func (l *xhttpMuxLease) Close() error {
 	l.once.Do(func() {
 		l.pool.mu.Lock()
-		defer l.pool.mu.Unlock()
 		l.entry.running--
-		if l.entry.retired && l.entry.running == 0 {
-			closeXHTTPTransport(l.entry.transport)
+		var closing xhttpCloser
+		if l.entry.running == 0 {
+			// Keep sharing while leases are active, but do not retain sockets and
+			// configuration keys after the last authorized session has closed.
+			l.entry.retired = true
+			list := l.pool.entries[l.key]
+			for i, entry := range list {
+				if entry == l.entry {
+					copy(list[i:], list[i+1:])
+					list[len(list)-1] = nil
+					list = list[:len(list)-1]
+					break
+				}
+			}
+			if len(list) == 0 {
+				delete(l.pool.entries, l.key)
+			} else {
+				l.pool.entries[l.key] = list
+			}
+			closing = l.entry.transport
+		}
+		l.pool.mu.Unlock()
+		if closing != nil {
+			closeXHTTPTransport(closing)
 		}
 	})
 	return nil

@@ -75,16 +75,27 @@ func sameBindingTransport(a, b model.Snapshot) bool {
 }
 
 func (s *service) bindingOwner(user string) (*service, model.Binding, bool) {
-	if children := s.children.Load(); children != nil {
-		for _, child := range *children {
-			if b, ok := child.byUser[user]; ok && child.ctx.Err() == nil {
-				return child, b, true
-			}
+	if owners := s.userOwners.Load(); owners != nil {
+		if child := (*owners)[user]; child != nil && child.ctx.Err() == nil {
+			return child, child.byUser[user], true
 		}
 		return nil, model.Binding{}, false
 	}
 	b, ok := s.byUser[user]
 	return s, b, ok && s.ctx.Err() == nil
+}
+
+// Publish an immutable authentication index; stopped owners reject admission
+// while a replacement or rollback is being prepared.
+func (s *service) publishChildren(children bindingServices) {
+	owners := make(map[string]*service, len(children))
+	for _, child := range children {
+		for user := range child.byUser {
+			owners[user] = child
+		}
+	}
+	s.children.Store(&children)
+	s.userOwners.Store(&owners)
 }
 
 func (s *service) linkedBindings() []string {
@@ -160,7 +171,7 @@ func (s *service) reconcile(next model.Snapshot) error {
 			}
 			restored[id] = child
 		}
-		s.children.Store(&restored)
+		s.publishChildren(restored)
 		if len(failures) > 0 {
 			return fmt.Errorf("%w; %w: %v", cause, errRollbackFailed, errors.Join(failures...))
 		}
@@ -179,7 +190,7 @@ func (s *service) reconcile(next model.Snapshot) error {
 			current[id] = child
 		}
 	}
-	s.children.Store(&current)
+	s.publishChildren(current)
 	return nil
 }
 

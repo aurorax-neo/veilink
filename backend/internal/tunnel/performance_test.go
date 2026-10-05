@@ -25,6 +25,8 @@ import (
 type perfCase struct {
 	name, transport, mode, key, ticket string
 	vision                             bool
+	mldsa                              bool
+	xhttp                              model.XHTTP
 }
 
 func performanceCases() []perfCase {
@@ -76,6 +78,15 @@ func perfSelected(name string) bool { f := os.Getenv("VEILINK_PERF_CASE"); retur
 func perfSetup(t *testing.T, tc perfCase, target, pool int, network string) (int, *Runtime) {
 	t.Helper()
 	files := tlsFiles(t)
+	cover := ""
+	if tc.transport == "REALITY" {
+		cover = camouflage(t, files.CertPEM, files.KeyPEM, tc.mldsa)
+	}
+	return perfSetupWithFiles(t, tc, target, pool, network, "", files, cover)
+}
+
+func perfSetupWithFiles(t *testing.T, tc perfCase, target, pool int, network, mux string, files model.LocalTLS, cover string) (int, *Runtime) {
+	t.Helper()
 	server, client := fixtures(t, target)
 	local := files
 	if tc.transport == "plain" {
@@ -86,7 +97,13 @@ func perfSetup(t *testing.T, tc perfCase, target, pool int, network string) (int
 		if err != nil {
 			t.Fatal(err)
 		}
-		local = model.LocalTLS{Reality: model.Reality{PrivateKey: priv, Dest: camouflage(t, files.CertPEM, files.KeyPEM), ShortIDs: "0123456789abcdef", ServerNames: "gateway.test"}}
+		local = model.LocalTLS{Reality: model.Reality{PrivateKey: priv, Dest: cover, ShortIDs: "0123456789abcdef", ServerNames: "gateway.test"}}
+		if tc.mldsa {
+			local.Reality.Mldsa65Seed, local.Reality.Mldsa65Verify, err = GenerateMldsa65()
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	if tc.transport == "HY2" {
 		local.Hysteria2.Password = "local-perf-only"
@@ -107,6 +124,11 @@ func perfSetup(t *testing.T, tc perfCase, target, pool int, network string) (int
 	if tc.vision {
 		local.Flow = flowVision
 	}
+	local.XHTTP = tc.xhttp
+	if tc.xhttp.HTTPVersion == "3" {
+		server.Node.Tunnel.ListenPort = freeUDPPort(t)
+		server.Node.Port = server.Node.Tunnel.ListenPort
+	}
 	local.ListenPort = server.Node.Tunnel.ListenPort
 	public, err := PublicPeerTunnel(local, server.Node)
 	if err != nil {
@@ -116,9 +138,11 @@ func perfSetup(t *testing.T, tc perfCase, target, pool int, network string) (int
 	if tc.ticket == "1rtt" {
 		public.Encryption = strings.Replace(public.Encryption, ".0rtt.", ".1rtt.", 1)
 	}
+	client.Nodes[0] = server.Node
 	client.Nodes[0].Tunnel = public
 	server.Mappings[0].Network = network
 	server.Mappings[0].Pool = pool
+	server.Mappings[0].Mux, server.Mappings[0].MuxType = mux != "", mux
 	if network == "udp" {
 		server.Mappings[0].ListenPort = freeUDPPort(t)
 	}
@@ -139,17 +163,46 @@ func perfSetup(t *testing.T, tc perfCase, target, pool int, network string) (int
 		}
 		time.Sleep(time.Millisecond * 10)
 	}
-	if tc.vision && network == "tcp" {
+	if mux != "" {
+		p := binding.singPools[singKey("one", mux)]
+		for {
+			p.mu.Lock()
+			ready := p.count >= pool
+			p.mu.Unlock()
+			if ready {
+				break
+			}
+			if time.Now().After(until) {
+				t.Fatal("authenticated mux pool not ready")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if tc.vision && network == "tcp" && mux == "" {
 		awaitApplication(t, sr.instance, "one")
 	}
 	return server.Mappings[0].ListenPort, sr
 }
+
+const perfBlockSize = 64 << 10
+
+func perfPayloadBlock() []byte {
+	pattern := []byte("veilink-perf-data")
+	return bytes.Repeat(pattern, (perfBlockSize+len(pattern)-1)/len(pattern))[:perfBlockSize]
+}
+
+func TestPerformancePayloadSize(t *testing.T) {
+	if got := len(perfPayloadBlock()); got != 65536 {
+		t.Fatalf("performance block has %d bytes, want 65536", got)
+	}
+}
+
 func perfTCP(t *testing.T, app net.Conn, blocks int) (time.Duration, []time.Duration) {
 	t.Helper()
 	if err := app.SetDeadline(time.Now().Add(90 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	block := bytes.Repeat([]byte("veilink-perf-data"), 4096)
+	block := perfPayloadBlock()
 	transfer := func(n int) time.Duration {
 		t.Helper()
 		result := make(chan error, 1)
@@ -241,8 +294,9 @@ func perfUDP(t *testing.T, app net.Conn) (time.Duration, []time.Duration) {
 		batch(i, 16)
 	}
 	start := time.Now()
-	for i := 0; i < 16384; i += 16 {
-		batch(i, 16)
+	datagrams := perfEnvInt(t, "VEILINK_PERF_DATAGRAMS", 16384)
+	for i := 0; i < datagrams; i += 16 {
+		batch(i, min(16, datagrams-i))
 	}
 	elapsed := time.Since(start)
 	latencies := make([]time.Duration, 200)
@@ -278,7 +332,7 @@ func TestLocalPerformance(t *testing.T) {
 					files := tlsFiles(t)
 					target := 0
 					if network == "tcp" {
-						target = tlsApplicationTarget(t, files, tls.VersionTLS13)
+						target = tlsApplicationTargetTimeout(t, files, tls.VersionTLS13, 90*time.Second)
 					} else {
 						target = udpEchoServer(t)
 					}
@@ -290,7 +344,7 @@ func TestLocalPerformance(t *testing.T) {
 					defer app.Close()
 					var elapsed time.Duration
 					var latencies []time.Duration
-					size := 16384 * 1200
+					size := perfEnvInt(t, "VEILINK_PERF_DATAGRAMS", 16384) * 1200
 					if network == "tcp" {
 						roots, err := roots(files.CAPEM)
 						if err != nil {
@@ -304,7 +358,7 @@ func TestLocalPerformance(t *testing.T) {
 							t.Fatal(err)
 						}
 						elapsed, latencies = perfTCP(t, c, blocks)
-						size = blocks * 65536
+						size = blocks * perfBlockSize
 					} else {
 						elapsed, latencies = perfUDP(t, app)
 					}
