@@ -122,7 +122,9 @@ func (p *singPool) DialContext(ctx context.Context, network string, dst M.Socksa
 		p.dialMu.Unlock()
 		return nil, net.ErrClosed
 	}
-	expand := best == nil || (n < limit && best.active >= 8 && len(p.queue) > 0)
+	// Use idle authorized transports before sharing a busy lane: a slow reader
+	// can exhaust a mux session's receive buffer and stall its other streams.
+	expand := best == nil || (n < limit && best.active > 0 && len(p.queue) > 0)
 	if expand {
 		p.mu.Unlock()
 		acquire := ctx

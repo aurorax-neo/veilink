@@ -16,6 +16,7 @@ import (
 type singRecordConn struct {
 	net.Conn
 	wmu         sync.Mutex
+	writeBuf    [2 + maxPayload]byte
 	writeClosed bool
 	readClosed  bool
 	remaining   int
@@ -55,12 +56,12 @@ func (c *singRecordConn) Write(b []byte) (int, error) {
 	total := 0
 	for len(b) > 0 {
 		n := min(len(b), maxPayload)
-		var head [2]byte
-		binary.BigEndian.PutUint16(head[:], uint16(n))
-		if err := writeAll(c.Conn, head[:]); err != nil {
-			return total, err
-		}
-		if err := writeAll(c.Conn, b[:n]); err != nil {
+		// Keep the header and payload in one write: packet-up transports await
+		// acknowledgement after each write, even for a header-only record.
+		packet := c.writeBuf[:2+n]
+		binary.BigEndian.PutUint16(packet[:2], uint16(n))
+		copy(packet[2:], b[:n])
+		if err := writeAll(c.Conn, packet); err != nil {
 			return total, err
 		}
 		total += n

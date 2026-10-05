@@ -227,24 +227,66 @@ func TestMuxTransportFailureIsIsolated(t *testing.T) {
 			c.Mappings = append([]model.Mapping(nil), s.Mappings...)
 			server := run(t, s, local)
 			run(t, c, local)
-			awaitEcho(t, s.Mappings[0].ListenPort)
-			var flows []net.Conn
-			for range 16 {
-				flows = append(flows, persistentEcho(t, s.Mappings[0].ListenPort))
+			service := testBindingService(server.instance, "one")
+			awaitSessions(t, service, "one", 2)
+			p := service.singPools[singKey("one", kind)]
+			until := time.Now().Add(3 * time.Second)
+			for {
+				p.mu.Lock()
+				ready := p.count == 2
+				p.mu.Unlock()
+				if ready {
+					break
+				}
+				if time.Now().After(until) {
+					t.Fatal("authorized mux transports not ready")
+				}
+				time.Sleep(10 * time.Millisecond)
 			}
-			p := testBindingService(server.instance, "one").singPools[singKey("one", kind)]
+			flows := make(map[*singLane][]net.Conn)
+			for i := range 16 {
+				p.mu.Lock()
+				before := make(map[*singLane]int)
+				for _, lane := range p.lanes {
+					before[lane] = lane.active
+				}
+				p.mu.Unlock()
+				conn := persistentEcho(t, s.Mappings[0].ListenPort)
+				p.mu.Lock()
+				var assigned *singLane
+				for _, lane := range p.lanes {
+					if lane.active == before[lane]+1 {
+						if assigned != nil {
+							p.mu.Unlock()
+							t.Fatal("multiple lanes acquired one stream")
+						}
+						assigned = lane
+					}
+				}
+				p.mu.Unlock()
+				if assigned == nil {
+					t.Fatal("stream not assigned to a lane")
+				}
+				flows[assigned] = append(flows[assigned], conn)
+				if i == 1 && len(flows) != 2 {
+					t.Fatal("second stream did not use the idle authorized transport")
+				}
+			}
 			p.mu.Lock()
 			if len(p.lanes) != 2 {
 				p.mu.Unlock()
 				t.Fatal("pool did not use two transports")
 			}
-			broken, survivor := p.lanes[0].conn, p.lanes[1].conn
+			broken, survivor := p.lanes[0].conn, p.lanes[1]
 			p.mu.Unlock()
 			broken.Close()
-			for _, conn := range flows[8:] {
+			if len(flows[survivor]) != 8 {
+				t.Fatalf("unbalanced pool: survivor has %d streams, want 8", len(flows[survivor]))
+			}
+			for _, conn := range flows[survivor] {
 				assertPersistentEcho(t, conn)
 			}
-			if survivor.closed() {
+			if survivor.conn.closed() {
 				t.Fatal("unrelated mux transport closed")
 			}
 			awaitEcho(t, s.Mappings[0].ListenPort)
