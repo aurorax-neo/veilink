@@ -51,6 +51,21 @@ test('mapping defaults to first enabled endpoint, saves and restores explicit an
   assert.equal(e.draft.connectEndpointId, 'a')
 })
 
+test('bandwidth accepts numbers in Mbps, zero disables, invalid input never saves', async () => {
+  const e = setup()
+  for (const [value, expected] of [['48', '48Mbps'], ['1.234', '1.234Mbps'], ['0.001234', '1.234Kbps'], ['0', ''], ['', '']]) {
+    e.draft.bandwidthLimit = value
+    await e.save()
+    assert.equal(e.requests.at(-1)[2].bandwidth_limit, expected)
+  }
+  const count = e.requests.length
+  for (const value of ['48Mbps', '-1', 'NaN', '100001', '1.2345678', '0.0001']) {
+    e.draft.bandwidthLimit = value
+    await assert.rejects(e.save(), /带宽上限/)
+  }
+  assert.equal(e.requests.length, count)
+})
+
 test('switching server resets selection but editing stale selection does not silently fallback', async () => {
   const e = setup()
   e.draft.connectEndpointId = 'b'

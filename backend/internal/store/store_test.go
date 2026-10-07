@@ -491,6 +491,9 @@ func TestFreshSchemaAndUnsupportedDatabases(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			path, key := filepath.Join(dir, "db"), filepath.Join(dir, "key")
+			if err := os.WriteFile(key, make([]byte, 32), 0600); err != nil {
+				t.Fatal(err)
+			}
 			db, err := sql.Open("sqlite", path)
 			if err != nil {
 				t.Fatal(err)

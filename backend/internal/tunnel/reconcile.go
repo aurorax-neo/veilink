@@ -188,6 +188,7 @@ func (s *service) reconcile(next model.Snapshot) error {
 func sameMapping(a, b model.Mapping) bool {
 	a.Name, b.Name = "", ""
 	a.Pool, b.Pool = 0, 0
+	a.BandwidthLimit, b.BandwidthLimit = "", ""
 	return reflect.DeepEqual(a, b)
 }
 
@@ -202,7 +203,7 @@ func (s *service) newMappingListener(m model.Mapping) (*mappingListener, error) 
 			go s.serveUDP(l.udp, m)
 		}
 	} else {
-		l.tcp, err = net.Listen("tcp", addr)
+		l.tcp, err = listenTCP(s.ctx, addr)
 		if err == nil {
 			go s.acceptMapping(l.tcp, l)
 		}
@@ -270,9 +271,23 @@ func (s *service) reconcileMappings(next model.Snapshot) error {
 	saved := cloneSnapshot(next)
 	s.mu.Lock()
 	s.policy.Store(&saved)
+	for _, m := range saved.Mappings {
+		if bucket := s.bandwidth[m.ID]; bucket != nil {
+			bucket.update(m.BandwidthLimit)
+		}
+	}
+	for id := range s.bandwidth {
+		if _, ok := wanted[id]; !ok {
+			delete(s.bandwidth, id)
+		}
+	}
 	var withdrawn []net.Conn
 	for conn, target := range s.targetConns {
-		if !s.targetAllowed(target.binding, target.host, target.port, target.network, target.mux, target.kind) {
+		allowed := s.targetAllowed(target.binding, target.host, target.port, target.network, target.mux, target.kind)
+		if target.mappingID != "" {
+			_, allowed = s.mappingFor(target.mappingID, target.binding, target.host, target.port, target.network, target.mux, target.kind)
+		}
+		if !allowed {
 			withdrawn = append(withdrawn, conn)
 		}
 	}
@@ -335,6 +350,7 @@ func (s *service) closeMapping(id string) {
 
 type targetPolicy struct {
 	binding, host, network, kind string
+	mappingID                    string
 	port                         int
 	mux                          bool
 }
@@ -370,6 +386,11 @@ func (s *service) trackTarget(conn net.Conn, target targetPolicy) bool {
 	defer s.mu.Unlock()
 	if s.conns == nil || !s.targetAllowed(target.binding, target.host, target.port, target.network, target.mux, target.kind) {
 		return false
+	}
+	if target.mappingID != "" {
+		if _, ok := s.mappingFor(target.mappingID, target.binding, target.host, target.port, target.network, target.mux, target.kind); !ok {
+			return false
+		}
 	}
 	s.targetConns[conn] = target
 	s.conns[conn] = struct{}{}

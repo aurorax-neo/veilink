@@ -65,7 +65,7 @@ docker run -itd --restart unless-stopped --name veilink-master \
 
 首次启动自动完成：
 - 生成管理员 API Key（日志中显示一次，请妥善保存）
-- 使用内置前端界面（支持在控制台热拉取或更新指定版本前端）
+- 使用镜像内置前端界面，前后端随统一镜像一起更新
 - 数据目录自动初始化，无需手动 `mkdir`/`chown`
 
 查看 API Key：
@@ -76,7 +76,7 @@ docker logs veilink-master 2>&1 | grep "API Key"
 ### 镜像与版本
 
 - **统一 Docker 镜像**：`ghcr.io/aurorax-neo/veilink:latest`（包含全功能二进制与预置 Web 前端，通过 `master|server|client` 子命令选择角色）
-- **前端静态资源包**：独立发布 tarball（tag `web-v*` 触发，供 Master 运行时热更新拉取或离线解包）
+- **Web 前端**：固定包含在统一镜像的 `/opt/veilink-web`，不再单独发布或运行时拉取
 - **原生二进制**：全平台独立发布（tag `v*` 触发）
 
 原生二进制（Linux/macOS/Windows）：
@@ -115,7 +115,7 @@ docker run -itd \
   ghcr.io/aurorax-neo/veilink:latest master
 ```
 
-entrypoint 自动处理 `/data` 权限，无需手动 `mkdir`/`chown`。宿主机映射目录 `/opt/docker/veilink-master/data` 保存 SQLite 数据库与凭据（`master.db`）。统一镜像已内置完整 Web 前端；在控制台在线更新或离线替换静态资源时，文件存放在 `/opt/docker/veilink-master/data/web` 下，无需单独挂载 web 目录。
+entrypoint 自动处理 `/data` 权限，无需手动 `mkdir`/`chown`。宿主机映射目录 `/opt/docker/veilink-master/data` 保存 SQLite 数据库与凭据（`master.db`）。Web 只读取镜像内 `/opt/veilink-web`，不读取或创建 `/data/web`，也不支持前端跳转地址、pull 模式、在线拉取版本或 GitHub 加速。旧 Web 文件不会覆盖新镜像资源，升级不会自动删除旧文件或数据库。已发布的 schema 5 数据库自动升级：先备份数据库与部署密钥，再事务化清理已知旧 Web 字段、修复旧版缺失的 ML-DSA 验证公钥；未知结构或损坏配置仍拒绝启动，不删库。
 
 ### 2. 获取 API Key
 
@@ -253,10 +253,8 @@ docker exec veilink-master /usr/local/bin/veilink keys revoke <id>
 
 Web 控制台「设置」页集中管理：
 
-- **前端地址**：CPA 式自定义前端地址，设置后访问 `/` 跳转到分离部署的前端
-- **下载加速**：多加速地址管理（增删改排序），拉取前端时按顺序尝试
-- **版本更新**：指定前端版本号或拉取最新
-- **服务配置**：监听地址、协议、证书、Web 模式（修改后需重启）
+- **Web 版本**：只读显示统一镜像内置版本，随镜像更新；Web/API 固定同源
+- **服务配置**：监听地址、协议、证书（修改后需重启）
 - **API Key**：列表/新建/撤销（明文仅显示一次）
 
 ### 如何理解状态
@@ -341,7 +339,7 @@ docker run -itd \
 | Hysteria2 | 独立 UDP/QUIC + TLS；需要证书、私钥和密码；不叠加 VLESS Encryption、REALITY、XHTTP、Vision |
 | XHTTP | Veilink 双端业务通道；HTTP 版本与模式须符合下表和能力矩阵 |
 
-ML-DSA-65 使用独立的 32 字节种子（Base64）生成签名密钥，不能填写展开的私钥或复用 REALITY 的 X25519 私钥。只填写种子时自动派生验证公钥；同时填写公钥时必须与种子配对。回落目标须支持 TLS 1.3，且其证书握手记录需要容纳额外的 3309 字节签名，过短的证书链可能导致握手失败。种子只保存在服务端，不下发客户端。关闭时清空种子和验证公钥，或使用“关闭 ML-DSA-65”后保存。TLS / REALITY 下可清空可选 VLESS Encryption；无 TLS 的 plain / HTTP 仍须保留 Encryption，不能关闭全部传输保护。
+ML-DSA-65 新配置使用独立的 32 字节种子（Base64）生成签名密钥，不能复用 REALITY 的 X25519 私钥。v0.4.2 生成的 4032 字节展开私钥经严格校验后兼容读取，升级保留原密钥身份，无需重新生成。只填写私有材料时自动派生验证公钥；同时填写公钥时必须配对。回落目标须支持 TLS 1.3，且其证书握手记录需要容纳额外的 3309 字节签名，过短的证书链可能导致握手失败。私有材料只保存在服务端，不下发客户端。关闭时清空种子和验证公钥，或使用“关闭 ML-DSA-65”后保存。TLS / REALITY 下可清空可选 VLESS Encryption；无 TLS 的 plain / HTTP 仍须保留 Encryption，不能关闭全部传输保护。
 
 TCP 映射可选择关闭 mux 或使用 `smux`、`yamux`、`h2mux`；UDP 业务使用授权 XUDP，不启用 TCP mux，也不代表原生 Hysteria2 datagram 互通。
 
@@ -405,7 +403,7 @@ tools/backup-master.sh restore master \
   /opt/docker/veilink-master/recovery-data
 ```
 
-先在隔离环境验证登录、节点身份、上报和业务探针，再切换正式挂载。保留原数据副本，禁止旧、新 Master 同时提供写服务。旧 schema 不自动迁移或删库，任何数据删除都须先备份并得到明确授权。
+先在隔离环境验证登录、节点身份、上报和业务探针，再切换正式挂载。保留原数据副本，禁止旧、新 Master 同时提供写服务。已知已发布 schema 自动备份后迁移；未知 schema 不自动迁移或删库，任何数据删除都须先备份并得到明确授权。
 
 ### API Key 维护
 
@@ -478,7 +476,16 @@ docker exec veilink-master /usr/local/bin/veilink master --help
 | `frontend/tests/acceptance` | 历史 Web 验收记录和截图 |
 | `tools` | 离线备份及节点验证工具 |
 
-Go 版本以 [backend/go.mod](backend/go.mod) 为准；前端发布构建使用 Node.js 22 和 npm 锁文件。前端 `npm run build` 输出到 `frontend/dist/`，通过 `web-v*` tag 独立发布；Master 在 `pull` 模式下自动拉取，仅 Master 加载。
+Go 版本以 [backend/go.mod](backend/go.mod) 为准；前端构建使用 Node.js 22 和 npm 锁文件。`npm run build` 输出到 `frontend/dist/`，Docker 构建将其复制到统一镜像，仅 Master 提供 Web。
+
+### 映射限速与连接检测
+
+- Web 的“带宽上限（Mbps）”只填数字，例如 `48`；`0` 或留空表示不限速，支持最多六位小数，非零范围为 `0.001` 至 `100000`。API 的 `bandwidth_limit` 保留单位字符串，例如 `48Mbps`；`0`、`0Mbps` 或空字符串表示不限速，非零支持十进制 `Kbps`、`Mbps`、`Gbps`，范围 `1Kbps` 至 `100Gbps`。
+- 同一映射的所有连接、Pool 通道共享限额，两个方向各自独立限速。只计算业务负载，不包含 TCP/TLS/mux/XHTTP 等协议开销；50Mbps 链路可先试 48Mbps，若开销或共享流量较大应继续降低。
+- TCP 采用令牌桶等待和有界读取，将背压传回源端；UDP 不具备可靠背压，保留有界队列，过载仍可能丢包。限速不能保证消除所有 RST，也不能让持续 60Mbps 的视频在 50Mbps 链路上流畅播放。
+- 修改或清空限速实时应用，不主动断开现有业务连接。映射标识纳入私有隧道授权头，Master、Server、Client 必须一起升级，不能混用升级前后的数据面版本。
+- TCP 拨号及监听启用 keepalive：空闲 60 秒、探测间隔 60 秒、3 次未响应后由操作系统关闭。它检测空闲半开连接，不替代繁忙连接的 TCP 重传超时；重连不会恢复已断开的业务 TCP 会话。
+- 15 秒期限用于握手或单次阻塞写入，不应成为业务连接寿命。XHTTP 在每次写入并刷新后清除响应写期限，空闲时不再因遗留期限被断开；协议心跳、空闲回收和异常写入超时仍保留。
 
 ### 检查命令
 

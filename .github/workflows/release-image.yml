@@ -6,10 +6,6 @@ on:
       backend_version:
         description: '后端版本 (如 v1.2.0)'
         required: true
-      web_version:
-        description: '前端版本 (如 web-v1.0.0，留空用 latest)'
-        required: false
-        default: ''
 
 permissions:
   packages: write

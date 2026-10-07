@@ -4,6 +4,8 @@ go 1.27.0
 
 require (
 	github.com/apernet/quic-go v0.61.1-0.20260806010916-184d081eef3e
+	github.com/cloudflare/circl v1.6.5
+	github.com/juju/ratelimit v1.0.2
 	github.com/metacubex/sing v0.5.8
 	github.com/metacubex/sing-mux v0.3.10
 	github.com/quic-go/qpack v0.6.0
@@ -20,10 +22,8 @@ require (
 
 require (
 	github.com/andybalholm/brotli v1.0.6 // indirect
-	github.com/cloudflare/circl v1.6.5 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/juju/ratelimit v1.0.2 // indirect
 	github.com/klauspost/compress v1.17.4 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/kr/text v0.2.0 // indirect

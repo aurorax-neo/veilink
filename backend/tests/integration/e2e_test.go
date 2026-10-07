@@ -232,7 +232,7 @@ func TestCLIEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	st.Close()
-	masterEnv := []string{"WEB_MODE=off"}
+	var masterEnv []string
 	master := launchWithEnv(t, masterEnv, bin, "master", masterFlags...)
 	jar, _ := cookiejar.New(nil)
 	pool := x509.NewCertPool()

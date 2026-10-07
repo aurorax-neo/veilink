@@ -165,13 +165,17 @@ export function validateNode(input: { name: string; role: string; address: strin
 }
 
 export function validateMapping(
-  input: { name: string; serverId: string; clientId: string; connectEndpointId?: string; pool: number; listenHost: string; listenPort: string; targetHost: string; targetPort: string; network?: string; enabled?: boolean },
+  input: { name: string; serverId: string; clientId: string; connectEndpointId?: string; bandwidthLimit?: string; pool: number; listenHost: string; listenPort: string; targetHost: string; targetPort: string; network?: string; enabled?: boolean },
   nodes: Node[],
   mappings: Mapping[],
   selfId = '',
 ): string | null {
   const name = input.name.trim()
   if (!name || name.length > 128) return '映射名称需要 1 到 128 个字符。'
+  const limit = String(input.bandwidthLimit ?? '').trim()
+  if (limit) {
+    if (!/^[0-9]+(?:\.[0-9]{1,6})?$/.test(limit) || !Number.isFinite(Number(limit)) || Number(limit) > 100000 || (Number(limit) > 0 && Number(limit) < 0.001)) return '带宽上限需为 0 或 0.001 到 100000 的数字，最多六位小数。'
+  }
   const net = (input.network || 'tcp').toLowerCase()
   if (net !== 'tcp' && net !== 'udp') return '网络协议只能是 TCP 或 UDP。'
   const server = nodes.find((node) => node.id === input.serverId && node.role === 'server' && !node.revoked)

@@ -119,8 +119,14 @@ func (h *xhttpHandler) streamResponse(w http.ResponseWriter, r *http.Request, ap
 		w.Header()["Content-Type"] = nil // suppress net/http's content sniffing
 	}
 	controller := http.NewResponseController(w)
+	if controller.SetWriteDeadline(time.Now().Add(h.timeout)) != nil {
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	if controller.Flush() != nil {
+		return
+	}
+	if controller.SetWriteDeadline(time.Time{}) != nil {
 		return
 	}
 	var uploadDone chan struct{}
@@ -145,6 +151,9 @@ func (h *xhttpHandler) streamResponse(w http.ResponseWriter, r *http.Request, ap
 				return
 			}
 			if _, e := w.Write(buf[:n]); e != nil || controller.Flush() != nil {
+				return
+			}
+			if controller.SetWriteDeadline(time.Time{}) != nil {
 				return
 			}
 		}

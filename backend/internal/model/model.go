@@ -90,7 +90,8 @@ type Mapping struct {
 	TargetHost        string `json:"target_host"`
 	TargetPort        int    `json:"target_port"`
 	Network           string `json:"network,omitempty"`
-	Pool              int    `json:"pool"`               // 1..32: shared sessions per binding (maximum of enabled mappings)
+	Pool              int    `json:"pool"` // 1..32: shared sessions per binding (maximum of enabled mappings)
+	BandwidthLimit    string `json:"bandwidth_limit,omitempty"`
 	Mux               bool   `json:"mux"`                // TCP stream multiplexing; disabled by default
 	MuxType           string `json:"mux_type,omitempty"` // extensible implementation selector; ignored when mux is off
 	Enabled           bool   `json:"enabled"`
@@ -328,21 +329,13 @@ func DeriveX25519Public(privateKey string) string {
 	return base64.RawURLEncoding.EncodeToString(k.PublicKey().Bytes())
 }
 
-// DeriveMldsa65Verify computes the base64 raw URL encoded ML-DSA-65 public key from a 32-byte seed.
+// DeriveMldsa65Verify computes the public key from a seed or legacy packed private key.
 func DeriveMldsa65Verify(seed string) string {
-	s := strings.TrimSpace(seed)
-	if s == "" {
+	private, err := ParseMldsa65Private(seed)
+	if err != nil {
 		return ""
 	}
-	enc := base64.RawURLEncoding
-	if strings.ContainsAny(s, "+/=") {
-		enc = base64.StdEncoding
-	}
-	b, err := enc.DecodeString(s)
-	if err != nil || len(b) != 32 {
-		return ""
-	}
-	pub, _ := mldsa65.NewKeyFromSeed((*[32]byte)(b))
+	pub := private.Public().(*mldsa65.PublicKey)
 	return base64.RawURLEncoding.EncodeToString(pub.Bytes())
 }
 

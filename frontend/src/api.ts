@@ -1,8 +1,7 @@
-// 统一 API 封装：服务地址配置 + /api/v1 前缀 + API Key 认证 + 401 自动跳登录
+// 同源 API 封装：/api/v1 前缀 + API Key 认证 + 401 自动跳登录
 
 const API_PREFIX = '/api/v1';
 const KEY_STORAGE = 'veilink_api_key';
-const SERVER_STORAGE = 'veilink_server_url';
 export class ApiError extends Error {
   status: number;
   constructor(message: string, status: number) {
@@ -32,44 +31,8 @@ export function clearApiKey(): void {
   safeStorage()?.removeItem(KEY_STORAGE);
 }
 
-export function getDefaultServerUrl(): string {
-  try {
-    if (typeof window !== 'undefined' && window.location?.origin) {
-      return window.location.origin.replace(/\/+$/, '');
-    }
-  } catch {}
-  return '';
-}
-
-export function getServerUrl(): string {
-  const stored = safeStorage()?.getItem(SERVER_STORAGE);
-  if (stored && stored.trim()) {
-    return stored.trim().replace(/\/+$/, '');
-  }
-  return getDefaultServerUrl();
-}
-
-export function setServerUrl(url: string): void {
-  const clean = (url || '').trim().replace(/\/+$/, '');
-  if (!clean || clean === getDefaultServerUrl()) {
-    safeStorage()?.removeItem(SERVER_STORAGE);
-  } else {
-    safeStorage()?.setItem(SERVER_STORAGE, clean);
-  }
-}
-
-export function clearServerUrl(): void {
-  safeStorage()?.removeItem(SERVER_STORAGE);
-}
-
-export function hasCustomServerUrl(): boolean {
-  return !!safeStorage()?.getItem(SERVER_STORAGE);
-}
-
 export function buildUrl(path: string): string {
-  const base = getServerUrl();
-  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
-  return base ? `${base}${normalizedPath}` : normalizedPath;
+  return `/${path.replace(/^\/+/, '')}`;
 }
 
 let onUnauthorized: () => void = () => {};

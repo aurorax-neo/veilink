@@ -27,23 +27,18 @@ type API struct {
 	webManager *web.WebManager
 	streamHub  *backend.StreamHub
 	tokenStore *backend.StreamTokenStore
-	webCfg     web.WebConfig
 	webPersist WebPersistConfig
 }
 
-// WebPersistConfig 前端配置的 DB 持久化参数（master_config 表）
+// WebPersistConfig 包含服务设置数据库和非持久化的静态资源路径。
 type WebPersistConfig struct {
-	Mirrors     []string
-	Version     string
-	FrontendURL string
-	Mode        string
-	DBPath      string
-	HTMLDir     string
+	DBPath  string
+	HTMLDir string
 }
 
 // New 创建 Master 的 HTTP API 处理器。
 // 注意：仅 Master 角色调用此函数，Server/Client 角色不启动 Web/API。
-// WebManager 仅在 Master 下初始化（pull 前端），s/c 二进制不包含也不触发拉取逻辑。
+// WebManager 仅在 Master 下提供镜像内置的静态资源。
 func New(s *store.Store, insecureLoopback bool, ring *logring.Ring, webPersist WebPersistConfig) http.Handler {
 	// API Key 存储初始化（含旧版迁移）
 	ks := backend.NewKeyStore(s.DB())
@@ -64,22 +59,9 @@ func New(s *store.Store, insecureLoopback bool, ring *logring.Ring, webPersist W
 	}
 
 	// WebManager 初始化
-	webCfg := web.LoadConfigFromEnv()
-	if webPersist.HTMLDir != "" {
-		webCfg.PrebundledDir = webPersist.HTMLDir
-	}
-	wm := web.NewWebManager(webCfg)
-	// DB 持久化的配置覆盖环境变量（设置页/CLI 保存的值优先）
-	wm.ApplyPersisted(webPersist.Mirrors, webPersist.Version, webPersist.FrontendURL, webPersist.Mode)
-	// 设置页的保存写回 DB 的 master_config 表
-	if webPersist.DBPath != "" {
-		dbPath := webPersist.DBPath
-		wm.SetPersist(func(mirrors []string, version string, frontendURL *string) error {
-			return config.UpdateWebConfig(dbPath, mirrors, version, true, frontendURL)
-		})
-	}
+	wm := web.NewWebManager(web.WebConfig{PrebundledDir: webPersist.HTMLDir})
 	if _, err := wm.Ensure(); err != nil {
-		slog.Error("前端初始化失败，降级为纯 API 模式", "err", err)
+		slog.Error("内置前端资源不可用，Web 请求将返回 503", "err", err)
 	}
 
 	a := &API{
@@ -90,7 +72,6 @@ func New(s *store.Store, insecureLoopback bool, ring *logring.Ring, webPersist W
 		webManager: wm,
 		streamHub:  backend.NewStreamHub(),
 		tokenStore: backend.NewStreamTokenStore(),
-		webCfg:     webCfg,
 		webPersist: webPersist,
 	}
 	return a
@@ -177,17 +158,6 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 
-	// 1. CORS
-	if a.webCfg.EnableCORS {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "*")
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-	}
-
 	// 2. 健康检查（免认证）
 	if r.URL.Path == "/healthz" || r.URL.Path == "/api/health" {
 		output(w, 200, map[string]string{"status": "ok"})
@@ -200,7 +170,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"api_version":     "v1",
 			"backend_version": buildinfo.Version,
 			"web_version":     a.webManager.Version(),
-			"web_mode":        string(a.webCfg.Mode),
+			"web_mode":        "builtin",
 		})
 		return
 	}
@@ -252,28 +222,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 8. 前端热更新（仅 admin）
-	if r.URL.Path == "/api/v1/web/update" && r.Method == "POST" {
-		if role != backend.RoleAdmin {
-			failure(w, 403)
-			return
-		}
-		var req struct {
-			Version string `json:"version"`
-		}
-		if !decode(w, r, &req) {
-			return
-		}
-		if err := a.webManager.Update(req.Version); err != nil {
-			slog.Error("web update failed", "err", err)
-			output(w, 500, map[string]string{"error": "前端更新失败：请检查版本是否存在、镜像连通性及缓存目录写权限。当前前端未切换，详细原因见 Master 日志。"})
-			return
-		}
-		output(w, 200, map[string]bool{"ok": true})
-		return
-	}
-
-	// 8b. 前端配置查询/更新（仅 admin）
+	// 内置前端状态只读。
 	if r.URL.Path == "/api/v1/web/config" {
 		if role != backend.RoleAdmin {
 			failure(w, 403)
@@ -283,59 +232,10 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case http.MethodGet:
 			output(w, 200, a.webManager.Status())
 			return
-		case http.MethodPost:
-			var req struct {
-				Mirrors []string `json:"mirrors"`
-				// 兼容旧单值字段
-				Mirror *string `json:"mirror"`
-				// CPA 自定义前端地址（null=不改，""=清空）
-				FrontendURL *string `json:"frontend_url"`
-			}
-			if !decode(w, r, &req) {
-				return
-			}
-			mirrors := req.Mirrors
-			if mirrors == nil && req.Mirror != nil {
-				if *req.Mirror != "" {
-					mirrors = []string{*req.Mirror}
-				} else {
-					mirrors = []string{}
-				}
-			}
-			if mirrors != nil {
-				if err := a.webManager.SetMirrors(mirrors); err != nil {
-					slog.Error("web config save failed", "err", err)
-					failure(w, 500)
-					return
-				}
-			}
-			if req.FrontendURL != nil {
-				if err := a.webManager.SetFrontendURL(*req.FrontendURL); err != nil {
-					slog.Error("frontend url save failed", "err", err)
-					failure(w, 500)
-					return
-				}
-			}
-			output(w, 200, a.webManager.Status())
-			return
 		default:
 			failure(w, 404)
 			return
 		}
-	}
-
-	// 8c. 前端下载地址连通性探测（仅 admin）
-	if r.URL.Path == "/api/v1/web/probe" && r.Method == "POST" {
-		if role != backend.RoleAdmin {
-			failure(w, 403)
-			return
-		}
-		var req struct {
-			Version string `json:"version"`
-		}
-		_ = decode(w, r, &req)
-		output(w, 200, map[string]any{"results": a.webManager.Probe(req.Version)})
-		return
 	}
 
 	// 8d. master 通用配置（仅 admin）
@@ -363,10 +263,6 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				output(w, 400, map[string]string{"error": err.Error()})
 				return
 			}
-			// WebMode 生效：实时更新 webManager
-			if req.WebMode != nil {
-				a.webManager.ApplyPersisted(nil, "", "", *req.WebMode)
-			}
 			output(w, 200, map[string]any{"ok": true, "need_restart": needRestart})
 			return
 		}
@@ -380,26 +276,15 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 10. CPA 自定义前端地址：重定向到分离部署的前端
-	if redirect := a.webManager.FrontendRedirect(); redirect != "" {
-		// 只重定向页面请求，API 请求不受影响（前面已处理）
-		if r.URL.Path == "/" || !strings.HasPrefix(r.URL.Path, "/api/") {
-			target := strings.TrimRight(redirect, "/")
-			if r.URL.Path != "/" {
-				target += r.URL.Path
-			}
-			if r.URL.RawQuery != "" {
-				target += "?" + r.URL.RawQuery
-			}
-			http.Redirect(w, r, target, http.StatusFound)
-			return
-		}
-	}
-
 	// 11. 前端静态资源
 	if root := a.webManager.Root(); root != "" {
+		w.Header().Set("Cache-Control", "no-cache")
 		p := filepath.Join(root, filepath.Clean(r.URL.Path))
-		if info, err := os.Stat(p); os.IsNotExist(err) || info.IsDir() {
+		if info, err := os.Stat(p); err != nil || info.IsDir() {
+			if strings.HasPrefix(r.URL.Path, "/assets/") || filepath.Ext(r.URL.Path) != "" {
+				http.NotFound(w, r)
+				return
+			}
 			http.ServeFile(w, r, filepath.Join(root, "index.html"))
 			return
 		}
@@ -407,9 +292,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 11. 纯 API 模式兜底
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"mode":"api-only","message":"Web UI not hosted. Set WEB_MODE=pull or deploy veilink-web separately."}`))
+	output(w, http.StatusServiceUnavailable, map[string]string{"error": "内置 Web 资源不可用，请检查统一镜像是否完整。"})
 }
 
 // serveKeys API Key 管理接口

@@ -18,6 +18,8 @@ import (
 
 const singMuxPort = 2
 
+type mappingContextKey struct{}
+
 var singMagic = []byte("veilink-sing-mux/1\x00")
 var singKinds = []string{model.MuxTypeSMux, model.MuxTypeYAMux, model.MuxTypeH2Mux}
 
@@ -428,6 +430,7 @@ func (s *service) openSingMux(conn net.Conn, m model.Mapping) {
 	defer func() { <-p.slots }()
 	ctx, cancel := context.WithTimeout(s.ctx, applicationWait)
 	defer cancel()
+	ctx = context.WithValue(ctx, mappingContextKey{}, m.ID)
 	stream, err := p.client.DialContext(ctx, "tcp", M.ParseSocksaddrHostPort(m.TargetHost, uint16(m.TargetPort)))
 	if err != nil {
 		return
@@ -440,6 +443,13 @@ func (s *service) openSingMux(conn net.Conn, m model.Mapping) {
 	// Flush the real sing-mux stream request before bidirectional relay (server-first TCP).
 	if _, err = stream.Write(nil); err != nil {
 		return
+	}
+	if kind != model.MuxTypeH2Mux {
+		stream.SetWriteDeadline(time.Now().Add(15 * time.Second))
+		if err = writeMappingID(stream, m.ID); err != nil {
+			return
+		}
+		stream.SetWriteDeadline(time.Time{})
 	}
 	relayApplication(&singRecordConn{Conn: stream}, conn)
 }
@@ -564,6 +574,15 @@ func (h *singHandler) NewConnection(ctx context.Context, c net.Conn, metadata M.
 	if !h.s.singTargetAllowed(h.binding, h.kind, metadata.Destination.AddrString(), int(metadata.Destination.Port)) {
 		return errors.New("unauthorized mux target")
 	}
+	_ = c.SetReadDeadline(time.Now().Add(15 * time.Second))
+	mappingID, err := readMappingIDTimeout(c, 15*time.Second)
+	if err != nil {
+		return err
+	}
+	m, authorized := h.s.mappingFor(mappingID, h.binding, metadata.Destination.AddrString(), int(metadata.Destination.Port), "tcp", true, h.kind)
+	if !authorized {
+		return errors.New("unauthorized mux mapping")
+	}
 	p := h.s.singPools[singKey(h.binding, h.kind)]
 	select {
 	case p.slots <- struct{}{}:
@@ -571,20 +590,22 @@ func (h *singHandler) NewConnection(ctx context.Context, c net.Conn, metadata M.
 		return errors.New("mux stream limit")
 	}
 	defer func() { <-p.slots }()
-	target, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(h.s.ctx, "tcp", metadata.Destination.String())
+	target, err := tunnelDialer().DialContext(h.s.ctx, "tcp", metadata.Destination.String())
 	if err != nil {
 		return err
 	}
 	defer target.Close()
-	if !h.s.trackTarget(target, targetPolicy{binding: h.binding, host: metadata.Destination.AddrString(), port: int(metadata.Destination.Port), network: "tcp", mux: true, kind: h.kind}) {
+	shaped := shapeConn(h.s.ctx, target, h.s.mappingBucket(m))
+	defer shaped.Close()
+	if !h.s.trackTarget(shaped, targetPolicy{mappingID: m.ID, binding: h.binding, host: metadata.Destination.AddrString(), port: int(metadata.Destination.Port), network: "tcp", mux: true, kind: h.kind}) {
 		return context.Canceled
 	}
-	defer h.s.untrack(target)
+	defer h.s.untrack(shaped)
 	c.SetReadDeadline(time.Time{})
 	if _, err = c.Write(nil); err != nil {
 		return err
 	}
-	relayApplication(&singRecordConn{Conn: c}, target)
+	relayApplication(&singRecordConn{Conn: c}, shaped)
 	return nil
 }
 func (h *singHandler) NewPacketConnection(_ context.Context, c N.PacketConn, _ M.Metadata) error {

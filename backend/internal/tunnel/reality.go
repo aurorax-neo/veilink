@@ -73,12 +73,12 @@ func checkRealityServer(r model.Reality, fallback string) error {
 		return fmt.Errorf("REALITY private key: %w", err)
 	}
 	if r.Mldsa65Seed != "" {
-		seed, err := decodeMLDSA(r.Mldsa65Seed, mldsa65.SeedSize)
+		signing, err := model.ParseMldsa65Private(r.Mldsa65Seed)
 		if err != nil {
 			return fmt.Errorf("REALITY ML-DSA-65 seed: %w", err)
 		}
 		private, _ := decodeKey(r.PrivateKey)
-		if bytes.Equal(seed, private) {
+		if bytes.Equal(signing.Seed(), private) {
 			return errors.New("REALITY ML-DSA-65 seed must differ from X25519 private key")
 		}
 		if r.Mldsa65Verify != "" {
@@ -86,7 +86,7 @@ func checkRealityServer(r model.Reality, fallback string) error {
 			if err != nil {
 				return fmt.Errorf("REALITY ML-DSA-65 verify: %w", err)
 			}
-			pub, _ := mldsa65.NewKeyFromSeed((*[mldsa65.SeedSize]byte)(seed))
+			pub := signing.Public().(*mldsa65.PublicKey)
 			if !bytes.Equal(verify, pub.Bytes()) {
 				return errors.New("REALITY ML-DSA-65 public key does not match seed")
 			}
@@ -244,7 +244,7 @@ func (s *service) dialGateway(gateway model.Node, peer *clientGateway) (net.Conn
 		serverName := endpoint.Host
 		if local.XHTTP.Enabled() {
 			dial := func(ctx context.Context) (net.Conn, error) {
-				return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", addr)
+				return tunnelDialer().DialContext(ctx, "tcp", addr)
 			}
 			if local.Reality.Enabled() {
 				dial = func(ctx context.Context) (net.Conn, error) { return dialReality(ctx, addr, serverName, local.Reality) }
@@ -260,7 +260,7 @@ func (s *service) dialGateway(gateway model.Node, peer *clientGateway) (net.Conn
 					}
 				} else {
 					downDial = func(ctx context.Context) (net.Conn, error) {
-						return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", downAddr)
+						return tunnelDialer().DialContext(ctx, "tcp", downAddr)
 					}
 				}
 			}
@@ -283,7 +283,7 @@ func (s *service) dialGateway(gateway model.Node, peer *clientGateway) (net.Conn
 			continue
 		}
 		if local.TransportSecurity == "plain" {
-			if conn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(s.ctx, "tcp", addr); err == nil {
+			if conn, err := tunnelDialer().DialContext(s.ctx, "tcp", addr); err == nil {
 				return conn, nil
 			} else {
 				last = err
@@ -298,7 +298,7 @@ func (s *service) dialGateway(gateway model.Node, peer *clientGateway) (net.Conn
 		if err != nil {
 			return nil, err
 		}
-		raw, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(s.ctx, "tcp", addr)
+		raw, err := tunnelDialer().DialContext(s.ctx, "tcp", addr)
 		if err != nil {
 			last = err
 			continue
@@ -344,15 +344,14 @@ func newRealityConfig(r model.Reality, fallback string) (*reality.Config, error)
 	// ML-DSA-65 后量子签名密钥（服务端）
 	var mldsa65Key []byte
 	if r.Mldsa65Seed != "" {
-		seed, err := decodeMLDSA(r.Mldsa65Seed, mldsa65.SeedSize)
+		privKey, err := model.ParseMldsa65Private(r.Mldsa65Seed)
 		if err != nil {
 			return nil, err
 		}
-		_, privKey := mldsa65.NewKeyFromSeed((*[mldsa65.SeedSize]byte)(seed))
 		mldsa65Key = privKey.Bytes()
 	}
 	cfg := &reality.Config{
-		DialContext:            (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+		DialContext:            tunnelDialer().DialContext,
 		Type:                   "tcp",
 		Dest:                   strings.TrimSpace(r.Dest),
 		Mldsa65Key:             mldsa65Key,
@@ -395,7 +394,7 @@ func dialReality(ctx context.Context, addr, serverName string, r model.Reality) 
 	if err != nil {
 		return nil, err
 	}
-	raw, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", addr)
+	raw, err := tunnelDialer().DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}

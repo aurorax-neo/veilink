@@ -664,6 +664,9 @@ func (h *xhttpHandler) download(w http.ResponseWriter, r *http.Request, id strin
 	if err := rc.Flush(); err != nil {
 		return
 	}
+	if rc.SetWriteDeadline(time.Time{}) != nil {
+		return
+	}
 	buf := make([]byte, xhttpChunk)
 	for {
 		_ = wire.SetReadDeadline(time.Now().Add(90 * time.Second))
@@ -676,6 +679,9 @@ func (h *xhttpHandler) download(w http.ResponseWriter, r *http.Request, id strin
 				return
 			}
 			if rc.Flush() != nil {
+				return
+			}
+			if rc.SetWriteDeadline(time.Time{}) != nil {
 				return
 			}
 		}
@@ -768,7 +774,7 @@ func (c *xhttpClientConn) Close() error {
 }
 func dialXHTTP(ctx context.Context, addr, serverName string, local model.LocalTLS) (net.Conn, error) {
 	return dialXHTTPWithDialer(ctx, addr, serverName, local, func(ctx context.Context) (net.Conn, error) {
-		return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", addr)
+		return tunnelDialer().DialContext(ctx, "tcp", addr)
 	})
 }
 func DialXHTTP(ctx context.Context, addr, serverName string, local model.LocalTLS) (net.Conn, error) {

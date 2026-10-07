@@ -63,7 +63,7 @@ func TestNodeControlTransportMatrix(t *testing.T) {
 				t.Fatal(err)
 			}
 			st.Close()
-			masterEnv := []string{"WEB_MODE=off"}
+			var masterEnv []string
 			launchWithEnv(t, masterEnv, bin, "master", flags...)
 			transport := &http.Transport{}
 			if scheme == "https" {

@@ -452,6 +452,7 @@ type service struct {
 	mappingListeners   map[string]*mappingListener
 	mappingConns       map[string]map[net.Conn]struct{}
 	targetConns        map[net.Conn]targetPolicy
+	bandwidth          map[string]*bandwidthBucket
 }
 
 func start(s model.Snapshot, local model.LocalTLS, traffic ...*Traffic) (*service, error) {
@@ -636,14 +637,14 @@ func (s *service) listenServer() error {
 				min = tls.VersionTLS13
 			}
 			if s.reality != nil || s.local.TransportSecurity == "plain" {
-				ln, err = net.Listen("tcp", addr)
+				ln, err = listenTCP(s.ctx, addr)
 			} else {
 				cert, loadErr := tls.X509KeyPair([]byte(s.local.CertPEM), []byte(s.local.KeyPEM))
 				if loadErr != nil {
 					return loadErr
 				}
 				s.tlsConfig = &tls.Config{MinVersion: min, Certificates: []tls.Certificate{cert}, SessionTicketsDisabled: true}
-				ln, err = net.Listen("tcp", addr)
+				ln, err = listenTCP(s.ctx, addr)
 			}
 			if err != nil {
 				return err
@@ -693,7 +694,7 @@ func (s *service) acceptMapping(ln net.Listener, listener *mappingListener) {
 			_ = conn.Close()
 			continue
 		}
-		go s.openPublic(conn, m)
+		go s.openPublic(conn, m, listener)
 	}
 }
 
@@ -740,7 +741,7 @@ func (s *service) authenticate(conn net.Conn) {
 	owner.serveAuthorized(conn, id, binding, port)
 }
 
-func (s *service) openPublic(conn net.Conn, m model.Mapping) {
+func (s *service) openPublic(conn net.Conn, m model.Mapping, listener *mappingListener) {
 	defer s.untrack(conn)
 	defer s.untrackMapping(conn, m.ID)
 	remote := ""
@@ -749,7 +750,23 @@ func (s *service) openPublic(conn net.Conn, m model.Mapping) {
 	}
 	s.noteMapping("opened", m, remote)
 	defer s.noteMapping("closed", m, remote)
-	public := &countedConn{Conn: conn, traffic: s.traffic, id: m.ID}
+	shaped := shapeConn(s.ctx, conn, s.mappingBucket(m))
+	s.mu.Lock()
+	if s.conns == nil || listener.closed.Load() || !sameMapping(*listener.mapping.Load(), m) {
+		s.mu.Unlock()
+		shaped.Close()
+		return
+	}
+	s.conns[shaped] = struct{}{}
+	if s.mappingConns[m.ID] == nil {
+		s.mappingConns[m.ID] = map[net.Conn]struct{}{}
+	}
+	s.mappingConns[m.ID][shaped] = struct{}{}
+	s.mu.Unlock()
+	defer s.untrack(shaped)
+	defer s.untrackMapping(shaped, m.ID)
+	defer shaped.Close()
+	public := &countedConn{Conn: shaped, traffic: s.traffic, id: m.ID}
 	if !m.Mux {
 		s.openApplication(public, m)
 		return
@@ -812,11 +829,12 @@ func (s *service) maintain(b model.Binding, gateway model.Node, peer *clientGate
 			defer close(done)
 			defer s.removeSession(b.ID, sess)
 			defer s.untrack(conn)
-			sess.readLoop(func(host string, port int, udp bool) (net.Conn, error) {
-				if !udp || !s.targetAllowed(b.ID, host, port, "udp", false, "") {
+			sess.readMappedLoop(func(mappingID, host string, port int, udp bool) (net.Conn, error) {
+				m, authorized := s.mappingFor(mappingID, b.ID, host, port, "udp", false, "")
+				if !udp || !authorized {
 					return nil, errors.New("target is not authorized")
 				}
-				dialer := net.Dialer{Timeout: 5 * time.Second}
+				dialer := tunnelDialer()
 				network := "tcp"
 				if udp {
 					network = "udp"
@@ -831,7 +849,9 @@ func (s *service) maintain(b model.Binding, gateway model.Node, peer *clientGate
 					return nil, errors.New("udp dial failed")
 				}
 				wrapped := newClientUDP(uc, host, port)
-				if !s.trackTarget(wrapped, targetPolicy{binding: b.ID, host: host, port: port, network: "udp"}) {
+				wrapped.bucket = s.mappingBucket(m)
+				wrapped.ctx, wrapped.cancel = context.WithCancel(s.ctx)
+				if !s.trackTarget(wrapped, targetPolicy{mappingID: m.ID, binding: b.ID, host: host, port: port, network: "udp"}) {
 					wrapped.Close()
 					return nil, errors.New("target is not authorized")
 				}
@@ -1162,6 +1182,15 @@ func (s *session) forget(id uint32) *stream {
 }
 
 func (s *session) readLoop(open func(string, int, bool) (net.Conn, error)) {
+	s.readMappedLoop(func(_ string, host string, port int, udp bool) (net.Conn, error) {
+		if open == nil {
+			return nil, errors.New("peer cannot open streams")
+		}
+		return open(host, port, udp)
+	})
+}
+
+func (s *session) readMappedLoop(open func(string, string, int, bool) (net.Conn, error)) {
 	defer s.close()
 	for {
 		_ = s.conn.SetReadDeadline(time.Now().Add(45 * time.Second))
@@ -1171,10 +1200,19 @@ func (s *session) readLoop(open func(string, int, bool) (net.Conn, error)) {
 		}
 		switch kind {
 		case frameOpen:
+			mappingID := ""
+			if len(payload) >= 4 && payload[0] == 0 && payload[1] == 0 && payload[2] == 'm' {
+				size := int(payload[3])
+				if size == 0 || size > 128 || len(payload) < 4+size+3 {
+					_ = s.writeFrame(frameReset, id, nil)
+					continue
+				}
+				mappingID, payload = string(payload[4:4+size]), payload[4+size:]
+			}
 			host, port, udp, err := parseOpen(payload)
 			conn, dialErr := net.Conn(nil), err
 			if err == nil && open != nil {
-				conn, dialErr = open(host, port, udp)
+				conn, dialErr = open(mappingID, host, port, udp)
 			} else if err == nil {
 				dialErr = errors.New("peer cannot open streams")
 			}

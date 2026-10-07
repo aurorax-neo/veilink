@@ -15,7 +15,7 @@ import (
 // a Veilink protocol extension, not a general-purpose VLESS destination port.
 const applicationPort = 1
 
-var applicationMagic = []byte("veilink-application/2\x00")
+var applicationMagic = []byte("veilink-application/3\x00")
 
 const applicationWait = 10 * time.Second
 const applicationQueueLimit = 64
@@ -98,6 +98,9 @@ func (s *service) acceptApplication(conn net.Conn, id [16]byte, binding model.Bi
 		return
 	}
 	_ = conn.SetDeadline(req.deadline)
+	if err := writeMappingID(conn, m.ID); err != nil {
+		return
+	}
 	payload := append([]byte{byte(m.TargetPort >> 8), byte(m.TargetPort)}, m.TargetHost...)
 	wire := append([]byte{byte(len(payload) >> 8), byte(len(payload))}, payload...)
 	if err := writeAll(conn, wire); err != nil {
@@ -233,6 +236,13 @@ func (s *service) maintainApplication(b model.Binding, gateway model.Node, peer 
 		}
 		if err == nil {
 			_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
+			mappingID, mappingErr := readMappingID(conn)
+			if mappingErr != nil {
+				tracked.Close()
+				s.untrack(tracked)
+				attempt, _ = s.afterShortContext(ctx, b, gateway, started, attempt)
+				continue
+			}
 			var size [2]byte
 			_, err = io.ReadFull(conn, size[:])
 			if err == nil {
@@ -244,13 +254,14 @@ func (s *service) maintainApplication(b model.Binding, gateway model.Node, peer 
 					_, err = io.ReadFull(conn, payload)
 					if err == nil {
 						host, port, udp, parseErr := parseOpen(payload)
-						if parseErr != nil || udp || !s.tcpModeAllowed(b.ID, host, port, false) {
+						m, authorized := s.mappingFor(mappingID, b.ID, host, port, "tcp", false, "")
+						if parseErr != nil || udp || !authorized {
 							err = io.ErrUnexpectedEOF
 						} else {
 							// The idle slot has been consumed. Replenish immediately,
 							// while this independently tracked connection serves one TCP flow.
 							worker.release(tracked)
-							go s.serveApplication(conn, tracked, id, b.ID, host, port, peer.flow)
+							go s.serveApplication(conn, tracked, id, m, peer.flow)
 							continue
 						}
 					}
@@ -268,19 +279,21 @@ func (s *service) maintainApplication(b model.Binding, gateway model.Node, peer 
 	}
 }
 
-func (s *service) serveApplication(conn, tracked net.Conn, id [16]byte, binding, host string, port int, flow string) {
+func (s *service) serveApplication(conn, tracked net.Conn, id [16]byte, m model.Mapping, flow string) {
 	defer tracked.Close()
 	defer s.untrack(tracked)
 	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
-	target, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(s.ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	target, err := tunnelDialer().DialContext(s.ctx, "tcp", net.JoinHostPort(m.TargetHost, strconv.Itoa(m.TargetPort)))
 	if err != nil {
 		return
 	}
 	defer target.Close()
-	if !s.trackTarget(target, targetPolicy{binding: binding, host: host, port: port, network: "tcp"}) {
+	shaped := shapeConn(s.ctx, target, s.mappingBucket(m))
+	defer shaped.Close()
+	if !s.trackTarget(shaped, targetPolicy{mappingID: m.ID, binding: m.BindingID, host: m.TargetHost, port: m.TargetPort, network: "tcp"}) {
 		return
 	}
-	defer s.untrack(target)
+	defer s.untrack(shaped)
 	if err = writeAll(conn, []byte{0}); err != nil {
 		return
 	}
@@ -288,7 +301,7 @@ func (s *service) serveApplication(conn, tracked net.Conn, id [16]byte, binding,
 	if flow != "" {
 		conn = newApplicationVision(conn, id)
 	}
-	relayApplication(conn, target)
+	relayApplication(conn, shaped)
 }
 
 func relayApplication(a, b net.Conn) {

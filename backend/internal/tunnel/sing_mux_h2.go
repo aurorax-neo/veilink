@@ -94,6 +94,15 @@ func (c *singH2Client) DialContext(ctx context.Context, network string, dst M.So
 	if err != nil {
 		return nil, err
 	}
+	// Authorization must precede CONNECT response headers: the peer validates
+	// the mapping before acknowledging the application stream.
+	if id, ok := ctx.Value(mappingContextKey{}).(string); ok {
+		var prefix bytes.Buffer
+		if err := writeMappingID(&prefix, id); err != nil {
+			return nil, err
+		}
+		wire = append(wire, prefix.Bytes()...)
+	}
 	reader, writer := io.Pipe()
 	life, cancel := context.WithCancel(c.pool.ctx)
 	request := (&http.Request{Method: http.MethodConnect, URL: &url.URL{Scheme: "https", Host: "localhost"}, Header: make(http.Header), Body: &singH2Body{Reader: io.MultiReader(bytes.NewReader(wire), reader), closer: reader}}).WithContext(life)

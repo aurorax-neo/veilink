@@ -15,6 +15,18 @@ test('mapping mux select defaults off, round-trips every option and clears for U
   const e = context.editor
   e.open()
   assert.equal(e.muxType.value, '')
+  assert.equal(e.draft.bandwidthLimit, '0')
+  e.draft.bandwidthLimit = '48'
+  await e.save()
+  assert.equal(requests.at(-1)[2].bandwidth_limit, '48Mbps')
+  e.open({ ...requests.at(-1)[2], id: 'm' })
+  assert.equal(e.draft.bandwidthLimit, '48')
+  for (const [value, expected] of [['1500Kbps', '1.5'], ['1.234Kbps', '0.001234'], ['0.048Gbps', '48'], ['', '0']]) {
+    assert.equal(e.fields({ ...requests.at(-1)[2], bandwidth_limit: value }).bandwidthLimit, expected)
+  }
+  e.draft.bandwidthLimit = '0'
+  await e.save()
+  assert.equal(requests.at(-1)[2].bandwidth_limit, '')
   await e.save()
   assert.equal(requests.at(-1)[2].mux, false)
   assert.equal(requests.at(-1)[2].mux_type, '')
@@ -42,7 +54,8 @@ test('mapping mux select defaults off, round-trips every option and clears for U
   assert.equal(e.muxType.value, '')
 })
 test('mux uses one standard dropdown with off and three protocols, never checkbox or radio', () => {
-  for (const text of ['TCP mux（默认关闭）', '独立认证连接', 'Vision 不直拷', 'UDP 始终使用 XUDP', '自动重建', '现有连接会断开']) assert.ok(source.includes(text), text)
+  for (const text of ['TCP mux（默认关闭）', '带宽上限（Mbps）', '0（不限速）', 'type="number"']) assert.ok(source.includes(text), text)
+  assert.ok(!source.includes('现有连接会断开'))
   const select = source.match(/<select id="map-mux-type"[^>]*>[\s\S]*?<\/select>/)?.[0]
   assert.ok(select)
   assert.ok(select.includes(':disabled="draft.network !== \'tcp\'"'))

@@ -164,6 +164,9 @@ func validate(s model.Snapshot, local model.LocalTLS) error {
 	ids := map[string]bool{}
 	names := map[string]bool{}
 	for _, m := range s.Mappings {
+		if _, err := model.BandwidthBytes(m.BandwidthLimit); err != nil {
+			return bad(err.Error())
+		}
 		if _, err := m.EffectiveMuxType(); err != nil {
 			return bad(err.Error())
 		}

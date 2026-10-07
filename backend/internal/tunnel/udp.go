@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"context"
 	"crypto/rand"
 	"io"
 	"net"
@@ -34,6 +35,9 @@ type xudpConn struct {
 	seen      time.Time
 	traffic   *Traffic
 	mappingID string
+	bucket    *bandwidthBucket
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
 func newClientUDP(conn *net.UDPConn, host string, port int) *xudpConn {
@@ -105,6 +109,11 @@ func (c *xudpConn) Read(p []byte) (int, error) {
 			break
 		}
 	}
+	if c.bucket != nil {
+		if err := c.bucket.wait(c.ctx, len(raw)); err != nil {
+			return 0, err
+		}
+	}
 	c.mu.Lock()
 	first := c.fresh
 	c.fresh = false
@@ -162,6 +171,9 @@ func sameUDPTarget(got string, gotPort int, want string, wantPort int) bool {
 }
 
 func (c *xudpConn) Close() error {
+	if c.cancel != nil {
+		c.cancel()
+	}
 	c.once.Do(func() { close(c.done) })
 	if c.udp != nil {
 		return c.udp.Close()
@@ -234,6 +246,8 @@ func (s *service) serveUDP(pc *net.UDPConn, m model.Mapping) {
 		if peer == nil {
 			peer = newGatewayUDP(pc, addr, m.TargetHost, m.TargetPort)
 			peer.traffic, peer.mappingID = s.traffic, m.ID
+			peer.bucket = s.mappingBucket(m)
+			peer.ctx, peer.cancel = context.WithCancel(s.ctx)
 			if !s.openUDP(peer, m) {
 				_ = peer.Close()
 				mu.Unlock()
@@ -266,7 +280,9 @@ func (s *service) openUDP(conn net.Conn, m model.Mapping) bool {
 	if !sess.track(&stream{id: id, conn: conn}) {
 		return false
 	}
-	payload := append([]byte{0, 0, 'u', byte(m.TargetPort >> 8), byte(m.TargetPort)}, m.TargetHost...)
+	payload := append([]byte{0, 0, 'm', byte(len(m.ID))}, m.ID...)
+	payload = append(payload, 0, 0, 'u', byte(m.TargetPort>>8), byte(m.TargetPort))
+	payload = append(payload, m.TargetHost...)
 	if err := sess.writeFrame(frameOpen, id, payload); err != nil {
 		if old := sess.forget(id); old != nil {
 			_ = old.conn.Close()

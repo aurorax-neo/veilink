@@ -14,7 +14,6 @@ import (
 // 返回 handler 和可用于 Authorization 头的明文 key
 func newTestAPI(t *testing.T, insecure bool) (http.Handler, string) {
 	t.Helper()
-	t.Setenv("WEB_MODE", "off") // 测试不拉取前端，避免网络依赖
 	dir := t.TempDir()
 	db, key := filepath.Join(dir, "db"), filepath.Join(dir, "key")
 	s, err := store.Open(db, key)

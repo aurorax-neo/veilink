@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 )
 
 type EmbeddedServerConfig struct {
@@ -17,19 +16,6 @@ type EmbeddedServerConfig struct {
 	Address  string
 	Port     int
 	StateDir string
-}
-
-// stringSlice 支持重复指定或逗号分隔的 CLI 参数
-type stringSlice []string
-
-func (s *stringSlice) String() string { return strings.Join(*s, ",") }
-func (s *stringSlice) Set(v string) error {
-	for _, part := range strings.Split(v, ",") {
-		if trimmed := strings.TrimSpace(part); trimmed != "" {
-			*s = append(*s, trimmed)
-		}
-	}
-	return nil
 }
 
 type Config struct {
@@ -47,14 +33,6 @@ type Config struct {
 	EnrollToken       string
 	StateDir          string
 	EmbeddedServer    EmbeddedServerConfig
-
-	// 前端拉取配置（持久化在 master_config 表）
-	WebMirrors []string
-	WebVersion string
-	// CPA 式自定义前端地址（设置后 / 重定向到该地址）
-	FrontendURL string
-	// Web 托管模式：pull（拉取）/ off（纯 API）
-	WebMode string
 
 	// explicit tracks visited CLI flags; defaults never overwrite stored settings.
 	explicit map[string]bool
@@ -103,11 +81,6 @@ func ParseFlagsOutput(role string, args []string, out io.Writer) (Config, error)
 		f.IntVar(&c.EmbeddedServer.Port, "embedded-server-port", c.EmbeddedServer.Port, "")
 		fields["embedded-server-port"] = "embedded_server.port"
 		stringFlag("embedded-server-state-dir", "embedded_server.state_dir", &c.EmbeddedServer.StateDir)
-		stringFlag("web-version", "web_version", &c.WebVersion)
-		stringFlag("frontend-url", "frontend_url", &c.FrontendURL)
-		stringFlag("web-mode", "web_mode", &c.WebMode)
-		f.Var((*stringSlice)(&c.WebMirrors), "web-mirror", "加速镜像（可重复指定或逗号分隔）")
-		fields["web-mirror"] = "web_mirrors"
 	case "server", "client":
 		stringFlag("master-addr", "master_addr", &c.MasterAddr)
 		stringFlag("node-id", "node_id", &c.NodeID)

@@ -87,30 +87,22 @@ test('login fails closed on rejected key or network error', async () => {
   assert.equal(app.getCurrentKey(), '')
 })
 
-test('LoginView validates API key format and supports server url reset', () => {
+test('LoginView validates API key format', () => {
   const text = readFileSync(new URL('../src/views/LoginView.vue', import.meta.url), 'utf8')
     .match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
     .replace(/^import .*$/gm, '')
 
   let submittedKey = ''
-  let defaultUrl = 'http://127.0.0.1:2545'
-  let currentServerUrl = ''
   const c = vm.createContext({
     exports: {},
     ref,
-    computed: (fn) => ({ get value() { return fn() } }),
     defineProps: () => ({ error: '', busy: false }),
     defineEmits: () => (event, key) => { if (event === 'submit') submittedKey = key },
-    getDefaultServerUrl: () => defaultUrl,
-    getServerUrl: () => currentServerUrl,
-    setServerUrl: (url) => { currentServerUrl = url },
-    clearServerUrl: () => { currentServerUrl = '' },
-    hasCustomServerUrl: () => currentServerUrl !== '' && currentServerUrl !== defaultUrl,
   })
 
   vm.runInContext(
     ts.transpileModule(
-      text + '\nglobalThis.login = { apiKey, serverUrl, localError, isCustom, resetServerUrl, onSubmit };',
+      text + '\nglobalThis.login = { apiKey, localError, onSubmit };',
       { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }
     ).outputText,
     c
@@ -129,21 +121,15 @@ test('LoginView validates API key format and supports server url reset', () => {
   assert.equal(submittedKey, '')
   assert.match(login.localError.value, /vlk_/)
 
-  // Custom server url formatted and saved
-  login.serverUrl.value = '192.168.1.100:2545/'
-  login.apiKey.value = 'vlk_correct_token'
+  login.apiKey.value = ' vlk_correct_token '
   login.onSubmit()
   assert.equal(submittedKey, 'vlk_correct_token')
-  assert.equal(currentServerUrl, 'http://192.168.1.100:2545')
-
-  // Reset restores default
-  login.resetServerUrl()
-  assert.equal(currentServerUrl, '')
+  assert.equal(login.localError.value, '')
 })
 
-test('login view template renders server url and API key fields', () => {
+test('login view renders API key without a configurable server address', () => {
   const view = readFileSync(new URL('../src/views/LoginView.vue', import.meta.url), 'utf8')
-  assert.match(view, /<label for="server-url">服务地址<\/label>/)
+  assert.doesNotMatch(view, /server-url|服务地址|恢复默认/)
   assert.match(view, /<label for="apikey">API Key<\/label>/)
   assert.match(view, /placeholder="vlk_\.\.\."/)
   assert.match(view, /进入控制台/)

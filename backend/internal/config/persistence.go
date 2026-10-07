@@ -11,10 +11,10 @@ import (
 	"io"
 	"net"
 	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"unicode"
+	"veilink/internal/dbbackup"
 
 	_ "modernc.org/sqlite"
 )
@@ -25,7 +25,6 @@ type MasterConfigUpdate struct {
 	Scheme     *string `json:"scheme"`
 	CertFile   *string `json:"cert_file"`
 	KeyFile    *string `json:"key_file"`
-	WebMode    *string `json:"web_mode"`
 }
 
 // UpdateMasterConfig 更新 master_config 表中的通用配置（设置页运行时调用）
@@ -75,13 +74,6 @@ func UpdateMasterConfig(dbPath string, update MasterConfigUpdate) ([]string, err
 	if update.KeyFile != nil {
 		set("KeyFile", *update.KeyFile, true)
 	}
-	if update.WebMode != nil {
-		mode := *update.WebMode
-		if mode != "pull" && mode != "off" {
-			return nil, errors.New("web_mode must be pull or off")
-		}
-		set("WebMode", mode, true)
-	}
 	body, err := json.Marshal(doc)
 	if err != nil {
 		return nil, err
@@ -96,7 +88,6 @@ type MasterConfigView struct {
 	Scheme     string `json:"scheme"`
 	CertFile   string `json:"cert_file"`
 	KeyFile    string `json:"key_file"`
-	WebMode    string `json:"web_mode"`
 }
 
 // GetMasterConfigView 从 DB 读取设置页展示用的配置
@@ -114,7 +105,7 @@ func GetMasterConfigView(dbPath string) (MasterConfigView, error) {
 	}
 	var cfg Config
 	decoder := json.NewDecoder(bytes.NewReader(data))
-	// 不用 DisallowUnknownFields，兼容未来字段
+	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&cfg); err != nil {
 		return view, err
 	}
@@ -122,56 +113,7 @@ func GetMasterConfigView(dbPath string) (MasterConfigView, error) {
 	view.Scheme = cfg.Scheme
 	view.CertFile = cfg.CertFile
 	view.KeyFile = cfg.KeyFile
-	view.WebMode = cfg.WebMode
-	if view.WebMode == "" {
-		view.WebMode = "pull"
-	}
 	return view, nil
-}
-
-// UpdateWebConfig 更新 master_config 表中的前端拉取配置（设置页运行时调用）
-func UpdateWebConfig(dbPath string, mirrors []string, version string, updateVersion bool, frontendURL *string) error {
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	db.SetMaxOpenConns(1)
-	if _, err = db.Exec(`PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS master_config(id INTEGER PRIMARY KEY CHECK(id=1), data BLOB NOT NULL)`); err != nil {
-		return err
-	}
-	var data []byte
-	err = db.QueryRow("SELECT data FROM master_config WHERE id=1").Scan(&data)
-	if err != nil {
-		return err
-	}
-	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(data, &doc); err != nil {
-		return err
-	}
-	// mirrors 为 nil 时不覆盖（仅更新 frontendURL 的场景）
-	if mirrors != nil {
-		mirrorsRaw, _ := json.Marshal(mirrors)
-		doc["WebMirrors"] = mirrorsRaw
-	}
-	// 兼容旧单值字段：清理
-	delete(doc, "WebMirror")
-	delete(doc, "HTMLDir")
-	delete(doc, "html_dir")
-	if updateVersion {
-		versionRaw, _ := json.Marshal(version)
-		doc["WebVersion"] = versionRaw
-	}
-	if frontendURL != nil {
-		urlRaw, _ := json.Marshal(*frontendURL)
-		doc["FrontendURL"] = urlRaw
-	}
-	body, err := json.Marshal(doc)
-	if err != nil {
-		return err
-	}
-	_, err = db.Exec("UPDATE master_config SET data=? WHERE id=1", body)
-	return err
 }
 
 // PersistMaster resolves and immediately commits settings for non-listening callers.
@@ -208,8 +150,14 @@ func ResolveMaster(local Config) (Config, func() error, error) {
 	var previous []byte
 	err = db.QueryRow("SELECT data FROM master_config WHERE id=1").Scan(&previous)
 	found := err == nil
+	migrating := false
 	if found {
-		decoder := json.NewDecoder(bytes.NewReader(previous))
+		upgraded, changed, upgradeErr := UpgradeMasterDocument(previous)
+		if upgradeErr != nil {
+			return local, nil, fmt.Errorf("invalid persisted master configuration: %w", upgradeErr)
+		}
+		migrating = changed
+		decoder := json.NewDecoder(bytes.NewReader(upgraded))
 		decoder.DisallowUnknownFields()
 		if err = decoder.Decode(&effective); err != nil {
 			return local, nil, fmt.Errorf("invalid persisted master configuration: %w", err)
@@ -228,11 +176,7 @@ func ResolveMaster(local Config) (Config, func() error, error) {
 	effective.Database = local.Database
 	effective.DeploymentKey = local.DeploymentKey
 	effective.EnrollToken = local.EnrollToken
-	if !effective.explicit["html_dir"] && effective.HTMLDir != "" {
-		if info, err := os.Stat(filepath.Join(effective.HTMLDir, "index.html")); err != nil || info.IsDir() {
-			effective.HTMLDir = ""
-		}
-	}
+	effective.HTMLDir = local.HTMLDir
 	if effective.Scheme == "" && !effective.explicit["scheme"] {
 		effective.Scheme = "http"
 	}
@@ -310,6 +254,15 @@ func ResolveMaster(local Config) (Config, func() error, error) {
 		db.SetMaxOpenConns(1)
 		if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
 			return err
+		}
+		if migrating {
+			key, err := os.ReadFile(local.DeploymentKey)
+			if err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			if _, err := dbbackup.Create(db, local.Database, key); err != nil {
+				return fmt.Errorf("pre-upgrade backup: %w", err)
+			}
 		}
 		var result sql.Result
 		if found {

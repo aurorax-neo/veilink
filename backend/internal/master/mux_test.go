@@ -30,6 +30,9 @@ import (
 
 func TestWebAndGRPCShareOnePort(t *testing.T) {
 	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte("<html>builtin-web</html>"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	cert, key := writeCert(t, dir)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -37,13 +40,10 @@ func TestWebAndGRPCShareOnePort(t *testing.T) {
 	}
 	addr := ln.Addr().String()
 	_ = ln.Close()
-	c, err := config.ParseFlags("master", []string{"-database", filepath.Join(dir, "veilink.db"), "-deployment-key", filepath.Join(dir, "veilink.key"), "-listen-addr", addr, "-scheme=https", "-cert-file", cert, "-key-file", key, "-embedded-server-enabled=false"})
+	c, err := config.ParseFlags("master", []string{"-database", filepath.Join(dir, "veilink.db"), "-deployment-key", filepath.Join(dir, "veilink.key"), "-html-dir", dir, "-listen-addr", addr, "-scheme=https", "-cert-file", cert, "-key-file", key, "-embedded-server-enabled=false"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// WEB_MODE=off keeps the test deterministic: no frontend download attempt,
-	// root path serves the api-only JSON fallback.
-	t.Setenv("WEB_MODE", "off")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errc := make(chan error, 1)
@@ -72,8 +72,8 @@ func TestWebAndGRPCShareOnePort(t *testing.T) {
 	if page.StatusCode != http.StatusOK {
 		t.Fatalf("http status %d", page.StatusCode)
 	}
-	if !strings.Contains(string(pageBody), `"mode":"api-only"`) {
-		t.Fatalf("expected api-only fallback body, got %q", pageBody)
+	if !strings.Contains(string(pageBody), "builtin-web") {
+		t.Fatalf("expected bundled web body, got %q", pageBody)
 	}
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{InsecureSkipVerify: true})))
 	if err != nil {

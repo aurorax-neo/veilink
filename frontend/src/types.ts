@@ -62,6 +62,8 @@ export interface Node {
 }
 
 export interface Mapping {
+
+  bandwidth_limit?: string
   id: string
   name: string
   server_id: string
@@ -148,7 +150,7 @@ export const pages: Record<PageId, { title: string; kicker: string; lead: string
   settings: {
     title: '设置',
     kicker: 'SETTINGS',
-    lead: '前端版本与下载加速配置。',
+    lead: '',
     icon: '⚙',
   },
 }

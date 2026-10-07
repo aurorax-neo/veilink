@@ -179,6 +179,11 @@ func Open(path, keyPath string) (*Store, error) {
 	}
 	key, e := os.ReadFile(keyPath)
 	if os.IsNotExist(e) {
+		if info, err := os.Stat(path); err == nil && info.Size() > 0 {
+			return nil, errors.New("deployment key missing for an existing database; restore the original key before startup")
+		} else if err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
 		key = make([]byte, 32)
 		if _, e = rand.Read(key); e != nil {
 			return nil, e
@@ -214,6 +219,10 @@ func Open(path, keyPath string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	if e = initializeSchema(db); e != nil {
+		db.Close()
+		return nil, e
+	}
+	if e = migratePreviousRelease(db, path, key); e != nil {
 		db.Close()
 		return nil, e
 	}
@@ -258,10 +267,10 @@ func OpenExisting(path, keyPath string) (*Store, error) {
 	return &Store{db: db, key: key}, nil
 }
 
-const schemaVersion = 5
+const schemaVersion = 6
 
-// Only fresh databases and this exact schema are supported. Never migrate or
-// discard an existing deployment implicitly.
+// Schema 5 is shared by the previous published releases; its upgrade is handled
+// after opening the database and before any role starts serving requests.
 func initializeSchema(db *sql.DB) error {
 	var tables, versions int
 	if err := db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").Scan(&tables); err != nil {
@@ -270,8 +279,8 @@ func initializeSchema(db *sql.DB) error {
 	if tables != 0 {
 		var version int
 		err := db.QueryRow("SELECT count(*), COALESCE(max(version),0) FROM schema_version").Scan(&versions, &version)
-		if err != nil || versions != 1 || version != schemaVersion {
-			return fmt.Errorf("unsupported database schema: expected version %d; back up and explicitly reset the database to continue (automatic migration is not supported)", schemaVersion)
+		if err != nil || versions != 1 || (version != schemaVersion && version != 5) {
+			return fmt.Errorf("unsupported database schema: expected version 5 or %d; back up before any explicit reset; unknown schemas cannot be automatically migrated", schemaVersion)
 		}
 	}
 	if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;"); err != nil {
@@ -1197,6 +1206,9 @@ func validate(st *state) error {
 		pairs[pair] = true
 	}
 	for id, m := range st.Mappings {
+		if _, err := model.BandwidthBytes(m.BandwidthLimit); err != nil {
+			return ErrInvalid
+		}
 		if _, err := m.EffectiveMuxType(); err != nil {
 			return ErrInvalid
 		}
@@ -1233,6 +1245,10 @@ func validate(st *state) error {
 	return nil
 }
 func (s *Store) SaveMapping(m model.Mapping) (model.Mapping, error) {
+	m.BandwidthLimit = strings.TrimSpace(m.BandwidthLimit)
+	if rate, err := model.BandwidthBytes(m.BandwidthLimit); err == nil && rate == 0 {
+		m.BandwidthLimit = ""
+	}
 	network := strings.ToLower(strings.TrimSpace(m.Network))
 	if network != "" && network != "tcp" && network != "udp" {
 		return m, ErrInvalid

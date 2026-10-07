@@ -30,7 +30,7 @@ func TestDevelopmentWorkflowContract(t *testing.T) {
 
 func TestReleaseWorkflowPaths(t *testing.T) {
 	root := projectRoot(t)
-	for _, name := range []string{"release-web.yml", "release-backend.yml", "release-image.yml"} {
+	for _, name := range []string{"release-backend.yml", "release-image.yml"} {
 		body, err := os.ReadFile(filepath.Join(root, ".github/workflows", name))
 		if err != nil {
 			t.Fatal(err)
@@ -40,18 +40,22 @@ func TestReleaseWorkflowPaths(t *testing.T) {
 			t.Errorf("%s contains old root paths", name)
 		}
 	}
-	body, err := os.ReadFile(filepath.Join(root, ".github/workflows/release-web.yml"))
+	if _, err := os.Stat(filepath.Join(root, ".github/workflows/release-web.yml")); !os.IsNotExist(err) {
+		t.Error("standalone web release must not exist")
+	}
+	body, err := os.ReadFile(filepath.Join(root, ".github/workflows/release-backend.yml"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(body), "frontend/package-lock.json") || !strings.Contains(string(body), "-C frontend/dist") {
-		t.Error("web release workflow is not rooted at frontend/")
+	workflow := string(body)
+	for _, required := range []string{"target: unified", "platforms: linux/amd64,linux/arm64", "needs: docker", "body_path: RELEASE_NOTES.md"} {
+		if !strings.Contains(workflow, required) {
+			t.Errorf("missing unified release contract %q", required)
+		}
 	}
-	body, err = os.ReadFile(filepath.Join(root, ".github/workflows/release-backend.yml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(body), "working-directory: backend") || !strings.Contains(string(body), "./cmd/veilink") {
-		t.Error("backend release workflow is not rooted at backend/")
+	for _, retired := range []string{"matrix:", "goos:", "download-artifact", "dist/veilink-*"} {
+		if strings.Contains(workflow, retired) {
+			t.Errorf("retired release matrix %q", retired)
+		}
 	}
 }

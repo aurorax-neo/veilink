@@ -63,7 +63,7 @@ async function refreshReported() {
 watch(() => desk.mappings, () => { if (active) void refreshStatus() })
 watch(() => desk.loading, (loading, previous) => { if (active && previous && !loading) void refreshStatus() })
 
-const draft = reactive({ id: '', name: '', serverId: '', clientId: '', connectEndpointId: '', pool: 1, listenHost: '0.0.0.0', listenPort: '', targetHost: '', targetPort: '', network: 'tcp', enabled: true })
+const draft = reactive({ id: '', name: '', serverId: '', clientId: '', connectEndpointId: '', bandwidthLimit: '0', pool: 1, listenHost: '0.0.0.0', listenPort: '', targetHost: '', targetPort: '', network: 'tcp', enabled: true })
 const defaultMuxType = 'smux'
 const muxType = ref('')
 watch(() => draft.network, network => { if (network !== 'tcp') muxType.value = '' }, { flush: 'sync' })
@@ -133,10 +133,12 @@ watchEffect(() => {
 })
 const rows = computed(() => desk.mappings.filter(m => (filter.value === 'all' || m.enabled === (filter.value === 'on')) && [m.name, m.listen_host, m.target_host, nodeName(desk.nodes, m.server_id), nodeName(desk.nodes, m.client_id)].join(' ').toLowerCase().includes(query.value.trim().toLowerCase())).sort(byNameAndId))
 function fields(m: Mapping) {
-  return { id: m.id, name: m.name, serverId: m.server_id, clientId: m.client_id, connectEndpointId: m.connect_endpoint_id || '', pool: m.pool || 1, listenHost: m.listen_host, listenPort: String(m.listen_port), targetHost: m.target_host, targetPort: String(m.target_port), network: m.network || 'tcp', enabled: m.enabled }
+  const limit = m.bandwidth_limit?.match(/^([0-9]+(?:\.[0-9]+)?)(Kbps|Mbps|Gbps)$/)
+  const bandwidthLimit = limit ? String(Number((Number(limit[1]) * ({ Kbps: 0.001, Mbps: 1, Gbps: 1000 }[limit[2]] || 0)).toFixed(6))) : '0'
+  return { id: m.id, name: m.name, serverId: m.server_id, clientId: m.client_id, connectEndpointId: m.connect_endpoint_id || '', bandwidthLimit, pool: m.pool || 1, listenHost: m.listen_host, listenPort: String(m.listen_port), targetHost: m.target_host, targetPort: String(m.target_port), network: m.network || 'tcp', enabled: m.enabled }
 }
 function open(mapping?: Mapping) {
-  Object.assign(draft, mapping ? fields(mapping) : { id: '', name: '', serverId: servers.value[0]?.id || '', clientId: clients.value[0]?.id || '', pool: 1, listenHost: '0.0.0.0', listenPort: '', targetHost: '127.0.0.1', targetPort: '', network: 'tcp', enabled: true })
+  Object.assign(draft, mapping ? fields(mapping) : { id: '', name: '', serverId: servers.value[0]?.id || '', clientId: clients.value[0]?.id || '', bandwidthLimit: '0', pool: 1, listenHost: '0.0.0.0', listenPort: '', targetHost: '127.0.0.1', targetPort: '', network: 'tcp', enabled: true })
   draft.connectEndpointId = mapping ? mapping.connect_endpoint_id || '' : connections.value[0]?.id || ''
   muxType.value = draft.network === 'tcp' && mapping?.mux ? mapping.mux_type || defaultMuxType : ''
   editor.value?.open()
@@ -148,6 +150,7 @@ async function save() {
     name: draft.name.trim(), server_id: draft.serverId, client_id: draft.clientId, pool: draft.pool, mux: draft.network === 'tcp' && muxType.value !== '',
     mux_type: draft.network === 'tcp' ? muxType.value : '',
     connect_endpoint_id: draft.connectEndpointId,
+    bandwidth_limit: Number(draft.bandwidthLimit) > 0 ? (Number(draft.bandwidthLimit) === Number(Number(draft.bandwidthLimit).toFixed(3)) ? `${Number(draft.bandwidthLimit)}Mbps` : `${Number((Number(draft.bandwidthLimit) * 1000).toFixed(3))}Kbps`) : '',
     listen_host: draft.listenHost.trim(), listen_port: Number(draft.listenPort), target_host: draft.targetHost.trim(), target_port: Number(draft.targetPort), network: draft.network, enabled: draft.enabled,
   })
   await desk.reload(); if (active) void refreshStatus(); desk.notify('映射已保存。')
@@ -190,7 +193,7 @@ async function run() {
           <td><strong>{{ mapping.name }}</strong><Badge :text="(mapping.network || 'tcp').toUpperCase()" /></td>
           <td>{{ nodeName(desk.nodes, mapping.server_id) }}<small>→ {{ nodeName(desk.nodes, mapping.client_id) }}</small><small>隧道入口：{{ connectionLabel(mapping) }}</small></td>
           <td><code>{{ endpoint(mapping.listen_host, mapping.listen_port) }}</code><small>→ <code>{{ endpoint(mapping.target_host, mapping.target_port) }}</code></small></td>
-          <td>{{ mapping.pool || 1 }}<small>{{ mapping.network === 'udp' ? 'XUDP' : mapping.mux ? (mapping.mux_type || 'smux') : 'mux 关闭' }}</small></td>
+          <td>{{ mapping.pool || 1 }}<small>{{ mapping.network === 'udp' ? 'XUDP' : mapping.mux ? (mapping.mux_type || 'smux') : 'mux 关闭' }}</small><small v-if="mapping.bandwidth_limit">{{ mapping.bandwidth_limit }}</small></td>
           <td><Badge reserve="客户端未连接" :text="tunnelState(mapping).text" :tone="tunnelState(mapping).tone" title="隧道会话是否保持" /></td>
           <td><span class="fit traffic-figure"><span class="fit-sizer" aria-hidden="true">{{ trafficFit[mapping.id] || trafficWidth(mapping) }}</span><span class="fit-value">{{ trafficLine(mapping) }}</span></span><small v-if="!desk.trafficError && desk.trafficLoaded && mapping.enabled && traffic(mapping)?.reported_at" class="traffic-figure">服务端本次进程 · {{ reportedClock(traffic(mapping)!.reported_at!) }} 上报</small></td>
           <td><div class="actions"><button type="button" class="btn small" @click="open(mapping)">编辑</button><button type="button" class="btn small" @click="ask(mapping, 'toggle')">{{ mapping.enabled ? '停用' : '启用' }}</button><button type="button" class="btn small danger" @click="ask(mapping, 'delete')">删除</button></div></td>
@@ -220,7 +223,7 @@ async function run() {
     </div>
     <label for="map-mux-type">TCP mux（默认关闭）</label>
     <select id="map-mux-type" v-model="muxType" :disabled="draft.network !== 'tcp'"><option value="">关闭</option><option value="smux">smux</option><option value="yamux">yamux</option><option value="h2mux">h2mux</option></select>
-    <p class="help">关闭：每条 TCP 流使用独立认证连接；开启：多条 TCP 流共享连接，Vision 不直拷。UDP 始终使用 XUDP，不受此开关影响。Pool 控制共享会话或独立连接的预备数量。保存后自动重建相关隧道，现有连接会断开。</p>
+    <label for="map-bandwidth">带宽上限（Mbps）</label><input id="map-bandwidth" v-model="draft.bandwidthLimit" type="number" min="0" max="100000" step="0.000001" placeholder="0（不限速）" />
     <div class="grid-2">
       <div><label for="map-listen">监听 IP</label><input id="map-listen" v-model="draft.listenHost" required spellcheck="false" /></div>
       <div><label for="map-port">监听端口</label><input id="map-port" v-model="draft.listenPort" type="number" min="1" max="65535" required /></div>

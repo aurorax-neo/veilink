@@ -27,7 +27,7 @@ RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
-# ============ 后端镜像（纯 API + pull 前端） ============
+# ============ 统一镜像运行环境 ============
 FROM alpine:3.23 AS backend
 ARG APK_MIRROR
 ARG VERSION=dev
@@ -35,7 +35,7 @@ ARG COMMIT=unknown
 ARG SOURCE_URL=unknown
 RUN if [ -n "$APK_MIRROR" ] && [ "$APK_MIRROR" != "https://dl-cdn.alpinelinux.org/alpine" ]; then printf '%s/v3.23/main\n%s/v3.23/community\n' "$APK_MIRROR" "$APK_MIRROR" > /etc/apk/repositories; fi \
  && apk add --no-cache ca-certificates tzdata sqlite su-exec curl \
- && mkdir -p /data/web \
+ && mkdir -p /data \
  && adduser -D -u 65532 -g 65532 veilink \
  && chown -R veilink:veilink /data
 LABEL org.opencontainers.image.title="veilink-backend" \
@@ -63,4 +63,3 @@ LABEL org.opencontainers.image.title="veilink" \
       org.opencontainers.image.revision="${COMMIT}" \
       org.opencontainers.image.source="${SOURCE_URL}"
 COPY --from=build-web /src/frontend/dist /opt/veilink-web/
-ENV WEB_PREBUNDLED_DIR=/opt/veilink-web

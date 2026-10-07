@@ -121,6 +121,11 @@ func TestRealityMLDSAEnableDisableReapply(t *testing.T) {
 	files := tlsFiles(t)
 	private, public, _ := GenerateX25519()
 	seed, verify, _ := GenerateMldsa65()
+	parsed, err := model.ParseMldsa65Private(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := base64.RawURLEncoding.EncodeToString(parsed.Bytes())
 	local := model.LocalTLS{Reality: model.Reality{Dest: camouflage(t, files.CertPEM, files.KeyPEM, true), PrivateKey: private, ShortIDs: "aa", ServerNames: "gateway.test", Mldsa65Seed: seed, Mldsa65Verify: verify}}
 	s, c := fixtures(t, echoServer(t))
 	s.Node.Tunnel = local
@@ -128,12 +133,12 @@ func TestRealityMLDSAEnableDisableReapply(t *testing.T) {
 	c.Nodes[0].Tunnel = model.DeriveClientTunnel(s.Node.Tunnel, s.Node)
 	server, client := run(t, s, model.LocalTLS{}), run(t, c, model.LocalTLS{})
 	awaitEcho(t, s.Mappings[0].ListenPort)
-	for _, enabled := range []bool{false, true} {
+	for _, material := range []string{"", seed, legacy} {
 		s.Revision++
 		c.Revision++
 		s.Node.Tunnel.Reality.Mldsa65Seed, s.Node.Tunnel.Reality.Mldsa65Verify = "", ""
-		if enabled {
-			s.Node.Tunnel.Reality.Mldsa65Seed, s.Node.Tunnel.Reality.Mldsa65Verify = seed, verify
+		if material != "" {
+			s.Node.Tunnel.Reality.Mldsa65Seed, s.Node.Tunnel.Reality.Mldsa65Verify = material, verify
 		}
 		c.Nodes[0].Tunnel = model.DeriveClientTunnel(s.Node.Tunnel, s.Node)
 		if err := server.Apply(s); err != nil {
@@ -146,7 +151,7 @@ func TestRealityMLDSAEnableDisableReapply(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := dialReality(ctx, "127.0.0.1:1", "gateway.test", model.Reality{PublicKey: public, ShortID: "aa", Mldsa65Verify: verify})
+	_, err = dialReality(ctx, "127.0.0.1:1", "gateway.test", model.Reality{PublicKey: public, ShortID: "aa", Mldsa65Verify: verify})
 	if err == nil || !strings.Contains(err.Error(), "canceled") {
 		t.Fatalf("cancellation not honored: %v", err)
 	}

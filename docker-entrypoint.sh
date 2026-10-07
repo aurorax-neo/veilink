@@ -7,7 +7,7 @@ APP_GID="65532"
 DATA_DIR="${DATA_DIR:-/data}"
 
 # 确保数据目录存在
-mkdir -p "${DATA_DIR}" "${DATA_DIR}/web"
+mkdir -p "${DATA_DIR}"
 
 # 如果当前是 root，修复属主后降权执行
 if [ "$(id -u)" = "0" ]; then

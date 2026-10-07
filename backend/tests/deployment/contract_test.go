@@ -73,7 +73,7 @@ func TestUnifiedImageContents(t *testing.T) {
 			t.Errorf("unified image missing %q", required)
 		}
 	}
-	for _, forbidden := range []string{"COPY web", "/src/web", " AS master", " AS server", " AS client", " AS web"} {
+	for _, forbidden := range []string{"COPY web", "/src/web", " AS master", " AS server", " AS client", " AS web", "/data/web", "WEB_PREBUNDLED_DIR"} {
 		if strings.Contains(file, forbidden) {
 			t.Errorf("obsolete Dockerfile reference %q", forbidden)
 		}

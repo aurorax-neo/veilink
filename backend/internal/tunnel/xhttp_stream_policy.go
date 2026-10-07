@@ -43,8 +43,16 @@ func (h *xhttpHandler) streamUploadResponse(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set("Trailer", "X-Veilink-Upload-Complete")
 	controller := http.NewResponseController(w)
+	if controller.SetWriteDeadline(time.Now().Add(h.timeout)) != nil {
+		_ = wire.Close()
+		return false
+	}
 	w.WriteHeader(http.StatusOK)
 	if controller.Flush() != nil {
+		_ = wire.Close()
+		return false
+	}
+	if controller.SetWriteDeadline(time.Time{}) != nil {
 		_ = wire.Close()
 		return false
 	}
@@ -77,6 +85,9 @@ func (h *xhttpHandler) streamUploadResponse(w http.ResponseWriter, r *http.Reque
 				return abort()
 			}
 			if _, err = io.WriteString(w, padding); err != nil || controller.Flush() != nil {
+				return abort()
+			}
+			if controller.SetWriteDeadline(time.Time{}) != nil {
 				return abort()
 			}
 			timer.Reset(xhttpStreamPolicyInterval(h.settings))
