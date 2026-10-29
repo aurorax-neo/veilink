@@ -26,6 +26,15 @@
   line-height: 1.5;
 }
 * { box-sizing: border-box; }
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, .16) transparent;
+}
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, .16); border-radius: 99px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, .28); }
+::-webkit-scrollbar-corner { background: transparent; }
 html { background: var(--bg-deep); height: 100%; overflow: hidden; }
 body { margin: 0; min-width: 320px; height: 100%; overflow: hidden; background: linear-gradient(180deg, #0d1721 0, var(--bg) 260px); }
 #app { height: 100%; min-height: 0; overflow: hidden; }
@@ -93,11 +102,11 @@ input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent);
 .side { min-height: 0; overflow-y: auto; overscroll-behavior-y: contain; background: #0d151e; border-right: 1px solid var(--line); padding: 22px 14px; }
 .side-label { margin: 30px 9px 9px; color: var(--faint); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; }
 .side nav { display: grid; gap: 3px; }
-.nav-btn { text-align: left; border: 1px solid transparent; background: transparent; color: var(--muted); border-radius: 7px; padding: 9px 12px; cursor: pointer; transition: background-color 140ms ease, color 140ms ease, border-color 140ms ease; }
+.nav-btn { text-align: left; border: 1px solid transparent; background: transparent; color: var(--muted); border-radius: 7px; padding: 9px 12px; cursor: pointer; min-height: 36px; transition: background-color 140ms ease, color 140ms ease, border-color 140ms ease; }
 .nav-btn:hover { background: rgba(255, 255, 255, .04); color: var(--text); }
 .nav-btn.on { background: var(--accent-soft); border-color: rgba(85, 183, 199, .35); color: var(--accent-strong); }
 .nav-icon { margin-right: 8px; font-size: 14px; }
-.workspace { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.workspace { height: 100%; overflow: hidden; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 .topbar { position: relative; flex: none; min-height: 60px; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 28px; background: rgba(13, 21, 30, .92); border-bottom: 1px solid var(--line); }
 .topbar p { margin: 0; font-weight: 650; }
 .topbar span, .who { color: var(--muted); font-weight: 400; }
@@ -121,7 +130,7 @@ input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent);
 .panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); min-width: 0; box-shadow: 0 12px 32px rgba(0, 0, 0, .12); }
 .panel-head { padding: 13px 16px; border-bottom: 1px solid var(--line); }
 .panel-body { padding: 16px; }
-.table-scroll { overflow-x: auto; min-width: 0; -webkit-overflow-scrolling: touch; }
+.table-scroll { overflow-x: auto; overflow-y: hidden; min-width: 0; -webkit-overflow-scrolling: touch; }
 table { width: 100%; border-collapse: collapse; min-width: 760px; table-layout: auto; }
 .table-scroll > table { width: max-content; min-width: 100%; }
 th, td { text-align: left; padding: 11px 16px; vertical-align: middle; }
