@@ -63,31 +63,41 @@ defineExpose({ open })
 </script>
 
 <template>
-  <Modal ref="modal" :title="`快捷接入 · ${node?.name || ''}`" save-label="生成命令" :hide-save="!!result" :submit="generate" @close="clear">
-    <p class="help">在已安装 Docker 的节点上执行；命令使用统一镜像 ghcr.io/aurorax-neo/veilink:latest，以 server 或 client 子命令选择角色。容器启动时会自动创建所需目录并设置权限。</p>
+  <Modal ref="modal" :title="`快捷接入 · ${node?.name || ''}`" save-label="生成接入命令" :hide-save="!!result" :submit="generate" @close="clear">
     <label for="join-master">管理地址</label>
-    <input id="join-master" v-model="masterURL" type="url" required :disabled="!!result" placeholder="https://vl.vekt.cc.cd:8843" />
-    <small class="help">填写节点实际可达的管理地址（http:// 或 https://）及端口；HTTP/h2c 不加密，仅用于可信网络，跨主机不能填写 Master 的 127.0.0.1。HTTPS 证书须匹配主机名。</small>
-    <p class="help">接入令牌在有效期内可重复用于此节点；重新生成会替换旧令牌，撤销或过期后不能再接入。</p>
+    <input id="join-master" v-model="masterURL" type="url" required :disabled="!!result" placeholder="https://master.example.com:8443" />
+    <small class="help">填写节点可访问的 Master 地址（含端口）；HTTPS 证书须匹配主机名。</small>
     <p v-if="result?.warning" class="warning" role="note">{{ result.warning }}</p>
     <template v-if="result">
-      <div class="command-heading"><label for="join-command">Docker 接入命令（含接入令牌）</label><button type="button" class="btn small" :disabled="expired" @click="copy(result.command, '接入命令')">复制接入命令</button></div>
+      <div class="command-heading"><label for="join-command">Docker 接入命令</label><button type="button" class="btn small primary" :disabled="expired" @click="copy(result.command, '接入命令')">复制接入命令</button></div>
       <textarea id="join-command" class="command-block secret" :value="result.command" readonly rows="5" spellcheck="false" />
-      <small class="help">{{ expired ? '已过期' : '到期' }} · {{ new Date(result.expires_at * 1000).toLocaleString('zh-CN', { hour12: false }) }}</small>
-      <div v-if="expired" class="actions"><button type="button" class="btn" @click="clear">重新生成</button></div>
+      <div class="token-meta">
+        <small class="help" :class="{ bad: expired }">{{ expired ? '令牌已过期' : '令牌到期' }} · {{ new Date(result.expires_at * 1000).toLocaleString('zh-CN', { hour12: false }) }}</small>
+        <button v-if="expired" type="button" class="btn small" @click="clear">重新生成</button>
+        <button v-else type="button" class="btn small quiet danger revoke-token" style="margin-top: 0;" @click="revokeModal?.open()">撤销此接入令牌</button>
+      </div>
     </template>
-    <p class="help">接入命令只设置管理连接，-control-ca 仅信任 Master HTTPS。TLS、plain、REALITY、Hysteria2、VLESS Encryption 与 Vision 均在服务端编辑页配置并统一下发；客户端不加本地隧道 flags。节点在线仅代表心跳，仍需确认应用修订及映射目标可达。</p>
+    <details class="help-details">
+      <summary class="help-summary">接入参数与通信说明</summary>
+      <div class="help-content">
+        <p class="help">命令使用统一镜像 ghcr.io/aurorax-neo/veilink:latest，以 server 或 client 子命令选择角色。接入令牌在有效期内可重复用于此节点，重新生成会替换旧令牌。</p>
+        <p class="help">HTTP/h2c 不加密，仅用于可信网络；接入命令只设置管理连接，-control-ca 仅信任 Master HTTPS。客户端不加本地隧道 flags。节点在线仅代表心跳，仍需确认应用修订及映射目标可达。</p>
+      </div>
+    </details>
     <p v-if="status" class="help" role="status">{{ status }}</p>
     <p v-if="copyError" class="error" role="alert">{{ copyError }}</p>
-    <div class="onboarding-actions" style="display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px;">
-      <button type="button" class="btn danger revoke-token" style="margin-top: 0;" @click="revokeModal?.open()">撤销接入令牌</button>
-      <button type="button" class="btn danger" style="margin-top: 0;" @click="resetModal?.open()">重置节点凭据</button>
-    </div>
+    <details v-if="!node?.embedded" class="advanced-danger">
+      <summary>高危操作：重置节点永久凭据</summary>
+      <div class="danger-panel">
+        <p class="fine">若节点私钥泄露或需彻底废弃当前节点的长期凭据，可重置凭据。重置后该节点当前所有在线连接将被立即中断，必须使用新生成的接入命令重新启动。</p>
+        <button type="button" class="btn small danger" @click="resetModal?.open()">重置节点凭据</button>
+      </div>
+    </details>
   </Modal>
-  <Modal ref="revokeModal" title="撤销接入令牌" save-label="撤销" danger :submit="revoke">
-    <p>撤销后此令牌不能再用于接入，包括已使用过的令牌；不影响已接入节点的有效凭据。</p>
+  <Modal ref="revokeModal" title="撤销接入令牌" save-label="确认撤销" danger size="small" :submit="revoke">
+    <p>撤销后当前接入令牌立即失效，无法再用于启动节点；不影响已接入节点的有效凭据。</p>
   </Modal>
-  <Modal ref="resetModal" title="重置节点凭据" save-label="重置" danger :submit="resetCredential">
-    <p>重置后该节点的已有有效凭据将立即失效并被删除，当前正在运行的节点连接会被断开。重新运行接入命令后将签发全新凭据。</p>
+  <Modal ref="resetModal" title="重置节点凭据" save-label="确认重置并断开连接" danger size="small" :submit="resetCredential">
+    <p>重置后该节点的已有有效凭据将立即失效并被删除，当前正在运行的节点连接会被强制断开。重新运行接入命令后将签发全新凭据。</p>
   </Modal>
 </template>

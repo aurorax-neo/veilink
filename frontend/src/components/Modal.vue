@@ -10,6 +10,7 @@ const props = withDefaults(
     hideSave?: boolean
     danger?: boolean
     disabled?: boolean
+    size?: 'small' | 'medium' | 'large'
     submit?: () => Promise<boolean>
   }>(),
   {
@@ -19,6 +20,7 @@ const props = withDefaults(
     hideSave: false,
     danger: false,
     disabled: false,
+    size: 'medium',
   },
 )
 
@@ -67,7 +69,7 @@ defineExpose({ open, close })
 </script>
 
 <template>
-  <dialog ref="dlg" class="modal" :aria-labelledby="titleId" @cancel="onCancel" @close="onClose">
+  <dialog ref="dlg" class="modal" :class="[`modal-${size}`, { 'modal-danger': danger }]" :aria-labelledby="titleId" @cancel="onCancel" @close="onClose">
     <form @submit.prevent="onSubmit">
       <header class="modal-head">
         <div>
