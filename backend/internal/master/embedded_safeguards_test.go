@@ -61,11 +61,11 @@ func TestEmbeddedExpiredCredentialRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, err := db.Exec("UPDATE credentials SET expires=? WHERE node=?", time.Now().Add(-time.Hour).Unix(), n.ID); err != nil {
+	if _, err := db.Exec("DELETE FROM credentials WHERE node=?", n.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Snapshot(n.ID, expired); !errors.Is(err, store.ErrAuth) {
-		t.Fatal("credential not expired", err)
+		t.Fatal("deleted credential accepted", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -233,7 +233,7 @@ func TestEmbeddedLiveCredentialExpiry(t *testing.T) {
 	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec("UPDATE credentials SET expires=0 WHERE node=?", id); err != nil {
+	if _, err := db.Exec("DELETE FROM credentials WHERE node=?", id); err != nil {
 		t.Fatal(err)
 	}
 	wait(func() bool {

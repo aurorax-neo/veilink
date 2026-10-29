@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
@@ -215,5 +216,49 @@ func TestJoinCommandAuthenticationRotationAndRevocation(t *testing.T) {
 	}
 	if w = call("POST", path, body); w.Code != 400 {
 		t.Fatal("revoked node got token")
+	}
+
+	// Test ResetCredential endpoint and rotation via join
+	activeNode, err := s.SaveNode(model.Node{Name: "active-node", Role: "client"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstToken, err := s.EnrollToken(activeNode.ID, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstCred, err := s.Enroll(activeNode.ID, firstToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Re-enrolling with existing credential reuses it
+	secondToken, err := s.EnrollToken(activeNode.ID, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reusedCred, err := s.Enroll(activeNode.ID, secondToken)
+	if err != nil || reusedCred != firstCred {
+		t.Fatal("re-enrollment did not reuse credential", err)
+	}
+	// Reset credential via API
+	resetW := call("POST", "/api/v1/nodes/"+activeNode.ID+"/reset-credential", "{}")
+	if resetW.Code != 200 {
+		t.Fatal("reset-credential failed", resetW.Code, resetW.Body.String())
+	}
+	// Old credential now rejected
+	if _, err := s.Snapshot(activeNode.ID, firstCred); !errors.Is(err, store.ErrAuth) {
+		t.Fatal("old credential accepted after reset")
+	}
+	// Next enrollment issues fresh credential
+	thirdToken, err := s.EnrollToken(activeNode.ID, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdCred, err := s.Enroll(activeNode.ID, thirdToken)
+	if err != nil || thirdCred == firstCred {
+		t.Fatal("credential was not rotated after reset")
+	}
+	if _, err := s.Snapshot(activeNode.ID, thirdCred); err != nil {
+		t.Fatal("new credential not authorized", err)
 	}
 }

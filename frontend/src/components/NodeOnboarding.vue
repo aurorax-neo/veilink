@@ -8,6 +8,7 @@ import Modal from './Modal.vue'
 interface JoinResult { prepare?: string; command: string; expires_at: number; token: string; warning: string }
 const modal = ref<InstanceType<typeof Modal> | null>(null)
 const revokeModal = ref<InstanceType<typeof Modal> | null>(null)
+const resetModal = ref<InstanceType<typeof Modal> | null>(null)
 const node = ref<Node | null>(null)
 const masterURL = ref(location.origin)
 const result = ref<JoinResult | null>(null)
@@ -50,6 +51,14 @@ async function revoke() {
   status.value = '接入令牌已撤销。'
   return true
 }
+async function resetCredential() {
+  if (!node.value) throw new Error('未选择节点。')
+  if (node.value.embedded) throw new Error('内置节点不支持重置凭据。')
+  await api(`/nodes/${encodeURIComponent(node.value.id)}/reset-credential`, 'POST', {})
+  clear()
+  status.value = '节点凭据已重置，原有凭据已失效。请重新生成接入命令并接入。'
+  return true
+}
 defineExpose({ open })
 </script>
 
@@ -70,9 +79,15 @@ defineExpose({ open })
     <p class="help">接入命令只设置管理连接，-control-ca 仅信任 Master HTTPS。TLS、plain、REALITY、Hysteria2、VLESS Encryption 与 Vision 均在服务端编辑页配置并统一下发；客户端不加本地隧道 flags。节点在线仅代表心跳，仍需确认应用修订及映射目标可达。</p>
     <p v-if="status" class="help" role="status">{{ status }}</p>
     <p v-if="copyError" class="error" role="alert">{{ copyError }}</p>
-    <button type="button" class="btn danger revoke-token" @click="revokeModal?.open()">撤销接入令牌</button>
+    <div class="onboarding-actions" style="display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px;">
+      <button type="button" class="btn danger revoke-token" style="margin-top: 0;" @click="revokeModal?.open()">撤销接入令牌</button>
+      <button type="button" class="btn danger" style="margin-top: 0;" @click="resetModal?.open()">重置节点凭据</button>
+    </div>
   </Modal>
   <Modal ref="revokeModal" title="撤销接入令牌" save-label="撤销" danger :submit="revoke">
     <p>撤销后此令牌不能再用于接入，包括已使用过的令牌；不影响已接入节点的有效凭据。</p>
+  </Modal>
+  <Modal ref="resetModal" title="重置节点凭据" save-label="重置" danger :submit="resetCredential">
+    <p>重置后该节点的已有有效凭据将立即失效并被删除，当前正在运行的节点连接会被断开。重新运行接入命令后将签发全新凭据。</p>
   </Modal>
 </template>

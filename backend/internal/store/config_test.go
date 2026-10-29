@@ -252,12 +252,22 @@ func TestCredentialTTLRotationAndRevocation(t *testing.T) {
 	s, _, _ := testStore(t)
 	n := testNode(t, s, "client", "client")
 	credential := testCredential(t, s, n.ID)
-	var expires int64
-	if err := s.db.QueryRow("SELECT expires FROM credentials WHERE node=?", n.ID).Scan(&expires); err != nil {
+	// Credentials never expire by time; active credential remains usable
+	if _, err := s.Snapshot(n.ID, credential); err != nil {
+		t.Fatal("initial snapshot failed", err)
+	}
+	if _, err := s.Heartbeat(n.ID, credential, 0, false); err != nil {
+		t.Fatal("initial heartbeat failed", err)
+	}
+	// Legacy expiry in the past does not expire active credential
+	if _, err := s.db.Exec("UPDATE credentials SET expires=? WHERE node=?", time.Now().Add(-time.Hour).Unix(), n.ID); err != nil {
 		t.Fatal(err)
 	}
-	if delta := expires - time.Now().Unix(); delta < int64((29*24*time.Hour)/time.Second) || delta > int64((30*24*time.Hour)/time.Second) {
-		t.Fatal("credential not bounded", delta)
+	if _, err := s.Snapshot(n.ID, credential); err != nil {
+		t.Fatal("credential unexpectedly expired by time", err)
+	}
+	if _, err := s.Heartbeat(n.ID, credential, 0, false); err != nil {
+		t.Fatal("heartbeat rejected on past timestamp", err)
 	}
 	token, err := s.EnrollToken(n.ID, time.Hour)
 	if err != nil {
@@ -276,33 +286,32 @@ func TestCredentialTTLRotationAndRevocation(t *testing.T) {
 	if reused != credential {
 		t.Fatal("new enrollment token changed an active credential")
 	}
-	if _, err := s.db.Exec("UPDATE credentials SET expires=? WHERE node=?", time.Now().Unix(), n.ID); err != nil {
-		t.Fatal(err)
+	// ResetCredential invalidates old credential and forces rotation
+	if err := s.ResetCredential(n.ID); err != nil {
+		t.Fatal("reset credential failed", err)
+	}
+	if _, err := s.Snapshot(n.ID, credential); !errors.Is(err, ErrAuth) {
+		t.Fatal("old credential accepted after reset")
 	}
 	rotated := testCredential(t, s, n.ID)
 	if rotated == credential {
-		t.Fatal("expired credential was not replaced")
+		t.Fatal("reset credential was not replaced")
 	}
-	if _, err := s.Snapshot(n.ID, credential); !errors.Is(err, ErrAuth) {
-		t.Fatal("expired credential revived")
+	if _, err := s.Snapshot(n.ID, rotated); err != nil {
+		t.Fatal("new credential rejected", err)
 	}
-	if _, err := s.db.Exec("UPDATE credentials SET expires=?", time.Now().Unix()); err != nil {
+	if _, err := s.Heartbeat(n.ID, rotated, 0, false); err != nil {
+		t.Fatal("new credential heartbeat failed", err)
+	}
+	// Revoking node invalidates active credential
+	if err := s.RemoveNode(n.ID, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Snapshot(n.ID, rotated); !errors.Is(err, ErrAuth) {
-		t.Fatal("expired snapshot accepted")
+		t.Fatal("revoked node snapshot accepted")
 	}
 	if _, err := s.Heartbeat(n.ID, rotated, 0, false); !errors.Is(err, ErrAuth) {
-		t.Fatal("expired heartbeat accepted")
-	}
-	if _, err := s.db.Exec("UPDATE credentials SET expires=0"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.Snapshot(n.ID, rotated); !errors.Is(err, ErrAuth) {
-		t.Fatal("zero-expiry credential accepted")
-	}
-	if _, err := s.Heartbeat(n.ID, rotated, 0, false); !errors.Is(err, ErrAuth) {
-		t.Fatal("zero-expiry heartbeat accepted")
+		t.Fatal("revoked node heartbeat accepted")
 	}
 }
 

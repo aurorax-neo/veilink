@@ -124,15 +124,15 @@ func TestReusableEnrollmentLifecycle(t *testing.T) {
 					t.Fatal(err)
 				}
 			case "expire-credential":
-				if _, err := s.db.Exec("UPDATE credentials SET expires=0 WHERE node=?", n.ID); err != nil {
+				if err := s.ResetCredential(n.ID); err != nil {
 					t.Fatal(err)
 				}
 				renewed, err := s.Enroll(n.ID, token)
 				if err != nil || renewed == credential {
-					t.Fatal("expired credential not rotated", err)
+					t.Fatal("reset credential not rotated", err)
 				}
 				if _, err := s.Snapshot(n.ID, credential); !errors.Is(err, ErrAuth) {
-					t.Fatal("expired credential accepted", err)
+					t.Fatal("old credential accepted", err)
 				}
 				if _, err := s.Snapshot(n.ID, renewed); err != nil {
 					t.Fatal(err)

@@ -226,6 +226,8 @@ func Open(path, keyPath string) (*Store, error) {
 		db.Close()
 		return nil, e
 	}
+	// Clear any legacy expiry on credentials so upgraded deployments never expire.
+	_, _ = db.Exec("UPDATE credentials SET expires=0 WHERE expires>0")
 	return &Store{db: db, key: key}, nil
 }
 
@@ -909,6 +911,13 @@ func (s *Store) RemoveNode(id string, remove bool) error {
 			}
 		}
 		delete(s.software, id)
+		delete(st.Secrets, enrollmentCredentialKey(id))
+		if _, err := s.db.Exec("DELETE FROM credentials WHERE node=?", id); err != nil {
+			return err
+		}
+		if _, err := s.db.Exec("DELETE FROM enroll WHERE node=?", id); err != nil {
+			return err
+		}
 		return nil
 	})
 }
@@ -928,6 +937,38 @@ func (s *Store) EnrollToken(id string, ttl time.Duration) (string, error) {
 	return token, e
 }
 func enrollmentCredentialKey(id string) string { return "credential:" + id }
+
+// ResetCredential revokes and clears the active credential for a node,
+// forcing it to re-enroll with a new enrollment token.
+func (s *Store) ResetCredential(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, err := s.load()
+	if err != nil {
+		return err
+	}
+	n, ok := st.Nodes[id]
+	if !ok || n.Embedded {
+		return ErrInvalid
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM credentials WHERE node=?", id); err != nil {
+		return err
+	}
+	delete(st.Secrets, enrollmentCredentialKey(id))
+	b, err := json.Marshal(st)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec("UPDATE config SET data=? WHERE id=1", b); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
 func (s *Store) Enroll(id, token string) (string, error) {
 	s.mu.Lock()
@@ -970,7 +1011,7 @@ func (s *Store) Enroll(id, token string) (string, error) {
 	if credentialErr != nil && !errors.Is(credentialErr, sql.ErrNoRows) {
 		return "", credentialErr
 	}
-	if credentialErr == nil && credentialExpires > time.Now().Unix() {
+	if credentialErr == nil {
 		sealed, exists := st.Secrets[enrollmentCredentialKey(id)]
 		if !exists {
 			return "", errors.New("existing credential is hash-only; reusable enrollment cannot replace an active credential")
@@ -990,7 +1031,7 @@ func (s *Store) Enroll(id, token string) (string, error) {
 		st.Secrets = map[string][]byte{}
 	}
 	st.Secrets[enrollmentCredentialKey(id)] = sealed
-	if _, e = tx.Exec("INSERT OR REPLACE INTO credentials(node,hash,expires) VALUES(?,?,?)", id, auth.Hash(credential), time.Now().Add(30*24*time.Hour).Unix()); e != nil {
+	if _, e = tx.Exec("INSERT OR REPLACE INTO credentials(node,hash,expires) VALUES(?,?,0)", id, auth.Hash(credential)); e != nil {
 		return "", e
 	}
 	b, e := json.Marshal(st)
@@ -1008,8 +1049,7 @@ func (s *Store) authorized(st state, id, credential string) bool {
 		return false
 	}
 	var h string
-	var expires int64
-	return s.db.QueryRow("SELECT hash,expires FROM credentials WHERE node=?", id).Scan(&h, &expires) == nil && h == auth.Hash(credential) && expires > time.Now().Unix()
+	return s.db.QueryRow("SELECT hash FROM credentials WHERE node=?", id).Scan(&h) == nil && h == auth.Hash(credential)
 }
 func (s *Store) Snapshot(id, credential string) (model.Snapshot, error) {
 	s.mu.Lock()

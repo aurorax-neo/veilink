@@ -51,8 +51,9 @@ func joinAddress(raw string) (address, serverName string, err error) {
 
 func (a *API) joinCommand(w http.ResponseWriter, r *http.Request, id string) {
 	var in struct {
-		MasterURL string `json:"master_url"`
-		TTL       int64  `json:"ttl_seconds"`
+		MasterURL       string `json:"master_url"`
+		TTL             int64  `json:"ttl_seconds"`
+		ResetCredential bool   `json:"reset_credential"`
 	}
 	if !decode(w, r, &in) {
 		return
@@ -64,6 +65,12 @@ func (a *API) joinCommand(w http.ResponseWriter, r *http.Request, id string) {
 	if err != nil || in.TTL < 1 || in.TTL > defaultJoinTTL {
 		failure(w, 400)
 		return
+	}
+	if in.ResetCredential {
+		if err := a.store.ResetCredential(id); err != nil {
+			failure(w, 500)
+			return
+		}
 	}
 	nodes, err := a.store.Nodes()
 	if err != nil {

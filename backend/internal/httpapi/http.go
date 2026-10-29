@@ -447,6 +447,11 @@ func (a *API) serveAPI(w http.ResponseWriter, r *http.Request) {
 			result = map[string]bool{"connected": connected}
 		case r.Method == "POST" && len(p) == 3 && p[2] == "revoke":
 			err = a.store.RemoveNode(id, false)
+		case r.Method == "POST" && len(p) == 3 && p[2] == "reset-credential":
+			err = a.store.ResetCredential(id)
+			if err == nil {
+				result = map[string]bool{"ok": true}
+			}
 		case r.Method == "POST" && len(p) == 3 && p[2] == "disabled":
 			var in struct {
 				Disabled bool `json:"disabled"`

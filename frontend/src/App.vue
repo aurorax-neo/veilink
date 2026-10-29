@@ -123,10 +123,14 @@ function navigate(next: PageId) {
   page.value = next
   const hash = `#/${next}`
   if (location.hash !== hash) location.hash = hash
+  const stage = document.getElementById('main')
+  if (stage) stage.scrollTop = 0
 }
 
 function onHash() {
   page.value = pageFromHash()
+  const stage = document.getElementById('main')
+  if (stage) stage.scrollTop = 0
 }
 
 provide(deskKey, desk)
