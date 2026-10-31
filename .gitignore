@@ -16,6 +16,9 @@ Thumbs.db
 /bin/
 /dist/
 /html/
+/docker-bin/
+/docker-web/
+/release-packages/
 /veilink
 /veilink.exe
 go.work

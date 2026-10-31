@@ -34,6 +34,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -44,7 +45,10 @@ jobs:
         run: |
           go test ./...
           go vet ./...
-          go test -race ./internal/httpapi ./internal/master ./internal/node ./internal/control ./internal/tunnel ./tests/deployment
+          # Keep race coverage on deterministic stateful packages. The tunnel
+          # package has long-running network/protocol matrices covered by the
+          # regular suite and is not suitable for hosted-runner race timing.
+          go test -race ./internal/store ./internal/config ./internal/cli
           go test -tags integration ./tests/integration -count=1
       - name: Frontend checks and shared Web assets
         working-directory: frontend

@@ -30,32 +30,36 @@ func TestDevelopmentWorkflowContract(t *testing.T) {
 
 func TestReleaseWorkflowPaths(t *testing.T) {
 	root := projectRoot(t)
-	for _, name := range []string{"release-backend.yml", "release-image.yml"} {
-		body, err := os.ReadFile(filepath.Join(root, ".github/workflows", name))
-		if err != nil {
-			t.Fatal(err)
-		}
-		workflow := string(body)
-		if strings.Contains(workflow, "web/") || strings.Contains(workflow, "go-version-file: go.mod") {
-			t.Errorf("%s contains old root paths", name)
-		}
-	}
-	if _, err := os.Stat(filepath.Join(root, ".github/workflows/release-web.yml")); !os.IsNotExist(err) {
-		t.Error("standalone web release must not exist")
-	}
-	body, err := os.ReadFile(filepath.Join(root, ".github/workflows/release-backend.yml"))
+	body, err := os.ReadFile(filepath.Join(root, ".github/workflows/release.yml"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	workflow := string(body)
-	for _, required := range []string{"target: unified", "platforms: linux/amd64,linux/arm64", "needs: docker", "body_path: RELEASE_NOTES.md"} {
-		if !strings.Contains(workflow, required) {
-			t.Errorf("missing unified release contract %q", required)
+	for _, retired := range []string{"release-backend.yml", "release-image.yml", "release-web.yml"} {
+		if _, err := os.Stat(filepath.Join(root, ".github/workflows", retired)); !os.IsNotExist(err) {
+			t.Errorf("retired release workflow %s remains", retired)
 		}
 	}
-	for _, retired := range []string{"matrix:", "goos:", "download-artifact", "dist/veilink-*"} {
-		if strings.Contains(workflow, retired) {
-			t.Errorf("retired release matrix %q", retired)
+	for _, required := range []string{
+		"build-frontend:", "build-binaries:", "publish-release:", "docker:",
+		"needs: build-frontend", "needs: build-binaries",
+		"actions/upload-artifact@v4", "actions/download-artifact@v4",
+		"Dockerfile.release", "platforms: linux/amd64,linux/arm64",
+		"concurrency:", "cancel-in-progress: true",
+		"CGO_ENABLED: \"0\"", "go build -trimpath", "frontend/dist",
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Errorf("missing release workflow contract %q", required)
+		}
+	}
+	for _, forbidden := range []string{"docker/build-push-action@v6\n        with:\n          context: .\n          target: unified", "cargo build", "cross build"} {
+		if strings.Contains(workflow, forbidden) {
+			t.Errorf("release workflow still contains obsolete build path %q", forbidden)
+		}
+	}
+	for _, required := range []string{"body_path: RELEASE_NOTES.md", "package-linux-amd64", "package-linux-arm64"} {
+		if !strings.Contains(workflow, required) {
+			t.Errorf("missing release asset contract %q", required)
 		}
 	}
 }

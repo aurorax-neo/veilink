@@ -82,3 +82,29 @@ func TestUnifiedImageContents(t *testing.T) {
 		t.Error("expected two build stages, backend intermediate, unified runtime and one healthcheck")
 	}
 }
+
+func TestReleaseImageOnlyAssemblesPreparedArtifacts(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join(projectRoot(t), "Dockerfile.release"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := string(body)
+	for _, required := range []string{
+		"FROM alpine:3.23",
+		"ARG TARGETARCH",
+		"COPY docker-bin/${TARGETARCH}/veilink /usr/local/bin/veilink",
+		"COPY docker-web/ /opt/veilink-web/",
+		"COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md /usr/local/share/doc/veilink/",
+		"ENTRYPOINT [\"/usr/local/bin/docker-entrypoint.sh\"]",
+		"HEALTHCHECK ",
+	} {
+		if !strings.Contains(file, required) {
+			t.Errorf("release Dockerfile missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{"golang:", "node:", "go build", "npm ci", "cargo build", "cross build"} {
+		if strings.Contains(file, forbidden) {
+			t.Errorf("release Dockerfile compiles or installs toolchain via %q", forbidden)
+		}
+	}
+}
