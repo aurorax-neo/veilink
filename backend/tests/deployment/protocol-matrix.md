@@ -63,3 +63,23 @@ XHTTP 不支持 Vision/Hysteria2 叠加；可使用 REALITY + TCP + XHTTP，此�
 ## 尚未完成的验收
 
 当前 HY2 已完成绑定级身份隔离的本地覆盖：服务端只接受授权 Binding UUID 对应的标准 `Hysteria-Auth` password，并要求后续目标属于同一 Binding；跨绑定凭据复用、跨绑定目标、错误凭据测试已通过。统一镜像构建及三角色实际启动/健康检查、WAN/NAT、恢复、监控和供应链等生产验收仍未完成。
+
+## CI 失败排查记录（2026-10-31）
+
+关联排查记录：`01a1863b-21b0-7d20-8e42-75a8bcec0c95`。GitHub Actions Run `41191422964` 在 `Go checks` 阶段失败，前端阶段未开始。初始冷运行在连续执行协议矩阵后，REALITY/XHTTP 组合出现连接建立或 UDP 回包等待；单独执行同一子用例可以通过，说明问题发生在子测试之间的资源生命周期累积，而不是该协议组合的固定功能错误。
+
+根因是 `realityListener` 包装底层 TCP listener 后，服务停止路径只关闭了内部 listener，没有把包装 listener 纳入 `service.listeners`；在途 REALITY 握手协程也没有等待关闭完成。前一个子测试的握手和 cover 连接因此可能跨越到下一个子测试，最终表现为矩阵测试卡在 `awaitEcho`/`awaitUDPEcho`，并触发 Actions 的 Go 检查超时。
+
+本次修复：
+
+- `backend/internal/tunnel/tunnel.go`：创建 REALITY 包装 listener 后，用包装对象替换服务关闭列表中的内部 listener，确保 `Runtime.Close` 能取消 REALITY 上下文并关闭包装层。
+- `backend/internal/tunnel/reality_listener.go`：为 listener 主循环和每个握手协程增加等待组；关闭时取消上下文、关闭底层 listener，并等待所有在途握手退出，避免资源泄漏到后续测试。
+
+复现与修复后的结果：
+
+- `go test ./internal/tunnel -run '^TestProtocolMatrixRoundTrip$' -count=1 -v -timeout=6m`：75/75 组合通过，用时 179.93 秒。
+- `go test ./internal/tunnel -run '^TestXHTTPCombinationMatrix$' -count=1 -v -timeout=6m`：350/350 组合通过，用时 104.133 秒。
+- `go test -race ./internal/tunnel -run '^TestRealityListener' -count=1 -timeout=2m`：通过，无 race 报告。
+- `go test ./... -count=1 -timeout=12m`：全部通过，用时 464.779 秒。
+
+该问题属于测试/运行时关闭生命周期缺陷，不能通过单纯增加 Actions 超时解决；后续若新增传输包装 listener，必须同时纳入 `service.listeners` 的关闭路径，并为在途握手或后台协程提供可等待的退出信号。

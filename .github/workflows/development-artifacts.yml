@@ -43,7 +43,7 @@ jobs:
       - name: Go checks
         working-directory: backend
         run: |
-          go test ./...
+          go test ./... -timeout=15m
           go vet ./...
           # Keep race coverage on deterministic stateful packages. The tunnel
           # package has long-running network/protocol matrices covered by the

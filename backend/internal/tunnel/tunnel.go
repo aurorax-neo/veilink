@@ -660,6 +660,10 @@ func (s *service) listenServer() error {
 				ln = newRealityListener(s.ctx, ln, func(ctx context.Context, conn net.Conn) (net.Conn, error) {
 					return reality.Server(ctx, conn, s.reality)
 				})
+				// Keep the wrapper in the service's shutdown list. Closing only
+				// the inner TCP listener leaves in-flight REALITY handshakes
+				// alive until their deadline and lets them overlap later runs.
+				s.listeners[len(s.listeners)-1] = ln
 			}
 			if s.local.XHTTP.Enabled() {
 				s.serveXHTTP(ln)

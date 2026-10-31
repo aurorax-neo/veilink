@@ -11,23 +11,26 @@ import (
 // Shutdown cancels their raw sockets instead of racing a send with channel close.
 type realityListener struct {
 	net.Listener
-	ctx       context.Context
-	cancel    context.CancelFunc
-	ready     chan net.Conn
-	done      chan struct{}
-	err       error
-	once      sync.Once
-	handshake func(context.Context, net.Conn) (net.Conn, error)
+	ctx        context.Context
+	cancel     context.CancelFunc
+	ready      chan net.Conn
+	done       chan struct{}
+	err        error
+	once       sync.Once
+	handshakes sync.WaitGroup
+	handshake  func(context.Context, net.Conn) (net.Conn, error)
 }
 
 func newRealityListener(parent context.Context, inner net.Listener, handshake func(context.Context, net.Conn) (net.Conn, error)) *realityListener {
 	ctx, cancel := context.WithCancel(parent)
 	l := &realityListener{Listener: inner, ctx: ctx, cancel: cancel, ready: make(chan net.Conn), done: make(chan struct{}), handshake: handshake}
+	l.handshakes.Add(1)
 	go l.serve()
 	return l
 }
 
 func (l *realityListener) serve() {
+	defer l.handshakes.Done()
 	stop := context.AfterFunc(l.ctx, func() { _ = l.Listener.Close() })
 	defer stop()
 	defer close(l.done)
@@ -46,7 +49,9 @@ func (l *realityListener) serve() {
 			l.err = err
 			return
 		}
+		l.handshakes.Add(1)
 		go func() {
+			defer l.handshakes.Done()
 			defer func() { <-slots }()
 			stop := context.AfterFunc(l.ctx, func() { _ = raw.Close() })
 			defer stop()
@@ -104,5 +109,6 @@ func (l *realityListener) Close() error {
 		err = l.Listener.Close()
 		l.drainReady()
 	})
+	l.handshakes.Wait()
 	return err
 }
