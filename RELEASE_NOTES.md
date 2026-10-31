@@ -1,3 +1,26 @@
+# v0.4.12
+
+发布日期：2026-10-31
+
+- 修复 REALITY listener 生命周期：
+  - 关闭时同时取消 REALITY 上下文并关闭包装 listener；
+  - 等待在途握手协程退出，避免连接和 cover 资源泄漏到后续会话；
+  - 降低连续协议矩阵运行时出现连接建立或 UDP 回包等待的概率。
+- 扩展并稳定原生协议回归覆盖：
+  - 75 项 VLESS / REALITY / TLS / Hysteria2 / mux / XUDP / XHTTP 往返矩阵；
+  - 350 项 XHTTP 组合矩阵；
+  - 增加 Hysteria2 绑定级凭据、跨绑定凭据和目标隔离验证。
+- 重构 GitHub Actions 发布流水线：
+  - Go 普通包、隧道回归、协议矩阵、XHTTP、vet、race、integration 和前端检查分步执行；
+  - 发布构建使用预编译二进制装配多架构 Docker 镜像，避免在 Docker 内通过 QEMU 编译；
+  - 发布产物包含 Linux amd64/arm64、macOS amd64/arm64 和 Windows amd64 压缩包及 SHA256 校验和；
+  - GHCR 发布 `linux/amd64` 与 `linux/arm64` 多架构镜像。
+- 修复 CI 测试稳定性：
+  - Master 嵌入式服务测试改用动态端口；
+  - 测试失败时等待后台 Master 和 embedded server 完整退出；
+  - 普通 Go 包逐包执行并输出失败包诊断；
+  - 移除对本地 `.gitignore` 参考目录 `ref/` 的错误依赖。
+
 # v0.4.11
 
 - 彻底根除控制台切换视图时闪烁双滚动条的问题：
