@@ -15,7 +15,12 @@ func TestDevelopmentWorkflowContract(t *testing.T) {
 	workflow := string(body)
 	for _, required := range []string{
 		"go-version-file: backend/go.mod", "cache-dependency-path: frontend/package-lock.json",
-		"working-directory: backend", "working-directory: frontend", "go test ./...", "go vet ./...",
+		"working-directory: backend", "working-directory: frontend",
+		"go test $(go list ./... | grep -v '^veilink/internal/tunnel$') -timeout=5m",
+		"-skip '^(TestProtocolMatrixRoundTrip|TestXHTTPCombinationMatrix)$'",
+		"go test ./internal/tunnel -run '^TestProtocolMatrixRoundTrip$' -count=1 -timeout=5m",
+		"go test ./internal/tunnel -run '^TestXHTTPCombinationMatrix$' -count=1 -timeout=5m",
+		"go vet ./...",
 		"go test -tags integration ./tests/integration -count=1", "node --test tests/*.mjs", "npm run build",
 		"path: frontend/dist/", "./cmd/veilink", "VERSION=dev", "COMMIT=${{ github.sha }}",
 	} {

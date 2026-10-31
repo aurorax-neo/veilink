@@ -40,15 +40,33 @@ jobs:
           node-version: '22'
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-      - name: Go checks
+      - name: Go package tests
         working-directory: backend
         run: |
-          go test ./... -timeout=15m
+          go test $(go list ./... | grep -v '^veilink/internal/tunnel$') -timeout=5m
+      - name: Tunnel regression tests
+        working-directory: backend
+        run: |
+          go test ./internal/tunnel \
+            -skip '^(TestProtocolMatrixRoundTrip|TestXHTTPCombinationMatrix)$' \
+            -count=1 -timeout=5m
+      - name: Protocol matrix
+        working-directory: backend
+        run: go test ./internal/tunnel -run '^TestProtocolMatrixRoundTrip$' -count=1 -timeout=5m
+      - name: XHTTP matrix
+        working-directory: backend
+        run: go test ./internal/tunnel -run '^TestXHTTPCombinationMatrix$' -count=1 -timeout=5m
+      - name: Go vet
+        working-directory: backend
+        run: |
           go vet ./...
-          # Keep race coverage on deterministic stateful packages. The tunnel
-          # package has long-running network/protocol matrices covered by the
-          # regular suite and is not suitable for hosted-runner race timing.
+      - name: Go race checks
+        working-directory: backend
+        run: |
           go test -race ./internal/store ./internal/config ./internal/cli
+      - name: Integration tests
+        working-directory: backend
+        run: |
           go test -tags integration ./tests/integration -count=1
       - name: Frontend checks and shared Web assets
         working-directory: frontend

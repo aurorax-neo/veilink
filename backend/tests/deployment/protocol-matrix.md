@@ -82,4 +82,6 @@ XHTTP 不支持 Vision/Hysteria2 叠加；可使用 REALITY + TCP + XHTTP，此�
 - `go test -race ./internal/tunnel -run '^TestRealityListener' -count=1 -timeout=2m`：通过，无 race 报告。
 - `go test ./... -count=1 -timeout=12m`：全部通过，用时 464.779 秒。
 
-该问题属于测试/运行时关闭生命周期缺陷，不能通过单纯增加 Actions 超时解决；后续若新增传输包装 listener，必须同时纳入 `service.listeners` 的关闭路径，并为在途握手或后台协程提供可等待的退出信号。
+后续提交 `53c1f35` 的复跑 Run `41194907219` 已证明还存在流水线层面的独立限制：完整 `Go checks` 步骤在 4 分 58 秒被 Actions 的 5 分钟步骤上限终止，命令自己的 `-timeout=15m` 无法覆盖平台步骤上限。为此，`.github/workflows/ci.yml` 和 `development-artifacts.yml` 已将普通包、隧道回归、75 项协议矩阵、350 项 XHTTP 矩阵、vet、race、集成测试拆成独立步骤；每个步骤都保留 5 分钟内的明确测试超时，避免长矩阵拖死同一流水线步骤。
+
+该事件包含两个独立修复：产品运行时的 REALITY listener 关闭生命周期，以及 CI 长测试步骤的拆分。后续若新增传输包装 listener，必须同时纳入 `service.listeners` 的关闭路径，并为在途握手或后台协程提供可等待的退出信号。
