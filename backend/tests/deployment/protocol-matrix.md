@@ -107,3 +107,14 @@ XHTTP 不支持 Vision/Hysteria2 叠加；可使用 REALITY + TCP + XHTTP，此�
 - `go test ./... -count=1 -timeout=12m`：全部通过，隧道包用时 476.748 秒。
 - `go vet ./...`、目标包 race 测试、集成测试：全部通过。
 - 前端 116 项 Node 测试、`npm run typecheck`、`npm run build`：全部通过。
+
+### 第三次 CI 失败（Run `41197965538`）
+
+逐包诊断后，失败包和错误已由 GitHub 检查注释确认：
+
+```text
+veilink/tests/deployment: required project path "ref":
+stat /home/runner/work/veilink/veilink/ref: no such file or directory
+```
+
+`ref/` 是 `.gitignore` 明确排除的本地参考源码目录，不属于构建或测试所需的版本库制品；本地工作区存在该目录掩盖了契约测试错误，GitHub checkout 没有它才暴露问题。修复为从 `TestProjectLayout` 的 CI 必需路径中移除 `ref`，保留报告和文档中的参考路径说明。普通包工作流继续逐包运行，并在失败时输出包名和错误摘要，后续同类问题可直接定位。

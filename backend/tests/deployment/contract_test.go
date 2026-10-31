@@ -19,7 +19,7 @@ func projectRoot(t *testing.T) string {
 
 func TestProjectLayout(t *testing.T) {
 	root := projectRoot(t)
-	for _, required := range []string{"frontend/package.json", "frontend/package-lock.json", "backend/go.mod", "backend/go.sum", "backend/cmd/veilink", "backend/internal", "backend/tests", "ref", "tools"} {
+	for _, required := range []string{"frontend/package.json", "frontend/package-lock.json", "backend/go.mod", "backend/go.sum", "backend/cmd/veilink", "backend/internal", "backend/tests", "tools"} {
 		if _, err := os.Stat(filepath.Join(root, required)); err != nil {
 			t.Errorf("required project path %q: %v", required, err)
 		}
