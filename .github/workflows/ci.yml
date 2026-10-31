@@ -32,7 +32,7 @@ jobs:
       - name: Go package tests
         working-directory: backend
         run: |
-          go test $(go list ./... | grep -v '^veilink/internal/tunnel$') -timeout=5m
+          go test -p 1 -count=1 $(go list ./... | grep -v '^veilink/internal/tunnel$') -timeout=5m
       - name: Tunnel regression tests
         working-directory: backend
         run: |

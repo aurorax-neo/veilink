@@ -85,3 +85,25 @@ XHTTP 不支持 Vision/Hysteria2 叠加；可使用 REALITY + TCP + XHTTP，此�
 后续提交 `53c1f35` 的复跑 Run `41194907219` 已证明还存在流水线层面的独立限制：完整 `Go checks` 步骤在 4 分 58 秒被 Actions 的 5 分钟步骤上限终止，命令自己的 `-timeout=15m` 无法覆盖平台步骤上限。为此，`.github/workflows/ci.yml` 和 `development-artifacts.yml` 已将普通包、隧道回归、75 项协议矩阵、350 项 XHTTP 矩阵、vet、race、集成测试拆成独立步骤；每个步骤都保留 5 分钟内的明确测试超时，避免长矩阵拖死同一流水线步骤。
 
 该事件包含两个独立修复：产品运行时的 REALITY listener 关闭生命周期，以及 CI 长测试步骤的拆分。后续若新增传输包装 listener，必须同时纳入 `service.listeners` 的关闭路径，并为在途握手或后台协程提供可等待的退出信号。
+
+### 第二次 CI 失败（Run `41195758727`）
+
+提交 `3af0b06` 将长隧道测试拆步后，新的 `Go package tests` 仍失败。GitHub API 只返回退出码 `1`，没有提供公开步骤日志；按相同命令在本地复现后，失败点落在 `internal/master` 的 `TestEmbeddedServerLifecycleAndRegistration`：
+
+- 测试把映射监听端口固定为 `127.0.0.1:10080`，多个 Go 包测试进程并行运行或宿主机已有服务时会发生 `bind: address already in use`。
+- 测试原先只 `cancel()`，断言失败时没有等待 `Run` 返回，后台 Master/embedded server 可能继续占用监听端口并污染后续测试。
+- 端口冲突后，运行时恢复了旧 revision，但嵌入式服务没有在测试等待窗口内重新监听，最终表现为 `embedded server is not listening`。
+
+本次修复：
+
+- `backend/internal/master/embedded_test.go`：映射端口改为每次动态分配；增加幂等的 `stop` 清理函数，在正常结束和任何断言失败路径都等待 Master 及 embedded server 完整退出；禁用 embedded server 的生命周期测试同步采用该清理方式。
+- `.github/workflows/ci.yml`、`.github/workflows/development-artifacts.yml`：普通包测试使用 `go test -p 1 -count=1`，避免端口型包测试并行争用并关闭测试缓存。
+- `backend/tests/deployment/workflow_test.go`：更新工作流契约，锁定串行、无缓存的普通包测试命令。
+
+修复后的验证：
+
+- `go test -p 1 -count=1 $(go list ./... | grep -v '^veilink/internal/tunnel$') -timeout=5m`：通过，用时约 35 秒。
+- `go test ./internal/master -run '^TestEmbeddedServer(LifecycleAndRegistration|Disabled)$' -count=3 -timeout=3m`：3 次全部通过。
+- `go test ./... -count=1 -timeout=12m`：全部通过，隧道包用时 476.748 秒。
+- `go vet ./...`、目标包 race 测试、集成测试：全部通过。
+- 前端 116 项 Node 测试、`npm run typecheck`、`npm run build`：全部通过。

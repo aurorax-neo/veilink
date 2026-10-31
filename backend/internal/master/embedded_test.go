@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -45,12 +46,26 @@ func TestEmbeddedServerLifecycleAndRegistration(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	errc := make(chan error, 1)
 	go func() {
 		errc <- Run(ctx, c)
 	}()
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			cancel()
+			select {
+			case err := <-errc:
+				if err != nil {
+					t.Errorf("master and embedded server shutdown failed: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Error("master and embedded server did not stop in time")
+			}
+		})
+	}
+	t.Cleanup(stop)
 
 	// 1. Wait for Master HTTP server to become responsive
 	httpClient := &http.Client{
@@ -134,6 +149,7 @@ func TestEmbeddedServerLifecycleAndRegistration(t *testing.T) {
 	if _, err := s.SaveNode(embeddedNode); err != nil {
 		t.Fatal(err)
 	}
+	mappingPort := freeMasterPort(t)
 	clientNode, err := s.SaveNode(model.Node{
 		Name: "test-client",
 		Role: "client",
@@ -143,7 +159,7 @@ func TestEmbeddedServerLifecycleAndRegistration(t *testing.T) {
 	}
 	_, err = s.SaveMapping(model.Mapping{
 		Name: "test-route", ServerID: embeddedNode.ID, ClientID: clientNode.ID,
-		Pool: 1, ListenHost: "127.0.0.1", ListenPort: 10080,
+		Pool: 1, ListenHost: "127.0.0.1", ListenPort: mappingPort,
 		TargetHost: "127.0.0.1", TargetPort: 80, Enabled: true,
 	})
 	if err != nil {
@@ -166,16 +182,9 @@ func TestEmbeddedServerLifecycleAndRegistration(t *testing.T) {
 		t.Fatalf("embedded server is not listening on port %d", serverPort)
 	}
 
-	// 5. Test graceful shutdown
-	cancel()
-	select {
-	case err := <-errc:
-		if err != nil {
-			t.Fatalf("expected clean shutdown, got error: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatalf("master and embedded server did not stop in time")
-	}
+	// 5. Test graceful shutdown. The cleanup above also covers assertion
+	// failures, so a failed test cannot leave a background master listening.
+	stop()
 }
 
 func TestEmbeddedServerDisabled(t *testing.T) {
@@ -198,12 +207,26 @@ func TestEmbeddedServerDisabled(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	errc := make(chan error, 1)
 	go func() {
 		errc <- Run(ctx, c)
 	}()
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			cancel()
+			select {
+			case err := <-errc:
+				if err != nil {
+					t.Errorf("clean shutdown error: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Error("master shutdown timeout")
+			}
+		})
+	}
+	t.Cleanup(stop)
 
 	httpClient := &http.Client{
 		Timeout: 2 * time.Second,
@@ -238,13 +261,18 @@ func TestEmbeddedServerDisabled(t *testing.T) {
 		t.Fatalf("expected 0 nodes when embedded_server is disabled, got %d", len(nodes))
 	}
 
-	cancel()
-	select {
-	case err := <-errc:
-		if err != nil {
-			t.Fatalf("clean shutdown error: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("master shutdown timeout")
+	stop()
+}
+
+func freeMasterPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
 	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return port
 }
