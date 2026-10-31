@@ -34,11 +34,19 @@ func (t *Traffic) add(id string, up, down int) {
 	v := t.totals[id]
 	// Integers remain exactly representable by structpb's number transport.
 	const max = uint64(1<<53 - 1)
-	if up > 0 && uint64(up) <= max-v.Up {
-		v.Up += uint64(up)
+	if up > 0 {
+		if uint64(up) <= max-v.Up {
+			v.Up += uint64(up)
+		} else {
+			v.Up = max
+		}
 	}
-	if down > 0 && uint64(down) <= max-v.Down {
-		v.Down += uint64(down)
+	if down > 0 {
+		if uint64(down) <= max-v.Down {
+			v.Down += uint64(down)
+		} else {
+			v.Down = max
+		}
 	}
 	t.totals[id] = v
 }

@@ -127,12 +127,19 @@ func TestReusableEnrollmentLifecycle(t *testing.T) {
 				if err := s.ResetCredential(n.ID); err != nil {
 					t.Fatal(err)
 				}
-				renewed, err := s.Enroll(n.ID, token)
-				if err != nil || renewed == credential {
-					t.Fatal("reset credential not rotated", err)
+				if _, err := s.Enroll(n.ID, token); !errors.Is(err, ErrAuth) {
+					t.Fatal("old enrollment token still valid after credential reset", err)
 				}
 				if _, err := s.Snapshot(n.ID, credential); !errors.Is(err, ErrAuth) {
 					t.Fatal("old credential accepted", err)
+				}
+				fresh, err := s.EnrollToken(n.ID, time.Hour)
+				if err != nil {
+					t.Fatal(err)
+				}
+				renewed, err := s.Enroll(n.ID, fresh)
+				if err != nil || renewed == credential {
+					t.Fatal("reset credential not rotated", err)
 				}
 				if _, err := s.Snapshot(n.ID, renewed); err != nil {
 					t.Fatal(err)

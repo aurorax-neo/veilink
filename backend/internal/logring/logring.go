@@ -210,12 +210,38 @@ func NewNodeRing(r *Ring) *NodeRing { return &NodeRing{ring: r} }
 
 // Ingest stores node-reported log entries.
 func (n *NodeRing) Ingest(nodeID string, entries []Entry) {
-	for i := range entries {
-		entries[i].Source = "node"
-		entries[i].NodeID = nodeID
-		if entries[i].At == 0 {
-			entries[i].At = time.Now().Unix()
-		}
+	if len(entries) > 100 {
+		entries = entries[:100]
 	}
-	n.ring.AppendBatch(entries)
+	clean := make([]Entry, 0, len(entries))
+	for _, entry := range entries {
+		entry.Source = "node"
+		entry.NodeID = nodeID
+		if entry.At == 0 {
+			entry.At = time.Now().Unix()
+		}
+		switch strings.ToUpper(strings.TrimSpace(entry.Level)) {
+		case "DEBUG", "INFO", "WARN", "ERROR":
+			entry.Level = strings.ToUpper(strings.TrimSpace(entry.Level))
+		default:
+			entry.Level = "INFO"
+		}
+		entry.Message = cleanText(entry.Message, 1024)
+		clean = append(clean, entry)
+	}
+	n.ring.AppendBatch(clean)
+}
+
+func cleanText(s string, limit int) string {
+	s = strings.Map(func(r rune) rune {
+		if r < 32 || r == 127 {
+			return ' '
+		}
+		return r
+	}, s)
+	rs := []rune(s)
+	if limit > 0 && len(rs) > limit {
+		return string(rs[:limit])
+	}
+	return s
 }

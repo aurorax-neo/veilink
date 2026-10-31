@@ -64,29 +64,19 @@ docker run -itd --restart unless-stopped --name veilink-master \
 ```
 
 首次启动自动完成：
-- 生成管理员 API Key（日志中显示一次，请妥善保存）
 - 使用镜像内置前端界面，前后端随统一镜像一起更新
 - 数据目录自动初始化，无需手动 `mkdir`/`chown`
+- 不自动创建管理员。启动后执行一次 `veilink keys create`，明文只在该命令输出里出现一次
 
-查看 API Key：
+创建管理员 API Key：
 ```sh
-docker logs veilink-master 2>&1 | grep "API Key"
+docker exec veilink-master /usr/local/bin/veilink keys create admin
 ```
 
 ### 镜像与版本
 
 - **统一 Docker 镜像**：`ghcr.io/aurorax-neo/veilink:latest`（包含全功能二进制与预置 Web 前端，通过 `master|server|client` 子命令选择角色）
 - **Web 前端**：固定包含在统一镜像的 `/opt/veilink-web`，不再单独发布或运行时拉取
-- **原生二进制**：全平台独立发布（tag `v*` 触发）
-
-原生二进制（Linux/macOS/Windows）：
-```sh
-# Linux/macOS
-curl -fsSL https://raw.githubusercontent.com/aurorax-neo/veilink/main/scripts/install.sh | sh
-
-# Windows (PowerShell)
-irm https://raw.githubusercontent.com/aurorax-neo/veilink/main/scripts/install.ps1 | iex
-```
 
 ### 目录与网络
 
@@ -101,7 +91,7 @@ irm https://raw.githubusercontent.com/aurorax-neo/veilink/main/scripts/install.p
 | `8444` | 内置 Server 首次默认隧道监听 | 按传输放行 TCP 或 UDP |
 | Web 中设置的映射端口 | 业务访问入口 | 实际业务访问来源 |
 
-首次启动前建议限制管理入口来源。API Key 仅在首次启动日志中显示一次，请妥善保存。
+首次启动前建议限制管理入口来源。管理员 API Key 由 `veilink keys create` 生成，明文只出现在该命令输出中，不会写入日志。
 
 ## 启动 Master
 
@@ -115,15 +105,15 @@ docker run -itd \
   ghcr.io/aurorax-neo/veilink:latest master
 ```
 
-entrypoint 自动处理 `/data` 权限，无需手动 `mkdir`/`chown`。宿主机映射目录 `/opt/docker/veilink-master/data` 保存 SQLite 数据库与凭据（`master.db`）。Web 只读取镜像内 `/opt/veilink-web`，不读取或创建 `/data/web`，也不支持前端跳转地址、pull 模式、在线拉取版本或 GitHub 加速。旧 Web 文件不会覆盖新镜像资源，升级不会自动删除旧文件或数据库。已发布的 schema 5 数据库自动升级：先备份数据库与部署密钥，再事务化清理已知旧 Web 字段、修复旧版缺失的 ML-DSA 验证公钥；未知结构或损坏配置仍拒绝启动，不删库。
+entrypoint 自动处理 `/data` 权限，无需手动 `mkdir`/`chown`。宿主机映射目录 `/opt/docker/veilink-master/data` 保存 SQLite 数据库与凭据（`veilink.db`）。Web 只读取镜像内 `/opt/veilink-web`，不读取或创建 `/data/web`，也不支持前端跳转地址、pull 模式、在线拉取版本或 GitHub 加速。旧 Web 文件不会覆盖新镜像资源，升级不会自动删除旧文件或数据库。已发布的 schema 5 数据库自动升级：先备份数据库与部署密钥，再事务化清理已知旧 Web 字段、修复旧版缺失的 ML-DSA 验证公钥；未知结构或损坏配置仍拒绝启动，不删库。
 
 ### 2. 获取 API Key
 
 ```sh
-docker logs veilink-master 2>&1 | grep "API Key"
+docker exec veilink-master /usr/local/bin/veilink keys create admin
 ```
 
-在浏览器打开 `http://服务器IP:2545`，输入 Key 进入控制台。
+命令输出里的 `vlk_` 明文只出现这一次。在浏览器打开 `http://服务器IP:2545`，输入 Key 进入控制台。Master 不会把 Key 写入日志。
 
 镜像名后必须先写 `master`，再写 flags。内置 Server 首次默认显示名为 `default`，端口为 `8444`；已有稳定身份和自定义名称保持不变。无需内置节点时，将 `-embedded-server-enabled` 改为 `false`。
 
@@ -221,7 +211,7 @@ openssl s_client -connect panel.example.com:8843 \
 
 ## 首次配置与映射
 
-1. **获取 API Key**：首次启动 Master 时自动生成管理员 API Key，日志中显示一次（`docker logs veilink-master 2>&1 | grep "API Key"`）。在 Web 登录页输入该 Key 即可进入控制台。
+1. **获取 API Key**：Master 不自动创建管理员。执行 `docker exec veilink-master /usr/local/bin/veilink keys create admin`，明文只在命令输出中显示一次。在 Web 登录页输入该 Key。
 2. **配置 Server**：使用内置 `default` 或创建独立 Server。在 Web 保存隧道、连接入口和本地监听配置；客户端模板由 Server 配置自动派生。
 3. **创建 Client**：获取节点 ID 和接入令牌，按下文或 Web「快捷接入」生成的命令启动。生成命令和手工命令二选一。
 4. **创建映射**：选择 Server、Client、TCP/UDP、Server 监听地址与端口、Client 可达的目标地址与端口，以及 Pool（`1–32`）。没有独立的公开绑定管理。
@@ -247,7 +237,7 @@ docker exec veilink-master /usr/local/bin/veilink keys create my-key
 docker exec veilink-master /usr/local/bin/veilink keys revoke <id>
 ```
 
-旧版用户名密码用户升级：首次启动检测到旧 `admin` 表数据时自动生成 API Key 并在日志中提示，旧账号即刻失效。
+旧版用户名密码用户升级：执行 `veilink keys list`。若旧 `admin` 表还没有 API Key，命令会生成 `migrated-admin` 并把明文只打印一次，然后才列出前缀。旧用户名密码即刻失效。
 
 ### 设置页
 
@@ -430,7 +420,7 @@ docker exec veilink-master /usr/local/bin/veilink keys revoke <id>
 4. 检查日志、健康接口、节点应用状态及实际业务请求。
 5. 回滚前备份当前状态，确认旧版本兼容性；不兼容时用匹配旧版本的成套备份在新目录验证，不直接覆盖数据库。
 
-**从旧版（用户名密码）升级**：首次启动自动检测旧 `admin` 表，生成 `migrated-admin` API Key 并在日志中显示一次（`docker logs veilink-master 2>&1 | grep "API Key"`）。旧用户名密码即刻失效，需改用 Key 登录；老 `/api/*` 路径 301 重定向到 `/api/v1/*`，旧前端可用。数据（节点、映射、配置）无缝保留。
+**从旧版（用户名密码）升级**：执行 `docker exec veilink-master /usr/local/bin/veilink keys list`。存在旧 `admin` 表且还没有 API Key 时，命令生成 `migrated-admin` 并只在这次输出里显示明文；输出失败则回滚，不会留下无人知道的 Key。旧用户名密码即刻失效。老 `/api/*` 路径 301 重定向到 `/api/v1/*`。数据（节点、映射、配置）保留。
 
 ## 故障排查
 
@@ -494,7 +484,7 @@ Go 版本以 [backend/go.mod](backend/go.mod) 为准；前端构建使用 Node.j
 ```sh
 cd backend && go test ./...
 cd backend && go vet ./...
-cd backend && go test -race ./internal/store ./internal/control ./internal/httpapi ./internal/master ./internal/node ./internal/tunnel ./tests/deployment
+cd backend && go test -race ./internal/store ./internal/config ./internal/cli ./internal/control ./internal/httpapi ./internal/master ./internal/node ./internal/tunnel ./tests/deployment
 cd backend && go test -tags=integration ./tests/integration -count=1
 (
   cd frontend &&
@@ -515,7 +505,7 @@ git diff --check
 - [XHTTP 验证记录](backend/tests/deployment/xhttp.md)：对应阶段的执行证据。
 - [统一镜像验收记录](frontend/tests/acceptance/unified-image-acceptance.md)：历史镜像与三角色验证。
 
-`backend/tests/` 与 `frontend/tests/` 下的执行结果只对应记录中的版本和环境，不是当前版本的生产认证。真实多主机 WAN/NAT、24–72 小时长稳、生产 CA 生命周期和供应链签名仍需目标环境验收。开发约束集中在 [AGENTS.md](AGENTS.md)。
+`backend/tests/` 与 `frontend/tests/` 下的执行结果只对应记录中的版本和环境，不是当前版本的生产认证。真实多主机 WAN/NAT、24–72 小时长稳、生产 CA 生命周期和供应链签名仍需目标环境验收。
 
 ## 许可证与第三方组件
 

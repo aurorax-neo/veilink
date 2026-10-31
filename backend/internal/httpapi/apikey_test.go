@@ -90,10 +90,17 @@ func TestKeyManagement(t *testing.T) {
 		t.Fatalf("invalid key format: %s", newKey)
 	}
 
-	// 新 key 可用
+	// 新 key 可用，但不能写
 	w = testCall(h, newKey, "GET", "/api/v1/nodes", "")
 	if w.Code != 200 {
 		t.Fatalf("new key failed: %d", w.Code)
+	}
+	w = testCall(h, newKey, "POST", "/api/v1/nodes", `{"name":"nope","role":"client"}`)
+	if w.Code != 403 {
+		t.Fatalf("readonly key write: %d %s", w.Code, w.Body.String())
+	}
+	if w = testCall(h, "", "POST", "/api/v1/stream/token", ""); w.Code != 401 {
+		t.Fatalf("stream token without key: %d", w.Code)
 	}
 
 	// 删除 key（需要 ID，先查列表）

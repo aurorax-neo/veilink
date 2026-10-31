@@ -375,7 +375,10 @@ func newClientGateway(local model.LocalTLS, gateway model.Node) (*clientGateway,
 	if err != nil {
 		return nil, err
 	}
-	flow, _ := normalizeFlow(config.Flow)
+	flow, err := normalizeFlow(config.Flow)
+	if err != nil {
+		return nil, err
+	}
 	peer := &clientGateway{local: config, flow: flow}
 	if config.EffectiveProtocol() == "hysteria2" {
 		return peer, nil
@@ -530,7 +533,10 @@ func startService(s model.Snapshot, local model.LocalTLS, diagnostics *dialDiagn
 	}
 	svc.initSingPools()
 	if s.Node.Role == "server" {
-		svc.flow, _ = normalizeFlow(local.Flow)
+		svc.flow, err = normalizeFlow(local.Flow)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if s.Node.Role == "server" {
 		for _, m := range s.Mappings {
@@ -1066,7 +1072,7 @@ func (s *session) keepalive() {
 func (s *session) track(st *stream) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.streams == nil || s.draining || len(s.streams) >= maxStreams {
+	if s.streams == nil || s.draining || len(s.streams) >= maxStreams || s.streams[st.id] != nil {
 		return false
 	}
 	if st.in == nil {
@@ -1123,6 +1129,19 @@ func (s *session) deliver(id uint32, c chunk) {
 	case <-s.done:
 	case <-st.stop:
 	case st.in <- c:
+	default:
+		timer := time.NewTimer(5 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-s.done:
+		case <-st.stop:
+		case st.in <- c:
+		case <-timer.C:
+			if old := s.forget(id); old != nil {
+				_ = old.conn.Close()
+				_ = s.writeFrame(frameReset, id, nil)
+			}
+		}
 	}
 }
 

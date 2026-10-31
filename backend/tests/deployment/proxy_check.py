@@ -24,7 +24,7 @@ def main():
     network = prefix + '-net'
     names = {r: prefix + '-' + r for r in ('master', 'nginx', 'server', 'client')}
     created = []
-    csrf = ''
+    api_key = ''
     result = {'passed': False}
     certs = a.output / 'certs'
     certs.mkdir(mode=0o700)
@@ -84,8 +84,8 @@ http {
         args = ['docker', 'exec', names['master'], 'curl', '--noproxy', '*', '--cacert', '/tmp/ca.pem', '-sS',
                 '--max-time', '10', '-b', '/tmp/cookie', '-c', '/tmp/cookie', '-H', 'Content-Type: application/json',
                 '-H', 'Origin: ' + origin, '-w', '\n%{http_code}']
-        if token:
-            args += ['-H', 'X-CSRF-Token: ' + csrf]
+        if token and api_key:
+            args += ['-H', 'Authorization: Bearer ' + api_key]
         if headers:
             args += ['-D', '-']
         if body is not None:
@@ -107,22 +107,27 @@ http {
         created.append(names['nginx'])
         time.sleep(2)
         command('docker', 'exec', names['nginx'], 'nginx', '-t')
-        request('/api/setup')
-        # Browser-origin protections must survive TLS termination.
-        password = secrets.token_urlsafe(24)
-        credentials = {'username': 'proxy-check', 'password': password}
-        request('/api/register', credentials, expected=403, origin='https://evil.example')
-        request('/api/register', credentials, expected=201)
-        login = request('/api/login', credentials, headers=True)
-        header, body = login.split('\r\n\r\n', 1)
-        cookie = next(x for x in header.splitlines() if x.lower().startswith('set-cookie:')).lower()
-        assert all(x in cookie for x in ('secure', 'httponly', 'samesite=strict'))
-        csrf = json.loads(body)['csrf']
-        request('/api/nodes', {'name': 'blocked', 'role': 'client'}, expected=403, token=False)
-        request('/api/nodes', {'name': 'blocked', 'role': 'client'}, expected=403, origin='https://evil.example')
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if command('docker', 'exec', names['master'], 'curl', '--noproxy', '*', '--cacert', '/tmp/ca.pem', '-fsS', '--max-time', '4', 'https://panel.test/api/version', check=False).returncode == 0:
+                break
+            time.sleep(1)
+        else:
+            raise RuntimeError('master did not answer /api/version')
+        minted = command('docker', 'exec', names['master'], 'veilink', 'keys', 'create', 'proxy-check')
+        for line in minted.stdout.decode().splitlines():
+            if line.startswith('vlk_'):
+                api_key = line.strip()
+        if not api_key:
+            raise RuntimeError('API key was not created')
+        listed = request('/api/v1/nodes', headers=True)
+        header = listed.split('\r\n\r\n', 1)[0].lower()
+        assert 'x-content-type-options: nosniff' in header
+        assert 'content-security-policy:' in header
+        request('/api/v1/nodes', {'name': 'blocked', 'role': 'client'}, expected=401, token=False)
         html = command('docker', 'exec', names['master'], 'curl', '--noproxy', '*', '--cacert', '/tmp/ca.pem', '-fsS', 'https://panel.test/').stdout
         assert b'<html' in html
-        untrusted = command('docker', 'exec', names['master'], 'curl', '--noproxy', '*', '-fsS', 'https://panel.test/api/setup', check=False)
+        untrusted = command('docker', 'exec', names['master'], 'curl', '--noproxy', '*', '-fsS', 'https://panel.test/api/version', check=False)
         assert untrusted.returncode == 60
         cert = request('/api/nodes/generate', {'role': 'server', 'kind': 'certificate', 'host': 'server', 'ttl_days': 1})
         for role in ('server', 'client'):
@@ -130,7 +135,7 @@ http {
             if role == 'server':
                 body.update(address='server', port=18444, tunnel=dict(transport_security='tls', listen_host='0.0.0.0', listen_port=18444,
                             **{k: cert[k] for k in ('cert_pem', 'key_pem', 'ca_pem')}))
-            n = request('/api/nodes', body)
+            n = request('/api/v1/nodes', body)
             join = request('/api/nodes/' + n['id'] + '/join', {'master_url': 'https://panel.test', 'ttl_seconds': 3600})
             # Consume actual shortcut role flags, not a hand-constructed enrollment request.
             words = shlex.split(join['command'])
@@ -146,7 +151,7 @@ http {
             created.append(names[role])
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
-            nodes = [n for n in request('/api/nodes') if n['role'] in ('server', 'client') and not n.get('embedded')]
+            nodes = [n for n in request('/api/v1/nodes') if n['role'] in ('server', 'client') and not n.get('embedded')]
             if len(nodes) == 2 and all(n['last_seen'] and n['desired_revision'] == n['applied_revision'] and not n['error'] for n in nodes):
                 break
             time.sleep(2)
@@ -154,7 +159,7 @@ http {
             raise RuntimeError('gRPC enrollment/heartbeat/application through nginx timed out')
         before = {n['id']: n['last_seen'] for n in nodes}
         time.sleep(12)
-        nodes = [n for n in request('/api/nodes') if n['role'] in ('server', 'client') and not n.get('embedded')]
+        nodes = [n for n in request('/api/v1/nodes') if n['role'] in ('server', 'client') and not n.get('embedded')]
         assert all(n['last_seen'] > before[n['id']] for n in nodes)
         # A broken candidate must fail validation without taking down active workers.
         original_cert = (certs / 'cert.pem').read_bytes()
@@ -165,16 +170,16 @@ http {
         command('docker', 'exec', names['nginx'], 'nginx', '-t')
         command('docker', 'exec', names['nginx'], 'nginx', '-s', 'reload')
         # A fresh request after HUP verifies the renewed certificate remains usable.
-        request('/api/setup')
+        request('/api/version', token=False)
         assert 'serial=02' in command('openssl', 'x509', '-in', str(certs / 'cert.pem'), '-noout', '-serial').stdout.decode().lower()
-        request('/api/nodes', {'name': 'blocked', 'role': 'client'}, expected=403, token=False)
-        request('/api/nodes', {'name': 'blocked', 'role': 'client'}, expected=403, origin='https://evil.example')
-        before = {n['id']: n['last_seen'] for n in request('/api/nodes') if n['role'] in ('server', 'client') and not n.get('embedded')}
+        request('/api/v1/nodes', {'name': 'blocked', 'role': 'client'}, expected=403, token=False)
+        request('/api/v1/nodes', {'name': 'blocked', 'role': 'client'}, expected=403, origin='https://evil.example')
+        before = {n['id']: n['last_seen'] for n in request('/api/v1/nodes') if n['role'] in ('server', 'client') and not n.get('embedded')}
         for role in ('server', 'client'):
             command('docker', 'restart', names[role])
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
-            nodes = [n for n in request('/api/nodes') if n['role'] in ('server', 'client') and not n.get('embedded')]
+            nodes = [n for n in request('/api/v1/nodes') if n['role'] in ('server', 'client') and not n.get('embedded')]
             if len(nodes) == 2 and all(n['last_seen'] > before[n['id']] and
                                       n['desired_revision'] == n['applied_revision'] and not n['error'] for n in nodes):
                 break
@@ -183,8 +188,8 @@ http {
             raise RuntimeError('gRPC reconnect after certificate renewal timed out')
         result.update(invalid_certificate_candidate_rejected=True, certificate_reload=True,
                       renewed_serial_verified=True, h2c_reconnect_after_reload=True)
-        result.update(passed=True, tls_verification=True, untrusted_ca_rejected=True, cookie_flags=True,
-                      cross_origin_rejected=True, csrf_required=True, web=True, shortcut_enrollment=True,
+        result.update(passed=True, tls_verification=True, untrusted_ca_rejected=True, api_key_auth=True,
+                      security_headers=True, web=True, shortcut_enrollment=True,
                       h2c_heartbeat_advanced=True, nodes=[{k: n[k] for k in ('role', 'desired_revision', 'applied_revision')} for n in nodes])
     except Exception as e:
         result['error'] = str(e)

@@ -219,6 +219,27 @@ func (c *xudpConn) SetWriteDeadline(t time.Time) error {
 func (s *service) serveUDP(pc *net.UDPConn, m model.Mapping) {
 	peers := map[string]*xudpConn{}
 	var mu sync.Mutex
+	stopCleaner := make(chan struct{})
+	defer close(stopCleaner)
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopCleaner:
+				return
+			case <-ticker.C:
+				mu.Lock()
+				for k, p := range peers {
+					if p.idle(2 * time.Minute) {
+						_ = p.Close()
+						delete(peers, k)
+					}
+				}
+				mu.Unlock()
+			}
+		}
+	}()
 	defer func() {
 		mu.Lock()
 		for _, peer := range peers {
@@ -244,6 +265,18 @@ func (s *service) serveUDP(pc *net.UDPConn, m model.Mapping) {
 			peer = nil
 		}
 		if peer == nil {
+			if len(peers) >= 512 {
+				for k, p := range peers {
+					if p.idle(2 * time.Minute) {
+						_ = p.Close()
+						delete(peers, k)
+					}
+				}
+				if len(peers) >= 512 {
+					mu.Unlock()
+					continue
+				}
+			}
 			peer = newGatewayUDP(pc, addr, m.TargetHost, m.TargetPort)
 			peer.traffic, peer.mappingID = s.traffic, m.ID
 			peer.bucket = s.mappingBucket(m)

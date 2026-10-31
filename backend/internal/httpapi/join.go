@@ -12,8 +12,9 @@ import (
 	"time"
 )
 
-// defaultJoinTTL matches frp-panel's quick-join token lifetime in seconds.
-const defaultJoinTTL int64 = 1_000_000_000
+// defaultJoinTTL is 24 hours (86400s), max 7 days (604800s).
+const defaultJoinTTL int64 = 86400
+const maxJoinTTL int64 = 604800
 
 // shellQuote keeps all generated values data, never executable shell syntax.
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
@@ -62,15 +63,9 @@ func (a *API) joinCommand(w http.ResponseWriter, r *http.Request, id string) {
 		in.TTL = defaultJoinTTL
 	}
 	address, serverName, err := joinAddress(in.MasterURL)
-	if err != nil || in.TTL < 1 || in.TTL > defaultJoinTTL {
+		if err != nil || in.TTL < 1 || in.TTL > maxJoinTTL {
 		failure(w, 400)
 		return
-	}
-	if in.ResetCredential {
-		if err := a.store.ResetCredential(id); err != nil {
-			failure(w, 500)
-			return
-		}
 	}
 	nodes, err := a.store.Nodes()
 	if err != nil {
@@ -88,7 +83,12 @@ func (a *API) joinCommand(w http.ResponseWriter, r *http.Request, id string) {
 		failure(w, 400)
 		return
 	}
-	token, err := a.store.EnrollToken(id, time.Duration(in.TTL)*time.Second)
+	var token string
+	if in.ResetCredential {
+		token, err = a.store.ResetCredentialAndEnroll(id, time.Duration(in.TTL)*time.Second)
+	} else {
+		token, err = a.store.EnrollToken(id, time.Duration(in.TTL)*time.Second)
+	}
 	if err != nil {
 		failure(w, 400)
 		return

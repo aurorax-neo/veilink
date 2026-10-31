@@ -20,3 +20,15 @@ test('key creation is bottom-aligned and collapses to a single column on mobile'
   assert.match(settings, /minmax\(min\(220px, 100%\), 1fr\)/)
   assert.match(settings, /class="key-details"[\s\S]*class="key-sub muted"/)
 })
+
+test('settings, secret input, listen placeholder and SSE reconnect follow audit fixes', () => {
+  const secretField = readFileSync(new URL('../src/components/SecretField.vue', import.meta.url), 'utf8')
+  const nodeEditor = readFileSync(new URL('../src/components/NodeEditor.vue', import.meta.url), 'utf8')
+  const stream = readFileSync(new URL('../src/stream.ts', import.meta.url), 'utf8')
+  assert.match(settings, /\{\{\s*k\.key_prefix\s*\}\}/)
+  assert.doesNotMatch(secretField, /autocomplete="new-password"/)
+  assert.match(secretField, /<input[^>]*autocomplete="off"/)
+  assert.match(nodeEditor, /placeholder="默认 127\.0\.0\.1；全部接口填 0\.0\.0\.0"/)
+  assert.match(stream, /es\.close\(\)/)
+  assert.match(stream, /this\.connect\(this\.types\)/)
+})

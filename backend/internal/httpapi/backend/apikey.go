@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -22,18 +23,17 @@ const (
 
 // APIKey 数据库中的密钥记录
 type APIKey struct {
-	ID        int64     `json:"id"`
-	Name      string    `json:"name"`
-	KeyHash   string    `json:"-"` // 永不序列化
-	KeyPrefix string    `json:"key_prefix"`
-	Role      KeyRole   `json:"role"`
-	CreatedAt time.Time `json:"created_at"`
+	ID        int64      `json:"id"`
+	Name      string     `json:"name"`
+	KeyHash   string     `json:"-"` // 永不序列化
+	KeyPrefix string     `json:"key_prefix"`
+	Role      KeyRole    `json:"role"`
+	CreatedAt time.Time  `json:"created_at"`
 	LastUsed  *time.Time `json:"last_used,omitempty"`
 }
 
 type KeyStore struct {
-	db         *sql.DB
-	migratedKey string
+	db *sql.DB
 }
 
 func NewKeyStore(db *sql.DB) *KeyStore {
@@ -54,46 +54,67 @@ func (s *KeyStore) Migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
 	`)
+	return err
+}
+
+func isNoSuchTable(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "no such table")
+}
+
+// LegacyAdminPending reports an old username table that has not been minted into an API key.
+func (s *KeyStore) LegacyAdminPending() (bool, error) {
+	var adminCount int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM admin`).Scan(&adminCount)
+	if isNoSuchTable(err) || (err == nil && adminCount == 0) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var keyCount int
+	if err = s.db.QueryRow(`SELECT COUNT(*) FROM api_keys`).Scan(&keyCount); err != nil {
+		return false, err
+	}
+	return keyCount == 0, nil
+}
+
+// CommitLegacyMigration prints a migrated admin key once, then commits it.
+// A write failure rolls the new key back so it cannot exist unseen.
+func (s *KeyStore) CommitLegacyMigration(w io.Writer) error {
+	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
-	// 旧版迁移：检测到 admin 表有数据且 api_keys 为空时，自动生成迁移 key
-	return s.migrateFromLegacy()
-}
-
-// migrateFromLegacy 旧版用户名密码 → API Key 无痛迁移
-func (s *KeyStore) migrateFromLegacy() error {
-	// 检查旧 admin 表是否存在且有数据
+	defer tx.Rollback()
 	var adminCount int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM admin`).Scan(&adminCount)
+	err = tx.QueryRow(`SELECT COUNT(*) FROM admin`).Scan(&adminCount)
+	if isNoSuchTable(err) || (err == nil && adminCount == 0) {
+		return nil
+	}
 	if err != nil {
-		// 表不存在，跳过迁移（新安装）
-		return nil
+		return err
 	}
-	if adminCount == 0 {
-		return nil
-	}
-	// 检查是否已迁移过
 	var keyCount int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM api_keys`).Scan(&keyCount); err != nil {
+	if err = tx.QueryRow(`SELECT COUNT(*) FROM api_keys`).Scan(&keyCount); err != nil {
 		return err
 	}
 	if keyCount > 0 {
-		return nil // 已有 key，不重复迁移
+		return nil
 	}
-	// 生成迁移 key
-	plaintext, err := s.Create("migrated-admin", RoleAdmin)
+	plaintext, err := generateKey()
 	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec(
+		`INSERT INTO api_keys (name, key_hash, key_prefix, role) VALUES (?, ?, ?, ?)`,
+		"migrated-admin", hashKey(plaintext), plaintext[:8], string(RoleAdmin),
+	); err != nil {
 		return fmt.Errorf("migrate legacy admin: %w", err)
 	}
-	// 记录迁移标记，避免重复打印
-	s.migratedKey = plaintext
-	return nil
-}
-
-// MigratedKey 返回迁移生成的 key（仅迁移时非空，调用方负责打印一次）
-func (s *KeyStore) MigratedKey() string {
-	return s.migratedKey
+	if _, err = fmt.Fprintf(w, "Migrated API key (shown only once):\n%s\n", plaintext); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func hashKey(key string) string {
@@ -126,34 +147,18 @@ func (s *KeyStore) Create(name string, role KeyRole) (plaintext string, err erro
 	return plaintext, nil
 }
 
-// EnsureDefaultAdmin 首次启动时自动生成管理员 key（CPA 式：打日志只显示一次）
-func (s *KeyStore) EnsureDefaultAdmin() (plaintext string, created bool, err error) {
-	var count int
-	if err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM api_keys WHERE role = 'admin'`,
-	).Scan(&count); err != nil {
-		return "", false, err
-	}
-	if count > 0 {
-		return "", false, nil
-	}
-	plaintext, err = s.Create("default-admin", RoleAdmin)
-	if err != nil {
-		return "", false, err
-	}
-	return plaintext, true, nil
-}
-
 // Validate 校验 key，返回角色
 func (s *KeyStore) Validate(key string) (KeyRole, bool) {
 	var role string
+	h := hashKey(key)
 	err := s.db.QueryRow(
 		`SELECT role FROM api_keys WHERE key_hash = ?`,
-		hashKey(key),
+		h,
 	).Scan(&role)
 	if err != nil {
 		return "", false
 	}
+	_, _ = s.db.Exec(`UPDATE api_keys SET last_used = CURRENT_TIMESTAMP WHERE key_hash = ?`, h)
 	return KeyRole(role), true
 }
 
@@ -186,24 +191,36 @@ func (s *KeyStore) Count() int64 {
 	return n
 }
 
-// Revoke 删除 key
+// Revoke deletes one key without allowing the last admin key to disappear.
+// The predicate and delete are a single statement so concurrent revokes cannot
+// both observe "more than one admin" and then remove all of them.
 func (s *KeyStore) Revoke(id int64) error {
-	// 不允许删除最后一个 admin key
-	var count int
-	if err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM api_keys WHERE role = 'admin'`,
-	).Scan(&count); err != nil {
+	res, err := s.db.Exec(`
+		DELETE FROM api_keys
+		WHERE id=?
+		  AND (role <> 'admin' OR (SELECT COUNT(*) FROM api_keys WHERE role='admin') > 1)`, id)
+	if err != nil {
 		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 1 {
+		return nil
 	}
 	var role string
-	if err := s.db.QueryRow(`SELECT role FROM api_keys WHERE id = ?`, id).Scan(&role); err != nil {
+	err = s.db.QueryRow(`SELECT role FROM api_keys WHERE id=?`, id).Scan(&role)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("api key not found")
+	}
+	if err != nil {
 		return err
 	}
-	if role == "admin" && count <= 1 {
+	if role == string(RoleAdmin) {
 		return fmt.Errorf("cannot revoke the last admin key")
 	}
-	_, err := s.db.Exec(`DELETE FROM api_keys WHERE id = ?`, id)
-	return err
+	return fmt.Errorf("api key not found")
 }
 
 // --- 中间件 ---
@@ -228,10 +245,6 @@ func APIKeyAuth(store *KeyStore, publicPaths []string) func(http.Handler) http.H
 			key := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 			if key == "" {
 				key = r.Header.Get("X-API-Key")
-			}
-			if key == "" {
-				// 兼容 query 参数（方便 curl 调试）
-				key = r.URL.Query().Get("api_key")
 			}
 			role, ok := store.Validate(key)
 			if !ok {

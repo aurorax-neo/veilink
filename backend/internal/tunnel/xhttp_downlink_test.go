@@ -24,6 +24,14 @@ func TestXHTTPDownloadEndpointRequiresAuthorizedGatewayEndpoint(t *testing.T) {
 	if _, err := bindingGateway(gateway, model.Binding{ServerID: "server", ConnectEndpointID: "down"}); err == nil {
 		t.Fatal("disabled endpoint accepted")
 	}
+	gateway.Tunnel = model.LocalTLS{XHTTP: model.XHTTP{Mode: "packet-up", DownloadEndpointID: "down"}}
+	if _, err := bindingGateway(gateway, model.Binding{ServerID: "server"}); err == nil {
+		t.Fatal("disabled xhttp download endpoint accepted")
+	}
+	gateway.Tunnel.XHTTP.DownloadEndpointID = "missing"
+	if _, err := bindingGateway(gateway, model.Binding{ServerID: "server", ConnectEndpointID: "up"}); err == nil {
+		t.Fatal("missing xhttp download endpoint accepted")
+	}
 }
 
 func TestXHTTPDownloadEndpointRuntimeRoundtrip(t *testing.T) {

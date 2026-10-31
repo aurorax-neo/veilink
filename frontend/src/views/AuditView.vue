@@ -28,7 +28,7 @@ const rows = computed(() => {
           <time>{{ seenText(item.at) }}</time>
           <div>
             <strong>{{ actionLabel(item.action) }}</strong>
-            <code>{{ item.object }}</code>
+            <code v-if="item.object">{{ item.object }}</code>
             <small class="mono">{{ item.action }}</small>
           </div>
         </li>

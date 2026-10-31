@@ -2,6 +2,7 @@
 import { onMounted, ref } from 'vue'
 import { api, ApiError } from '../api'
 import EmptyState from '../components/EmptyState.vue'
+import Modal from '../components/Modal.vue'
 
 interface WebStatus { mode: string; active_version: string; serving: boolean; prebundled: boolean }
 const status = ref<WebStatus | null>(null)
@@ -33,7 +34,7 @@ async function saveService() {
   } catch (e) { serviceBad.value = true; serviceMsg.value = e instanceof ApiError ? e.message : '保存失败' }
   finally { savingService.value = false }
 }
-interface ApiKey { id: number; name: string; role: string; prefix: string; created_at: string }
+interface ApiKey { id: number; name: string; role: string; key_prefix: string; created_at: string }
 const keys = ref<ApiKey[]>([])
 const showKeyForm = ref(false)
 const newKey = ref({ name: '', role: 'admin' })
@@ -59,12 +60,19 @@ async function createKey() {
   } catch (e) { keyBad.value = true; keyMsg.value = e instanceof ApiError ? e.message : '创建失败' }
   finally { creatingKey.value = false }
 }
-async function revokeKey(k: ApiKey) {
-  if (!confirm(`确定撤销 Key「${k.name}」？撤销后立即失效。`)) return
+const pendingKey = ref<ApiKey | null>(null)
+const confirmRevoke = ref<{ open: () => void } | null>(null)
+function revokeKey(k: ApiKey) {
+  pendingKey.value = k
+  confirmRevoke.value?.open()
+}
+async function commitRevoke() {
+  const k = pendingKey.value
+  if (!k) return false
   keyMsg.value = ''
   keyBad.value = false
-  try { await api(`/keys/${k.id}`, 'DELETE'); await loadKeys() }
-  catch (e) { keyBad.value = true; keyMsg.value = e instanceof ApiError ? e.message : '撤销失败' }
+  try { await api(`/keys/${k.id}`, 'DELETE'); await loadKeys(); return true }
+  catch (e) { keyBad.value = true; keyMsg.value = e instanceof ApiError ? e.message : '撤销失败'; return false }
 }
 async function copyKey() {
   try {
@@ -104,10 +112,10 @@ onMounted(() => { void load(); void loadService(); void loadKeys() })
           <label class="field"><span>角色</span><select v-model="newKey.role"><option value="admin">admin（完全控制）</option><option value="readonly">readonly（只读）</option></select></label>
           <div class="key-create"><button type="button" class="btn primary" :disabled="creatingKey" @click="createKey">{{ creatingKey ? '创建中…' : '创建' }}</button></div>
         </div>
-        <div v-if="createdKeyPlain" class="new-key"><code class="key-plain">{{ createdKeyPlain }}</code><button type="button" class="btn small" @click="copyKey">复制</button></div>
+        <div v-if="createdKeyPlain" class="new-key"><code class="key-plain">{{ createdKeyPlain }}</code><button type="button" class="btn small" @click="copyKey">复制</button><button type="button" class="btn small" @click="createdKeyPlain = ''">清除</button></div>
         <ul v-if="keys.length" class="key-list">
           <li v-for="k in keys" :key="k.id" class="key-item">
-            <div class="key-details"><div class="key-meta"><strong>{{ k.name }}</strong><span class="tag" :class="k.role === 'admin' ? 'admin' : 'ro'">{{ k.role }}</span><span class="muted mono">{{ k.prefix }}…</span></div><div class="key-sub muted">{{ k.created_at }}</div></div>
+            <div class="key-details"><div class="key-meta"><strong>{{ k.name }}</strong><span class="tag" :class="k.role === 'admin' ? 'admin' : 'ro'">{{ k.role }}</span><span class="muted mono">{{ k.key_prefix }}…</span></div><div class="key-sub muted">{{ k.created_at }}</div></div>
             <button type="button" class="btn danger small" @click="revokeKey(k)">撤销</button>
           </li>
         </ul>
@@ -115,6 +123,7 @@ onMounted(() => { void load(); void loadService(); void loadKeys() })
         <p v-if="keyMsg" class="hint" :class="{ bad: keyBad }" role="status">{{ keyMsg }}</p>
       </div>
     </section>
+    <Modal ref="confirmRevoke" title="撤销 API Key" save-label="撤销" danger :submit="commitRevoke" @close="pendingKey = null"><p>确定撤销 Key「{{ pendingKey?.name }}」？撤销后立即失效。</p></Modal>
   </div>
 </template>
 

@@ -501,8 +501,6 @@ func (s *service) runSingMux(b model.Binding, gateway model.Node, peer *clientGa
 			protocol = byte(i)
 		}
 	}
-	// Assignment can begin immediately after the selector reaches the gateway.
-	worker.release(tracked)
 	if writeAll(conn, append(append([]byte(nil), singMagic...), protocol)) != nil {
 		return
 	}
@@ -540,9 +538,13 @@ func (s *service) runSingMux(b model.Binding, gateway model.Node, peer *clientGa
 		defer s.untrack(tracked)
 		_ = service.NewConnection(context.WithoutCancel(s.ctx), checked, M.Metadata{})
 	}()
+	// Keep this worker slot occupied while an active mux session drains on the
+	// peer so a shrink/expand cycle cannot dial duplicate sessions above limit.
 	select {
 	case <-done:
-	case <-ctx.Done():
+	case <-s.ctx.Done():
+		_ = tracked.Close()
+		<-done
 	}
 }
 

@@ -18,7 +18,7 @@ async function copy() {
     <label :for="id">{{ label }}</label>
     <div class="field-actions">
       <textarea v-if="multiline && revealed" :id="id" :value="modelValue" :readonly="readonly" :required="required" rows="3" class="mono" autocomplete="off" :spellcheck="false" @input="emit('update:modelValue', ($event.target as HTMLTextAreaElement).value)" />
-      <input v-else :id="id" :value="modelValue" :type="revealed ? 'text' : 'password'" :readonly="readonly || multiline" :required="required" autocomplete="new-password" :spellcheck="false" @input="emit('update:modelValue', ($event.target as HTMLInputElement).value)" />
+      <input v-else :id="id" :value="modelValue" :type="revealed ? 'text' : 'password'" :readonly="readonly || multiline" :required="required" autocomplete="off" :spellcheck="false" @input="emit('update:modelValue', ($event.target as HTMLInputElement).value)" />
       <div class="actions">
         <button type="button" class="btn small" :aria-pressed="revealed" :aria-controls="id" @click="revealed = !revealed">{{ revealed ? '隐藏' : '显示' }}</button>
         <button type="button" class="btn small" :disabled="!modelValue" @click="copy">复制</button>

@@ -47,7 +47,7 @@ def main():
     parser.add_argument('--expected-commit', required=True)
     parser.add_argument('--master-url', required=True, help='HTTPS origin; HTTP permitted only for loopback inspection')
     parser.add_argument('--master-container', help='read API over trusted Docker exec; URL must be container loopback HTTP')
-    parser.add_argument('--session-file', type=Path, required=True, help='private file containing existing veilink_session cookie value')
+    parser.add_argument('--api-key-file', type=Path, required=True, help='private file containing an existing Bearer API key')
     parser.add_argument('--ca', type=Path)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
@@ -60,11 +60,11 @@ def main():
         parser.error('TLS required except loopback')
     if args.master_container and not (origin.scheme == 'http' and origin.hostname in ('127.0.0.1', '::1', 'localhost')):
         parser.error('master-container requires loopback HTTP')
-    if args.session_file.stat().st_mode & 0o077:
-        parser.error('session-file must not be accessible by group/others (chmod 600)')
-    session = args.session_file.read_text().strip()
-    if not session or any(c.isspace() or c in ';\r\n' for c in session):
-        parser.error('invalid session cookie')
+    if args.api_key_file.stat().st_mode & 0o077:
+        parser.error('api-key-file must not be accessible by group/others (chmod 600)')
+    api_key = args.api_key_file.read_text().strip()
+    if not api_key.startswith('vlk_') or any(c.isspace() for c in api_key):
+        parser.error('invalid API key')
     context = ssl.create_default_context(cafile=str(args.ca) if args.ca else None)
     # No proxy inheritance, redirects or credential forwarding to another origin.
     class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -73,14 +73,14 @@ def main():
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context), NoRedirect())
     def get(path):
         if args.master_container:
-            proc = subprocess.run(['docker', 'exec', '-i', args.master_container, 'curl', '--noproxy', '*', '-fsS', '--max-time', '10', '-H', '@-', args.master_url.rstrip('/') + path], input=('Cookie: veilink_session=' + session + '\n').encode(), capture_output=True, timeout=15)
+            proc = subprocess.run(['docker', 'exec', '-i', args.master_container, 'curl', '--noproxy', '*', '-fsS', '--max-time', '10', '-H', '@-', args.master_url.rstrip('/') + path], input=('Authorization: Bearer ' + api_key + '\n').encode(), capture_output=True, timeout=15)
             if proc.returncode:
                 raise RuntimeError('Master container API request failed')
             return json.loads(proc.stdout)
-        req = urllib.request.Request(args.master_url.rstrip('/') + path, headers={'Cookie': 'veilink_session=' + session})
+        req = urllib.request.Request(args.master_url.rstrip('/') + path, headers={'Authorization': 'Bearer ' + api_key})
         with opener.open(req, timeout=10) as response:
             return json.load(response)
-    nodes = get('/api/nodes')
+    nodes = get('/api/v1/nodes')
     node = next((n for n in nodes if n['id'] == args.node_id), None)
     if node is None:
         raise RuntimeError('node not found in authenticated management response')

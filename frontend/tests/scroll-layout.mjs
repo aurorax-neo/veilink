@@ -16,7 +16,7 @@ test('console confines scrolling to independent sidebar and content regions', ()
   assert.match(rule('.workspace'), /min-height: 0; display: flex; flex-direction: column/)
   assert.match(rule('.topbar'), /flex: none/)
   assert.match(rule('.stage'), /flex: 1 1 auto; min-height: 0/)
-  assert.match(rule('.stage'), /overflow-y: scroll; overflow-x: hidden; overscroll-behavior-y: contain; scrollbar-gutter: stable/)
+  assert.match(rule('.stage'), /overflow-y: auto; overflow-x: hidden; overscroll-behavior-y: contain; scrollbar-gutter: stable/)
 })
 
 test('narrow screens keep a bounded navigation scroll area above the content', () => {

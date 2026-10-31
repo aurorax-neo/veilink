@@ -1,6 +1,7 @@
 package store
 
 import (
+	"sort"
 	"time"
 )
 
@@ -117,5 +118,8 @@ func (s *Store) TrafficRows() ([]TrafficRow, error) {
 		}
 		rows = append(rows, row)
 	}
+	sort.Slice(rows, func(i, j int) bool {
+		return rows[i].MappingID < rows[j].MappingID
+	})
 	return rows, nil
 }

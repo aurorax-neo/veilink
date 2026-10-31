@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"veilink/internal/config"
@@ -41,6 +42,15 @@ func embeddedNode(c config.Config, s *store.Store) (model.Node, error) {
 	})
 	if err != nil {
 		return n, fmt.Errorf("failed to auto-register embedded server node: %w", err)
+	}
+	_, listenPortStr, _ := net.SplitHostPort(c.ListenAddr)
+	listenPort, _ := strconv.Atoi(listenPortStr)
+	actualPort := n.Port
+	if n.Tunnel.ListenPort > 0 {
+		actualPort = n.Tunnel.ListenPort
+	}
+	if actualPort == listenPort && listenPort != 0 {
+		return n, fmt.Errorf("embedded server port %d collides with master listen_addr", actualPort)
 	}
 	slog.Info("registered embedded server node", "node_id", n.ID, "name", n.Name, "port", n.Port)
 	return n, nil
@@ -178,11 +188,32 @@ func runEmbeddedAttempt(ctx context.Context, c config.Config, s *store.Store, n 
 		}
 	}
 	if cached.Credential == "" {
-		token, err := s.EnrollToken(n.ID, 24*time.Hour)
+		token, err := s.EnrollToken(n.ID, time.Minute)
 		if err != nil {
 			return fmt.Errorf("failed to issue enrollment token for embedded server: %w", err)
 		}
 		srvConfig.EnrollToken = token
+		go func() {
+			ticker := time.NewTicker(200 * time.Millisecond)
+			defer ticker.Stop()
+			for i := 0; i < 30; i++ {
+				select {
+				case <-ctx.Done():
+					_ = s.RevokeEnrollToken(n.ID)
+					return
+				case <-ticker.C:
+					data, readErr := os.ReadFile(statePath)
+					if readErr == nil {
+						var credState struct{ Credential string `json:"credential"` }
+						if json.Unmarshal(data, &credState) == nil && credState.Credential != "" {
+							_ = s.RevokeEnrollToken(n.ID)
+							return
+						}
+					}
+				}
+			}
+			_ = s.RevokeEnrollToken(n.ID)
+		}()
 		defer s.RevokeEnrollToken(n.ID)
 	}
 	if len(rings) > 0 && rings[0] != nil {

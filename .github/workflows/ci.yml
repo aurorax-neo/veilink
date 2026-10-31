@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Go checks
+        working-directory: backend
+        run: |
+          go test ./...
+          go vet ./...
+          go test -race ./internal/store ./internal/config ./internal/cli ./internal/httpapi ./internal/master ./internal/node ./internal/control ./internal/tunnel ./tests/deployment
+          go test -tags integration ./tests/integration -count=1
+      - name: Frontend checks
+        working-directory: frontend
+        run: |
+          npm ci
+          node --test tests/*.mjs
+          npm run typecheck
+          npm run build

@@ -62,11 +62,7 @@ func UpdateMasterConfig(dbPath string, update MasterConfigUpdate) ([]string, err
 		set("ListenAddr", *update.ListenAddr, true)
 	}
 	if update.Scheme != nil {
-		scheme := *update.Scheme
-		if scheme != "http" && scheme != "https" {
-			return nil, errors.New("scheme must be http or https")
-		}
-		set("Scheme", scheme, true)
+		set("Scheme", *update.Scheme, true)
 	}
 	if update.CertFile != nil {
 		set("CertFile", *update.CertFile, true)
@@ -78,8 +74,34 @@ func UpdateMasterConfig(dbPath string, update MasterConfigUpdate) ([]string, err
 	if err != nil {
 		return nil, err
 	}
-	_, err = db.Exec("UPDATE master_config SET data=? WHERE id=1", body)
-	return needRestart, err
+	var cfg Config
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err = decoder.Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("master configuration: %w", err)
+	}
+	cfg.Database = dbPath
+	cfg.DeploymentKey = "configured"
+	if err = cfg.Validate("master"); err != nil {
+		return nil, err
+	}
+	if cfg.Scheme == "https" {
+		if _, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile); err != nil {
+			return nil, fmt.Errorf("master control TLS: %w", err)
+		}
+	}
+	res, err := db.Exec("UPDATE master_config SET data=? WHERE id=1 AND data=?", body, data)
+	if err != nil {
+		return nil, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if n != 1 {
+		return nil, errors.New("master configuration changed concurrently")
+	}
+	return needRestart, nil
 }
 
 // MasterConfigView 设置页展示用的 master 配置（脱敏）

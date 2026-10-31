@@ -36,6 +36,12 @@ func TestTrafficConcurrentAndDisable(t *testing.T) {
 	if got := traffic.Snapshot()["map"]; got.Up != 3 || got.Down != 4 {
 		t.Fatal(got)
 	}
+	const max = uint64(1<<53 - 1)
+	traffic.totals["map"] = TrafficBytes{Up: max - 5, Down: max - 2}
+	traffic.add("map", 10, 10)
+	if got := traffic.Snapshot()["map"]; got.Up != max || got.Down != max {
+		t.Fatalf("expected saturation at max %d, got %+v", max, got)
+	}
 }
 func TestTrafficPendingApplyRollbackAndCommit(t *testing.T) {
 	var traffic Traffic

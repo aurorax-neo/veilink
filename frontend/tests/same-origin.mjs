@@ -12,9 +12,15 @@ test('API and version ignore obsolete custom server URLs and remain same-origin'
   const calls = []
   const context = vm.createContext({
     exports: {},
-    localStorage: {
+    sessionStorage: {
       getItem: (key) => values.get(key),
+      setItem: (key, value) => values.set(key, value),
       removeItem: (key) => values.delete(key),
+    },
+    localStorage: {
+      getItem: () => 'vlk_persistent_should_not_be_used',
+      setItem: () => { throw new Error('localStorage write') },
+      removeItem: () => values.delete('veilink_api_key'),
     },
     fetch: async (url, options) => {
       calls.push({ url, options })

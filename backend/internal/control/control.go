@@ -242,11 +242,15 @@ func reportLinks(st *store.Store, id, credential string, message *structpb.Struc
 		return st.ReportLinks(id, credential, nil)
 	}
 	list := raw.GetListValue()
-	if list == nil || len(list.GetValues()) > 64 {
+	if list == nil {
 		return store.ErrInvalid
 	}
-	bindings := make([]string, 0, len(list.GetValues()))
-	for _, item := range list.GetValues() {
+	values := list.GetValues()
+	if len(values) > 64 {
+		values = values[:64]
+	}
+	bindings := make([]string, 0, len(values))
+	for _, item := range values {
 		value, ok := item.GetKind().(*structpb.Value_StringValue)
 		if !ok {
 			return store.ErrInvalid

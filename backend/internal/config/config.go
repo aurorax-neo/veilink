@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 type EmbeddedServerConfig struct {
@@ -112,9 +113,12 @@ func (c Config) Validate(role string) error {
 		if c.Scheme == "https" && (c.CertFile == "" || c.KeyFile == "") {
 			return errors.New("HTTPS cert_file and key_file required")
 		}
-		_, listenPortStr, e := net.SplitHostPort(c.ListenAddr)
+		listenHost, listenPortStr, e := net.SplitHostPort(c.ListenAddr)
 		if e != nil {
 			return e
+		}
+		if !validListenHost(listenHost) {
+			return errors.New("master listen_addr host must be an IP address or valid hostname")
 		}
 		listenPort, e := strconv.Atoi(listenPortStr)
 		if e != nil || listenPort < 0 || listenPort > 65535 {
@@ -150,4 +154,27 @@ func (c Config) Validate(role string) error {
 		return errors.New("cert_file and key_file are master-only; configure tunnel certificates in Web")
 	}
 	return nil
+}
+
+func validListenHost(h string) bool {
+	if h == "" {
+		return true
+	}
+	if net.ParseIP(h) != nil {
+		return true
+	}
+	if len(h) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(h, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-') {
+				return false
+			}
+		}
+	}
+	return true
 }

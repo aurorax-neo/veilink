@@ -1,6 +1,9 @@
 package store
 
-import "veilink/internal/model"
+import (
+	"sort"
+	"veilink/internal/model"
+)
 
 // SoftwareReport is node-reported identity, not a desired configuration or proof
 // of the binary's authenticity. Empty fields mean not reported.
@@ -39,5 +42,11 @@ func (s *Store) ReportedNodes() ([]ReportedNode, error) {
 	for _, n := range st.Nodes {
 		out = append(out, ReportedNode{Node: n, SoftwareReport: s.software[n.ID]})
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].ID < out[j].ID
+	})
 	return out, nil
 }

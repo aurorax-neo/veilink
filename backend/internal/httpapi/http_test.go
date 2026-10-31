@@ -118,7 +118,10 @@ func TestAPIKeyAuthAndLimits(t *testing.T) {
 	if err != nil || len(rows) != 1 || rows[0].ServerID != server.ID || rows[0].ClientID != clientID || rows[0].Pool != 32 {
 		t.Fatal("direct mapping not persisted", err)
 	}
-	// 吊销 key 后应被拒绝
+	// 吊销 key 后应被拒绝。保留另一把管理员 Key，避免删掉最后一把。
+	if _, err := h.(*API).keyStore.Create("keeper", backend.RoleAdmin); err != nil {
+		t.Fatal(err)
+	}
 	keys, err := h.(*API).keyStore.List()
 	if err != nil {
 		t.Fatal(err)

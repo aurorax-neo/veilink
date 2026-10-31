@@ -59,13 +59,15 @@ func checkProtocol(c model.LocalTLS) error {
 // fields are standard; their target is an authorized Veilink reverse session,
 // not an arbitrary forward-proxy destination.
 func (s *service) dialProtocol(gateway model.Node, peer *clientGateway, b model.Binding, port uint16) (conn net.Conn, dialErr error) {
-	defer func() { s.dialLog.report(s.ctx, b, gateway, dialErr) }()
 	// All control, mux, dedicated TCP and XUDP sessions enter here, including
 	// HY2. Recheck even if the caller already scoped its gateway at startup.
-	gateway, err := bindingGateway(gateway, b)
+	boundGateway, err := bindingGateway(gateway, b)
 	if err != nil {
+		s.dialLog.report(s.ctx, b, gateway, err)
 		return nil, err
 	}
+	gateway = boundGateway
+	defer func() { s.dialLog.report(s.ctx, b, gateway, dialErr) }()
 	if peer.local.EffectiveProtocol() == "hysteria2" {
 		var last error
 		for _, ep := range enabledEndpoints(gateway) {

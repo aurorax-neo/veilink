@@ -40,6 +40,8 @@ func (c *singRecordConn) Read(b []byte) (int, error) {
 			return 0, io.EOF
 		}
 		if c.remaining > maxPayload {
+			c.readClosed = true
+			c.remaining = 0
 			return 0, errors.New("oversize mux application record")
 		}
 	}

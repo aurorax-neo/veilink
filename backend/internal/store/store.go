@@ -139,7 +139,7 @@ func (s *Store) MappingStatuses() (map[string]MappingStatus, error) {
 // An empty report means that node currently has no authenticated tunnel session.
 func (s *Store) ReportLinks(id, credential string, bindings []string) error {
 	if len(bindings) > 64 {
-		return ErrInvalid
+		bindings = bindings[:64]
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -212,7 +212,9 @@ func Open(path, keyPath string) (*Store, error) {
 		return nil, e
 	}
 	f.Close()
-	os.Chmod(path, 0600)
+	if e = os.Chmod(path, 0600); e != nil {
+		return nil, e
+	}
 	db, e := sql.Open("sqlite", path)
 	if e != nil {
 		return nil, e
@@ -227,7 +229,10 @@ func Open(path, keyPath string) (*Store, error) {
 		return nil, e
 	}
 	// Clear any legacy expiry on credentials so upgraded deployments never expire.
-	_, _ = db.Exec("UPDATE credentials SET expires=0 WHERE expires>0")
+	if _, e = db.Exec("UPDATE credentials SET expires=0 WHERE expires>0"); e != nil {
+		db.Close()
+		return nil, e
+	}
 	return &Store{db: db, key: key}, nil
 }
 
@@ -525,6 +530,10 @@ func affectedNodes(before, after state) map[string]bool {
 }
 
 func (s *Store) mutate(action, id string, fn func(*state) error) error {
+	return s.mutateWith(action, id, fn, nil)
+}
+
+func (s *Store) mutateWith(action, id string, fn func(*state) error, extra func(*sql.Tx) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	before, e := s.load()
@@ -553,6 +562,11 @@ func (s *Store) mutate(action, id string, fn func(*state) error) error {
 		return e
 	}
 	defer tx.Rollback()
+	if extra != nil {
+		if e = extra(tx); e != nil {
+			return e
+		}
+	}
 	if _, e = tx.Exec("UPDATE config SET data=? WHERE id=1", b); e != nil {
 		return e
 	}
@@ -895,7 +909,7 @@ func (s *Store) ControlConnected(id string) bool {
 }
 
 func (s *Store) RemoveNode(id string, remove bool) error {
-	return s.mutate("node.revoke", id, func(st *state) error {
+	err := s.mutateWith("node.revoke", id, func(st *state) error {
 		n, ok := st.Nodes[id]
 		if !ok || n.Embedded {
 			return ErrInvalid
@@ -910,16 +924,21 @@ func (s *Store) RemoveNode(id string, remove bool) error {
 				}
 			}
 		}
-		delete(s.software, id)
 		delete(st.Secrets, enrollmentCredentialKey(id))
-		if _, err := s.db.Exec("DELETE FROM credentials WHERE node=?", id); err != nil {
-			return err
-		}
-		if _, err := s.db.Exec("DELETE FROM enroll WHERE node=?", id); err != nil {
-			return err
-		}
 		return nil
+	}, func(tx *sql.Tx) error {
+		if _, err := tx.Exec("DELETE FROM credentials WHERE node=?", id); err != nil {
+			return err
+		}
+		_, err := tx.Exec("DELETE FROM enroll WHERE node=?", id)
+		return err
 	})
+	if err == nil {
+		s.mu.Lock()
+		delete(s.software, id)
+		s.mu.Unlock()
+	}
+	return err
 }
 func (s *Store) EnrollToken(id string, ttl time.Duration) (string, error) {
 	s.mu.Lock()
@@ -941,33 +960,60 @@ func enrollmentCredentialKey(id string) string { return "credential:" + id }
 // ResetCredential revokes and clears the active credential for a node,
 // forcing it to re-enroll with a new enrollment token.
 func (s *Store) ResetCredential(id string) error {
+	_, err := s.rotateCredential(id, 0)
+	return err
+}
+
+// ResetCredentialAndEnroll invalidates the active credential and enrollment
+// tokens, then inserts one replacement token in the same transaction.
+func (s *Store) ResetCredentialAndEnroll(id string, ttl time.Duration) (string, error) {
+	if ttl <= 0 || ttl > time.Duration(1_000_000_000)*time.Second {
+		return "", ErrInvalid
+	}
+	return s.rotateCredential(id, ttl)
+}
+
+func (s *Store) rotateCredential(id string, ttl time.Duration) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st, err := s.load()
 	if err != nil {
-		return err
+		return "", err
 	}
 	n, ok := st.Nodes[id]
 	if !ok || n.Embedded {
-		return ErrInvalid
+		return "", ErrInvalid
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer tx.Rollback()
-	if _, err := tx.Exec("DELETE FROM credentials WHERE node=?", id); err != nil {
-		return err
+	if _, err = tx.Exec("DELETE FROM credentials WHERE node=?", id); err != nil {
+		return "", err
+	}
+	if _, err = tx.Exec("DELETE FROM enroll WHERE node=?", id); err != nil {
+		return "", err
 	}
 	delete(st.Secrets, enrollmentCredentialKey(id))
 	b, err := json.Marshal(st)
 	if err != nil {
-		return err
+		return "", err
 	}
-	if _, err := tx.Exec("UPDATE config SET data=? WHERE id=1", b); err != nil {
-		return err
+	if _, err = tx.Exec("UPDATE config SET data=? WHERE id=1", b); err != nil {
+		return "", err
 	}
-	return tx.Commit()
+	token := ""
+	if ttl > 0 {
+		token = auth.Token()
+		if _, err = tx.Exec("INSERT OR REPLACE INTO enroll VALUES(?,?,?)", id, auth.Hash(token), time.Now().Add(ttl).Unix()); err != nil {
+			return "", err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return "", err
+	}
+	return token, nil
 }
 
 func (s *Store) Enroll(id, token string) (string, error) {
@@ -1363,6 +1409,9 @@ func (s *Store) Audit() ([]Audit, error) {
 		var a Audit
 		if e = rows.Scan(&a.At, &a.Action, &a.Object); e != nil {
 			return nil, e
+		}
+		if a.Action == "admin.rename" {
+			a.Object = ""
 		}
 		out = append(out, a)
 	}

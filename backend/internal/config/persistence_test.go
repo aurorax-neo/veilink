@@ -219,3 +219,29 @@ func TestMasterPersistenceStaleHTMLDir(t *testing.T) {
 		t.Fatalf("expected html_dir validation error, got: %v", err)
 	}
 }
+
+func TestUpdateMasterConfigValidatesAndKeepsPrevious(t *testing.T) {
+	dir := t.TempDir()
+	database := filepath.Join(dir, "master.db")
+	c, err := ParseFlags("master", []string{"-database", database, "-deployment-key", filepath.Join(dir, "key"), "-listen-addr", "127.0.0.1:2545"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = PersistMaster(c); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"not-an-addr", "$(id):2545", "bad host:2545", "host;id:2545"} {
+		v := bad
+		if _, err = UpdateMasterConfig(database, MasterConfigUpdate{ListenAddr: &v}); err == nil {
+			t.Fatalf("invalid listen address %q accepted", bad)
+		}
+	}
+	https := "https"
+	if _, err = UpdateMasterConfig(database, MasterConfigUpdate{Scheme: &https}); err == nil {
+		t.Fatal("https without certificate accepted")
+	}
+	view, err := GetMasterConfigView(database)
+	if err != nil || view.ListenAddr != "127.0.0.1:2545" || view.Scheme != "http" {
+		t.Fatalf("config changed after rejected update: %+v %v", view, err)
+	}
+}

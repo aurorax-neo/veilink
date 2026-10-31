@@ -5,9 +5,9 @@ import basicSsl from '@vitejs/plugin-basic-ssl'
 // Development proxy only. Production assets are bundled into the unified image.
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
-  const target = env.VEILINK_API || 'https://127.0.0.1:8443'
+  const target = env.VEILINK_API || 'http://127.0.0.1:2545'
   const proxy = {
-    '/api': { target, changeOrigin: true, secure: false },
+    '/api': { target, changeOrigin: true, secure: target.startsWith('https:') },
   }
   return {
     plugins: [vue(), basicSsl()],

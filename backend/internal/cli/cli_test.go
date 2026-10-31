@@ -58,6 +58,16 @@ func TestKeysCommands(t *testing.T) {
 		t.Fatalf("expected test-key in list, got: %s", out)
 	}
 
+	// list with flags after subcommand (VL-061)
+	var outAfter bytes.Buffer
+	err = RunWithInput(context.Background(), []string{"keys", "list", "-database", db, "-deployment-key", key}, strings.NewReader(""), &outAfter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(outAfter.String(), "test-key") {
+		t.Fatalf("expected test-key in list when flags after subcommand, got: %s", outAfter.String())
+	}
+
 	// revoke 需要 ID
 	if _, err := run("revoke"); err == nil {
 		t.Fatal("revoke without id should fail")

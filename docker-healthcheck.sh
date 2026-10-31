@@ -46,8 +46,21 @@ case "$host" in
   *:*) case "$host" in \[*\]) ;; *) host="[$host]" ;; esac ;;
 esac
 
+case "$port" in
+  ''|*[!0-9]*) exit 1 ;;
+esac
+case "$host" in
+  *[!0-9A-Za-z.:\[\]-]*|'') exit 1 ;;
+esac
+
 case "$scheme" in
-  https) curl --noproxy '*' --insecure --fail --silent --show-error --max-time 4 "https://${host}:${port}/healthz" >/dev/null ;;
-  http) curl --noproxy '*' --fail --silent --show-error --max-time 4 "http://${host}:${port}/healthz" >/dev/null ;;
+  https)
+    url="https://${host}:${port}/healthz"
+    exec curl --noproxy '*' --insecure --fail --silent --show-error --max-time 4 -- "$url" >/dev/null
+    ;;
+  http)
+    url="http://${host}:${port}/healthz"
+    exec curl --noproxy '*' --fail --silent --show-error --max-time 4 -- "$url" >/dev/null
+    ;;
   *) exit 1 ;;
 esac

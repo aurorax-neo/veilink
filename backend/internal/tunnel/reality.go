@@ -188,10 +188,23 @@ func bindingGateway(gateway model.Node, b model.Binding) (model.Node, error) {
 	if gateway.ID != b.ServerID {
 		return model.Node{}, errors.New("binding references a foreign gateway")
 	}
+	allEndpoints := enabledEndpoints(gateway)
+	var downEndpoint *model.ConnectEndpoint
+	if gateway.Tunnel.XHTTP.DownloadEndpointID != "" {
+		for i := range allEndpoints {
+			if allEndpoints[i].ID == gateway.Tunnel.XHTTP.DownloadEndpointID {
+				ep := allEndpoints[i]
+				downEndpoint = &ep
+				break
+			}
+		}
+		if downEndpoint == nil {
+			return model.Node{}, errors.New("xhttp download endpoint is not an enabled authorized gateway endpoint")
+		}
+	}
 	if b.ConnectEndpointID == "" {
 		return gateway, nil
 	}
-	allEndpoints := enabledEndpoints(gateway)
 	endpoints := gateway.ConnectEndpoints
 	if len(endpoints) == 0 {
 		endpoints = allEndpoints
@@ -208,13 +221,8 @@ func bindingGateway(gateway model.Node, b model.Binding) (model.Node, error) {
 		return model.Node{}, errors.New("binding connect endpoint is missing, disabled or invalid")
 	}
 	gateway.ConnectEndpoints = []model.ConnectEndpoint{selected}
-	if gateway.Tunnel.XHTTP.DownloadEndpointID != "" {
-		for _, ep := range allEndpoints {
-			if ep.ID == gateway.Tunnel.XHTTP.DownloadEndpointID && ep.ID != selected.ID {
-				gateway.ConnectEndpoints = append(gateway.ConnectEndpoints, ep)
-				break
-			}
-		}
+	if downEndpoint != nil && downEndpoint.ID != selected.ID {
+		gateway.ConnectEndpoints = append(gateway.ConnectEndpoints, *downEndpoint)
 	}
 	return gateway, nil
 }
@@ -599,24 +607,37 @@ func spiderRandBetween(min, max int64) int64 {
 	if max <= min {
 		return min
 	}
-	n, _ := rand.Int(rand.Reader, big.NewInt(max-min+1))
+	n, err := rand.Int(rand.Reader, big.NewInt(max-min+1))
+	if err != nil {
+		return min
+	}
 	return min + n.Int64()
 }
 
 // parseSpiderY 解析 spider_y 配置（10 个整数），缺省用 Xray-core 常用值
 func parseSpiderY(s string) [10]int64 {
-	// 默认值：padding 32-64，并发 1-2，每路径请求 1-3，间隔 0-100ms，返回前等待 0-50ms
+	// 默认值：padding 32-64，并发 1-2，每路径请求 1-3，间隔 0-100ms，返回前等待 0-50ms。
+	// 非法、负数或超出边界的值整组回退，避免 strings.Repeat 和随机范围把进程打崩。
 	def := [10]int64{32, 64, 1, 2, 1, 3, 0, 100, 0, 50}
-	if strings.TrimSpace(s) == "" {
+	parts := strings.Split(s, ",")
+	if strings.TrimSpace(s) == "" || len(parts) != 10 {
 		return def
 	}
-	parts := strings.Split(s, ",")
-	for i := 0; i < 10 && i < len(parts); i++ {
-		if v, err := strconv.ParseInt(strings.TrimSpace(parts[i]), 10, 64); err == nil {
-			def[i] = v
+	bounds := [10][2]int64{{0, 256}, {0, 256}, {0, 8}, {0, 8}, {1, 16}, {1, 16}, {0, 10000}, {0, 10000}, {0, 10000}, {0, 10000}}
+	var out [10]int64
+	for i := 0; i < 10; i++ {
+		v, err := strconv.ParseInt(strings.TrimSpace(parts[i]), 10, 64)
+		if err != nil || v < bounds[i][0] || v > bounds[i][1] {
+			return def
+		}
+		out[i] = v
+	}
+	for _, pair := range [][2]int{{0, 1}, {2, 3}, {4, 5}, {6, 7}, {8, 9}} {
+		if out[pair[0]] > out[pair[1]] {
+			return def
 		}
 	}
-	return def
+	return out
 }
 
 // camouflageBrowse 对齐 Xray-core：证书验证失败时，像正常浏览器一样爬目标站
@@ -704,7 +725,7 @@ func camouflageBrowse(conn net.Conn, serverName, spiderX, spiderY string) {
 					spiderPathCache.Lock()
 					for _, m := range spiderHrefRe.FindAllSubmatch(body, -1) {
 						m[1] = bytes.TrimPrefix(m[1], prefix)
-						if !bytes.Contains(m[1], spiderDot) {
+						if !bytes.Contains(m[1], spiderDot) && len(paths) < 128 {
 							paths[string(m[1])] = struct{}{}
 						}
 					}
@@ -717,11 +738,17 @@ func camouflageBrowse(conn net.Conn, serverName, spiderX, spiderY string) {
 			}
 		}
 		get(true)
+		var wg sync.WaitGroup
 		concurrency := int(spiderRandBetween(spiderYVals[2], spiderYVals[3]))
 		for i := 0; i < concurrency; i++ {
-			go get(false)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				get(false)
+			}()
 		}
-		// 不关闭连接，留给对端
+		wg.Wait()
+		_ = conn.Close()
 	}()
 	time.Sleep(time.Duration(spiderRandBetween(spiderYVals[8], spiderYVals[9])) * time.Millisecond)
 }

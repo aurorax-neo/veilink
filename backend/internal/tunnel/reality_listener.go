@@ -66,17 +66,33 @@ func (l *realityListener) serve() {
 	}
 }
 
+func (l *realityListener) drainReady() {
+	for {
+		select {
+		case conn := <-l.ready:
+			if conn != nil {
+				_ = conn.Close()
+			}
+		default:
+			return
+		}
+	}
+}
+
 func (l *realityListener) Accept() (net.Conn, error) {
 	select {
 	case conn := <-l.ready:
 		if l.ctx.Err() != nil {
 			_ = conn.Close()
+			l.drainReady()
 			return nil, net.ErrClosed
 		}
 		return conn, nil
 	case <-l.ctx.Done():
+		l.drainReady()
 		return nil, net.ErrClosed
 	case <-l.done:
+		l.drainReady()
 		return nil, l.err
 	}
 }
@@ -86,6 +102,7 @@ func (l *realityListener) Close() error {
 	l.once.Do(func() {
 		l.cancel()
 		err = l.Listener.Close()
+		l.drainReady()
 	})
 	return err
 }

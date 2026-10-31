@@ -1080,7 +1080,6 @@ func (c *recordConn) Write(p []byte) (int, error) {
 			chunk = chunk[:8192]
 		}
 		p = p[len(chunk):]
-		total += len(chunk)
 		packet := make([]byte, 5+len(chunk)+16)
 		encodeHeader(packet, len(chunk)+16)
 		rekey := bytes.Equal(c.out.nonce[:], maxNonce)
@@ -1094,8 +1093,9 @@ func (c *recordConn) Write(p []byte) (int, error) {
 		}
 		if _, err := c.Conn.Write(packet); err != nil {
 			c.expireTicket()
-			return 0, err
+			return total, err
 		}
+		total += len(chunk)
 	}
 	return total, nil
 }

@@ -25,36 +25,74 @@ type singH2Client struct {
 	dial     func(context.Context, string, M.Socksaddr) (net.Conn, error)
 	mu       sync.Mutex
 	sessions []*http2.ClientConn
+	dialing  chan struct{}
 	closed   bool
 }
 
 func (c *singH2Client) session(ctx context.Context) (*http2.ClientConn, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed {
-		return nil, net.ErrClosed
-	}
-	live := c.sessions[:0]
-	for _, s := range c.sessions {
-		if !s.State().Closed && !s.State().Closing {
-			live = append(live, s)
-		} else {
+	for {
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return nil, net.ErrClosed
+		}
+		live := c.sessions[:0]
+		for _, s := range c.sessions {
+			if !s.State().Closed && !s.State().Closing {
+				live = append(live, s)
+			} else {
+				s.Close()
+			}
+		}
+		c.sessions = live
+		var best *http2.ClientConn
+		for _, s := range live {
+			if s.CanTakeNewRequest() && (best == nil || s.State().StreamsActive < best.State().StreamsActive) {
+				best = s
+			}
+		}
+		if best != nil {
+			c.mu.Unlock()
+			return best, nil
+		}
+		if len(live) >= 1 {
+			c.mu.Unlock()
+			return nil, errors.New("h2mux connection limit")
+		}
+		if wait := c.dialing; wait != nil {
+			c.mu.Unlock()
+			select {
+			case <-wait:
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		wait := make(chan struct{})
+		c.dialing = wait
+		c.mu.Unlock()
+
+		s, err := c.dialSession(ctx)
+
+		c.mu.Lock()
+		c.dialing = nil
+		close(wait)
+		if err != nil {
+			c.mu.Unlock()
+			return nil, err
+		}
+		if c.closed {
+			c.mu.Unlock()
 			s.Close()
+			return nil, net.ErrClosed
 		}
+		c.sessions = append(c.sessions, s)
+		c.mu.Unlock()
+		return s, nil
 	}
-	c.sessions = live
-	var best *http2.ClientConn
-	for _, s := range live {
-		if s.CanTakeNewRequest() && (best == nil || s.State().StreamsActive < best.State().StreamsActive) {
-			best = s
-		}
-	}
-	if best != nil {
-		return best, nil
-	}
-	if len(live) >= 1 {
-		return nil, errors.New("h2mux connection limit")
-	}
+}
+
+func (c *singH2Client) dialSession(ctx context.Context) (*http2.ClientConn, error) {
 	conn, err := c.dial(ctx, "tcp", mux.Destination)
 	if err != nil {
 		return nil, err
@@ -74,7 +112,6 @@ func (c *singH2Client) session(ctx context.Context) (*http2.ClientConn, error) {
 		conn.Close()
 		return nil, err
 	}
-	c.sessions = append(c.sessions, s)
 	return s, nil
 }
 func (c *singH2Client) DialContext(ctx context.Context, network string, dst M.Socksaddr) (net.Conn, error) {

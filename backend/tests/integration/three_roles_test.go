@@ -12,6 +12,7 @@ import (
 )
 
 func TestThreeRolesCoordinated(t *testing.T) {
+	t.Skip("placeholder matrix does not create nodes or check traffic; use TestNodeControlTransportMatrix")
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX only")
 	}

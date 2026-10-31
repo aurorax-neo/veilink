@@ -12,9 +12,14 @@ import (
 )
 
 // StreamHub SSE 事件总线：日志、节点状态、隧道统计统一走这里推送
+type streamSubReq struct {
+	ch chan StreamEvent
+	ok chan bool
+}
+
 type StreamHub struct {
 	subs map[chan StreamEvent]bool
-	add  chan chan StreamEvent
+	add  chan streamSubReq
 	del  chan chan StreamEvent
 	pub  chan StreamEvent
 }
@@ -27,7 +32,7 @@ type StreamEvent struct {
 func NewStreamHub() *StreamHub {
 	h := &StreamHub{
 		subs: make(map[chan StreamEvent]bool),
-		add:  make(chan chan StreamEvent),
+		add:  make(chan streamSubReq),
 		del:  make(chan chan StreamEvent),
 		pub:  make(chan StreamEvent, 256),
 	}
@@ -35,12 +40,22 @@ func NewStreamHub() *StreamHub {
 	return h
 }
 
+const maxStreamSubs = 64
+
 func (h *StreamHub) run() {
 	for {
 		select {
-		case ch := <-h.add:
-			h.subs[ch] = true
+		case req := <-h.add:
+			if len(h.subs) >= maxStreamSubs {
+				req.ok <- false
+				continue
+			}
+			h.subs[req.ch] = true
+			req.ok <- true
 		case ch := <-h.del:
+			if _, ok := h.subs[ch]; !ok {
+				continue
+			}
 			delete(h.subs, ch)
 			close(ch)
 		case ev := <-h.pub:
@@ -48,7 +63,7 @@ func (h *StreamHub) run() {
 				select {
 				case ch <- ev:
 				default:
-					// 慢消费者直接踢掉，不阻塞
+					// 慢消费者直接踢掉，不阻塞。关闭权只在这里。
 					delete(h.subs, ch)
 					close(ch)
 				}
@@ -84,7 +99,12 @@ func (h *StreamHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	types := parseTypes(r.URL.Query().Get("types"))
 
 	ch := make(chan StreamEvent, 32)
-	h.add <- ch
+	okCh := make(chan bool, 1)
+	h.add <- streamSubReq{ch: ch, ok: okCh}
+	if !<-okCh {
+		http.Error(w, "too many streams", http.StatusTooManyRequests)
+		return
+	}
 	defer func() { h.del <- ch }()
 
 	// 首次建连先发一条 hello（含服务器时间，客户端可校准）
@@ -103,7 +123,10 @@ func (h *StreamHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case <-ticker.C:
 			fmt.Fprintf(w, ": ping\n\n")
 			flusher.Flush()
-		case ev := <-ch:
+		case ev, open := <-ch:
+			if !open {
+				return
+			}
 			if len(types) > 0 && !types[ev.Type] {
 				continue
 			}
@@ -168,12 +191,27 @@ func (s *StreamTokenStore) cleanup() {
 	}
 }
 
-func (s *StreamTokenStore) Issue() string {
-	tok := "st_" + randomHex(16)
+const maxStreamTokens = 128
+
+func (s *StreamTokenStore) Issue() (string, bool) {
 	s.mu.Lock()
-	s.tokens[tok] = time.Now().Add(60 * time.Second).Unix()
-	s.mu.Unlock()
-	return tok
+	defer s.mu.Unlock()
+	now := time.Now().Unix()
+	for tok, exp := range s.tokens {
+		if now > exp {
+			delete(s.tokens, tok)
+		}
+	}
+	if len(s.tokens) >= maxStreamTokens {
+		return "", false
+	}
+	hexPart := randomHex(16)
+	if hexPart == "" {
+		return "", false
+	}
+	tok := "st_" + hexPart
+	s.tokens[tok] = now + 60
+	return tok, true
 }
 
 func (s *StreamTokenStore) Consume(tok string) bool {
@@ -189,6 +227,8 @@ func (s *StreamTokenStore) Consume(tok string) bool {
 
 func randomHex(n int) string {
 	b := make([]byte, n)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
 	return hex.EncodeToString(b)
 }

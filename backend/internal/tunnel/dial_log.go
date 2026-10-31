@@ -95,7 +95,7 @@ func (d *dialDiagnostics) report(ctx context.Context, b model.Binding, gateway m
 		args = append(args, "addr", host, "port", port)
 	}
 	if failed {
-		d.logger.Warn("client tunnel connection failed ("+dialFailureReason(dialErr)+"); backing off", append(args, "err", dialErr)...)
+		d.logger.Warn("client tunnel connection failed ("+dialFailureReason(dialErr)+"); backing off", args...)
 	} else if previous.failing {
 		d.logger.Info("client tunnel connected again", args...)
 	} else {
@@ -105,14 +105,11 @@ func (d *dialDiagnostics) report(ctx context.Context, b model.Binding, gateway m
 
 func dialTarget(gateway model.Node) (string, int) {
 	endpoints := enabledEndpoints(gateway)
-	if len(endpoints) == 1 {
+	if len(endpoints) > 0 {
 		return endpoints[0].Host, endpoints[0].Port
 	}
 	if gateway.Address != "" && gateway.Port > 0 {
 		return gateway.Address, gateway.Port
-	}
-	if len(endpoints) > 0 {
-		return endpoints[0].Host, endpoints[0].Port
 	}
 	return "", 0
 }

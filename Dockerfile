@@ -42,6 +42,7 @@ LABEL org.opencontainers.image.title="veilink-backend" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${COMMIT}" \
       org.opencontainers.image.source="${SOURCE_URL}"
+COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md /usr/local/share/doc/veilink/
 COPY docker-entrypoint.sh docker-healthcheck.sh /usr/local/bin/
 COPY --from=build-backend /out/veilink /usr/local/bin/veilink
 RUN chmod 755 /usr/local/bin/docker-entrypoint.sh /usr/local/bin/docker-healthcheck.sh

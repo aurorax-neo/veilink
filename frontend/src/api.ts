@@ -11,24 +11,28 @@ export class ApiError extends Error {
   }
 }
 
-function safeStorage(): Storage | null {
+function browserStorage(kind: 'session' | 'local'): Storage | null {
   try {
-    if (typeof window !== 'undefined' && window.localStorage) return window.localStorage;
-    if (typeof localStorage !== 'undefined') return localStorage;
-  } catch {}
-  return null;
+    const root = typeof window !== 'undefined' ? window : globalThis;
+    const store = kind === 'session' ? root.sessionStorage : root.localStorage;
+    return store ?? null;
+  } catch {
+    return null;
+  }
 }
 
 export function getApiKey(): string | null {
-  return safeStorage()?.getItem(KEY_STORAGE) || null;
+  return browserStorage('session')?.getItem(KEY_STORAGE) || null;
 }
 
 export function setApiKey(key: string): void {
-  safeStorage()?.setItem(KEY_STORAGE, key);
+  browserStorage('session')?.setItem(KEY_STORAGE, key);
+  browserStorage('local')?.removeItem(KEY_STORAGE);
 }
 
 export function clearApiKey(): void {
-  safeStorage()?.removeItem(KEY_STORAGE);
+  browserStorage('session')?.removeItem(KEY_STORAGE);
+  browserStorage('local')?.removeItem(KEY_STORAGE);
 }
 
 export function buildUrl(path: string): string {

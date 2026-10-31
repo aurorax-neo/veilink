@@ -36,12 +36,39 @@ func runKeys(args []string, out io.Writer) error {
 	if len(args) == 0 {
 		return errors.New("usage: veilink keys list|create|revoke [flags]")
 	}
+
+	var subcmd string
+	var subArg string
+	var flagArgs []string
+
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if subcmd == "" && (a == "list" || a == "create" || a == "revoke") {
+			subcmd = a
+			if subcmd == "create" || subcmd == "revoke" {
+				if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+					subArg = args[i+1]
+					i++
+				}
+			}
+			continue
+		}
+		flagArgs = append(flagArgs, a)
+	}
+
+	if subcmd == "" {
+		return errors.New("usage: veilink keys list|create|revoke [flags]")
+	}
+
 	f := flag.NewFlagSet("keys", flag.ContinueOnError)
 	var db, key string
 	f.StringVar(&db, "database", "/data/veilink.db", "database path")
 	f.StringVar(&key, "deployment-key", "/data/veilink.key", "deployment key path")
-	if err := f.Parse(args); err != nil {
+	if err := f.Parse(flagArgs); err != nil {
 		return err
+	}
+	if f.NArg() > 0 {
+		return errors.New("unexpected arguments: " + strings.Join(f.Args(), " "))
 	}
 	s, err := store.OpenExisting(db, key)
 	if err != nil {
@@ -52,8 +79,11 @@ func runKeys(args []string, out io.Writer) error {
 	if err := ks.Migrate(); err != nil {
 		return err
 	}
+	if err := ks.CommitLegacyMigration(out); err != nil {
+		return err
+	}
 
-	switch f.Arg(0) {
+	switch subcmd {
 	case "list":
 		keys, err := ks.List()
 		if err != nil {
@@ -68,7 +98,7 @@ func runKeys(args []string, out io.Writer) error {
 			fmt.Fprintf(out, "%-5d %-20s %-10s %-10s %s\n", k.ID, k.Name, k.KeyPrefix, k.Role, k.CreatedAt.Format("2006-01-02 15:04"))
 		}
 	case "create":
-		name := f.Arg(1)
+		name := subArg
 		if name == "" {
 			name = fmt.Sprintf("key-%d", ks.Count()+1)
 		}
@@ -79,10 +109,10 @@ func runKeys(args []string, out io.Writer) error {
 		}
 		fmt.Fprintf(out, "API Key created (shown only once):\n%s\n", plaintext)
 	case "revoke":
-		if f.Arg(1) == "" {
+		if subArg == "" {
 			return errors.New("usage: veilink keys revoke <id>")
 		}
-		id, err := strconv.ParseInt(f.Arg(1), 10, 64)
+		id, err := strconv.ParseInt(subArg, 10, 64)
 		if err != nil {
 			return errors.New("invalid key id")
 		}

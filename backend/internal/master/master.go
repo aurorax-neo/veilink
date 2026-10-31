@@ -77,9 +77,14 @@ func Run(ctx context.Context, c config.Config) error {
 		panel.ServeHTTP(w, r)
 	})
 
+	h2Server := &http2.Server{
+		MaxConcurrentStreams: 16,
+		IdleTimeout:          5 * time.Minute,
+	}
+
 	var handler http.Handler
 	if mode == "http" {
-		handler = h2c.NewHandler(mux, &http2.Server{})
+		handler = h2c.NewHandler(mux, h2Server)
 	} else {
 		handler = mux
 	}
@@ -95,7 +100,7 @@ func Run(ctx context.Context, c config.Config) error {
 	errc := make(chan error, 2)
 	if mode == "https" {
 		// Serve (unlike ServeTLS) must have HTTP/2 configured explicitly.
-		if err := http2.ConfigureServer(h, &http2.Server{}); err != nil {
+		if err := http2.ConfigureServer(h, h2Server); err != nil {
 			return err
 		}
 	}
@@ -116,7 +121,6 @@ func Run(ctx context.Context, c config.Config) error {
 			defer close(embeddedDone)
 			if err := runEmbeddedServer(ctx, c, s, ring); err != nil && ctx.Err() == nil {
 				slog.Error("embedded server failed", "error", err)
-				errc <- err
 			}
 		}()
 	} else {

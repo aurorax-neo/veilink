@@ -400,7 +400,7 @@ defineExpose({ open })
       <section :key="session" aria-label="服务端配置">
         <h3>本地绑定</h3>
         <div class="grid-2">
-          <div><label for="node-listen">监听地址（IP）</label><input id="node-listen" v-model="draft.listen" placeholder="默认 0.0.0.0；仅本机监听可填 127.0.0.1" /></div>
+          <div><label for="node-listen">监听地址（IP）</label><input id="node-listen" v-model="draft.listen" placeholder="默认 127.0.0.1；全部接口填 0.0.0.0" /></div>
           <div><label for="node-listen-port">监听端口</label><input id="node-listen-port" v-model="draft.listenPort" type="number" min="1" max="65535" required /></div>
         </div>
         <small class="help">Server 只绑定这里的 IP、端口和传输网络；与客户端连接地址分离。</small>

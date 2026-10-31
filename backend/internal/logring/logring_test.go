@@ -73,3 +73,18 @@ func TestNodeHandlerSourceAndRedactedDiagnostics(t *testing.T) {
 		t.Fatalf("embedded node log duplicated or lost: %+v", got)
 	}
 }
+
+func TestNodeIngestSanitizes(t *testing.T) {
+	r := New(4)
+	NewNodeRing(r).Ingest("node-1", []Entry{{
+		Level:   "FAKE\nERROR",
+		Message: "hello\r\nworld\x00" + strings.Repeat("x", 2000),
+	}})
+	got := r.Query("node", "node-1", "", 0)
+	if len(got) != 1 {
+		t.Fatalf("entries: %+v", got)
+	}
+	if got[0].Level != "INFO" || strings.ContainsAny(got[0].Message, "\n\r\x00") || len([]rune(got[0].Message)) != 1024 {
+		t.Fatalf("unsanitized log: %+v", got[0])
+	}
+}

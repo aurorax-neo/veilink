@@ -43,8 +43,7 @@ def main():
     created = []
     events = []
     started = time.monotonic()
-    password = secrets.token_urlsafe(24)
-    csrf = ''
+    api_key = ''
     summary = {'passed': False, 'duration_requested': args.duration, 'image': args.image, 'events': events}
 
     def event(kind, **values):
@@ -56,21 +55,26 @@ def main():
 
     def api(path, body=None, method=None, expected=200):
         argv = ['docker', 'exec', names['master'], 'curl', '--noproxy', '*', '-sS', '--max-time', '8',
-                '-b', '/tmp/soak-cookie', '-c', '/tmp/soak-cookie', '-H', 'Content-Type: application/json',
-                '-H', 'X-CSRF-Token: ' + csrf, '-w', '\n%{http_code}']
+                '-H', 'Content-Type: application/json', '-H', 'Authorization: Bearer ' + api_key,
+                '-w', '\n%{http_code}']
         if method:
             argv += ['-X', method]
         if body is not None:
             argv += ['-d', json.dumps(body)]
-        raw = command(*argv, 'http://127.0.0.1:8443/api' + path).stdout.decode()
+        raw = command(*argv, 'http://127.0.0.1:8443/api/v1' + path).stdout.decode()
         data, status = raw.rsplit('\n', 1)
         if int(status) != expected:
             raise RuntimeError('API %s: status %s' % (path, status))
         return json.loads(data) if data else None
 
-    def login():
-        nonlocal csrf
-        csrf = api('/login', {'username': 'soak', 'password': password})['csrf']
+    def mint_key():
+        nonlocal api_key
+        minted = command('docker', 'exec', names['master'], 'veilink', 'keys', 'create', 'soak')
+        for line in minted.stdout.decode().splitlines():
+            if line.startswith('vlk_'):
+                api_key = line.strip()
+                return True
+        return False
 
     def wait(label, fn, timeout=90):
         start = time.monotonic()
@@ -110,9 +114,9 @@ def main():
                 'node:alpine', 'node', '-e',
                 "require('http').createServer((q,s)=>s.end('veilink-soak-business')).listen(8080,'0.0.0.0')")
         created.append(names['target'])
-        wait('master_ready', lambda: api('/setup'))
-        api('/register', {'username': 'soak', 'password': password}, expected=201)
-        login()
+        wait('master_ready', lambda: command('docker', 'exec', names['master'], 'curl', '--noproxy', '*', '-fsS', '--max-time', '4', 'http://127.0.0.1:8443/healthz', check=False).returncode == 0)
+        if not mint_key():
+            raise RuntimeError('API key was not created')
         cert = api('/nodes/generate', {'role': 'server', 'kind': 'certificate', 'host': 'server', 'ttl_days': 1})
         server = api('/nodes', {'name': 'soak-server', 'role': 'server', 'address': 'server', 'port': 18444,
                      'tunnel': dict(transport_security='tls', listen_host='0.0.0.0', listen_port=18444,
@@ -153,7 +157,7 @@ def main():
             command('docker', 'restart', names[role])
             event('process_restart', role=role)
             if role == 'master':
-                wait('master_relogin', lambda: (login() or True))
+                wait('master_relogin', lambda: api('/nodes') or True)
             wait(role + '_new_heartbeat', lambda: all(n['last_seen'] > previous[n['id']] for n in external_nodes()))
             wait(role + '_restart_converged', converged)
             wait(role + '_restart_business', probe)

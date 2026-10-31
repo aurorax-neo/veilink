@@ -97,7 +97,7 @@ onUnmounted(() => { active = false; unregisterPageRefresh?.(); if (timer) clearI
     </div>
 
     <p v-if="error" class="error" role="alert">{{ error }}</p>
-    <EmptyState v-else-if="loading && !logs.length" title="加载中…" text="" />
+    <EmptyState v-if="loading && !logs.length" title="加载中…" text="" />
     <EmptyState v-else-if="!logs.length" title="暂无近期日志" text="节点日志需成功连接 Master 后才会上报；日志仅保存在当前 Master 内存中，重启后不保留。" />
     <section v-else class="panel">
       <header class="panel-head"><h2>最近日志</h2><small>最新 {{ logs.length }} 条 · 内存记录</small></header>

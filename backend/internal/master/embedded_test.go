@@ -72,7 +72,7 @@ func TestEmbeddedServerLifecycleAndRegistration(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	// 2. API Key auth: first boot auto-generates an admin key, no username/password exists.
+	// 2. First boot must not mint an admin API key. Operators create one with veilink keys.
 	s, err := store.Open(dbPath, keyPath)
 	if err != nil {
 		t.Fatal(err)
@@ -87,18 +87,8 @@ func TestEmbeddedServerLifecycleAndRegistration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(keys) == 0 {
-		t.Fatal("expected auto-generated admin API key on first boot")
-	}
-	foundAdmin := false
-	for _, k := range keys {
-		if k.Name == "default-admin" && k.Role == "admin" {
-			foundAdmin = true
-			break
-		}
-	}
-	if !foundAdmin {
-		t.Fatalf("expected default-admin key, got %+v", keys)
+	if len(keys) != 0 {
+		t.Fatalf("master created an API key on startup: %+v", keys)
 	}
 
 	// 3. Verify embedded server node auto-registration and heartbeat in database

@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"veilink/internal/buildinfo"
 	"veilink/internal/config"
@@ -28,6 +30,7 @@ type API struct {
 	streamHub  *backend.StreamHub
 	tokenStore *backend.StreamTokenStore
 	webPersist WebPersistConfig
+	authFails  *failWindow
 }
 
 // WebPersistConfig 包含服务设置数据库和非持久化的静态资源路径。
@@ -45,17 +48,10 @@ func New(s *store.Store, insecureLoopback bool, ring *logring.Ring, webPersist W
 	if err := ks.Migrate(); err != nil {
 		slog.Error("api keys migration failed", "err", err)
 	}
-	// 旧版迁移提示
-	if mk := ks.MigratedKey(); mk != "" {
-		slog.Warn("检测到旧版管理员账号，已自动迁移为 API Key（旧用户名密码已失效）",
-			"key", mk, "note", "请妥善保存，此 Key 仅显示一次")
-	}
-	// 首次启动自动生成
-	if plaintext, created, err := ks.EnsureDefaultAdmin(); err != nil {
-		slog.Error("ensure default admin key failed", "err", err)
-	} else if created {
-		slog.Warn("未配置 API Key，已自动生成管理员 Key（仅显示一次，请妥善保存）",
-			"key", plaintext)
+	if pending, err := ks.LegacyAdminPending(); err != nil {
+		slog.Error("legacy admin check failed", "err", err)
+	} else if pending {
+		slog.Warn("旧版管理员尚未迁移。请执行 veilink keys list，迁移出的 API Key 只在该命令输出中显示一次")
 	}
 
 	// WebManager 初始化
@@ -73,6 +69,7 @@ func New(s *store.Store, insecureLoopback bool, ring *logring.Ring, webPersist W
 		streamHub:  backend.NewStreamHub(),
 		tokenStore: backend.NewStreamTokenStore(),
 		webPersist: webPersist,
+		authFails:  newFailWindow(30, time.Minute),
 	}
 	return a
 }
@@ -142,10 +139,6 @@ func (a *API) authenticate(r *http.Request) (backend.KeyRole, bool) {
 	if key == "" {
 		key = r.Header.Get("X-API-Key")
 	}
-	// query 参数方式默认关闭，需显式开启
-	if key == "" && os.Getenv("WEB_ALLOW_QUERY_KEY") == "true" {
-		key = r.URL.Query().Get("api_key")
-	}
 	if key == "" {
 		return "", false
 	}
@@ -186,13 +179,17 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 	}
 
-	// 5. API Key 认证（SSE 用一次性 token，跳过 Key 检查）
+	// 5. API Key 认证。只有已签发的一次性 SSE 连接跳过 Key。
 	var role backend.KeyRole
 	var ok bool
-	isStream := strings.HasPrefix(r.URL.Path, "/api/v1/stream")
-	if !isStream {
+	sse := r.URL.Path == "/api/v1/stream" && r.Method == http.MethodGet
+	if !sse {
 		role, ok = a.authenticate(r)
 		if !ok && strings.HasPrefix(r.URL.Path, "/api/") {
+			if !a.authFails.allow(clientIP(r)) {
+				failure(w, 429)
+				return
+			}
 			failure(w, 401)
 			return
 		}
@@ -209,8 +206,13 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/api/v1/stream/token" && r.Method == "POST" {
+		token, issued := a.tokenStore.Issue()
+		if !issued {
+			failure(w, 429)
+			return
+		}
 		output(w, 200, map[string]any{
-			"token":      a.tokenStore.Issue(),
+			"token":      token,
 			"expires_in": 60,
 		})
 		return
@@ -272,7 +274,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 9. 业务 API（/api/v1/*）
 	if strings.HasPrefix(r.URL.Path, "/api/v1/") {
-		a.serveAPI(w, r)
+		a.serveAPI(w, r, role)
 		return
 	}
 
@@ -323,6 +325,9 @@ func (a *API) serveKeys(w http.ResponseWriter, r *http.Request, role backend.Key
 		r := backend.RoleAdmin
 		if req.Role == "readonly" {
 			r = backend.RoleReadonly
+			} else if req.Role != "" && req.Role != "admin" {
+				failure(w, 400)
+				return
 		}
 		plaintext, err := a.keyStore.Create(req.Name, r)
 		if err != nil {
@@ -330,7 +335,7 @@ func (a *API) serveKeys(w http.ResponseWriter, r *http.Request, role backend.Key
 			return
 		}
 		// 明文仅返回一次
-		output(w, 201, map[string]string{"key": plaintext, "name": req.Name})
+			output(w, 201, map[string]string{"key": plaintext, "name": req.Name, "role": string(r)})
 	case strings.HasPrefix(r.URL.Path, "/api/v1/keys/") && r.Method == "DELETE":
 		idStr := strings.TrimPrefix(r.URL.Path, "/api/v1/keys/")
 		id, err := strconv.ParseInt(idStr, 10, 64)
@@ -349,7 +354,11 @@ func (a *API) serveKeys(w http.ResponseWriter, r *http.Request, role backend.Key
 }
 
 // serveAPI 业务 API（路径已确认为 /api/v1/* 前缀）
-func (a *API) serveAPI(w http.ResponseWriter, r *http.Request) {
+func (a *API) serveAPI(w http.ResponseWriter, r *http.Request, role backend.KeyRole) {
+	if r.Method != http.MethodGet && role != backend.RoleAdmin {
+		failure(w, 403)
+		return
+	}
 	// 去掉 /api/v1 前缀，复用原有分发逻辑
 	p := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/"), "/")
 	id := ""
@@ -419,6 +428,13 @@ func (a *API) serveAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		case r.Method == "GET" && len(p) == 1:
 			result, err = a.store.ReportedNodes()
+			if err == nil && role != backend.RoleAdmin {
+				nodes, _ := result.([]store.ReportedNode)
+				for i := range nodes {
+					nodes[i] = redactReported(nodes[i])
+				}
+				result = nodes
+			}
 		case (r.Method == "POST" && len(p) == 1) || (r.Method == "PUT" && len(p) == 2):
 			type nodeInput model.Node
 			var in struct {
@@ -580,4 +596,87 @@ func (a *API) computeStats() (any, error) {
 		"total_mappings":   len(mappings),
 		"enabled_mappings": enabledMappings,
 	}, nil
+}
+
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil || host == "" {
+		host = r.RemoteAddr
+	}
+	if (host == "127.0.0.1" || host == "::1") && r.Header.Get("X-Forwarded-For") != "" {
+		parts := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+		if client := strings.TrimSpace(parts[0]); client != "" {
+			return client
+		}
+	}
+	return host
+}
+
+type failWindow struct {
+	mu     sync.Mutex
+	limit  int
+	window time.Duration
+	hits   map[string][]time.Time
+}
+
+func newFailWindow(limit int, window time.Duration) *failWindow {
+	return &failWindow{limit: limit, window: window, hits: map[string][]time.Time{}}
+}
+
+func (f *failWindow) allow(key string) bool {
+	if f == nil {
+		return true
+	}
+	now := time.Now()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.hits) > 512 {
+		for k, times := range f.hits {
+			active := times[:0]
+			for _, at := range times {
+				if now.Sub(at) < f.window {
+					active = append(active, at)
+				}
+			}
+			if len(active) == 0 {
+				delete(f.hits, k)
+			} else {
+				f.hits[k] = active
+			}
+		}
+	}
+	kept := f.hits[key][:0]
+	for _, at := range f.hits[key] {
+		if now.Sub(at) < f.window {
+			kept = append(kept, at)
+		}
+	}
+	if len(kept) >= f.limit {
+		f.hits[key] = kept
+		return false
+	}
+	if len(kept) == 0 {
+		f.hits[key] = []time.Time{now}
+	} else {
+		f.hits[key] = append(kept, now)
+	}
+	return true
+}
+
+func redactReported(n store.ReportedNode) store.ReportedNode {
+	n.Tunnel = redactTunnel(n.Tunnel)
+	if n.ClientTunnel != nil {
+		copied := redactTunnel(*n.ClientTunnel)
+		n.ClientTunnel = &copied
+	}
+	return n
+}
+
+func redactTunnel(t model.LocalTLS) model.LocalTLS {
+	t.KeyPEM = ""
+	t.Decryption = ""
+	t.Reality.PrivateKey = ""
+	t.Reality.Mldsa65Seed = ""
+	t.Hysteria2.Password = ""
+	return t
 }

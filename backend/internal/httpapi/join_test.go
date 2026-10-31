@@ -89,8 +89,8 @@ func TestJoinCommandAuthenticationRotationAndRevocation(t *testing.T) {
 	}
 	body = `{"master_url":"https://panel.example:8443"}`
 	defaultTTL := generate()
-	if delta := defaultTTL.Expires - time.Now().Unix(); delta < 999999995 || delta > 1000000000 {
-		t.Fatal("omitted join TTL must match frp-panel lifetime")
+	if delta := defaultTTL.Expires - time.Now().Unix(); delta < 86390 || delta > 86405 {
+		t.Fatal("omitted join TTL must default to 24h", delta)
 	}
 	body = `{"master_url":"https://panel.example:8443","ttl_seconds":60}`
 	old := generate()
@@ -143,7 +143,7 @@ func TestJoinCommandAuthenticationRotationAndRevocation(t *testing.T) {
 	if _, err = s.Snapshot(n.ID, credential); err != nil {
 		t.Fatal("token revoke revoked active node", err)
 	}
-	for _, bad := range []string{`{"master_url":"https://host","ttl_seconds":1000000001}`, `{"master_url":"https://host;id"}`, `{"master_url":"ftp://host"}`, `{"master_url":"https://host","ttl_seconds":-1}`} {
+	for _, bad := range []string{`{"master_url":"https://host","ttl_seconds":604801}`, `{"master_url":"https://host;id"}`, `{"master_url":"ftp://host"}`, `{"master_url":"https://host","ttl_seconds":-1}`} {
 		if w = call("POST", path, bad); w.Code != 400 {
 			t.Fatal("accepted invalid join", w.Code)
 		}

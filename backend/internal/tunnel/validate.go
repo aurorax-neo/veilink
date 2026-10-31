@@ -113,10 +113,10 @@ func validate(s model.Snapshot, local model.LocalTLS) error {
 				return bad("gateway " + n.ID + ": " + err.Error())
 			}
 		}
-		if s.Node.Role == "client" && local.XHTTP.DownloadEndpointID != "" {
+		if s.Node.Role == "client" && n.Tunnel.XHTTP.DownloadEndpointID != "" {
 			found := false
 			for _, ep := range enabledEndpoints(n) {
-				if ep.ID == local.XHTTP.DownloadEndpointID {
+				if ep.ID == n.Tunnel.XHTTP.DownloadEndpointID {
 					found = true
 					break
 				}

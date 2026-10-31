@@ -20,8 +20,14 @@ func Create(db *sql.DB, path string, key []byte) (string, error) {
 		os.Remove(name)
 		return "", err
 	}
+	if err = os.Chmod(name, 0600); err != nil {
+		os.Remove(name)
+		return "", err
+	}
 	if len(key) != 0 {
 		if err = os.WriteFile(name+".key", key, 0600); err != nil {
+			os.Remove(name)
+			os.Remove(name + ".key")
 			return "", err
 		}
 	}
