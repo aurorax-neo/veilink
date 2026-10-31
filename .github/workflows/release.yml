@@ -7,9 +7,8 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "发布版本号，例如 v0.4.12；留空生成开发版标签"
-        required: false
-        default: ""
+        description: "发布版本号，例如 v0.4.13"
+        required: true
 
 permissions:
   contents: write
@@ -137,15 +136,46 @@ jobs:
         run: |
           set -euo pipefail
           tag="$RELEASE_TAG"
-          if [[ -z "$tag" || "$tag" == "main" || "$tag" == "master" ]]; then
-            tag="dev-${GITHUB_RUN_ID}"
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag '$tag' 不符合 SemVer，应为 vX.Y.Z 或 vX.Y.Z-pre"
+            exit 1
           fi
-          stable=false
-          if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            stable=true
+          version="${tag#v}"
+          source_version="$(tr -d '[:space:]' < VERSION)"
+          if [[ "$source_version" != "$version" ]]; then
+            echo "::error::VERSION=$source_version 与 Tag=$version 不一致"
+            exit 1
           fi
+          version_ere="${version//./\\.}"
+          header_count="$(grep -cE "^## \\[$version_ere\\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$" CHANGELOG.md || true)"
+          if [[ "$header_count" != "1" ]]; then
+            echo "::error::CHANGELOG.md 缺少唯一的 $version 版本段落"
+            exit 1
+          fi
+          body="$(awk -v ver="$version" '
+            $0 == "## [" ver "]" || index($0, "## [" ver "] - ") == 1 {found=1; next}
+            found && /^## \[/ {exit}
+            found {print}
+          ' CHANGELOG.md)"
+          if ! printf '%s\n' "$body" | grep -q '[^[:space:]]'; then
+            echo "::error::CHANGELOG.md 中版本 $version 内容为空"
+            exit 1
+          fi
+          if ! printf '%s\n' "$body" | grep -q '^### '; then
+            echo "::error::CHANGELOG.md 中版本 $version 缺少分类标题"
+            exit 1
+          fi
+          printf '%s\n' "$body" > release-body.md
+          stable=true
+          [[ "$tag" == *-* ]] && stable=false
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "stable=$stable" >> "$GITHUB_OUTPUT"
+      - name: Verify release body
+        run: |
+          set -euo pipefail
+          test -s release-body.md
+          sed -n '1,160p' release-body.md
       - name: Download all package artifacts
         uses: actions/download-artifact@v4
         with:
@@ -163,9 +193,9 @@ jobs:
         with:
           tag_name: ${{ steps.release.outputs.tag }}
           name: ${{ steps.release.outputs.tag }}
-          body_path: RELEASE_NOTES.md
+          body_path: release-body.md
           files: release-assets/*
-          generate_release_notes: true
+          generate_release_notes: false
           prerelease: ${{ steps.release.outputs.stable != 'true' }}
 
   docker:
@@ -221,17 +251,22 @@ jobs:
         run: |
           set -euo pipefail
           tag="$RELEASE_TAG"
-          if [[ -z "$tag" || "$tag" == "main" || "$tag" == "master" ]]; then
-            tag="dev-${GITHUB_RUN_ID}"
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag '$tag' 不符合 SemVer"
+            exit 1
           fi
+          version="${tag#v}"
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
-          tags="${image}:${tag}"
-          if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          tags="${image}:${version},${image}:${tag}"
+          if [[ "$tag" != *-* ]]; then
             tags="${tags},${image}:latest"
           fi
+          echo "image=$image" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
       - name: Build and push multi-arch image
+        id: build-image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -240,8 +275,22 @@ jobs:
           push: true
           tags: ${{ steps.image.outputs.tags }}
           build-args: |
-            VERSION=${{ steps.image.outputs.tag }}
+            VERSION=${{ steps.image.outputs.version }}
             COMMIT=${{ github.sha }}
             SOURCE_URL=https://github.com/${{ github.repository }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Record image digest
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          VERSION: ${{ steps.image.outputs.version }}
+          DIGEST: ${{ steps.build-image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          test -n "$DIGEST"
+          {
+            echo "### Multi-arch image published"
+            echo "- Image: \`${IMAGE}:${VERSION}\`"
+            echo "- Digest: \`${DIGEST}\`"
+            echo "- Platforms: linux/amd64, linux/arm64"
+          } >> "$GITHUB_STEP_SUMMARY"

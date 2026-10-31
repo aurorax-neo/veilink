@@ -63,9 +63,23 @@ func TestReleaseWorkflowPaths(t *testing.T) {
 			t.Errorf("release workflow still contains obsolete build path %q", forbidden)
 		}
 	}
-	for _, required := range []string{"body_path: RELEASE_NOTES.md", "package-linux-amd64", "package-linux-arm64"} {
+	for _, required := range []string{
+		"body_path: release-body.md",
+		"generate_release_notes: false",
+		"CHANGELOG.md",
+		"VERSION",
+		"不符合 SemVer",
+		"缺少分类标题",
+		"package-linux-amd64",
+		"package-linux-arm64",
+		"Record image digest",
+		"steps.build-image.outputs.digest",
+	} {
 		if !strings.Contains(workflow, required) {
 			t.Errorf("missing release asset contract %q", required)
 		}
+	}
+	if strings.Contains(workflow, "body_path: RELEASE_NOTES.md") || strings.Contains(workflow, "generate_release_notes: true") {
+		t.Error("release workflow must use the version-specific CHANGELOG body and disable automatic notes")
 	}
 }
