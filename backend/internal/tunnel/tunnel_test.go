@@ -77,12 +77,37 @@ func freePort(t *testing.T) int {
 	l.Close()
 	return p
 }
+
+func freePorts(t *testing.T, count int) []int {
+	t.Helper()
+	listeners := make([]net.Listener, count)
+	ports := make([]int, count)
+	for i := range listeners {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			for _, opened := range listeners[:i] {
+				if opened != nil {
+					_ = opened.Close()
+				}
+			}
+			t.Fatal(err)
+		}
+		listeners[i] = l
+		ports[i] = l.Addr().(*net.TCPAddr).Port
+	}
+	for _, l := range listeners {
+		_ = l.Close()
+	}
+	return ports
+}
+
 func fixtures(t *testing.T, target int) (model.Snapshot, model.Snapshot) {
 	t.Helper()
-	port := freePort(t)
+	ports := freePorts(t, 2)
+	port, mappingPort := ports[0], ports[1]
 	n := model.Node{ID: "server", Role: "server", Address: "127.0.0.1", Port: port, Tunnel: model.LocalTLS{TransportSecurity: "tls", ListenPort: port}}
 	b := model.Binding{ID: "one", ServerID: n.ID, ClientID: "client-one", UUID: "e2587f5e-b746-4e68-a131-184984fa56a0", Domain: "one.reverse.test"}
-	m := model.Mapping{ID: "echo", Name: "echo", BindingID: b.ID, ListenPort: freePort(t), TargetHost: "127.0.0.1", TargetPort: target, Pool: 1, Enabled: true}
+	m := model.Mapping{ID: "echo", Name: "echo", BindingID: b.ID, ListenPort: mappingPort, TargetHost: "127.0.0.1", TargetPort: target, Pool: 1, Enabled: true}
 	s := model.Snapshot{Revision: 1, Node: n, Bindings: []model.Binding{b}, Mappings: []model.Mapping{m}}
 	c := model.Snapshot{Revision: 1, Node: model.Node{ID: b.ClientID, Role: "client"}, Nodes: []model.Node{n}, Bindings: []model.Binding{b}, Mappings: []model.Mapping{m}}
 	return s, c
