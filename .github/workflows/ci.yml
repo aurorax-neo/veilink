@@ -32,7 +32,21 @@ jobs:
       - name: Go package tests
         working-directory: backend
         run: |
-          go test -p 1 -count=1 $(go list ./... | grep -v '^veilink/internal/tunnel$') -timeout=5m
+          failed=0
+          while IFS= read -r pkg; do
+            echo "::group::go test ${pkg}"
+            log_file="$(mktemp)"
+            if go test -count=1 "$pkg" -timeout=5m >"$log_file" 2>&1; then
+              cat "$log_file"
+            else
+              cat "$log_file"
+              details="$(tail -n 12 "$log_file" | tr '\r\n' ' ' | cut -c1-1000)"
+              echo "::error title=Go package test failed::${pkg}: ${details}"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done < <(go list ./... | grep -v '^veilink/internal/tunnel$')
+          exit "$failed"
       - name: Tunnel regression tests
         working-directory: backend
         run: |

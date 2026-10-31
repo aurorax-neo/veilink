@@ -16,7 +16,8 @@ func TestDevelopmentWorkflowContract(t *testing.T) {
 	for _, required := range []string{
 		"go-version-file: backend/go.mod", "cache-dependency-path: frontend/package-lock.json",
 		"working-directory: backend", "working-directory: frontend",
-		"go test -p 1 -count=1 $(go list ./... | grep -v '^veilink/internal/tunnel$') -timeout=5m",
+		"while IFS= read -r pkg", "go test -count=1 \"$pkg\" -timeout=5m",
+		"::error title=Go package test failed::${pkg}: ${details}",
 		"-skip '^(TestProtocolMatrixRoundTrip|TestXHTTPCombinationMatrix)$'",
 		"go test ./internal/tunnel -run '^TestProtocolMatrixRoundTrip$' -count=1 -timeout=5m",
 		"go test ./internal/tunnel -run '^TestXHTTPCombinationMatrix$' -count=1 -timeout=5m",
