@@ -14,6 +14,8 @@ const masterURL = ref(location.origin)
 const result = ref<JoinResult | null>(null)
 const status = ref('')
 const copyError = ref('')
+const showHelp = ref(false)
+const showDanger = ref(false)
 const now = ref(Date.now())
 const timer = window.setInterval(() => { now.value = Date.now() }, 1000)
 onUnmounted(() => window.clearInterval(timer))
@@ -23,6 +25,8 @@ function open(value: Node) {
   node.value = value
   masterURL.value = location.origin
   clear()
+  showHelp.value = false
+  showDanger.value = false
   modal.value?.open()
 }
 function clear() { result.value = null; status.value = ''; copyError.value = '' }
@@ -72,27 +76,37 @@ defineExpose({ open })
       <div class="command-heading"><label for="join-command">Docker 接入命令</label><button type="button" class="btn small primary" :disabled="expired" @click="copy(result.command, '接入命令')">复制接入命令</button></div>
       <textarea id="join-command" class="command-block secret" :value="result.command" readonly rows="5" spellcheck="false" />
       <div class="token-meta">
-        <small class="help" :class="{ bad: expired }">{{ expired ? '令牌已过期' : '令牌到期' }} · {{ new Date(result.expires_at * 1000).toLocaleString('zh-CN', { hour12: false }) }}</small>
+        <small class="help live-number" :class="{ bad: expired }">{{ expired ? '令牌已过期' : '令牌到期' }} · {{ new Date(result.expires_at * 1000).toLocaleString('zh-CN', { hour12: false }) }}</small>
         <button v-if="expired" type="button" class="btn small" @click="clear">重新生成</button>
         <button v-else type="button" class="btn small quiet danger revoke-token" style="margin-top: 0;" @click="revokeModal?.open()">撤销此接入令牌</button>
       </div>
     </template>
-    <details class="help-details">
-      <summary class="help-summary">接入参数与通信说明</summary>
-      <div class="help-content">
-        <p class="help">命令使用统一镜像 ghcr.io/aurorax-neo/veilink:latest，以 server 或 client 子命令选择角色。接入令牌在有效期内可重复用于此节点，重新生成会替换旧令牌。</p>
-        <p class="help">HTTP/h2c 不加密，仅用于可信网络；接入命令只设置管理连接，-control-ca 仅信任 Master HTTPS。客户端不加本地隧道 flags。节点在线仅代表心跳，仍需确认应用修订及映射目标可达。</p>
+    <div class="help-details">
+      <button type="button" class="help-summary" :aria-expanded="showHelp" @click="showHelp = !showHelp">
+        <span>接入参数与通信说明</span>
+        <span class="chevron-mark" :class="{ open: showHelp }" aria-hidden="true">▾</span>
+      </button>
+      <div class="collapsible" :data-open="showHelp ? 'true' : 'false'">
+        <div class="help-content">
+          <p class="help">命令使用统一镜像 ghcr.io/aurorax-neo/veilink:latest，以 server 或 client 子命令选择角色。接入令牌在有效期内可重复用于此节点，重新生成会替换旧令牌。</p>
+          <p class="help">HTTP/h2c 不加密，仅用于可信网络；接入命令只设置管理连接，-control-ca 仅信任 Master HTTPS。客户端不加本地隧道 flags。节点在线仅代表心跳，仍需确认应用修订及映射目标可达。</p>
+        </div>
       </div>
-    </details>
+    </div>
     <p v-if="status" class="help" role="status">{{ status }}</p>
-    <p v-if="copyError" class="error" role="alert">{{ copyError }}</p>
-    <details v-if="!node?.embedded" class="advanced-danger">
-      <summary>高危操作：重置节点永久凭据</summary>
-      <div class="danger-panel">
-        <p class="fine">若节点私钥泄露或需彻底废弃当前节点的长期凭据，可重置凭据。重置后该节点当前所有在线连接将被立即中断，必须使用新生成的接入命令重新启动。</p>
-        <button type="button" class="btn small danger" @click="resetModal?.open()">重置节点凭据</button>
+    <p v-if="copyError" class="error inline-alert" role="alert">{{ copyError }}</p>
+    <div v-if="!node?.embedded" class="advanced-danger">
+      <button type="button" class="danger-summary" :aria-expanded="showDanger" @click="showDanger = !showDanger">
+        <span>高危操作：重置节点永久凭据</span>
+        <span class="chevron-mark" :class="{ open: showDanger }" aria-hidden="true">▾</span>
+      </button>
+      <div class="collapsible" :data-open="showDanger ? 'true' : 'false'">
+        <div class="danger-panel">
+          <p class="fine">若节点私钥泄露或需彻底废弃当前节点的长期凭据，可重置凭据。重置后该节点当前所有在线连接将被立即中断，必须使用新生成的接入命令重新启动。</p>
+          <button type="button" class="btn small danger" @click="resetModal?.open()">重置节点凭据</button>
+        </div>
       </div>
-    </details>
+    </div>
   </Modal>
   <Modal ref="revokeModal" title="撤销接入令牌" save-label="确认撤销" danger size="small" :submit="revoke">
     <p>撤销后当前接入令牌立即失效，无法再用于启动节点；不影响已接入节点的有效凭据。</p>

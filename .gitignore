@@ -19,6 +19,8 @@ Thumbs.db
 /docker-bin/
 /docker-web/
 /release-packages/
+/backend/internal/webui/dist/*
+!/backend/internal/webui/dist/index.html
 /veilink
 /veilink.exe
 go.work

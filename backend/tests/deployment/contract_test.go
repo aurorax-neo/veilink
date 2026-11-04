@@ -64,7 +64,7 @@ func TestUnifiedImageContents(t *testing.T) {
 		"ARG TARGETOS\n", "ARG TARGETARCH\n",
 		"CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build",
 		"COPY --from=build-backend /out/veilink /usr/local/bin/veilink",
-		"COPY --from=build-web /src/frontend/dist /opt/veilink-web/",
+		"COPY --from=build-web /src/frontend/dist ./internal/webui/dist/",
 		"ENTRYPOINT [\"/usr/local/bin/docker-entrypoint.sh\"]",
 		"apk add --no-cache ca-certificates tzdata sqlite su-exec curl",
 		"HEALTHCHECK ", "org.opencontainers.image.version", "org.opencontainers.image.revision", "org.opencontainers.image.source",
@@ -73,7 +73,7 @@ func TestUnifiedImageContents(t *testing.T) {
 			t.Errorf("unified image missing %q", required)
 		}
 	}
-	for _, forbidden := range []string{"COPY web", "/src/web", " AS master", " AS server", " AS client", " AS web", "/data/web", "WEB_PREBUNDLED_DIR"} {
+	for _, forbidden := range []string{"COPY web", "/src/web", " AS master", " AS server", " AS client", " AS web", "/data/web", "WEB_PREBUNDLED_DIR", "/opt/veilink-web"} {
 		if strings.Contains(file, forbidden) {
 			t.Errorf("obsolete Dockerfile reference %q", forbidden)
 		}
@@ -93,7 +93,6 @@ func TestReleaseImageOnlyAssemblesPreparedArtifacts(t *testing.T) {
 		"FROM alpine:3.23",
 		"ARG TARGETARCH",
 		"COPY docker-bin/${TARGETARCH}/veilink /usr/local/bin/veilink",
-		"COPY docker-web/ /opt/veilink-web/",
 		"COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md /usr/local/share/doc/veilink/",
 		"ENTRYPOINT [\"/usr/local/bin/docker-entrypoint.sh\"]",
 		"HEALTHCHECK ",
@@ -102,7 +101,7 @@ func TestReleaseImageOnlyAssemblesPreparedArtifacts(t *testing.T) {
 			t.Errorf("release Dockerfile missing %q", required)
 		}
 	}
-	for _, forbidden := range []string{"golang:", "node:", "go build", "npm ci", "cargo build", "cross build"} {
+	for _, forbidden := range []string{"golang:", "node:", "go build", "npm ci", "cargo build", "cross build", "docker-web", "/opt/veilink-web"} {
 		if strings.Contains(file, forbidden) {
 			t.Errorf("release Dockerfile compiles or installs toolchain via %q", forbidden)
 		}

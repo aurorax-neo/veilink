@@ -8,14 +8,14 @@ ARG SOURCE_URL=unknown
 RUN apk add --no-cache ca-certificates tzdata sqlite su-exec curl \
     && ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
     && echo Asia/Shanghai > /etc/timezone \
-    && mkdir -p /data /opt/veilink-web /usr/local/share/doc/veilink \
+    && mkdir -p /data /usr/local/share/doc/veilink \
     && adduser -D -u 65532 -g 65532 veilink \
     && chown -R veilink:veilink /data
 
 ENV TZ=Asia/Shanghai
 
 LABEL org.opencontainers.image.title="veilink" \
-      org.opencontainers.image.description="Veilink master/server/client with pre-bundled web UI" \
+      org.opencontainers.image.description="Veilink master/server/client single binary with embedded web UI" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${COMMIT}" \
       org.opencontainers.image.source="${SOURCE_URL}"
@@ -23,7 +23,6 @@ LABEL org.opencontainers.image.title="veilink" \
 # docker-bin is prepared by the build-binaries job. The image stage never
 # invokes a compiler and only selects the native binary for TARGETARCH.
 COPY docker-bin/${TARGETARCH}/veilink /usr/local/bin/veilink
-COPY docker-web/ /opt/veilink-web/
 COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md /usr/local/share/doc/veilink/
 COPY docker-entrypoint.sh docker-healthcheck.sh /usr/local/bin/
 

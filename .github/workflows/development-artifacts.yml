@@ -115,7 +115,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: shared-web
-          path: bundle/html
+          path: backend/internal/webui/dist
       - name: Build one executable for all roles and package
         env:
           GOOS: ${{ matrix.goos }}
@@ -124,13 +124,15 @@ jobs:
         run: |
           suffix=''
           if [[ "$GOOS" == windows ]]; then suffix='.exe'; fi
+          mkdir -p bundle
           cd backend
+          test -s internal/webui/dist/index.html
           go build -trimpath -ldflags="-s -w -X veilink/internal/buildinfo.Version=dev -X veilink/internal/buildinfo.Commit=${GITHUB_SHA}" -o "../bundle/veilink${suffix}" ./cmd/veilink
           cp ../LICENSE ../NOTICE ../THIRD_PARTY_NOTICES.md ../README.md ../bundle/
           printf '%s\n' "Source: https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}" \
             'Unified executable: master|server|client subcommands; no role-specific packages.' \
             'Development archive, not a host production deployment guide.' \
-            'Master Web assets are in html/ (select with -html-dir); default management transport is HTTP, TLS is optional.' > ../bundle/BUILD.txt
+            'Master Web assets are embedded in the veilink binary; default management transport is HTTP, TLS is optional.' > ../bundle/BUILD.txt
           mkdir -p ../dist
           tar -czf "../dist/veilink-${GOOS}-${GOARCH}.tar.gz" -C ../bundle .
           (cd ../dist && sha256sum ./*.tar.gz > SHA256SUMS)

@@ -123,7 +123,7 @@ onMounted(() => { void load(); void loadService(); void loadKeys() })
         <p v-if="keyMsg" class="hint" :class="{ bad: keyBad }" role="status">{{ keyMsg }}</p>
       </div>
     </section>
-    <Modal ref="confirmRevoke" title="撤销 API Key" save-label="撤销" danger :submit="commitRevoke" @close="pendingKey = null"><p>确定撤销 Key「{{ pendingKey?.name }}」？撤销后立即失效。</p></Modal>
+    <Modal ref="confirmRevoke" size="small" title="撤销 API Key" save-label="确认撤销密钥" danger :submit="commitRevoke" @close="pendingKey = null"><p>确定撤销 Key「{{ pendingKey?.name }}」？撤销后立即失效。</p></Modal>
   </div>
 </template>
 

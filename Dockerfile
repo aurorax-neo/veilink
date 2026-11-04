@@ -2,21 +2,6 @@ ARG NPM_REGISTRY=https://registry.npmjs.org
 ARG GOPROXY=https://proxy.golang.org,direct
 ARG APK_MIRROR=https://dl-cdn.alpinelinux.org/alpine
 
-# ============ 后端构建 ============
-FROM --platform=$BUILDPLATFORM golang:1.27-alpine3.23 AS build-backend
-WORKDIR /src/backend
-ARG GOPROXY
-ENV GOPROXY=${GOPROXY}
-COPY backend/go.mod backend/go.sum ./
-RUN go mod download
-COPY backend/ ./
-ARG TARGETOS
-ARG TARGETARCH
-ARG VERSION=dev
-ARG COMMIT=unknown
-ARG SOURCE_URL=unknown
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w -X veilink/internal/buildinfo.Version=${VERSION} -X veilink/internal/buildinfo.Commit=${COMMIT}" -o /out/veilink ./cmd/veilink
-
 # ============ 前端构建 ============
 FROM --platform=$BUILDPLATFORM node:22-alpine3.23 AS build-web
 WORKDIR /src/frontend
@@ -26,6 +11,22 @@ COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/ ./
 RUN npm run build
+
+# ============ 后端构建 ============
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine3.23 AS build-backend
+WORKDIR /src/backend
+ARG GOPROXY
+ENV GOPROXY=${GOPROXY}
+COPY backend/go.mod backend/go.sum ./
+RUN go mod download
+COPY backend/ ./
+COPY --from=build-web /src/frontend/dist ./internal/webui/dist/
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG SOURCE_URL=unknown
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w -X veilink/internal/buildinfo.Version=${VERSION} -X veilink/internal/buildinfo.Commit=${COMMIT}" -o /out/veilink ./cmd/veilink
 
 # ============ 统一镜像运行环境 ============
 FROM alpine:3.23 AS backend
@@ -53,14 +54,13 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
   CMD ["/usr/local/bin/docker-healthcheck.sh"]
 
 
-# ============ 统一镜像（后端 + 预置前端，master 开箱即用） ============
+# ============ 统一镜像（单二进制内嵌前端，master 开箱即用） ============
 FROM backend AS unified
 ARG VERSION=dev
 ARG COMMIT=unknown
 ARG SOURCE_URL=unknown
 LABEL org.opencontainers.image.title="veilink" \
-      org.opencontainers.image.description="Veilink master/server/client with pre-bundled web UI" \
+      org.opencontainers.image.description="Veilink master/server/client single binary with embedded web UI" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${COMMIT}" \
       org.opencontainers.image.source="${SOURCE_URL}"
-COPY --from=build-web /src/frontend/dist /opt/veilink-web/

@@ -29,7 +29,12 @@ func TestBuiltinWebOnly(t *testing.T) {
 	if err != nil || len(entries) != 1 {
 		t.Fatalf("wrote runtime assets: %v %v", entries, err)
 	}
-	if NewWebManager(WebConfig{}).dir != BundledDir {
-		t.Fatal("wrong default image path")
+	def := NewWebManager(WebConfig{})
+	defRoot, err := def.Ensure()
+	if err != nil || defRoot != "embedded" || def.FS() == nil {
+		t.Fatalf("default embedded web failed: root=%q err=%v", defRoot, err)
+	}
+	if !def.Status().Serving {
+		t.Fatal("expected default embedded web manager to be serving")
 	}
 }

@@ -392,7 +392,7 @@ defineExpose({ open })
 </script>
 
 <template>
-  <Modal ref="modal" :title="`${draft.id ? '编辑' : '新建'}${server ? '服务端' : '客户端'}`" :submit="save" :disabled="reading || !!uploadError || !!generation.busy" @close="clearSecrets">
+  <Modal ref="modal" variant="drawer" :title="`${draft.id ? '编辑' : '新建'}${server ? '服务端' : '客户端'}`" :submit="save" :disabled="reading || !!uploadError || !!generation.busy" @close="clearSecrets">
     <label for="node-name">名称</label><input id="node-name" v-model="draft.name" maxlength="128" required />
     <p v-if="!server" class="help">客户端仅可修改名称。有效隧道配置由管理中心按映射服务端统一下发；在节点详情查看来源，不支持本地覆盖。</p>
     <template v-else>

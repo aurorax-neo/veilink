@@ -157,5 +157,13 @@ export const pages: Record<PageId, { title: string; kicker: string; lead: string
 
 export function pageFromHash(hash = location.hash): PageId {
   const id = hash.replace(/^#\/?/, '') as PageId
-  return id in pages ? id : 'dashboard'
+  if (id in pages) {
+    try { globalThis.sessionStorage?.setItem('veilink_page', id) } catch { /* ignore */ }
+    return id
+  }
+  try {
+    const saved = globalThis.sessionStorage?.getItem('veilink_page') as PageId | null
+    if (saved && saved in pages) return saved
+  } catch { /* ignore */ }
+  return 'dashboard'
 }

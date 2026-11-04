@@ -52,13 +52,13 @@ func TestReleaseWorkflowPaths(t *testing.T) {
 		"actions/upload-artifact@v4", "actions/download-artifact@v4",
 		"Dockerfile.release", "platforms: linux/amd64,linux/arm64",
 		"concurrency:", "cancel-in-progress: true",
-		"CGO_ENABLED: \"0\"", "go build -trimpath", "frontend/dist",
+		"CGO_ENABLED: \"0\"", "go build -trimpath", "frontend/dist", "internal/webui/dist",
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Errorf("missing release workflow contract %q", required)
 		}
 	}
-	for _, forbidden := range []string{"docker/build-push-action@v6\n        with:\n          context: .\n          target: unified", "cargo build", "cross build"} {
+	for _, forbidden := range []string{"docker/build-push-action@v6\n        with:\n          context: .\n          target: unified", "cargo build", "cross build", "release-pkg/html", "docker-web"} {
 		if strings.Contains(workflow, forbidden) {
 			t.Errorf("release workflow still contains obsolete build path %q", forbidden)
 		}

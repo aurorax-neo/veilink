@@ -44,6 +44,10 @@ func TestBuiltinWebAndRemovedUpdateAPI(t *testing.T) {
 	if w.Header().Get("Access-Control-Allow-Origin") != "" {
 		t.Fatal("cross-origin frontend enabled")
 	}
+	embedded := New(s, true, nil, WebPersistConfig{})
+	if w := testCall(embedded, "", "GET", "/", ""); w.Code != 200 {
+		t.Fatalf("embedded default web: %d", w.Code)
+	}
 	missing := New(s, true, nil, WebPersistConfig{HTMLDir: filepath.Join(dir, "missing")})
 	if w := testCall(missing, "", "GET", "/", ""); w.Code != 503 {
 		t.Fatalf("missing web: %d", w.Code)

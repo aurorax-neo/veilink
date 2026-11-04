@@ -237,7 +237,7 @@ async function run() {
   </div>
   <NodeEditor ref="editor" :role="role" :saved="saved" :default-name="defaultName" />
   <NodeOnboarding ref="onboarding" />
-  <Modal ref="confirm" :title="action === 'revoke' ? '吊销节点' : action === 'delete' ? '删除节点' : action === 'disable' ? '停用节点' : '启用节点'" save-label="确认" :danger="action === 'delete' || action === 'revoke' || action === 'disable'" :submit="run">
+  <Modal ref="confirm" size="small" :title="action === 'revoke' ? '吊销节点' : action === 'delete' ? '删除节点' : action === 'disable' ? '停用节点' : '启用节点'" :save-label="action === 'revoke' ? '确认吊销凭据' : action === 'delete' ? '确认删除节点' : action === 'disable' ? '确认停用节点' : '确认启用节点'" :danger="action === 'delete' || action === 'revoke' || action === 'disable'" :submit="run">
     <p v-if="action === 'revoke'">吊销「{{ pending?.name }}」的节点凭据？此操作不可撤销。</p>
     <p v-else-if="action === 'delete'">删除「{{ pending?.name }}」及其 {{ pending ? mappings(pending.id).length : 0 }} 条映射？此操作不可撤销。</p>
     <p v-else-if="action === 'disable'">停用「{{ pending?.name }}」？相关监听会关闭，拨号会停止。节点未连接时，重连后执行。</p>

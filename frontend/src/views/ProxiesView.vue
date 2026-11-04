@@ -201,7 +201,7 @@ async function run() {
       </table>
     </div>
   </div>
-  <Modal ref="editor" :title="draft.id ? '编辑映射' : '新建映射'" :disabled="!servers.length || !clients.length" :submit="save">
+  <Modal ref="editor" variant="drawer" :title="draft.id ? '编辑映射' : '新建映射'" :disabled="!servers.length || !clients.length" :submit="save">
     <p v-if="!servers.length || !clients.length" class="help">请先创建可用的服务端和客户端。</p>
     <label for="map-name">名称</label><input id="map-name" v-model="draft.name" maxlength="128" required />
     <div class="grid-2">
@@ -234,5 +234,5 @@ async function run() {
     </div>
     <label class="check" for="map-enabled"><input id="map-enabled" v-model="draft.enabled" type="checkbox" /> 启用</label>
   </Modal>
-  <Modal ref="confirm" :title="action === 'delete' ? '删除映射' : pending?.enabled ? '停用映射' : '启用映射'" save-label="确认" :danger="action === 'delete'" :submit="run"><p>确认修改「{{ pending?.name }}」？现有连接可能断开。</p></Modal>
+  <Modal ref="confirm" size="small" :title="action === 'delete' ? '删除映射' : pending?.enabled ? '停用映射' : '启用映射'" :save-label="action === 'delete' ? '确认删除映射' : pending?.enabled ? '确认停用映射' : '确认启用映射'" :danger="action === 'delete'" :submit="run"><p>确认修改「{{ pending?.name }}」？现有连接可能断开。</p></Modal>
 </template>

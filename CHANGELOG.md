@@ -8,6 +8,24 @@ Release。
 
 ## [Unreleased]
 
+## [0.4.13] - 2026-11-04
+
+### Features
+
+- Web 控制台构建产物通过 Go `//go:embed` 直接嵌入 `veilink` 单二进制，发布压缩包与 Docker 镜像不再依赖外部 `html/` 或 `/opt/veilink-web` 目录。
+- 按照前端设计规范全面重构 Web 控制台界面：新增深色/浅色双主题切换与持久化、左侧导航 Lucide 图标、自定义版本浮层、侧边抽屉式（Drawer / 移动端 Bottom Sheet）节点与映射编辑器。
+- 移除浏览器原生 `<dialog>` 与 `<details>`，统一改为受控 Teleport 浮层（400/520/720px 三档尺寸、高危操作独立 AlertDialog 与后果动作文案）及 CSS Grid `0fr -> 1fr` 折叠面板。
+- 持久化当前工作台导航标签页至 `sessionStorage`，刷新页面保持上下文不丢失。
+
+### Bug Fixes
+
+- 彻底修复页面切换时出现两个滚动条闪烁消失的问题：移除侧栏独立滚动、表格行入场位移动画与隐藏 DOM 滚动容器，全站仅保留 `main#main.stage` 唯一垂直滚动区。
+- 优化 1440px 桌面视口下服务端表格列宽与长字段换行布局，确保操作列按钮完整显示。
+
+### Maintenance
+
+- 更新 `.github/workflows/release.yml`、`.github/workflows/development-artifacts.yml`、`Dockerfile` 与 `Dockerfile.release` 构建与打包契约测试，适配单二进制内嵌 Web 产物。
+
 ## [0.4.12] - 2026-10-31
 
 ### Bug Fixes

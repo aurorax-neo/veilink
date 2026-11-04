@@ -3,11 +3,11 @@ package httpapi
 import (
 	"encoding/json"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
-	"path/filepath"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -279,22 +279,32 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 11. 前端静态资源
-	if root := a.webManager.Root(); root != "" {
+	if webFS := a.webManager.FS(); webFS != nil {
 		w.Header().Set("Cache-Control", "no-cache")
-		p := filepath.Join(root, filepath.Clean(r.URL.Path))
-		if info, err := os.Stat(p); err != nil || info.IsDir() {
-			if strings.HasPrefix(r.URL.Path, "/assets/") || filepath.Ext(r.URL.Path) != "" {
+		cleanPath := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
+		if cleanPath == "" {
+			cleanPath = "."
+		}
+		if info, err := fs.Stat(webFS, cleanPath); err != nil || info.IsDir() {
+			if strings.HasPrefix(r.URL.Path, "/assets/") || path.Ext(r.URL.Path) != "" {
 				http.NotFound(w, r)
 				return
 			}
-			http.ServeFile(w, r, filepath.Join(root, "index.html"))
+			body, err := fs.ReadFile(webFS, "index.html")
+			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
 			return
 		}
-		http.FileServer(http.Dir(root)).ServeHTTP(w, r)
+		http.FileServerFS(webFS).ServeHTTP(w, r)
 		return
 	}
 
-	output(w, http.StatusServiceUnavailable, map[string]string{"error": "内置 Web 资源不可用，请检查统一镜像是否完整。"})
+	output(w, http.StatusServiceUnavailable, map[string]string{"error": "内置 Web 资源不可用，请检查可执行文件是否完整。"})
 }
 
 // serveKeys API Key 管理接口

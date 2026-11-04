@@ -76,7 +76,7 @@ docker exec veilink-master /usr/local/bin/veilink keys create admin
 ### 镜像与版本
 
 - **统一 Docker 镜像**：`ghcr.io/aurorax-neo/veilink:latest`（包含全功能二进制与预置 Web 前端，通过 `master|server|client` 子命令选择角色）
-- **Web 前端**：固定包含在统一镜像的 `/opt/veilink-web`，不再单独发布或运行时拉取
+- **Web 前端**：直接通过 `go:embed` 内嵌在单个 `veilink` 可执行文件中，不再单独发布 `html/` 目录或运行时拉取
 
 ### 目录与网络
 
@@ -105,7 +105,7 @@ docker run -itd \
   ghcr.io/aurorax-neo/veilink:latest master
 ```
 
-entrypoint 自动处理 `/data` 权限，无需手动 `mkdir`/`chown`。宿主机映射目录 `/opt/docker/veilink-master/data` 保存 SQLite 数据库与凭据（`veilink.db`）。Web 只读取镜像内 `/opt/veilink-web`，不读取或创建 `/data/web`，也不支持前端跳转地址、pull 模式、在线拉取版本或 GitHub 加速。旧 Web 文件不会覆盖新镜像资源，升级不会自动删除旧文件或数据库。已发布的 schema 5 数据库自动升级：先备份数据库与部署密钥，再事务化清理已知旧 Web 字段、修复旧版缺失的 ML-DSA 验证公钥；未知结构或损坏配置仍拒绝启动，不删库。
+entrypoint 自动处理 `/data` 权限，无需手动 `mkdir`/`chown`。宿主机映射目录 `/opt/docker/veilink-master/data` 保存 SQLite 数据库与凭据（`veilink.db`）。Web 直接从 `veilink` 二进制内嵌资源提供服务，不读取或创建 `/data/web`，也不支持前端跳转地址、pull 模式、在线拉取版本或 GitHub 加速。旧 Web 文件不会覆盖新内嵌资源，升级不会自动删除旧文件或数据库。已发布的 schema 5 数据库自动升级：先备份数据库与部署密钥，再事务化清理已知旧 Web 字段、修复旧版缺失的 ML-DSA 验证公钥；未知结构或损坏配置仍拒绝启动，不删库。
 
 ### 2. 获取 API Key
 
@@ -466,7 +466,7 @@ docker exec veilink-master /usr/local/bin/veilink master --help
 | `frontend/tests/acceptance` | 历史 Web 验收记录和截图 |
 | `tools` | 离线备份及节点验证工具 |
 
-Go 版本以 [backend/go.mod](backend/go.mod) 为准；前端构建使用 Node.js 22 和 npm 锁文件。`npm run build` 输出到 `frontend/dist/`，Docker 构建将其复制到统一镜像，仅 Master 提供 Web。
+Go 版本以 [backend/go.mod](backend/go.mod) 为准；前端构建使用 Node.js 22 和 npm 锁文件。`npm run build` 输出到 `frontend/dist/`，发布与 Docker 构建在编译 Go 前将其同步到 `backend/internal/webui/dist/` 并内嵌进单二进制，仅 Master 提供 Web。
 
 ### 映射限速与连接检测
 

@@ -99,17 +99,20 @@ jobs:
             suffix=".exe"
           fi
           rm -rf ../release-pkg ../release-packages
-          mkdir -p ../release-pkg/html ../release-packages
+          mkdir -p ../release-pkg ../release-packages
+          rm -rf internal/webui/dist
+          mkdir -p internal/webui/dist
+          cp -R ../frontend/dist/. internal/webui/dist/
+          test -s internal/webui/dist/index.html
           go build -trimpath \
             -ldflags="-s -w -X veilink/internal/buildinfo.Version=${tag} -X veilink/internal/buildinfo.Commit=${GITHUB_SHA}" \
             -o "../release-pkg/veilink${suffix}" ./cmd/veilink
-          cp -R ../frontend/dist/. ../release-pkg/html/
           cp ../LICENSE ../NOTICE ../THIRD_PARTY_NOTICES.md ../README.md ../release-pkg/
           printf '%s\n' \
             "Source: https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}" \
             "Version: ${tag}" \
             "Unified executable: master|server|client subcommands." \
-            "Management Web assets are in html/." > ../release-pkg/BUILD.txt
+            "Management Web assets are embedded in the veilink binary." > ../release-pkg/BUILD.txt
           tar -czf "../release-packages/veilink-${GOOS}-${GOARCH}.tar.gz" -C ../release-pkg .
       - name: Upload package artifact
         uses: actions/upload-artifact@v4
@@ -224,16 +227,14 @@ jobs:
       - name: Prepare Docker inputs
         run: |
           set -euo pipefail
-          mkdir -p docker-bin/amd64 docker-bin/arm64 docker-web
+          mkdir -p docker-bin/amd64 docker-bin/arm64
           mkdir -p unpack-amd64 unpack-arm64
           tar -xzf pkg-amd64/*.tar.gz -C unpack-amd64
           tar -xzf pkg-arm64/*.tar.gz -C unpack-arm64
           install -m 0755 unpack-amd64/veilink docker-bin/amd64/veilink
           install -m 0755 unpack-arm64/veilink docker-bin/arm64/veilink
-          cp -R unpack-amd64/html/. docker-web/
           test -s docker-bin/amd64/veilink
           test -s docker-bin/arm64/veilink
-          test -s docker-web/index.html
       - name: Set up QEMU for target image assembly
         uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
