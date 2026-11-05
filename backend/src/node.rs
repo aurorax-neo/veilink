@@ -825,10 +825,13 @@ async fn run_control_cycle(
 ) -> Result<(), ControlError> {
     let mut first = true;
     let mut wait_ms = 0u64;
+    let mut post_apply_watch = false;
+    let mut expected_bindings = 0usize;
     let drain_ring = if is_embedded { None } else { Some(ring.as_ref()) };
 
     while !cancel.is_cancelled() {
-        let links = Some(runtime.linked_bindings());
+        let current_links = runtime.linked_bindings();
+        let links = Some(current_links.clone());
         let traffic_payload = if role == "server" {
             let snap = runtime.traffic().snapshot();
             if snap.len() <= 128 {
@@ -895,7 +898,6 @@ async fn run_control_cycle(
 
         let current_rev = applied_revision.load(Ordering::SeqCst);
         let need_pull = first
-            || ev_resp.refresh
             || ev_resp.revision > current_rev
             || apply_failed.load(Ordering::SeqCst);
 
@@ -930,6 +932,8 @@ async fn run_control_cycle(
                     let new_rev = runtime.revision();
                     applied_revision.store(new_rev, Ordering::SeqCst);
                     apply_failed.store(false, Ordering::SeqCst);
+                    expected_bindings = snap.bindings.len();
+                    post_apply_watch = expected_bindings > 0;
                     let snapshot_changed = st.snapshot.as_ref() != Some(&snap) || !state_path.exists();
                     st.snapshot = Some(snap.clone());
                     if snapshot_changed && save_disk_state(state_path, st).is_err() {
@@ -965,6 +969,8 @@ async fn run_control_cycle(
                 Err(err) => {
                     applied_revision.store(runtime.revision(), Ordering::SeqCst);
                     apply_failed.store(true, Ordering::SeqCst);
+                    expected_bindings = 0;
+                    post_apply_watch = false;
                     ring.push_entry(
                         "node",
                         &c.node_id,
@@ -978,8 +984,32 @@ async fn run_control_cycle(
             }
             // Immediately report updated applied_revision & link state on next iteration while keeping long-poll active
             wait_ms = 0;
+        } else if ev_resp.refresh {
+            wait_ms = 0;
+        } else if post_apply_watch {
+            post_apply_watch = false;
+            if runtime.linked_bindings().len() < expected_bindings {
+                tokio::select! {
+                    _ = cancel.cancelled() => return Ok(()),
+                    _ = runtime.state_notified() => {
+                        tokio::time::sleep(Duration::from_millis(15)).await;
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                }
+            }
+            wait_ms = if runtime.linked_bindings() != current_links
+                || (!is_embedded && !ring.is_empty())
+            {
+                0
+            } else {
+                1_000
+            };
+        } else if runtime.linked_bindings() != current_links
+            || (!is_embedded && !ring.is_empty())
+        {
+            wait_ms = 0;
         } else {
-            wait_ms = 2_000;
+            wait_ms = 1_000;
         }
     }
 

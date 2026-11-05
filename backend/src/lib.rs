@@ -755,11 +755,84 @@ mod tests {
             "client tunnel connected log should be recorded: {:?}",
             entries
         );
+
+        // Verify manual node refresh (/api/v1/nodes/{id}/refresh) wakes the node and gets immediate report
+        for nid in ["srv-https", "cli-https"] {
+            let refresh_req = Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "https://localhost:{}/api/v1/nodes/{}/refresh",
+                    master_port, nid
+                ))
+                .header("Authorization", format!("Bearer {}", admin_key))
+                .header("Content-Type", "application/json")
+                .body(http_body_util::Full::new(bytes::Bytes::from_static(b"{}")))
+                .unwrap();
+            let refresh_resp = sender.send_request(refresh_req).await.unwrap();
+            assert_eq!(refresh_resp.status(), StatusCode::OK);
+            let refresh_bytes = refresh_resp
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes();
+            let refresh_json: serde_json::Value =
+                serde_json::from_slice(&refresh_bytes).unwrap();
+            assert_eq!(
+                refresh_json.get("connected").and_then(|v| v.as_bool()),
+                Some(true),
+                "node {} should be connected: {:?}",
+                nid,
+                refresh_json
+            );
+            assert_eq!(
+                refresh_json.get("reported").and_then(|v| v.as_bool()),
+                Some(true),
+                "node {} should report immediately on refresh: {:?}",
+                nid,
+                refresh_json
+            );
+        }
         drop(probe_client);
 
         cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(3), master_handle).await;
         let _ = tokio::time::timeout(Duration::from_secs(3), srv_handle).await;
         let _ = tokio::time::timeout(Duration::from_secs(3), cli_handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_shared_mapping_bandwidth_limit_and_concurrent_streams() {
+        // 8 Mbps = 1_000_000 bytes/sec (50ms burst = 50_000 bytes)
+        let limiter = crate::tunnel::BandwidthLimiter::new(1_000_000);
+        assert_eq!(limiter.read_size(16377), 16377);
+
+        // Run 4 concurrent tasks each pushing 75_000 bytes (total 300_000 bytes).
+        // With 50_000 byte burst, the remaining 250_000 bytes at 1_000_000 B/s must take ~250ms
+        // (whereas per-connection unshared limiters would finish in ~25ms).
+        let start = std::time::Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let lim = Arc::clone(&limiter);
+            handles.push(tokio::spawn(async move {
+                for _ in 0..5 {
+                    lim.wait(15_000).await;
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "shared limiter across 4 concurrent streams was too fast: {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "shared limiter across 4 concurrent streams was too slow: {:?}",
+            elapsed
+        );
     }
 }

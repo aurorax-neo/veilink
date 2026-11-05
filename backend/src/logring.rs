@@ -23,6 +23,7 @@ pub struct Entry {
 #[derive(Clone)]
 pub struct Ring {
     inner: Arc<Mutex<RingInner>>,
+    notify: Arc<tokio::sync::Notify>,
 }
 
 struct RingInner {
@@ -46,6 +47,7 @@ impl Ring {
                 pos: 0,
                 full: false,
             })),
+            notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -57,9 +59,14 @@ impl Ring {
         if g.pos == 0 {
             g.full = true;
         }
+        drop(g);
+        self.notify.notify_waiters();
     }
 
     pub fn append_batch(&self, entries: &[Entry]) {
+        if entries.is_empty() {
+            return;
+        }
         let mut g = self.inner.lock();
         for e in entries {
             let pos = g.pos;
@@ -69,6 +76,17 @@ impl Ring {
                 g.full = true;
             }
         }
+        drop(g);
+        self.notify.notify_waiters();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        let g = self.inner.lock();
+        !g.full && g.pos == 0
+    }
+
+    pub async fn notified(&self) {
+        self.notify.notified().await;
     }
 
     pub fn query(&self, source: &str, node_id: &str, level: &str, limit: usize) -> Vec<Entry> {

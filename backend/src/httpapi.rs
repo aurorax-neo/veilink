@@ -743,6 +743,7 @@ impl Api {
                     "node",
                     &serde_json::json!({
                         "id": body.node_id,
+                        "node_id": body.node_id,
                         "applied_revision": body.applied_revision,
                     }),
                 );
@@ -1086,7 +1087,7 @@ impl Api {
                     return match self.store.request_refresh(id) {
                         Ok(connected) => {
                             let reported = if connected {
-                                self.wait_node_heartbeat(&mut hb_rx, id, Duration::from_millis(300))
+                                self.wait_node_heartbeat(&mut hb_rx, id, Duration::from_millis(600))
                                     .await
                             } else {
                                 false

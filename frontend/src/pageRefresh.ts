@@ -42,7 +42,7 @@ export async function askNodes(ids: string[]) {
 
 function waitEventOrSleep(ms: number) {
   return new Promise<void>(resolve => {
-    const bus = (globalThis as Record<string, unknown>).__veilinkStream as { on?: (type: string, fn: () => void) => () => void } | undefined
+    const bus = (globalThis as Record<string, unknown>).__veilinkStream as { on?: (type: string, fn: (data?: { node_id?: string }) => void) => () => void } | undefined
     let offNode: (() => void) | undefined
     let offTunnel: (() => void) | undefined
     const done = () => {
@@ -52,8 +52,14 @@ function waitEventOrSleep(ms: number) {
       resolve()
     }
     const timer = setTimeout(done, ms)
-    offNode = bus?.on?.('node', done)
-    offTunnel = bus?.on?.('tunnel', done)
+    offNode = bus?.on?.('node', (data) => {
+      if (data?.node_id) freshlyReported.add(data.node_id)
+      done()
+    })
+    offTunnel = bus?.on?.('tunnel', (data) => {
+      if (data?.node_id) freshlyReported.add(data.node_id)
+      done()
+    })
   })
 }
 

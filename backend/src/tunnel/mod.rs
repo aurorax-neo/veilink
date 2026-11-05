@@ -71,6 +71,80 @@ const VLESS_SCHEME: &str = "mlkem768x25519plus";
 const VLESS_PLAIN: &str = "none";
 const XHTTP_MAX_DATA_CHUNKS: usize = 32;
 
+pub struct BandwidthLimiter {
+    rate: f64,
+    burst: f64,
+    state: parking_lot::Mutex<LimiterState>,
+}
+
+struct LimiterState {
+    tokens: f64,
+    last: std::time::Instant,
+}
+
+impl BandwidthLimiter {
+    pub fn new(rate_bps: u64) -> Arc<Self> {
+        Self::with_burst_div(rate_bps, 20)
+    }
+
+    pub fn with_burst_div(rate_bps: u64, burst_div: u64) -> Arc<Self> {
+        let rate = rate_bps as f64;
+        let div = burst_div.max(1) as f64;
+        let burst = if rate_bps == 0 {
+            0.0
+        } else {
+            (rate / div).max(1.0)
+        };
+        Arc::new(Self {
+            rate,
+            burst,
+            state: parking_lot::Mutex::new(LimiterState {
+                tokens: burst,
+                last: std::time::Instant::now(),
+            }),
+        })
+    }
+
+    pub fn read_size(&self, max_len: usize) -> usize {
+        if self.rate <= 0.0 {
+            return max_len;
+        }
+        let chunk = ((self.rate / 20.0) as usize).clamp(1, 32 << 10);
+        max_len.min(chunk)
+    }
+
+    pub async fn wait(&self, n: usize) {
+        if n == 0 || self.rate <= 0.0 {
+            return;
+        }
+        let wait_dur = {
+            let mut st = self.state.lock();
+            let now = std::time::Instant::now();
+            let elapsed = now.saturating_duration_since(st.last).as_secs_f64();
+            st.last = now;
+            st.tokens = (st.tokens + elapsed * self.rate).min(self.burst);
+            st.tokens -= n as f64;
+            if st.tokens >= 0.0 {
+                Duration::ZERO
+            } else {
+                Duration::from_secs_f64((-st.tokens) / self.rate)
+            }
+        };
+        if !wait_dur.is_zero() {
+            tokio::time::sleep(wait_dur).await;
+        }
+    }
+}
+
+fn configure_tcp_stream(tcp: &TcpStream) {
+    let _ = tcp.set_nodelay(true);
+    let sock_ref = socket2::SockRef::from(tcp);
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(20))
+        .with_interval(Duration::from_secs(10));
+    let _ = sock_ref.set_tcp_keepalive(&ka);
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrafficBytes {
     pub up: u64,
@@ -2252,7 +2326,7 @@ impl SessionHandle {
         while id == 0 || map.contains_key(&id) {
             id = self.next_id.fetch_add(1, Ordering::Relaxed);
         }
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::channel(64);
         map.insert(id, tx);
         Some((id, rx))
     }
@@ -2531,7 +2605,7 @@ async fn connect_outer_stream(
         .await
         .map_err(|_| "tcp connect timeout".to_string())?
         .map_err(|e| e.to_string())?;
-    let _ = tcp.set_nodelay(true);
+    configure_tcp_stream(&tcp);
 
     if local.reality.enabled() {
         let rcfg = build_reality_client_cfg(&local, &gw_addr, &binding.domain)?;
@@ -2570,6 +2644,7 @@ async fn serve_vless_session(
     bindings: Vec<Binding>,
     sessions: SessionMap,
     linked: Arc<Mutex<HashSet<String>>>,
+    state_notify: Arc<tokio::sync::Notify>,
     logger: TunnelLogger,
     mut conn_stop: watch::Receiver<bool>,
 ) {
@@ -2616,7 +2691,16 @@ async fn serve_vless_session(
     if expected_flow == FLOW_VISION {
         stream = vision::wrap_vision_stream(stream, uuid_bytes, false);
     }
-    serve_established_session(stream, binding, sessions, linked, logger, conn_stop).await;
+    serve_established_session(
+        stream,
+        binding,
+        sessions,
+        linked,
+        state_notify,
+        logger,
+        conn_stop,
+    )
+    .await;
 }
 
 async fn serve_established_session(
@@ -2624,6 +2708,7 @@ async fn serve_established_session(
     binding: Binding,
     sessions: SessionMap,
     linked: Arc<Mutex<HashSet<String>>>,
+    state_notify: Arc<tokio::sync::Notify>,
     logger: TunnelLogger,
     mut conn_stop: watch::Receiver<bool>,
 ) {
@@ -2639,8 +2724,9 @@ async fn serve_established_session(
                 binding.id, binding.client_id
             ),
         );
+        state_notify.notify_waiters();
     }
-    let (tx, mut out_rx) = mpsc::channel::<(u8, u32, Vec<u8>)>(256);
+    let (tx, mut out_rx) = mpsc::channel::<(u8, u32, Vec<u8>)>(1024);
     let streams_map: Arc<Mutex<HashMap<u32, mpsc::Sender<(u8, Vec<u8>)>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let handle = SessionHandle {
@@ -2655,6 +2741,7 @@ async fn serve_established_session(
         .or_default()
         .push(handle.clone());
     let (mut rd, mut wr) = split_tunnel_stream(stream);
+    let (write_done_tx, mut write_done_rx) = watch::channel(false);
     let write_task = tokio::spawn(async move {
         let mut write_buf = Vec::with_capacity(65536);
         while let Some((kind, id, payload)) = out_rx.recv().await {
@@ -2665,24 +2752,43 @@ async fn serve_established_session(
             while write_buf.len() < 65536 {
                 let Ok((k, i, p)) = out_rx.try_recv() else { break };
                 if append_frame(&mut write_buf, k, i, &p).is_err() {
+                    let _ = write_done_tx.send(true);
                     let _ = wr.shutdown().await;
                     return;
                 }
             }
-            if wr.write_all(&write_buf).await.is_err() || wr.flush().await.is_err() {
+            let write_res = tokio::time::timeout(Duration::from_secs(30), async {
+                wr.write_all(&write_buf).await?;
+                wr.flush().await
+            })
+            .await;
+            if !matches!(write_res, Ok(Ok(()))) {
                 break;
             }
         }
+        let _ = write_done_tx.send(true);
         let _ = wr.shutdown().await;
     });
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ping_interval.tick().await;
     loop {
         tokio::select! {
             _ = conn_stop.changed() => break,
-            frame = read_frame(&mut rd) => {
-                let Ok((kind, id, payload)) = frame else { break };
+            _ = write_done_rx.changed() => break,
+            _ = ping_interval.tick() => {
+                let _ = tx.try_send((FRAME_PING, 0, Vec::new()));
+            }
+            frame = tokio::time::timeout(Duration::from_secs(45), read_frame(&mut rd)) => {
+                let Ok(Ok((kind, id, payload))) = frame else { break };
                 match kind {
                     FRAME_PING => {
-                        let _ = tx.send((FRAME_PONG, 0, Vec::new())).await;
+                        if tx.try_send((FRAME_PONG, 0, Vec::new())).is_err() {
+                            let tx_pong = tx.clone();
+                            tokio::spawn(async move {
+                                let _ = tx_pong.send((FRAME_PONG, 0, Vec::new())).await;
+                            });
+                        }
                     }
                     FRAME_PONG => {}
                     FRAME_DATA | FRAME_HALF | FRAME_RESET => {
@@ -2694,7 +2800,7 @@ async fn serve_established_session(
                             let sender = streams_map.lock().unwrap().get(&id).cloned();
                             if let Some(s) = sender {
                                 if tokio::time::timeout(
-                                    Duration::from_secs(10),
+                                    Duration::from_secs(30),
                                     s.send((kind, payload)),
                                 )
                                 .await
@@ -2714,7 +2820,9 @@ async fn serve_established_session(
     write_task.abort();
     drop(tx);
     if remove_session(&sessions, &binding.id, &handle) {
-        linked.lock().unwrap().remove(&binding.id);
+        if linked.lock().unwrap().remove(&binding.id) {
+            state_notify.notify_waiters();
+        }
         log_tunnel(
             &logger,
             "INFO",
@@ -2730,6 +2838,7 @@ fn start_instance(
     s: &Snapshot,
     local: &LocalTLS,
     traffic: Arc<Traffic>,
+    state_notify: Arc<tokio::sync::Notify>,
     logger: TunnelLogger,
 ) -> Result<RunningInstance, String> {
     validate(s, local)?;
@@ -2820,6 +2929,7 @@ fn start_instance(
                             let local_clone = local.clone();
                             let sessions_clone = sessions.clone();
                             let linked_clone = linked.clone();
+                            let notify_clone = state_notify.clone();
                             let logger_clone = logger.clone();
                             let mut rx = stop_rx.clone();
                             let jh = handle.spawn(async move {
@@ -2835,6 +2945,7 @@ fn start_instance(
                                             let local_c = local_clone.clone();
                                             let sessions = sessions_clone.clone();
                                             let linked = linked_clone.clone();
+                                            let notify_c = notify_clone.clone();
                                             let log_c = logger_clone.clone();
                                             let conn_stop = rx.clone();
                                             tokio::spawn(async move {
@@ -2844,7 +2955,7 @@ fn start_instance(
                                                 else {
                                                     return;
                                                 };
-                                                serve_established_session(stream, binding, sessions, linked, log_c, conn_stop).await;
+                                                serve_established_session(stream, binding, sessions, linked, notify_c, log_c, conn_stop).await;
                                             });
                                         }
                                     }
@@ -2862,6 +2973,7 @@ fn start_instance(
                     let bindings = s.bindings.clone();
                     let sessions_clone = sessions.clone();
                     let linked_clone = linked.clone();
+                    let notify_clone = state_notify.clone();
                     let local_clone = local.clone();
                     let tls_acceptor = if !local.reality.enabled()
                         && !local.cert_pem.is_empty()
@@ -2896,10 +3008,11 @@ fn start_instance(
                                         drop(tcp_stream);
                                         continue;
                                     };
-                                    let _ = tcp_stream.set_nodelay(true);
+                                    configure_tcp_stream(&tcp_stream);
                                     let bindings = bindings.clone();
                                     let sessions = sessions_clone.clone();
                                     let linked = linked_clone.clone();
+                                    let notify_c = notify_clone.clone();
                                     let local_c = local_clone.clone();
                                     let tls_acc = tls_acceptor.clone();
                                     let r_cfg = reality_cfg.clone();
@@ -2921,6 +3034,7 @@ fn start_instance(
                                         if let Some(xs) = x_state {
                                             let local_inner = local_c.clone();
                                             let log_inner = log_c.clone();
+                                            let notify_inner = notify_c.clone();
                                             tokio::select! {
                                                 _ = outer_stop.changed() => {}
                                                 _ = xhttp::handle_xhttp_server_conn(
@@ -2931,12 +3045,13 @@ fn start_instance(
                                                         let b = bindings.clone();
                                                         let s = sessions.clone();
                                                         let l = linked.clone();
+                                                        let n = notify_inner.clone();
                                                         let cs = conn_stop.clone();
                                                         let vd = v_dec.clone();
                                                         let lc = local_inner.clone();
                                                         let lg = log_inner.clone();
                                                         tokio::spawn(async move {
-                                                            serve_vless_session(tunnel_stream, lc, vd, b, s, l, lg, cs).await;
+                                                            serve_vless_session(tunnel_stream, lc, vd, b, s, l, n, lg, cs).await;
                                                         });
                                                     },
                                                 ) => {}
@@ -2949,6 +3064,7 @@ fn start_instance(
                                                 bindings,
                                                 sessions,
                                                 linked,
+                                                notify_c,
                                                 log_c,
                                                 conn_stop,
                                             )
@@ -2971,18 +3087,22 @@ fn start_instance(
                     let mut rx = stop_rx.clone();
                     let jh = handle.spawn(async move {
                         let rate_bps = bandwidth_bytes(&m.bandwidth_limit).unwrap_or(0) as u64;
+                        let up_limiter = BandwidthLimiter::new(rate_bps);
+                        let down_limiter = BandwidthLimiter::with_burst_div(rate_bps, 10);
                         let mux_type = m.effective_mux_type().unwrap_or_default();
                         loop {
                             tokio::select! {
                                 _ = rx.changed() => break,
                                 accepted = tokio_ln.accept() => {
                                     let Ok((pub_stream, _)) = accepted else { break };
-                                    let _ = pub_stream.set_nodelay(true);
+                                    configure_tcp_stream(&pub_stream);
                                     let Some(sess) = pick_session(&sessions_clone, &m.binding_id) else { continue };
                                     let Some((stream_id, mut in_rx)) = sess.open_stream() else { continue };
                                     let m_clone = m.clone();
                                     let traffic_conn = traffic_clone.clone();
                                     let mux_t = mux_type.clone();
+                                    let up_lim = up_limiter.clone();
+                                    let down_lim = down_limiter.clone();
                                     tokio::spawn(async move {
                                         let meta = if mux_t.is_empty() {
                                             m_clone.target_host.clone()
@@ -3000,8 +3120,9 @@ fn start_instance(
                                         let tx_up = sess.tx.clone();
                                         let t_up = traffic_conn.clone();
                                         let mid_up = m_clone.id.clone();
-                                        let up_task = tokio::spawn(async move {
-                                            let mut buf = vec![0u8; OPTIMAL_DATA_CHUNK];
+                                        let mut up_task = tokio::spawn(async move {
+                                            let read_cap = up_lim.read_size(OPTIMAL_DATA_CHUNK);
+                                            let mut buf = vec![0u8; read_cap];
                                             loop {
                                                 match pr.read(&mut buf).await {
                                                     Ok(0) => {
@@ -3009,15 +3130,10 @@ fn start_instance(
                                                         break;
                                                     }
                                                     Ok(n) => {
+                                                        up_lim.wait(n).await;
                                                         t_up.add(&mid_up, n, 0);
                                                         if tx_up.send((FRAME_DATA, stream_id, buf[..n].to_vec())).await.is_err() {
                                                             break;
-                                                        }
-                                                        if rate_bps > 0 {
-                                                            let sleep_us = ((n as u64) * 1_000_000) / rate_bps;
-                                                            if sleep_us > 1000 {
-                                                                tokio::time::sleep(Duration::from_micros(sleep_us)).await;
-                                                            }
                                                         }
                                                     }
                                                     Err(_) => {
@@ -3038,12 +3154,7 @@ fn start_instance(
                                                     if pw.write_all(&data).await.is_err() {
                                                         break;
                                                     }
-                                                    if rate_bps > 0 {
-                                                        let sleep_us = ((data.len() as u64) * 1_000_000) / rate_bps;
-                                                        if sleep_us > 1000 {
-                                                            tokio::time::sleep(Duration::from_micros(sleep_us)).await;
-                                                        }
-                                                    }
+                                                    down_lim.wait(data.len()).await;
                                                 }
                                                 FRAME_HALF => {
                                                     half_closed = true;
@@ -3058,7 +3169,19 @@ fn start_instance(
                                             }
                                         }
                                         if half_closed && !remote_reset {
-                                            let _ = tokio::time::timeout(Duration::from_secs(10), up_task).await;
+                                            tokio::select! {
+                                                _ = &mut up_task => {}
+                                                _ = async {
+                                                    while let Some((k, _)) = in_rx.recv().await {
+                                                        if k == FRAME_RESET {
+                                                            break;
+                                                        }
+                                                    }
+                                                } => {
+                                                    remote_reset = true;
+                                                    up_task.abort();
+                                                }
+                                            }
                                         } else {
                                             up_task.abort();
                                         }
@@ -3083,6 +3206,9 @@ fn start_instance(
                     let traffic_clone = traffic.clone();
                     let mut rx = stop_rx.clone();
                     let jh = handle.spawn(async move {
+                        let rate_bps = bandwidth_bytes(&m.bandwidth_limit).unwrap_or(0) as u64;
+                        let up_limiter = BandwidthLimiter::new(rate_bps);
+                        let down_limiter = BandwidthLimiter::with_burst_div(rate_bps, 10);
                         let mut peer_streams: HashMap<SocketAddr, mpsc::Sender<Vec<u8>>> =
                             HashMap::new();
                         let mut buf = vec![0u8; 65535];
@@ -3114,6 +3240,8 @@ fn start_instance(
                                     let m_clone = m.clone();
                                     let udp_reply = udp_sock.clone();
                                     let traffic_down = traffic_clone.clone();
+                                    let up_lim = up_limiter.clone();
+                                    let down_lim = down_limiter.clone();
                                     tokio::spawn(async move {
                                         let meta = format!("{}\0udp\0", m_clone.target_host);
                                         let mut open_payload = Vec::with_capacity(2 + meta.len());
@@ -3126,6 +3254,7 @@ fn start_instance(
                                         let tx_up = sess.tx.clone();
                                         let up_task = tokio::spawn(async move {
                                             while let Some(dg) = pkt_rx.recv().await {
+                                                up_lim.wait(dg.len()).await;
                                                 let xudp = encode_xudp(&dg);
                                                 if tx_up.send((FRAME_DATA, stream_id, xudp)).await.is_err() {
                                                     break;
@@ -3138,6 +3267,7 @@ fn start_instance(
                                                     let raw_dg = decode_xudp(&data);
                                                     traffic_down.add(&m_clone.id, 0, raw_dg.len());
                                                     let _ = udp_reply.send_to(raw_dg, peer_addr).await;
+                                                    down_lim.wait(raw_dg.len()).await;
                                                 }
                                                 _ => break,
                                             }
@@ -3156,6 +3286,14 @@ fn start_instance(
         }
     } else if s.node.role == "client" && !s.bindings.is_empty() {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let mut mapping_limiters: HashMap<String, Arc<BandwidthLimiter>> = HashMap::new();
+            for m in &s.mappings {
+                if m.enabled {
+                    let rate_bps = bandwidth_bytes(&m.bandwidth_limit).unwrap_or(0) as u64;
+                    mapping_limiters.insert(m.id.clone(), BandwidthLimiter::new(rate_bps));
+                }
+            }
+            let mapping_limiters = Arc::new(mapping_limiters);
             for b in &s.bindings {
                 let Some(gw) = s.nodes.iter().find(|n| n.id == b.server_id).cloned() else {
                     continue;
@@ -3183,7 +3321,9 @@ fn start_instance(
                 for worker_idx in 0..pool_count {
                     let b_clone = b.clone();
                     let mappings = s.mappings.clone();
+                    let limiters_clone = mapping_limiters.clone();
                     let linked_clone = linked.clone();
+                    let notify_clone = state_notify.clone();
                     let eps_clone = eps.clone();
                     let cfg_clone = client_cfg.clone();
                     let gw_addr = bound_gw.address.clone();
@@ -3191,7 +3331,7 @@ fn start_instance(
                     let workers_ref = active_workers.clone();
                     let log_c = logger.clone();
                     let mut rx = stop_rx.clone();
-                    handle.spawn(async move {
+                    let jh = handle.spawn(async move {
                         let Ok(uuid_bytes) = parse_uuid(&b_clone.uuid) else { return };
                         let mut ep_cursor = worker_idx;
                         let mut fail_streak = 0u32;
@@ -3219,7 +3359,8 @@ fn start_instance(
                                     let prev_fails = fail_streak;
                                     fail_streak = 0;
                                     let prev_workers = workers_ref.fetch_add(1, Ordering::SeqCst);
-                                    linked_clone.lock().unwrap().insert(b_clone.id.clone());
+                                    let newly_linked =
+                                        linked_clone.lock().unwrap().insert(b_clone.id.clone());
                                     if (worker_idx == 0 && !ever_connected)
                                         || (prev_workers == 0 && prev_fails > 0)
                                     {
@@ -3237,11 +3378,15 @@ fn start_instance(
                                             ),
                                         );
                                     }
-                                let (tx, mut out_rx) = mpsc::channel::<(u8, u32, Vec<u8>)>(256);
+                                    if newly_linked {
+                                        notify_clone.notify_waiters();
+                                    }
+                                let (tx, mut out_rx) = mpsc::channel::<(u8, u32, Vec<u8>)>(1024);
                                 let streams_map: Arc<
                                     Mutex<HashMap<u32, mpsc::Sender<(u8, Vec<u8>)>>>,
                                 > = Arc::new(Mutex::new(HashMap::new()));
                                 let (mut rd, mut wr) = split_tunnel_stream(stream);
+                                let (write_done_tx, mut write_done_rx) = watch::channel(false);
                                 let write_task = tokio::spawn(async move {
                                     let mut write_buf = Vec::with_capacity(65536);
                                     while let Some((kind, id, payload)) = out_rx.recv().await {
@@ -3252,33 +3397,58 @@ fn start_instance(
                                         while write_buf.len() < 65536 {
                                             let Ok((k, i, p)) = out_rx.try_recv() else { break };
                                             if append_frame(&mut write_buf, k, i, &p).is_err() {
+                                                let _ = write_done_tx.send(true);
                                                 let _ = wr.shutdown().await;
                                                 return;
                                             }
                                         }
-                                        if wr.write_all(&write_buf).await.is_err()
-                                            || wr.flush().await.is_err()
-                                        {
+                                        let write_res = tokio::time::timeout(
+                                            Duration::from_secs(30),
+                                            async {
+                                                wr.write_all(&write_buf).await?;
+                                                wr.flush().await
+                                            },
+                                        )
+                                        .await;
+                                        if !matches!(write_res, Ok(Ok(()))) {
                                             break;
                                         }
                                     }
+                                    let _ = write_done_tx.send(true);
                                     let _ = wr.shutdown().await;
                                 });
+                                let mut ping_interval =
+                                    tokio::time::interval(Duration::from_secs(15));
+                                ping_interval.set_missed_tick_behavior(
+                                    tokio::time::MissedTickBehavior::Delay,
+                                );
+                                ping_interval.tick().await;
                                 loop {
                                     tokio::select! {
                                         _ = rx.changed() => break,
-                                        frame = read_frame(&mut rd) => {
-                                            let Ok((kind, id, payload)) = frame else { break };
+                                        _ = write_done_rx.changed() => break,
+                                        _ = ping_interval.tick() => {
+                                            let _ = tx.try_send((FRAME_PING, 0, Vec::new()));
+                                        }
+                                        frame = tokio::time::timeout(Duration::from_secs(45), read_frame(&mut rd)) => {
+                                            let Ok(Ok((kind, id, payload))) = frame else { break };
                                             match kind {
                                                 FRAME_PING => {
-                                                    let _ = tx.send((FRAME_PONG, 0, Vec::new())).await;
+                                                    if tx.try_send((FRAME_PONG, 0, Vec::new())).is_err() {
+                                                        let tx_pong = tx.clone();
+                                                        tokio::spawn(async move {
+                                                            let _ = tx_pong.send((FRAME_PONG, 0, Vec::new())).await;
+                                                        });
+                                                    }
                                                 }
+                                                FRAME_PONG => {}
                                                 FRAME_OPEN => {
                                                     handle_client_frame_open(
                                                         id,
                                                         payload,
                                                         &b_clone,
                                                         &mappings,
+                                                        &limiters_clone,
                                                         &tx,
                                                         &streams_map,
                                                     );
@@ -3292,7 +3462,7 @@ fn start_instance(
                                                         let sender = streams_map.lock().unwrap().get(&id).cloned();
                                                         if let Some(s) = sender {
                                                             if tokio::time::timeout(
-                                                                Duration::from_secs(10),
+                                                                Duration::from_secs(30),
                                                                 s.send((kind, payload)),
                                                             )
                                                             .await
@@ -3312,7 +3482,9 @@ fn start_instance(
                                 write_task.abort();
                                 streams_map.lock().unwrap().clear();
                                 if workers_ref.fetch_sub(1, Ordering::SeqCst) == 1 {
-                                    linked_clone.lock().unwrap().remove(&b_clone.id);
+                                    if linked_clone.lock().unwrap().remove(&b_clone.id) {
+                                        notify_clone.notify_waiters();
+                                    }
                                 }
                                 }
                                 Err(err) => {
@@ -3347,6 +3519,7 @@ fn start_instance(
                             }
                         }
                     });
+                    tasks.push(jh.abort_handle());
                 }
             }
         }
@@ -3494,6 +3667,7 @@ fn handle_client_frame_open(
     payload: Vec<u8>,
     binding: &Binding,
     mappings: &[Mapping],
+    mapping_limiters: &Arc<HashMap<String, Arc<BandwidthLimiter>>>,
     tx: &mpsc::Sender<(u8, u32, Vec<u8>)>,
     streams_map: &Arc<Mutex<HashMap<u32, mpsc::Sender<(u8, Vec<u8>)>>>>,
 ) {
@@ -3518,7 +3692,7 @@ fn handle_client_frame_open(
     let req_mux = parts.next().unwrap_or("");
     let has_meta = raw_meta.contains('\0');
 
-    let authorized = mappings.iter().any(|m| {
+    let matched_mapping = mappings.iter().find(|m| {
         if !m.enabled
             || m.binding_id != binding.id
             || m.target_host != host
@@ -3534,15 +3708,22 @@ fn handle_client_frame_open(
             true
         }
     });
-    if !authorized {
+    let Some(matched_m) = matched_mapping else {
         let tx_c = tx.clone();
         tokio::spawn(async move {
             let _ = tx_c.send((FRAME_RESET, id, Vec::new())).await;
         });
         return;
-    }
+    };
+    let limiter = mapping_limiters
+        .get(&matched_m.id)
+        .cloned()
+        .unwrap_or_else(|| {
+            let rate_bps = bandwidth_bytes(&matched_m.bandwidth_limit).unwrap_or(0) as u64;
+            BandwidthLimiter::new(rate_bps)
+        });
 
-    let (stx, mut srx) = mpsc::channel::<(u8, Vec<u8>)>(256);
+    let (stx, mut srx) = mpsc::channel::<(u8, Vec<u8>)>(64);
     streams_map.lock().unwrap().insert(id, stx);
     let tx_back = tx.clone();
     let streams_done = streams_map.clone();
@@ -3572,11 +3753,13 @@ fn handle_client_frame_open(
             let udp_arc = Arc::new(udp_sock);
             let udp_recv = udp_arc.clone();
             let tx_read = tx_back.clone();
+            let lim_read = limiter.clone();
             let read_target = tokio::spawn(async move {
                 let mut buf = vec![0u8; 65535];
                 while let Ok(Ok(n)) =
                     tokio::time::timeout(Duration::from_secs(30), udp_recv.recv(&mut buf)).await
                 {
+                    lim_read.wait(n).await;
                     let xudp = encode_xudp(&buf[..n]);
                     if tx_read.send((FRAME_DATA, id, xudp)).await.is_err() {
                         break;
@@ -3615,11 +3798,13 @@ fn handle_client_frame_open(
                 let _ = tx_back.send((FRAME_RESET, id, Vec::new())).await;
                 return;
             };
-            let _ = target_stream.set_nodelay(true);
+            configure_tcp_stream(&target_stream);
             let (mut tr, mut tw) = target_stream.into_split();
             let tx_read = tx_back.clone();
-            let read_target = tokio::spawn(async move {
-                let mut buf = vec![0u8; OPTIMAL_DATA_CHUNK];
+            let lim_read = limiter.clone();
+            let mut read_target = tokio::spawn(async move {
+                let read_cap = lim_read.read_size(OPTIMAL_DATA_CHUNK);
+                let mut buf = vec![0u8; read_cap];
                 loop {
                     match tr.read(&mut buf).await {
                         Ok(0) => {
@@ -3627,6 +3812,7 @@ fn handle_client_frame_open(
                             break;
                         }
                         Ok(n) => {
+                            lim_read.wait(n).await;
                             if tx_read.send((FRAME_DATA, id, buf[..n].to_vec())).await.is_err() {
                                 break;
                             }
@@ -3660,7 +3846,19 @@ fn handle_client_frame_open(
                 }
             }
             if half_closed && !peer_reset {
-                let _ = tokio::time::timeout(Duration::from_secs(10), read_target).await;
+                tokio::select! {
+                    _ = &mut read_target => {}
+                    _ = async {
+                        while let Some((k, _)) = srx.recv().await {
+                            if k == FRAME_RESET {
+                                break;
+                            }
+                        }
+                    } => {
+                        peer_reset = true;
+                        read_target.abort();
+                    }
+                }
             } else {
                 read_target.abort();
             }
@@ -3686,6 +3884,7 @@ struct RuntimeState {
 pub struct Runtime {
     state: Mutex<RuntimeState>,
     traffic: Arc<Traffic>,
+    state_notify: Arc<tokio::sync::Notify>,
     logger: Mutex<TunnelLogger>,
 }
 
@@ -3703,6 +3902,7 @@ impl Runtime {
                 closed: false,
             }),
             traffic: Arc::new(Traffic::new()),
+            state_notify: Arc::new(tokio::sync::Notify::new()),
             logger: Mutex::new(None),
         }
     }
@@ -3713,6 +3913,10 @@ impl Runtime {
 
     pub fn traffic(&self) -> Arc<Traffic> {
         self.traffic.clone()
+    }
+
+    pub async fn state_notified(&self) {
+        self.state_notify.notified().await;
     }
 
     pub fn linked_bindings(&self) -> Vec<String> {
@@ -3774,7 +3978,13 @@ impl Runtime {
         let logger = self.logger.lock().unwrap().clone();
         self.traffic
             .prepare_active(&s.mappings, s.node.role == "server");
-        match start_instance(&s, &effective, self.traffic.clone(), logger.clone()) {
+        match start_instance(
+            &s,
+            &effective,
+            self.traffic.clone(),
+            self.state_notify.clone(),
+            logger.clone(),
+        ) {
             Ok(instance) => {
                 self.traffic
                     .set_active(&s.mappings, s.node.role == "server");
@@ -3784,6 +3994,7 @@ impl Runtime {
                 g.document = document;
                 g.revision = s.revision;
                 g.high_water = s.revision;
+                self.state_notify.notify_waiters();
                 Ok(())
             }
             Err(err) => {
@@ -3793,7 +4004,13 @@ impl Runtime {
                 }
                 if let Some(good) = g.good.clone() {
                     let good_local = g.good_local.clone();
-                    match start_instance(&good, &good_local, self.traffic.clone(), logger) {
+                    match start_instance(
+                        &good,
+                        &good_local,
+                        self.traffic.clone(),
+                        self.state_notify.clone(),
+                        logger,
+                    ) {
                         Ok(restored) => {
                             self.traffic
                                 .set_active(&good.mappings, good.node.role == "server");

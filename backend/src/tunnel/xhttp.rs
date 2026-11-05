@@ -1,7 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -28,13 +28,14 @@ pub fn is_valid_xhttp_sid(sid: &str) -> bool {
 
 pub struct XhttpServerState {
     sessions: Mutex<HashMap<String, Arc<XhttpSession>>>,
+    epoch: Instant,
 }
 
 struct XhttpSession {
     up_tx: mpsc::Sender<SessionPacket>,
     dn_rx: tokio::sync::Mutex<Option<tokio::io::ReadHalf<DuplexStream>>>,
     dn_taken: AtomicBool,
-    created_at: Instant,
+    last_active_ms: AtomicU64,
 }
 
 enum SessionPacket {
@@ -43,10 +44,18 @@ enum SessionPacket {
     Eof,
 }
 
+impl XhttpSession {
+    fn touch(&self, epoch: &Instant) {
+        let ms = epoch.elapsed().as_millis() as u64;
+        self.last_active_ms.store(ms, Ordering::Relaxed);
+    }
+}
+
 impl XhttpServerState {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
+            epoch: Instant::now(),
         })
     }
 
@@ -61,29 +70,30 @@ impl XhttpServerState {
         if !is_valid_xhttp_sid(sid) {
             return None;
         }
-        let now = Instant::now();
+        let now_ms = self.epoch.elapsed().as_millis() as u64;
         let mut map = self.sessions.lock();
         if map.len() >= 256 {
             map.retain(|_, s| {
-                let max_age = if s.dn_taken.load(Ordering::Relaxed) {
-                    Duration::from_secs(120)
+                let max_idle_ms = if s.dn_taken.load(Ordering::Relaxed) {
+                    120_000
                 } else {
-                    Duration::from_secs(15)
+                    15_000
                 };
-                now.duration_since(s.created_at) < max_age
+                now_ms.saturating_sub(s.last_active_ms.load(Ordering::Relaxed)) < max_idle_ms
             });
         }
         if let Some(existing) = map.get(sid) {
+            existing.touch(&self.epoch);
             return Some(existing.clone());
         }
         if map.len() >= MAX_XHTTP_SESSIONS {
             map.retain(|_, s| {
-                let max_age = if s.dn_taken.load(Ordering::Relaxed) {
-                    Duration::from_secs(120)
+                let max_idle_ms = if s.dn_taken.load(Ordering::Relaxed) {
+                    120_000
                 } else {
-                    Duration::from_secs(15)
+                    15_000
                 };
-                now.duration_since(s.created_at) < max_age
+                now_ms.saturating_sub(s.last_active_ms.load(Ordering::Relaxed)) < max_idle_ms
             });
             if map.len() >= MAX_XHTTP_SESSIONS {
                 return None;
@@ -148,7 +158,7 @@ impl XhttpServerState {
             up_tx,
             dn_rx: tokio::sync::Mutex::new(Some(dn_read)),
             dn_taken: AtomicBool::new(false),
-            created_at: now,
+            last_active_ms: AtomicU64::new(now_ms),
         });
         map.insert(sid.to_string(), sess.clone());
         drop(map);
@@ -218,7 +228,7 @@ pub async fn handle_xhttp_server_conn<F>(
 
     loop {
         let req = match tokio::time::timeout(
-            Duration::from_secs(15),
+            Duration::from_secs(60),
             read_http_request_head(&mut rd, &mut read_buf, max_header_bytes),
         )
         .await
@@ -300,6 +310,7 @@ pub async fn handle_xhttp_server_conn<F>(
                         break;
                     }
                     Ok(n) => {
+                        sess.touch(&state.epoch);
                         if write_http_chunk(&mut wr, &chunk_buf[..n], &mut scratch)
                             .await
                             .is_err()
@@ -330,6 +341,7 @@ pub async fn handle_xhttp_server_conn<F>(
             };
             if req.chunked {
                 while let Ok(Some(chunk)) = read_http_chunk(&mut rd, &mut read_buf).await {
+                    sess.touch(&state.epoch);
                     if sess.up_tx.send(SessionPacket::StreamData(chunk)).await.is_err() {
                         break;
                     }
@@ -338,6 +350,7 @@ pub async fn handle_xhttp_server_conn<F>(
                 if let Ok(body) =
                     read_exact_with_buf(&mut rd, &mut read_buf, req.content_length).await
                 {
+                    sess.touch(&state.epoch);
                     let _ = sess.up_tx.send(SessionPacket::StreamData(body)).await;
                 }
             }
@@ -403,6 +416,7 @@ pub async fn handle_xhttp_server_conn<F>(
             if body.is_empty() {
                 let _ = sess.up_tx.send(SessionPacket::Eof).await;
             } else {
+                sess.touch(&state.epoch);
                 if sess.up_tx.send(SessionPacket::SeqData(seq, body)).await.is_err() {
                     break;
                 }
@@ -530,6 +544,7 @@ where
     }
 
     // packet-up mode
+    let connect_transport = Arc::new(connect_transport);
     let up_conn = connect_transport(up_addr, local.clone(), binding.clone()).await?;
     let (mut up_rd, mut up_wr) = tokio::io::split(up_conn);
 
@@ -544,99 +559,162 @@ where
     };
     let min_interval_ms = local.xhttp.min_posts_interval_ms.max(0) as u64;
     let ep_clone = local.clone();
-
-    let inflight = Arc::new(tokio::sync::Semaphore::new(16));
-    let inflight_ack = inflight.clone();
-    let up_ack_task = tokio::spawn(async move {
-        let mut up_resp_buf = Vec::with_capacity(4096);
-        while let Ok(200) = read_http_response_head(&mut up_rd, &mut up_resp_buf).await {
-            inflight_ack.add_permits(1);
-        }
-        inflight_ack.close();
-    });
+    let binding_clone = binding.clone();
+    let connect_up = Arc::clone(&connect_transport);
+    let (write_failed_tx, mut write_failed_rx) = tokio::sync::watch::channel(false);
 
     let write_task = tokio::spawn(async move {
         use std::io::Write as _;
-        let _ack_guard = up_ack_task;
         let mut seq = 0u64;
         let mut buf = vec![0u8; max_post_size];
         let mut post_buf = Vec::with_capacity(max_post_size + 1024);
+        let mut up_resp_buf = Vec::with_capacity(4096);
+        let mut unacked: VecDeque<(u64, Vec<u8>)> = VecDeque::with_capacity(8);
+        let mut peer_eof = false;
+
+        let format_post = |post_buf: &mut Vec<u8>, pkt_seq: u64, data: &[u8]| {
+            let post_path = if up_base == "/" {
+                format!("/{}/{}", sid, pkt_seq)
+            } else {
+                format!("{}/{}/{}", up_base, sid, pkt_seq)
+            };
+            let pad_s =
+                random_xhttp_padding(ep_clone.xhttp.padding_bytes, ep_clone.xhttp.padding_max_bytes);
+            post_buf.clear();
+            if data.is_empty() {
+                let _ = write!(
+                    post_buf,
+                    "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\nConnection: keep-alive\r\nX-Padding: {}\r\n\r\n",
+                    post_path, up_host, pad_s
+                );
+            } else {
+                let _ = write!(
+                    post_buf,
+                    "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\nX-Padding: {}\r\n\r\n",
+                    post_path, up_host, data.len(), pad_s
+                );
+                post_buf.extend_from_slice(data);
+            }
+        };
+
         loop {
-            match peer_rd.read(&mut buf).await {
-                Ok(0) => {
-                    let Ok(permit) = inflight.acquire().await else {
-                        break;
-                    };
-                    permit.forget();
-                    let post_path = if up_base == "/" {
-                        format!("/{}/{}", sid, seq)
-                    } else {
-                        format!("{}/{}/{}", up_base, sid, seq)
-                    };
-                    let pad_s =
-                        random_xhttp_padding(ep_clone.xhttp.padding_bytes, ep_clone.xhttp.padding_max_bytes);
-                    let hdr = format!(
-                        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\nConnection: keep-alive\r\nX-Padding: {}\r\n\r\n",
-                        post_path, up_host, pad_s
-                    );
-                    let _ = up_wr.write_all(hdr.as_bytes()).await;
-                    let _ = up_wr.flush().await;
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(5),
-                        inflight.acquire_many(16),
-                    )
-                    .await;
+            if peer_eof && unacked.is_empty() {
+                break;
+            }
+            let mut need_reconnect = false;
+            tokio::select! {
+                read_res = peer_rd.read(&mut buf), if !peer_eof && unacked.len() < 8 => {
+                    match read_res {
+                        Ok(0) => {
+                            peer_eof = true;
+                            let pkt_seq = seq;
+                            seq += 1;
+                            unacked.push_back((pkt_seq, Vec::new()));
+                            format_post(&mut post_buf, pkt_seq, &[]);
+                            if up_wr.write_all(&post_buf).await.is_err()
+                                || up_wr.flush().await.is_err()
+                            {
+                                need_reconnect = true;
+                            }
+                        }
+                        Ok(n) => {
+                            let pkt_seq = seq;
+                            seq += 1;
+                            let payload = buf[..n].to_vec();
+                            format_post(&mut post_buf, pkt_seq, &payload);
+                            unacked.push_back((pkt_seq, payload));
+                            if up_wr.write_all(&post_buf).await.is_err()
+                                || up_wr.flush().await.is_err()
+                            {
+                                need_reconnect = true;
+                            } else if min_interval_ms > 0 {
+                                tokio::time::sleep(Duration::from_millis(min_interval_ms)).await;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                resp_res = read_http_response_head(&mut up_rd, &mut up_resp_buf), if !unacked.is_empty() => {
+                    match resp_res {
+                        Ok(200) => {
+                            unacked.pop_front();
+                        }
+                        _ => {
+                            need_reconnect = true;
+                        }
+                    }
+                }
+            }
+
+            if need_reconnect {
+                let mut reconnected = false;
+                for _ in 0..3 {
+                    if let Ok(new_conn) =
+                        connect_up(up_addr, ep_clone.clone(), binding_clone.clone()).await
+                    {
+                        let (new_rd, mut new_wr) = tokio::io::split(new_conn);
+                        let mut replay_ok = true;
+                        for (pkt_seq, payload) in &unacked {
+                            format_post(&mut post_buf, *pkt_seq, payload);
+                            if new_wr.write_all(&post_buf).await.is_err()
+                                || new_wr.flush().await.is_err()
+                            {
+                                replay_ok = false;
+                                break;
+                            }
+                        }
+                        if replay_ok {
+                            up_rd = new_rd;
+                            up_wr = new_wr;
+                            up_resp_buf.clear();
+                            reconnected = true;
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                if !reconnected {
                     break;
                 }
-                Ok(n) => {
-                    let Ok(permit) = inflight.acquire().await else {
-                        break;
-                    };
-                    permit.forget();
-                    let post_path = if up_base == "/" {
-                        format!("/{}/{}", sid, seq)
-                    } else {
-                        format!("{}/{}/{}", up_base, sid, seq)
-                    };
-                    seq += 1;
-                    let pad_s =
-                        random_xhttp_padding(ep_clone.xhttp.padding_bytes, ep_clone.xhttp.padding_max_bytes);
-                    post_buf.clear();
-                    let _ = write!(
-                        &mut post_buf,
-                        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\nX-Padding: {}\r\n\r\n",
-                        post_path, up_host, n, pad_s
-                    );
-                    post_buf.extend_from_slice(&buf[..n]);
-                    if up_wr.write_all(&post_buf).await.is_err() {
-                        break;
-                    }
-                    if up_wr.flush().await.is_err() {
-                        break;
-                    }
-                    if min_interval_ms > 0 {
-                        tokio::time::sleep(Duration::from_millis(min_interval_ms)).await;
-                    }
-                }
-                Err(_) => break,
             }
         }
+        if !peer_eof {
+            let _ = write_failed_tx.send(true);
+        }
+        let _ = up_wr.shutdown().await;
     });
 
+    let write_abort = write_task.abort_handle();
     let read_task = tokio::spawn(async move {
         let _keep_dn_wr = dn_wr;
         match read_http_response_head(&mut dn_rd, &mut dn_buf).await {
             Ok(200) => {}
             _ => {
+                write_abort.abort();
                 let _ = peer_wr.shutdown().await;
                 return;
             }
         }
-        while let Ok(Some(chunk)) = read_http_chunk(&mut dn_rd, &mut dn_buf).await {
-            if peer_wr.write_all(&chunk).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                _ = write_failed_rx.changed() => {
+                    if *write_failed_rx.borrow() {
+                        break;
+                    }
+                }
+                chunk_res = read_http_chunk(&mut dn_rd, &mut dn_buf) => {
+                    match chunk_res {
+                        Ok(Some(chunk)) => {
+                            if peer_wr.write_all(&chunk).await.is_err() {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
             }
         }
+        write_abort.abort();
         let _ = peer_wr.shutdown().await;
     });
 
@@ -653,13 +731,16 @@ where
 {
     let (local_stream, peer_stream) = tokio::io::duplex(256 * 1024);
     let (mut peer_rd, mut peer_wr) = tokio::io::split(peer_stream);
+    let (write_failed_tx, mut write_failed_rx) = tokio::sync::watch::channel(false);
 
     let write_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 65520];
         let mut scratch = Vec::with_capacity(65536);
+        let mut clean_eof = false;
         loop {
             match peer_rd.read(&mut buf).await {
                 Ok(0) => {
+                    clean_eof = true;
                     let _ = wr.write_all(b"0\r\n\r\n").await;
                     let _ = wr.flush().await;
                     break;
@@ -675,14 +756,34 @@ where
                 Err(_) => break,
             }
         }
+        if !clean_eof {
+            let _ = write_failed_tx.send(true);
+        }
+        let _ = wr.shutdown().await;
     });
 
+    let write_abort = write_task.abort_handle();
     let read_task = tokio::spawn(async move {
-        while let Ok(Some(chunk)) = read_http_chunk(&mut rd, &mut read_buf).await {
-            if peer_wr.write_all(&chunk).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                _ = write_failed_rx.changed() => {
+                    if *write_failed_rx.borrow() {
+                        break;
+                    }
+                }
+                chunk_res = read_http_chunk(&mut rd, &mut read_buf) => {
+                    match chunk_res {
+                        Ok(Some(chunk)) => {
+                            if peer_wr.write_all(&chunk).await.is_err() {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
             }
         }
+        write_abort.abort();
         let _ = peer_wr.shutdown().await;
     });
 
