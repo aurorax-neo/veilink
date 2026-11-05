@@ -61,7 +61,7 @@ jobs:
             rust_target: x86_64-unknown-linux-musl
           - goos: linux
             goarch: arm64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04-arm
             rust_target: aarch64-unknown-linux-musl
           - goos: darwin
             goarch: amd64
@@ -88,7 +88,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+          sudo apt-get install -y musl-tools
       - name: Download frontend artifact
         uses: actions/download-artifact@v4
         with:
@@ -112,10 +112,10 @@ jobs:
           if [[ "$GOOS" == "windows" ]]; then
             suffix=".exe"
           fi
-          if [[ "$RUST_TARGET" == "aarch64-unknown-linux-musl" ]]; then
+          if [[ "$RUST_TARGET" == "aarch64-unknown-linux-musl" ]] && ! command -v aarch64-linux-musl-gcc >/dev/null 2>&1; then
             export CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc
             export AR_aarch64_unknown_linux_musl=aarch64-linux-gnu-ar
-            export CFLAGS_aarch64_unknown_linux_musl="-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -D_POSIX_C_SOURCE=200809L -std=c11"
+            export CFLAGS_aarch64_unknown_linux_musl="-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -DSQLITE_DISABLE_LFS"
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
           fi
           rm -rf ../release-pkg ../release-packages
