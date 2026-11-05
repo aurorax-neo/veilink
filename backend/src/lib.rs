@@ -534,4 +534,232 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(3), srv_handle).await;
         let _ = tokio::time::timeout(Duration::from_secs(3), cli_handle).await;
     }
+
+    #[tokio::test]
+    async fn test_https_h2_control_and_multi_node_logs_preserved() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("master.db").to_string_lossy().into_owned();
+        let key = dir.path().join("master.key").to_string_lossy().into_owned();
+
+        // Generate a self-signed TLS certificate for localhost
+        let cert = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .unwrap();
+        let cert_path = dir.path().join("master.crt");
+        let key_path = dir.path().join("master.key.pem");
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+
+        let srv_tunnel_port = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap().port() as i64
+        };
+        let emb_tunnel_port = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap().port() as i64
+        };
+        let public_port = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap().port() as i64
+        };
+        let master_port = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let master_addr = format!("127.0.0.1:{}", master_port);
+
+        let store = Store::open(&db, &key).unwrap();
+        let ks = KeyStore::new(store.db());
+        ks.migrate().unwrap();
+        let admin_key = ks.create("admin", ROLE_ADMIN).unwrap();
+
+        let (dec_e2e, _, _, _) = tunnel::generate_vless_enc().unwrap();
+        store
+            .save_node(Node {
+                id: "srv-https".into(),
+                name: "Server HTTPS".into(),
+                role: "server".into(),
+                address: "127.0.0.1".into(),
+                port: srv_tunnel_port,
+                tunnel: LocalTLS {
+                    transport_security: "plain".into(),
+                    decryption: dec_e2e,
+                    listen_port: srv_tunnel_port,
+                    ..Default::default()
+                },
+                connect_endpoints: vec![ConnectEndpoint {
+                    id: "ep1".into(),
+                    name: "local".into(),
+                    host: "127.0.0.1".into(),
+                    port: srv_tunnel_port,
+                    enabled: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .save_node(Node {
+                id: "cli-https".into(),
+                name: "Client HTTPS".into(),
+                role: "client".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .save_mapping(Mapping {
+                id: "map-https".into(),
+                name: "HTTPS Mapping".into(),
+                server_id: "srv-https".into(),
+                client_id: "cli-https".into(),
+                connect_endpoint_id: "ep1".into(),
+                listen_host: "127.0.0.1".into(),
+                listen_port: public_port,
+                target_host: "127.0.0.1".into(),
+                target_port: 9,
+                network: "tcp".into(),
+                pool: 1,
+                enabled: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let srv_token = store
+            .enroll_token("srv-https", Duration::from_secs(300))
+            .unwrap();
+        let cli_token = store
+            .enroll_token("cli-https", Duration::from_secs(300))
+            .unwrap();
+        drop(store);
+
+        let cancel = CancellationToken::new();
+        let mut master_cfg = Config {
+            listen_addr: master_addr.clone(),
+            scheme: "https".into(),
+            cert_file: cert_path.to_string_lossy().into_owned(),
+            key_file: key_path.to_string_lossy().into_owned(),
+            control_ca: cert_path.to_string_lossy().into_owned(),
+            control_server_name: "localhost".into(),
+            database: db.clone(),
+            deployment_key: key.clone(),
+            state_dir: dir.path().join("master-state").to_string_lossy().into_owned(),
+            ..config::defaults()
+        };
+        master_cfg.embedded_server.port = emb_tunnel_port;
+
+        let master_cancel = cancel.child_token();
+        let master_handle = tokio::spawn(async move {
+            master::run(master_cancel, master_cfg).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let srv_cfg = Config {
+            master_addr: master_addr.clone(),
+            control_ca: cert_path.to_string_lossy().into_owned(),
+            control_server_name: "localhost".into(),
+            node_id: "srv-https".into(),
+            enroll_token: srv_token,
+            state_dir: dir.path().join("srv-state").to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let srv_cancel = cancel.child_token();
+        let srv_handle = tokio::spawn(async move {
+            let _ = node::run(srv_cancel, srv_cfg, "server").await;
+        });
+
+        let cli_cfg = Config {
+            master_addr: master_addr.clone(),
+            control_ca: cert_path.to_string_lossy().into_owned(),
+            control_server_name: "localhost".into(),
+            node_id: "cli-https".into(),
+            enroll_token: cli_token,
+            state_dir: dir.path().join("cli-state").to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let cli_cancel = cancel.child_token();
+        let cli_handle = tokio::spawn(async move {
+            let _ = node::run(cli_cancel, cli_cfg, "client").await;
+        });
+
+        // Wait across an embedded heartbeat interval (>2.2s) to ensure embedded default
+        // node does not drain or overwrite srv-https / cli-https / master logs.
+        tokio::time::sleep(Duration::from_millis(2400)).await;
+
+        let probe_client = node::HttpControlClient::new(&Config {
+            master_addr: master_addr.clone(),
+            control_ca: cert_path.to_string_lossy().into_owned(),
+            control_server_name: "localhost".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        // Verify we can also query /api/v1/logs via HTTPS using rustls + hyper
+        let mut root_store = rustls::RootCertStore::empty();
+        let cert_pem = cert.cert.pem();
+        let mut reader = std::io::BufReader::new(cert_pem.as_bytes());
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut reader).map(|r| r.unwrap()).collect();
+        root_store.add_parsable_certificates(certs);
+        let mut tls_cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        tls_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_cfg));
+        let tcp = tokio::net::TcpStream::connect(&master_addr).await.unwrap();
+        let sni = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
+        let tls = connector.connect(sni, tcp).await.unwrap();
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+        let (mut sender, conn) =
+            hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .handshake(hyper_util::rt::TokioIo::new(tls))
+                .await
+                .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("https://localhost:{}/api/v1/logs?limit=200", master_port))
+            .header("Authorization", format!("Bearer {}", admin_key))
+            .body(http_body_util::Full::new(bytes::Bytes::new()))
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        use http_body_util::BodyExt as _;
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let entries: Vec<crate::logring::Entry> = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert!(
+            entries.iter().any(|e| e.source == "master"),
+            "master logs should be preserved: {:?}",
+            entries
+        );
+        assert!(
+            entries.iter().any(|e| e.node_id == "srv-https"),
+            "srv-https logs should be preserved: {:?}",
+            entries
+        );
+        assert!(
+            entries.iter().any(|e| e.node_id == "cli-https"),
+            "cli-https logs should be preserved: {:?}",
+            entries
+        );
+        assert!(
+            entries.iter().any(|e| e.node_id == "srv-https" && e.message.contains("server tunnel session established")),
+            "server tunnel session log should be recorded: {:?}",
+            entries
+        );
+        assert!(
+            entries.iter().any(|e| e.node_id == "cli-https" && e.message.contains("client tunnel connected")),
+            "client tunnel connected log should be recorded: {:?}",
+            entries
+        );
+        drop(probe_client);
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(3), master_handle).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), srv_handle).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), cli_handle).await;
+    }
 }

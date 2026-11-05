@@ -13,6 +13,7 @@ fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
 fn set_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
 }
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -21,7 +22,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rand::{Rng, RngCore};
 use rustls::pki_types::{CertificateDer, ServerName};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -122,15 +123,36 @@ pub fn configuration_quiesced(snap: Option<&Snapshot>) -> bool {
     !s.mappings.iter().any(|m| m.enabled)
 }
 
+enum PooledConn {
+    Http1(hyper::client::conn::http1::SendRequest<Full<Bytes>>),
+    Http2(hyper::client::conn::http2::SendRequest<Full<Bytes>>),
+}
+
+impl PooledConn {
+    async fn ready(&mut self) -> Result<(), ControlError> {
+        match self {
+            PooledConn::Http1(s) => s
+                .ready()
+                .await
+                .map_err(|e| ControlError::Transport(e.to_string())),
+            PooledConn::Http2(s) => s
+                .ready()
+                .await
+                .map_err(|e| ControlError::Transport(e.to_string())),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct HttpControlClient {
-    #[allow(dead_code)]
     scheme: String,
     connect_addr: String,
     host_header: String,
     server_name: String,
     base_path: String,
     tls_config: Option<Arc<rustls::ClientConfig>>,
+    tls_config_h1: Option<Arc<rustls::ClientConfig>>,
+    conn_pool: Arc<tokio::sync::Mutex<Option<PooledConn>>>,
 }
 
 impl HttpControlClient {
@@ -167,11 +189,26 @@ impl HttpControlClient {
                 } else {
                     "https".to_string()
                 };
-                let host_only = split_host(raw);
+                let (host_only, port_only) = split_host_port_opt(raw);
+                let host_hdr = if !c.control_server_name.is_empty() {
+                    let sni_host = c.control_server_name.trim();
+                    match port_only.as_deref() {
+                        Some(p) if !p.is_empty() && p != "443" && p != "80" => {
+                            if sni_host.contains(':') && !sni_host.starts_with('[') {
+                                format!("[{}]:{}", sni_host, p)
+                            } else {
+                                format!("{}:{}", sni_host, p)
+                            }
+                        }
+                        _ => sni_host.to_string(),
+                    }
+                } else {
+                    raw.to_string()
+                };
                 (
                     sch,
                     raw.to_string(),
-                    raw.to_string(),
+                    host_hdr,
                     host_only,
                     String::new(),
                 )
@@ -183,7 +220,7 @@ impl HttpControlClient {
             default_sni
         };
 
-        let tls_config = if scheme == "https" {
+        let (tls_config, tls_config_h1) = if scheme == "https" {
             let mut root_store = rustls::RootCertStore::empty();
             if !c.control_ca.is_empty() {
                 let pem_bytes =
@@ -201,13 +238,31 @@ impl HttpControlClient {
                 }
             } else {
                 root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                for sys_ca in ["/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem"] {
+                    if let Ok(pem_bytes) = fs::read(sys_ca) {
+                        let mut reader = std::io::BufReader::new(&pem_bytes[..]);
+                        let certs: Vec<CertificateDer<'static>> =
+                            rustls_pemfile::certs(&mut reader)
+                                .filter_map(Result::ok)
+                                .collect();
+                        if !certs.is_empty() {
+                            let _ = root_store.add_parsable_certificates(certs);
+                        }
+                    }
+                }
             }
-            let cfg = rustls::ClientConfig::builder()
+            let mut cfg_h2 = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store.clone())
+                .with_no_client_auth();
+            cfg_h2.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+            let mut cfg_h1 = rustls::ClientConfig::builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth();
-            Some(Arc::new(cfg))
+            cfg_h1.alpn_protocols = vec![b"http/1.1".to_vec()];
+            (Some(Arc::new(cfg_h2)), Some(Arc::new(cfg_h1)))
         } else {
-            None
+            (None, None)
         };
 
         Ok(Self {
@@ -217,6 +272,8 @@ impl HttpControlClient {
             server_name,
             base_path,
             tls_config,
+            tls_config_h1,
+            conn_pool: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -240,32 +297,59 @@ impl HttpControlClient {
         };
 
         let fut = async {
-            let tcp = TcpStream::connect(&self.connect_addr)
-                .await
-                .map_err(|e| ControlError::Transport(e.to_string()))?;
-            let _ = tcp.set_nodelay(true);
+            let mut pool_guard = self.conn_pool.lock().await;
+            let mut outcome = None;
 
-            let req = Request::builder()
-                .method("POST")
-                .uri(&full_path)
-                .header("Host", &self.host_header)
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
-                .header("Content-Length", body_bytes.len().to_string())
-                .body(Full::new(Bytes::from(body_bytes)))
-                .map_err(|e| ControlError::Transport(e.to_string()))?;
+            if let Some(mut pooled) = pool_guard.take() {
+                if pooled.ready().await.is_ok() {
+                    if let Ok(res) = self
+                        .send_on_conn(&mut pooled, &full_path, &body_bytes)
+                        .await
+                    {
+                        *pool_guard = Some(pooled);
+                        outcome = Some(res);
+                    }
+                }
+            }
 
-            let (status, auth_rejected, resp_bytes) = if let Some(ref tls_cfg) = self.tls_config {
-                let connector = TlsConnector::from(Arc::clone(tls_cfg));
-                let sni = ServerName::try_from(self.server_name.clone())
-                    .map_err(|_| ControlError::Transport("invalid control server name".to_string()))?;
-                let tls_stream = connector
-                    .connect(sni, tcp)
-                    .await
-                    .map_err(|e| ControlError::Transport(e.to_string()))?;
-                send_http1_request(tls_stream, req).await?
-            } else {
-                send_http1_request(tcp, req).await?
+            let (status, auth_rejected, resp_bytes) = match outcome {
+                Some(res) => res,
+                None => {
+                    let mut last_err =
+                        ControlError::Transport("control connection failed".to_string());
+                    let mut connected_res = None;
+                    for attempt in 0..3 {
+                        let force_h1 = attempt == 2;
+                        match self.open_pooled_conn(force_h1).await {
+                            Ok(mut pooled) => {
+                                match self
+                                    .send_on_conn(&mut pooled, &full_path, &body_bytes)
+                                    .await
+                                {
+                                    Ok(res) => {
+                                        *pool_guard = Some(pooled);
+                                        connected_res = Some(res);
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        last_err = e;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                last_err = e;
+                            }
+                        }
+                        if attempt + 1 < 3 {
+                            tokio::time::sleep(Duration::from_millis(150 * (attempt as u64 + 1)))
+                                .await;
+                        }
+                    }
+                    match connected_res {
+                        Some(res) => res,
+                        None => return Err(last_err),
+                    }
+                }
             };
 
             match status.as_u16() {
@@ -283,40 +367,155 @@ impl HttpControlClient {
             .await
             .map_err(|_| ControlError::Transport("request timeout".to_string()))?
     }
-}
 
-async fn send_http1_request<S>(
-    stream: S,
-    req: Request<Full<Bytes>>,
-) -> Result<(hyper::StatusCode, bool, Vec<u8>), ControlError>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let io = TokioIo::new(stream);
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-        .await
-        .map_err(|e| ControlError::Transport(e.to_string()))?;
-    let conn_task = tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    let res = sender
-        .send_request(req)
-        .await
-        .map_err(|e| ControlError::Transport(e.to_string()))?;
-    let status = res.status();
-    let auth_rejected = res
-        .headers()
-        .get("x-veilink-auth-rejected")
-        .and_then(|v| v.to_str().ok())
-        == Some("1");
-    let limited = http_body_util::Limited::new(res.into_body(), 4 << 20);
-    let collected = limited
-        .collect()
-        .await
-        .map_err(|e| ControlError::Transport(e.to_string()))?
-        .to_bytes();
-    conn_task.abort();
-    Ok((status, auth_rejected, collected.to_vec()))
+    async fn connect_tcp(&self) -> Result<TcpStream, ControlError> {
+        let mut addrs: Vec<SocketAddr> = if let Ok(sa) = self.connect_addr.parse::<SocketAddr>() {
+            vec![sa]
+        } else {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::net::lookup_host(&self.connect_addr),
+            )
+            .await
+            .map_err(|_| ControlError::Transport("dns lookup timeout".to_string()))?
+            .map_err(|e| ControlError::Transport(e.to_string()))?
+            .collect()
+        };
+        if addrs.is_empty() {
+            return Err(ControlError::Transport(
+                "no resolved control addresses".to_string(),
+            ));
+        }
+        addrs.sort_by_key(|a| if a.is_ipv4() { 0 } else { 1 });
+        let mut last_err = None;
+        for addr in addrs {
+            match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr)).await {
+                Ok(Ok(tcp)) => {
+                    let _ = tcp.set_nodelay(true);
+                    let sock_ref = socket2::SockRef::from(&tcp);
+                    let ka = socket2::TcpKeepalive::new()
+                        .with_time(Duration::from_secs(30))
+                        .with_interval(Duration::from_secs(10));
+                    let _ = sock_ref.set_tcp_keepalive(&ka);
+                    return Ok(tcp);
+                }
+                Ok(Err(e)) => last_err = Some(ControlError::Transport(e.to_string())),
+                Err(_) => {
+                    last_err = Some(ControlError::Transport("tcp connect timeout".to_string()))
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| ControlError::Transport("tcp connect failed".to_string())))
+    }
+
+    async fn open_pooled_conn(&self, force_h1: bool) -> Result<PooledConn, ControlError> {
+        let tcp = self.connect_tcp().await?;
+        let tls_opt = if force_h1 {
+            self.tls_config_h1.as_ref().or(self.tls_config.as_ref())
+        } else {
+            self.tls_config.as_ref()
+        };
+        if let Some(tls_cfg) = tls_opt {
+            let connector = TlsConnector::from(Arc::clone(tls_cfg));
+            let sni = ServerName::try_from(self.server_name.clone())
+                .map_err(|_| ControlError::Transport("invalid control server name".to_string()))?;
+            let tls_stream = tokio::time::timeout(Duration::from_secs(8), connector.connect(sni, tcp))
+                .await
+                .map_err(|_| ControlError::Transport("tls handshake timeout".to_string()))?
+                .map_err(|e| ControlError::Transport(e.to_string()))?;
+            let is_h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2");
+            let io = TokioIo::new(tls_stream);
+            if is_h2 {
+                let mut builder = hyper::client::conn::http2::Builder::new(TokioExecutor::new());
+                builder
+                    .timer(TokioTimer::new())
+                    .keep_alive_interval(Some(Duration::from_secs(20)))
+                    .keep_alive_timeout(Duration::from_secs(10))
+                    .keep_alive_while_idle(true);
+                let (sender, conn) = builder
+                    .handshake(io)
+                    .await
+                    .map_err(|e| ControlError::Transport(e.to_string()))?;
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                Ok(PooledConn::Http2(sender))
+            } else {
+                let (sender, conn) = hyper::client::conn::http1::handshake(io)
+                    .await
+                    .map_err(|e| ControlError::Transport(e.to_string()))?;
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                Ok(PooledConn::Http1(sender))
+            }
+        } else {
+            let io = TokioIo::new(tcp);
+            let (sender, conn) = hyper::client::conn::http1::handshake(io)
+                .await
+                .map_err(|e| ControlError::Transport(e.to_string()))?;
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            Ok(PooledConn::Http1(sender))
+        }
+    }
+
+    async fn send_on_conn(
+        &self,
+        conn: &mut PooledConn,
+        full_path: &str,
+        body_bytes: &[u8],
+    ) -> Result<(hyper::StatusCode, bool, Vec<u8>), ControlError> {
+        let res = match conn {
+            PooledConn::Http2(sender) => {
+                let uri = format!("{}://{}{}", self.scheme, self.host_header, full_path);
+                let req = Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json")
+                    .header("User-Agent", "veilink/1.0")
+                    .header("Content-Length", body_bytes.len().to_string())
+                    .body(Full::new(Bytes::copy_from_slice(body_bytes)))
+                    .map_err(|e| ControlError::Transport(e.to_string()))?;
+                sender
+                    .send_request(req)
+                    .await
+                    .map_err(|e| ControlError::Transport(e.to_string()))?
+            }
+            PooledConn::Http1(sender) => {
+                let req = Request::builder()
+                    .method("POST")
+                    .uri(full_path)
+                    .header("Host", &self.host_header)
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json")
+                    .header("User-Agent", "veilink/1.0")
+                    .header("Connection", "keep-alive")
+                    .header("Content-Length", body_bytes.len().to_string())
+                    .body(Full::new(Bytes::copy_from_slice(body_bytes)))
+                    .map_err(|e| ControlError::Transport(e.to_string()))?;
+                sender
+                    .send_request(req)
+                    .await
+                    .map_err(|e| ControlError::Transport(e.to_string()))?
+            }
+        };
+        let status = res.status();
+        let auth_rejected = res
+            .headers()
+            .get("x-veilink-auth-rejected")
+            .and_then(|v| v.to_str().ok())
+            == Some("1");
+        let limited = http_body_util::Limited::new(res.into_body(), 4 << 20);
+        let collected = limited
+            .collect()
+            .await
+            .map_err(|e| ControlError::Transport(e.to_string()))?
+            .to_bytes();
+        Ok((status, auth_rejected, collected.to_vec()))
+    }
 }
 
 pub(crate) fn is_master_auth_error(bytes: &[u8]) -> bool {
@@ -328,16 +527,17 @@ pub(crate) fn is_master_auth_error(bytes: &[u8]) -> bool {
     false
 }
 
-fn split_host(addr: &str) -> String {
+fn split_host_port_opt(addr: &str) -> (String, Option<String>) {
     if let Some(rest) = addr.strip_prefix('[') {
-        if let Some((h, _)) = rest.split_once(']') {
-            return h.to_string();
+        if let Some((h, after)) = rest.split_once(']') {
+            let port = after.strip_prefix(':').map(|p| p.to_string());
+            return (h.to_string(), port);
         }
     }
-    if let Some((h, _)) = addr.rsplit_once(':') {
-        return h.to_string();
+    if let Some((h, p)) = addr.rsplit_once(':') {
+        return (h.to_string(), Some(p.to_string()));
     }
-    addr.to_string()
+    (addr.to_string(), None)
 }
 
 pub fn build_heartbeat_request(
@@ -402,6 +602,7 @@ pub async fn run_with_ring(
     external_ring: Option<Arc<Ring>>,
 ) -> Result<(), NodeError> {
     c.validate(role).map_err(NodeError::Other)?;
+    let is_embedded = external_ring.is_some();
     let ring = external_ring.unwrap_or_else(|| Arc::new(Ring::new(1000)));
     ring.push_entry(
         "node",
@@ -437,6 +638,7 @@ pub async fn run_with_ring(
     }
 
     let runtime = Arc::new(Runtime::new(LocalTLS::default()));
+    runtime.set_logger(Arc::clone(&ring), c.node_id.clone(), role.to_string());
 
     let applied_revision = Arc::new(AtomicI64::new(-1));
     let apply_failed = Arc::new(AtomicBool::new(false));
@@ -461,9 +663,39 @@ pub async fn run_with_ring(
             Ok(()) => {
                 applied_revision.store(runtime.revision(), Ordering::SeqCst);
                 apply_failed.store(false, Ordering::SeqCst);
+                if configuration_quiesced(Some(snap)) {
+                    ring.push_entry(
+                        "node",
+                        &c.node_id,
+                        "INFO",
+                        &format!(
+                            "tunnel stopped; configuration sync idle until the node is enabled role={} revision={}",
+                            role, snap.revision
+                        ),
+                    );
+                } else {
+                    ring.push_entry(
+                        "node",
+                        &c.node_id,
+                        "INFO",
+                        &format!(
+                            "runtime configuration applied role={} revision={}",
+                            role, snap.revision
+                        ),
+                    );
+                }
             }
-            Err(_) => {
+            Err(err) => {
                 apply_failed.store(true, Ordering::SeqCst);
+                ring.push_entry(
+                    "node",
+                    &c.node_id,
+                    "WARN",
+                    &format!(
+                        "runtime configuration apply failed role={} revision={} err={}",
+                        role, snap.revision, err
+                    ),
+                );
             }
         }
     }
@@ -526,6 +758,7 @@ pub async fn run_with_ring(
             &client,
             &c,
             role,
+            is_embedded,
             &mut st,
             &state_path,
             &runtime,
@@ -579,6 +812,7 @@ async fn run_control_cycle(
     client: &HttpControlClient,
     c: &Config,
     role: &str,
+    is_embedded: bool,
     st: &mut DiskState,
     state_path: &Path,
     runtime: &Arc<Runtime>,
@@ -591,6 +825,7 @@ async fn run_control_cycle(
 ) -> Result<(), ControlError> {
     let mut first = true;
     let mut wait_ms = 0u64;
+    let drain_ring = if is_embedded { None } else { Some(ring.as_ref()) };
 
     while !cancel.is_cancelled() {
         let links = Some(runtime.linked_bindings());
@@ -621,7 +856,7 @@ async fn run_control_cycle(
             &st.credential,
             applied_revision.load(Ordering::SeqCst),
             apply_failed.load(Ordering::SeqCst),
-            Some(ring.as_ref()),
+            drain_ring,
             links,
             traffic_payload,
         )
@@ -635,8 +870,23 @@ async fn run_control_cycle(
         let timeout_dur = Duration::from_millis(wait_ms + 10_000);
 
         let ev_resp: EventsResponse = tokio::select! {
-            _ = cancel.cancelled() => return Ok(()),
-            res = client.post_json(&events_path, &hb_req, timeout_dur) => res?,
+            _ = cancel.cancelled() => {
+                if !hb_req.logs.is_empty() {
+                    ring.append_batch(&hb_req.logs);
+                }
+                return Ok(());
+            }
+            res = client.post_json(&events_path, &hb_req, timeout_dur) => {
+                match res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if !hb_req.logs.is_empty() {
+                            ring.append_batch(&hb_req.logs);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
         };
 
         if ev_resp.revision < 0 || ev_resp.revision > 9_007_199_254_740_991 {
@@ -644,8 +894,10 @@ async fn run_control_cycle(
         }
 
         let current_rev = applied_revision.load(Ordering::SeqCst);
-        let need_pull =
-            first || ev_resp.revision > current_rev || apply_failed.load(Ordering::SeqCst);
+        let need_pull = first
+            || ev_resp.refresh
+            || ev_resp.revision > current_rev
+            || apply_failed.load(Ordering::SeqCst);
 
         if need_pull {
             first = false;
@@ -725,7 +977,7 @@ async fn run_control_cycle(
                 }
             }
             // Immediately report updated applied_revision & link state on next iteration while keeping long-poll active
-            wait_ms = 2_000;
+            wait_ms = 0;
         } else {
             wait_ms = 2_000;
         }

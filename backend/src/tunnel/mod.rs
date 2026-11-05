@@ -40,10 +40,19 @@ fn split_tunnel_stream(stream: BoxStream) -> (BoxRead, BoxWrite) {
     )
 }
 
+use crate::logring::Ring;
 use crate::model::{
     self, bandwidth_bytes, Binding, ConnectEndpoint, Hysteria2, LocalTLS, Mapping, Node, Reality,
     Snapshot, XHTTP,
 };
+
+type TunnelLogger = Option<(Arc<Ring>, String, String)>;
+
+fn log_tunnel(logger: &TunnelLogger, level: &str, msg: String) {
+    if let Some((ref ring, ref node_id, _)) = logger {
+        ring.push_entry("node", node_id, level, msg);
+    }
+}
 
 pub const FRAME_OPEN: u8 = 1;
 pub const FRAME_DATA: u8 = 2;
@@ -2561,6 +2570,7 @@ async fn serve_vless_session(
     bindings: Vec<Binding>,
     sessions: SessionMap,
     linked: Arc<Mutex<HashSet<String>>>,
+    logger: TunnelLogger,
     mut conn_stop: watch::Receiver<bool>,
 ) {
     if *conn_stop.borrow() {
@@ -2606,7 +2616,7 @@ async fn serve_vless_session(
     if expected_flow == FLOW_VISION {
         stream = vision::wrap_vision_stream(stream, uuid_bytes, false);
     }
-    serve_established_session(stream, binding, sessions, linked, conn_stop).await;
+    serve_established_session(stream, binding, sessions, linked, logger, conn_stop).await;
 }
 
 async fn serve_established_session(
@@ -2614,12 +2624,22 @@ async fn serve_established_session(
     binding: Binding,
     sessions: SessionMap,
     linked: Arc<Mutex<HashSet<String>>>,
+    logger: TunnelLogger,
     mut conn_stop: watch::Receiver<bool>,
 ) {
     if *conn_stop.borrow() {
         return;
     }
-    linked.lock().unwrap().insert(binding.id.clone());
+    if linked.lock().unwrap().insert(binding.id.clone()) {
+        log_tunnel(
+            &logger,
+            "INFO",
+            format!(
+                "server tunnel session established role=server binding_id={} client_id={}",
+                binding.id, binding.client_id
+            ),
+        );
+    }
     let (tx, mut out_rx) = mpsc::channel::<(u8, u32, Vec<u8>)>(256);
     let streams_map: Arc<Mutex<HashMap<u32, mpsc::Sender<(u8, Vec<u8>)>>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -2695,6 +2715,14 @@ async fn serve_established_session(
     drop(tx);
     if remove_session(&sessions, &binding.id, &handle) {
         linked.lock().unwrap().remove(&binding.id);
+        log_tunnel(
+            &logger,
+            "INFO",
+            format!(
+                "server tunnel session closed role=server binding_id={} client_id={}",
+                binding.id, binding.client_id
+            ),
+        );
     }
 }
 
@@ -2702,6 +2730,7 @@ fn start_instance(
     s: &Snapshot,
     local: &LocalTLS,
     traffic: Arc<Traffic>,
+    logger: TunnelLogger,
 ) -> Result<RunningInstance, String> {
     validate(s, local)?;
     let (stop_tx, stop_rx) = watch::channel(false);
@@ -2741,6 +2770,15 @@ fn start_instance(
                 }
                 listeners.push(ln);
             }
+            log_tunnel(
+                &logger,
+                "INFO",
+                format!(
+                    "server tunnel listening role=server protocol={} addr={}",
+                    local.effective_protocol(),
+                    addr
+                ),
+            );
         }
         let mut mapping_tcp_lns: Vec<(Mapping, std::net::TcpListener)> = Vec::new();
         let mut mapping_udp_socks: Vec<(Mapping, std::net::UdpSocket)> = Vec::new();
@@ -2782,6 +2820,7 @@ fn start_instance(
                             let local_clone = local.clone();
                             let sessions_clone = sessions.clone();
                             let linked_clone = linked.clone();
+                            let logger_clone = logger.clone();
                             let mut rx = stop_rx.clone();
                             let jh = handle.spawn(async move {
                                 loop {
@@ -2796,6 +2835,7 @@ fn start_instance(
                                             let local_c = local_clone.clone();
                                             let sessions = sessions_clone.clone();
                                             let linked = linked_clone.clone();
+                                            let log_c = logger_clone.clone();
                                             let conn_stop = rx.clone();
                                             tokio::spawn(async move {
                                                 let Ok(conn) = incoming.await else { return };
@@ -2804,7 +2844,7 @@ fn start_instance(
                                                 else {
                                                     return;
                                                 };
-                                                serve_established_session(stream, binding, sessions, linked, conn_stop).await;
+                                                serve_established_session(stream, binding, sessions, linked, log_c, conn_stop).await;
                                             });
                                         }
                                     }
@@ -2843,6 +2883,7 @@ fn start_instance(
                     } else {
                         None
                     };
+                    let logger_clone = logger.clone();
                     let mut rx = stop_rx.clone();
                     let conn_sem = Arc::new(tokio::sync::Semaphore::new(4096));
                     let jh = handle.spawn(async move {
@@ -2864,6 +2905,7 @@ fn start_instance(
                                     let r_cfg = reality_cfg.clone();
                                     let v_dec = vless_dec.clone();
                                     let x_state = xhttp_state.clone();
+                                    let log_c = logger_clone.clone();
                                     let conn_stop = rx.clone();
                                     tokio::spawn(async move {
                                         let _permit = permit;
@@ -2878,6 +2920,7 @@ fn start_instance(
                                         };
                                         if let Some(xs) = x_state {
                                             let local_inner = local_c.clone();
+                                            let log_inner = log_c.clone();
                                             tokio::select! {
                                                 _ = outer_stop.changed() => {}
                                                 _ = xhttp::handle_xhttp_server_conn(
@@ -2891,8 +2934,9 @@ fn start_instance(
                                                         let cs = conn_stop.clone();
                                                         let vd = v_dec.clone();
                                                         let lc = local_inner.clone();
+                                                        let lg = log_inner.clone();
                                                         tokio::spawn(async move {
-                                                            serve_vless_session(tunnel_stream, lc, vd, b, s, l, cs).await;
+                                                            serve_vless_session(tunnel_stream, lc, vd, b, s, l, lg, cs).await;
                                                         });
                                                     },
                                                 ) => {}
@@ -2905,6 +2949,7 @@ fn start_instance(
                                                 bindings,
                                                 sessions,
                                                 linked,
+                                                log_c,
                                                 conn_stop,
                                             )
                                             .await;
@@ -3144,11 +3189,13 @@ fn start_instance(
                     let gw_addr = bound_gw.address.clone();
                     let enc_cli = vless_enc_cli.clone();
                     let workers_ref = active_workers.clone();
+                    let log_c = logger.clone();
                     let mut rx = stop_rx.clone();
                     handle.spawn(async move {
                         let Ok(uuid_bytes) = parse_uuid(&b_clone.uuid) else { return };
                         let mut ep_cursor = worker_idx;
                         let mut fail_streak = 0u32;
+                        let mut ever_connected = false;
                         loop {
                             if *rx.borrow() {
                                 break;
@@ -3167,10 +3214,29 @@ fn start_instance(
                             )
                             .await;
 
-                            if let Ok(stream) = maybe_stream {
-                                fail_streak = 0;
-                                workers_ref.fetch_add(1, Ordering::SeqCst);
-                                linked_clone.lock().unwrap().insert(b_clone.id.clone());
+                            match maybe_stream {
+                                Ok(stream) => {
+                                    let prev_fails = fail_streak;
+                                    fail_streak = 0;
+                                    let prev_workers = workers_ref.fetch_add(1, Ordering::SeqCst);
+                                    linked_clone.lock().unwrap().insert(b_clone.id.clone());
+                                    if (worker_idx == 0 && !ever_connected)
+                                        || (prev_workers == 0 && prev_fails > 0)
+                                    {
+                                        ever_connected = true;
+                                        log_tunnel(
+                                            &log_c,
+                                            "INFO",
+                                            format!(
+                                                "client tunnel connected role=client id={} node_id={} network={} addr={} port={}",
+                                                b_clone.id,
+                                                b_clone.server_id,
+                                                cfg_clone.effective_protocol(),
+                                                dial_ep.host,
+                                                dial_ep.port
+                                            ),
+                                        );
+                                    }
                                 let (tx, mut out_rx) = mpsc::channel::<(u8, u32, Vec<u8>)>(256);
                                 let streams_map: Arc<
                                     Mutex<HashMap<u32, mpsc::Sender<(u8, Vec<u8>)>>>,
@@ -3248,8 +3314,26 @@ fn start_instance(
                                 if workers_ref.fetch_sub(1, Ordering::SeqCst) == 1 {
                                     linked_clone.lock().unwrap().remove(&b_clone.id);
                                 }
-                            } else {
-                                fail_streak = fail_streak.saturating_add(1);
+                                }
+                                Err(err) => {
+                                    fail_streak = fail_streak.saturating_add(1);
+                                    if worker_idx == 0 && (fail_streak == 1 || fail_streak % 10 == 0) {
+                                        log_tunnel(
+                                            &log_c,
+                                            "WARN",
+                                            format!(
+                                                "client tunnel connection failed; backing off role=client id={} node_id={} attempt={} network={} addr={} port={} err={}",
+                                                b_clone.id,
+                                                b_clone.server_id,
+                                                fail_streak,
+                                                cfg_clone.effective_protocol(),
+                                                dial_ep.host,
+                                                dial_ep.port,
+                                                err
+                                            ),
+                                        );
+                                    }
+                                }
                             }
                             let retry_delay = if fail_streak <= eps_clone.len() as u32 {
                                 Duration::from_millis(50)
@@ -3602,6 +3686,7 @@ struct RuntimeState {
 pub struct Runtime {
     state: Mutex<RuntimeState>,
     traffic: Arc<Traffic>,
+    logger: Mutex<TunnelLogger>,
 }
 
 impl Runtime {
@@ -3618,7 +3703,12 @@ impl Runtime {
                 closed: false,
             }),
             traffic: Arc::new(Traffic::new()),
+            logger: Mutex::new(None),
         }
+    }
+
+    pub fn set_logger(&self, ring: Arc<Ring>, node_id: String, role: String) {
+        *self.logger.lock().unwrap() = Some((ring, node_id, role));
     }
 
     pub fn traffic(&self) -> Arc<Traffic> {
@@ -3681,9 +3771,10 @@ impl Runtime {
             inst.stop();
             g.revision = -1;
         }
+        let logger = self.logger.lock().unwrap().clone();
         self.traffic
             .prepare_active(&s.mappings, s.node.role == "server");
-        match start_instance(&s, &effective, self.traffic.clone()) {
+        match start_instance(&s, &effective, self.traffic.clone(), logger.clone()) {
             Ok(instance) => {
                 self.traffic
                     .set_active(&s.mappings, s.node.role == "server");
@@ -3702,7 +3793,7 @@ impl Runtime {
                 }
                 if let Some(good) = g.good.clone() {
                     let good_local = g.good_local.clone();
-                    match start_instance(&good, &good_local, self.traffic.clone()) {
+                    match start_instance(&good, &good_local, self.traffic.clone(), logger) {
                         Ok(restored) => {
                             self.traffic
                                 .set_active(&good.mappings, good.node.role == "server");
