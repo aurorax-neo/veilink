@@ -260,6 +260,9 @@ pub async fn handle_xhttp_server_conn<F>(
             if wr.write_all(resp_hdr.as_bytes()).await.is_err() {
                 break;
             }
+            if wr.flush().await.is_err() {
+                break;
+            }
             let stream = wrap_chunked_duplex(rd, wr, read_buf);
             on_tunnel_stream(stream);
             return;
@@ -297,6 +300,10 @@ pub async fn handle_xhttp_server_conn<F>(
                 pad
             );
             if wr.write_all(resp_hdr.as_bytes()).await.is_err() {
+                state.remove_session(&sid);
+                break;
+            }
+            if wr.flush().await.is_err() {
                 state.remove_session(&sid);
                 break;
             }
@@ -429,7 +436,7 @@ pub async fn handle_xhttp_server_conn<F>(
             if wr.write_all(resp.as_bytes()).await.is_err() {
                 break;
             }
-            if read_buf.is_empty() && wr.flush().await.is_err() {
+            if wr.flush().await.is_err() {
                 break;
             }
         } else {

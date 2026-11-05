@@ -8,6 +8,13 @@ Release。
 
 ## [Unreleased]
 
+## [0.4.17] - 2026-11-05
+
+### Bug Fixes
+
+- 修复节点访问未备案域名或跨网控制面（如 `vl.vekt.cc.cd:8843`）被运营商 DPI 按 TLS `ClientHello` 明文 SNI 注入 `TCP RST`（`SSL_ERROR_SYSCALL` / `os error 104`）及公共 DNS 解析失败的问题：当常规 TLS 握手被重置或超时时，自动使用纯净 UDP DNS（`119.29.29.29` / `180.76.76.76`）并回退为省略明文 SNI 扩展的 TLS 握手（仍严格校验服务端 `*.vekt.cc.cd` 证书并携带加密层 `Host` 头路由），且支持 `-master-addr https://<IP>:端口 -control-server-name <域名>` 直连模式。
+- 修复隧道双向打流期间 `ping_interval.tick()` 在 `tokio::select!` 中取消未完成的 `read_frame` 导致帧边界错位断流的问题：将会话保活 `FRAME_PING` 拆分为独立异步任务，并在发送 `FRAME_RESET` 前先释放流接收端以避免通道满时死锁，同时为 XHTTP 响应头统一立即 `flush`。
+
 ## [0.4.16] - 2026-11-05
 
 ### Bug Fixes

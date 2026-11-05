@@ -152,6 +152,8 @@ pub struct HttpControlClient {
     base_path: String,
     tls_config: Option<Arc<rustls::ClientConfig>>,
     tls_config_h1: Option<Arc<rustls::ClientConfig>>,
+    tls_config_no_sni: Option<Arc<rustls::ClientConfig>>,
+    prefer_no_sni: Arc<AtomicBool>,
     conn_pool: Arc<tokio::sync::Mutex<Option<PooledConn>>>,
 }
 
@@ -172,9 +174,14 @@ impl HttpControlClient {
                 } else {
                     format!("{}:{}", host, port)
                 };
+                let hdr_host = if !c.control_server_name.trim().is_empty() {
+                    c.control_server_name.trim().to_string()
+                } else {
+                    host.clone()
+                };
                 let host_hdr = match u.port() {
-                    Some(p) => format!("{}:{}", host, p),
-                    None => host.clone(),
+                    Some(p) => format!("{}:{}", hdr_host, p),
+                    None => hdr_host,
                 };
                 let sni = host
                     .strip_prefix('[')
@@ -220,7 +227,7 @@ impl HttpControlClient {
             default_sni
         };
 
-        let (tls_config, tls_config_h1) = if scheme == "https" {
+        let (tls_config, tls_config_h1, tls_config_no_sni) = if scheme == "https" {
             let mut root_store = rustls::RootCertStore::empty();
             if !c.control_ca.is_empty() {
                 let pem_bytes =
@@ -257,12 +264,22 @@ impl HttpControlClient {
             cfg_h2.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
             let mut cfg_h1 = rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
+                .with_root_certificates(root_store.clone())
                 .with_no_client_auth();
             cfg_h1.alpn_protocols = vec![b"http/1.1".to_vec()];
-            (Some(Arc::new(cfg_h2)), Some(Arc::new(cfg_h1)))
+
+            let mut cfg_no_sni = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            cfg_no_sni.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            cfg_no_sni.enable_sni = false;
+            (
+                Some(Arc::new(cfg_h2)),
+                Some(Arc::new(cfg_h1)),
+                Some(Arc::new(cfg_no_sni)),
+            )
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         Ok(Self {
@@ -273,6 +290,8 @@ impl HttpControlClient {
             base_path,
             tls_config,
             tls_config_h1,
+            tls_config_no_sni,
+            prefer_no_sni: Arc::new(AtomicBool::new(false)),
             conn_pool: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
@@ -368,18 +387,38 @@ impl HttpControlClient {
             .map_err(|_| ControlError::Transport("request timeout".to_string()))?
     }
 
-    async fn connect_tcp(&self) -> Result<TcpStream, ControlError> {
+    async fn connect_tcp(&self, prefer_clean_dns: bool) -> Result<TcpStream, ControlError> {
         let mut addrs: Vec<SocketAddr> = if let Ok(sa) = self.connect_addr.parse::<SocketAddr>() {
             vec![sa]
+        } else if prefer_clean_dns {
+            match udp_dns_lookup_addrs(&self.connect_addr).await {
+                Ok(v) if !v.is_empty() => v,
+                _ => tokio::time::timeout(
+                    Duration::from_secs(5),
+                    tokio::net::lookup_host(&self.connect_addr),
+                )
+                .await
+                .map_err(|_| ControlError::Transport("dns lookup timeout".to_string()))?
+                .map_err(|e| ControlError::Transport(e.to_string()))?
+                .collect(),
+            }
         } else {
-            tokio::time::timeout(
+            match tokio::time::timeout(
                 Duration::from_secs(5),
                 tokio::net::lookup_host(&self.connect_addr),
             )
             .await
-            .map_err(|_| ControlError::Transport("dns lookup timeout".to_string()))?
-            .map_err(|e| ControlError::Transport(e.to_string()))?
-            .collect()
+            {
+                Ok(Ok(iter)) => {
+                    let v: Vec<SocketAddr> = iter.collect();
+                    if v.is_empty() {
+                        udp_dns_lookup_addrs(&self.connect_addr).await?
+                    } else {
+                        v
+                    }
+                }
+                _ => udp_dns_lookup_addrs(&self.connect_addr).await?,
+            }
         };
         if addrs.is_empty() {
             return Err(ControlError::Transport(
@@ -409,8 +448,11 @@ impl HttpControlClient {
     }
 
     async fn open_pooled_conn(&self, force_h1: bool) -> Result<PooledConn, ControlError> {
-        let tcp = self.connect_tcp().await?;
-        let tls_opt = if force_h1 {
+        let use_no_sni_first = self.prefer_no_sni.load(Ordering::Relaxed);
+        let tcp = self.connect_tcp(use_no_sni_first).await?;
+        let tls_opt = if use_no_sni_first {
+            self.tls_config_no_sni.as_ref().or(self.tls_config.as_ref())
+        } else if force_h1 {
             self.tls_config_h1.as_ref().or(self.tls_config.as_ref())
         } else {
             self.tls_config.as_ref()
@@ -419,10 +461,50 @@ impl HttpControlClient {
             let connector = TlsConnector::from(Arc::clone(tls_cfg));
             let sni = ServerName::try_from(self.server_name.clone())
                 .map_err(|_| ControlError::Transport("invalid control server name".to_string()))?;
-            let tls_stream = tokio::time::timeout(Duration::from_secs(8), connector.connect(sni, tcp))
-                .await
-                .map_err(|_| ControlError::Transport("tls handshake timeout".to_string()))?
-                .map_err(|e| ControlError::Transport(e.to_string()))?;
+            let first_try = tokio::time::timeout(
+                Duration::from_secs(6),
+                connector.connect(sni.clone(), tcp),
+            )
+            .await;
+            let tls_stream = match first_try {
+                Ok(Ok(s)) => s,
+                first_err => {
+                    // Carrier DPI walls may inject TCP RST when ClientHello contains a blocked SNI.
+                    // Retry with SNI-less ClientHello (or normal SNI if prefer_no_sni was cached) while
+                    // still verifying the server certificate against `sni` and routing via HTTP Host.
+                    let fallback_cfg = if use_no_sni_first {
+                        if force_h1 {
+                            self.tls_config_h1.as_ref().or(self.tls_config.as_ref())
+                        } else {
+                            self.tls_config.as_ref()
+                        }
+                    } else {
+                        self.tls_config_no_sni.as_ref()
+                    };
+                    if let Some(alt_cfg) = fallback_cfg {
+                        let tcp2 = self.connect_tcp(!use_no_sni_first).await?;
+                        let alt_connector = TlsConnector::from(Arc::clone(alt_cfg));
+                        let s = tokio::time::timeout(
+                            Duration::from_secs(6),
+                            alt_connector.connect(sni, tcp2),
+                        )
+                        .await
+                        .map_err(|_| ControlError::Transport("tls handshake timeout".to_string()))?
+                        .map_err(|e| ControlError::Transport(e.to_string()))?;
+                        self.prefer_no_sni
+                            .store(!use_no_sni_first, Ordering::Relaxed);
+                        s
+                    } else {
+                        return match first_err {
+                            Err(_) => Err(ControlError::Transport(
+                                "tls handshake timeout".to_string(),
+                            )),
+                            Ok(Err(e)) => Err(ControlError::Transport(e.to_string())),
+                            Ok(Ok(_)) => unreachable!(),
+                        };
+                    }
+                }
+            };
             let is_h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2");
             let io = TokioIo::new(tls_stream);
             if is_h2 {
@@ -540,6 +622,129 @@ fn split_host_port_opt(addr: &str) -> (String, Option<String>) {
     (addr.to_string(), None)
 }
 
+pub(crate) async fn udp_dns_lookup_addrs(host_port: &str) -> Result<Vec<SocketAddr>, ControlError> {
+    let (host, port_opt) = split_host_port_opt(host_port);
+    let port: u16 = port_opt
+        .as_deref()
+        .unwrap_or("443")
+        .parse()
+        .map_err(|_| ControlError::Transport("invalid port".to_string()))?;
+    if let Ok(ip) = host.parse::< std::net::IpAddr >() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    let query = build_dns_a_query(&host)
+        .ok_or_else(|| ControlError::Transport("invalid dns host".to_string()))?;
+    for dns_srv in ["119.29.29.29:53", "180.76.76.76:53", "1.1.1.1:53"] {
+        let Ok(sock) = tokio::net::UdpSocket::bind("0.0.0.0:0").await else {
+            continue;
+        };
+        if sock.send_to(&query, dns_srv).await.is_err() {
+            continue;
+        }
+        let mut buf = [0u8; 512];
+        if let Ok(Ok((n, _))) =
+            tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf)).await
+        {
+            let ips = parse_dns_a_response(&buf[..n]);
+            if !ips.is_empty() {
+                return Ok(ips
+                    .into_iter()
+                    .map(|ip| SocketAddr::new(std::net::IpAddr::V4(ip), port))
+                    .collect());
+            }
+        }
+    }
+    Err(ControlError::Transport(
+        "dns lookup failed across all resolvers".to_string(),
+    ))
+}
+
+fn build_dns_a_query(domain: &str) -> Option<Vec<u8>> {
+    let domain = domain.trim_end_matches('.');
+    if domain.is_empty() {
+        return None;
+    }
+    let mut pkt = Vec::with_capacity(64);
+    pkt.extend_from_slice(&[0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    for label in domain.split('.') {
+        let b = label.as_bytes();
+        if b.is_empty() || b.len() > 63 {
+            return None;
+        }
+        pkt.push(b.len() as u8);
+        pkt.extend_from_slice(b);
+    }
+    pkt.push(0);
+    pkt.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+    Some(pkt)
+}
+
+fn skip_dns_name(buf: &[u8], mut pos: usize) -> Option<usize> {
+    let mut jumps = 0;
+    loop {
+        let b = *buf.get(pos)?;
+        if b == 0 {
+            return Some(pos + 1);
+        }
+        if (b & 0xC0) == 0xC0 {
+            let _ = *buf.get(pos + 1)?;
+            return Some(pos + 2);
+        }
+        if (b & 0xC0) != 0 {
+            return None;
+        }
+        pos = pos.checked_add(1 + b as usize)?;
+        jumps += 1;
+        if jumps > 64 || pos > buf.len() {
+            return None;
+        }
+    }
+}
+
+fn parse_dns_a_response(buf: &[u8]) -> Vec<std::net::Ipv4Addr> {
+    if buf.len() < 12 || (buf[3] & 0x0F) != 0 {
+        return Vec::new();
+    }
+    let qdcount = u16::from_be_bytes([buf[4], buf[5]]) as usize;
+    let ancount = u16::from_be_bytes([buf[6], buf[7]]) as usize;
+    let mut pos = 12;
+    for _ in 0..qdcount {
+        let Some(next) = skip_dns_name(buf, pos) else {
+            return Vec::new();
+        };
+        pos = next + 4;
+        if pos > buf.len() {
+            return Vec::new();
+        }
+    }
+    let mut out = Vec::new();
+    for _ in 0..ancount {
+        let Some(next) = skip_dns_name(buf, pos) else {
+            break;
+        };
+        pos = next;
+        if pos + 10 > buf.len() {
+            break;
+        }
+        let rtype = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+        let rclass = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]);
+        let rdlen = u16::from_be_bytes([buf[pos + 8], buf[pos + 9]]) as usize;
+        pos += 10;
+        if pos + rdlen > buf.len() {
+            break;
+        }
+        if rtype == 1 && rclass == 1 && rdlen == 4 {
+            out.push(std::net::Ipv4Addr::new(
+                buf[pos],
+                buf[pos + 1],
+                buf[pos + 2],
+                buf[pos + 3],
+            ));
+        }
+        pos += rdlen;
+    }
+    out
+}
 pub fn build_heartbeat_request(
     node_id: &str,
     credential: &str,
@@ -1056,4 +1261,134 @@ async fn wait_backoff(
         *backoff = (*backoff * 2).min(Duration::from_secs(30));
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn test_parse_dns_cname_and_a_response() {
+        let mut pkt = build_dns_a_query("vl.vekt.cc.cd").unwrap();
+        // Turn query into response: QR=1, RCODE=0, QDCOUNT=1, ANCOUNT=2
+        pkt[2] = 0x81;
+        pkt[3] = 0x80;
+        pkt[6] = 0x00;
+        pkt[7] = 0x02;
+        // Answer 1: CNAME (type 5) pointing to tfa.vekt.cc.cd
+        pkt.extend_from_slice(&[
+            0xC0, 0x0C, // name pointer
+            0x00, 0x05, // TYPE CNAME
+            0x00, 0x01, // CLASS IN
+            0x00, 0x00, 0x01, 0x2C, // TTL
+            0x00, 0x06, // RDLENGTH
+            3, b't', b'f', b'a', 0xC0, 0x0F, // tfa.vekt.cc.cd
+        ]);
+        // Answer 2: A (type 1) = 36.138.249.195
+        pkt.extend_from_slice(&[
+            0xC0, 0x0C, // name pointer
+            0x00, 0x01, // TYPE A
+            0x00, 0x01, // CLASS IN
+            0x00, 0x00, 0x01, 0x2C, // TTL
+            0x00, 0x04, // RDLENGTH 4
+            36, 138, 249, 195,
+        ]);
+        let ips = parse_dns_a_response(&pkt);
+        assert_eq!(ips, vec![std::net::Ipv4Addr::new(36, 138, 249, 195)]);
+    }
+
+    #[tokio::test]
+    async fn test_control_client_sni_rst_fallback() {
+        let cert = rcgen::generate_simple_self_signed(vec![
+            "*.vekt.cc.cd".to_string(),
+            "vekt.cc.cd".to_string(),
+        ])
+        .unwrap();
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.key_pair.serialize_pem();
+        let tmp = tempfile::tempdir().unwrap();
+        let ca_path = tmp.path().join("ca.pem");
+        std::fs::write(&ca_path, &cert_pem).unwrap();
+
+        let certs: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut std::io::BufReader::new(cert_pem.as_bytes()))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+        let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_pem.as_bytes()))
+            .unwrap()
+            .unwrap();
+        let mut srv_cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        srv_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(srv_cfg));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sni_rst_count = Arc::new( std::sync::atomic::AtomicUsize::new(0) );
+        let sni_rst_clone = Arc::clone(&sni_rst_count);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut peek_buf = [0u8; 1024];
+                let n = tcp.peek(&mut peek_buf).await.unwrap_or(0);
+                if peek_buf[..n]
+                    .windows(b"vl.vekt.cc.cd".len())
+                    .any(|w| w == b"vl.vekt.cc.cd")
+                {
+                    sni_rst_clone.fetch_add(1, Ordering::SeqCst);
+                    // Simulate TCP RST by enabling linger=0 and dropping
+                    let sock_ref = socket2::SockRef::from(&tcp);
+                    let _ = sock_ref.set_linger(Some(Duration::ZERO));
+                    drop(tcp);
+                    continue;
+                }
+                let acc = acceptor.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut tls) = acc.accept(tcp).await {
+                        let mut req_buf = vec![0u8; 4096];
+                        let n = tls.read(&mut req_buf).await.unwrap_or(0);
+                        let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                        assert!(
+                            req_str
+                                .to_ascii_lowercase()
+                                .contains(&format!("host: vl.vekt.cc.cd:{}", addr.port()))
+                        );
+                        let body = r#"{"revision":42,"refresh":false}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = tls.write_all(resp.as_bytes()).await;
+                        let _ = tls.flush().await;
+                    }
+                });
+            }
+        });
+
+        let cfg = Config {
+            master_addr: format!("https://{}", addr),
+            node_id: "node-1".to_string(),
+            state_dir: tmp.path().to_string_lossy().to_string(),
+            control_ca: ca_path.to_string_lossy().to_string(),
+            control_server_name: "vl.vekt.cc.cd".to_string(),
+            ..Config::default()
+        };
+        let client = HttpControlClient::new(&cfg).unwrap();
+        let req = serde_json::json!({"hello": "world"});
+        let resp: EventsResponse = client
+            .post_json("/api/v1/node/events", &req, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(resp.revision, 42);
+        assert_eq!(sni_rst_count.load(Ordering::SeqCst), 1);
+        assert!(client.prefer_no_sni.load(Ordering::Relaxed));
+    }
 }

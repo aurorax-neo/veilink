@@ -2473,6 +2473,13 @@ fn build_tls_acceptor(local: &LocalTLS) -> Result<tokio_rustls::TlsAcceptor, Str
 }
 
 fn build_tls_connector(local: &LocalTLS) -> Result<tokio_rustls::TlsConnector, String> {
+    build_tls_connector_with_sni(local, true)
+}
+
+fn build_tls_connector_with_sni(
+    local: &LocalTLS,
+    enable_sni: bool,
+) -> Result<tokio_rustls::TlsConnector, String> {
     let provider = fast_crypto_provider();
     let builder = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -2500,6 +2507,7 @@ fn build_tls_connector(local: &LocalTLS) -> Result<tokio_rustls::TlsConnector, S
     };
     let mut cfg = builder.with_root_certificates(roots).with_no_client_auth();
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    cfg.enable_sni = enable_sni;
     Ok(tokio_rustls::TlsConnector::from(Arc::new(cfg)))
 }
 
@@ -2627,10 +2635,30 @@ async fn connect_outer_stream(
         };
         let server_name = ServerName::try_from(sni_str)
             .unwrap_or_else(|_| ServerName::try_from("localhost".to_string()).unwrap());
-        let s = tokio::time::timeout(Duration::from_secs(8), connector.connect(server_name, tcp))
-            .await
-            .map_err(|_| "tls handshake timeout".to_string())?
-            .map_err(|e| e.to_string())?;
+        let first_try = tokio::time::timeout(
+            Duration::from_secs(8),
+            connector.connect(server_name.clone(), tcp),
+        )
+        .await;
+        let s = match first_try {
+            Ok(Ok(s)) => s,
+            _ => {
+                let tcp2 =
+                    tokio::time::timeout(Duration::from_secs(8), TcpStream::connect(remote_addr))
+                        .await
+                        .map_err(|_| "tcp connect timeout".to_string())?
+                        .map_err(|e| e.to_string())?;
+                configure_tcp_stream(&tcp2);
+                let no_sni_connector = build_tls_connector_with_sni(&local, false)?;
+                tokio::time::timeout(
+                    Duration::from_secs(8),
+                    no_sni_connector.connect(server_name, tcp2),
+                )
+                .await
+                .map_err(|_| "tls handshake timeout".to_string())?
+                .map_err(|e| e.to_string())?
+            }
+        };
         Ok(Box::new(s))
     } else {
         Ok(Box::new(tcp))
@@ -2769,16 +2797,22 @@ async fn serve_established_session(
         let _ = write_done_tx.send(true);
         let _ = wr.shutdown().await;
     });
-    let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
-    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ping_interval.tick().await;
+    let tx_ping = tx.clone();
+    let ping_task = tokio::spawn(async move {
+        let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
+        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ping_interval.tick().await;
+        loop {
+            ping_interval.tick().await;
+            if tx_ping.try_send((FRAME_PING, 0, Vec::new())).is_err() {
+                let _ = tx_ping.send((FRAME_PING, 0, Vec::new())).await;
+            }
+        }
+    });
     loop {
         tokio::select! {
             _ = conn_stop.changed() => break,
             _ = write_done_rx.changed() => break,
-            _ = ping_interval.tick() => {
-                let _ = tx.try_send((FRAME_PING, 0, Vec::new()));
-            }
             frame = tokio::time::timeout(Duration::from_secs(45), read_frame(&mut rd)) => {
                 let Ok(Ok((kind, id, payload))) = frame else { break };
                 match kind {
@@ -2817,6 +2851,7 @@ async fn serve_established_session(
             }
         }
     }
+    ping_task.abort();
     write_task.abort();
     drop(tx);
     if remove_session(&sessions, &binding.id, &handle) {
@@ -3185,6 +3220,7 @@ fn start_instance(
                                         } else {
                                             up_task.abort();
                                         }
+                                        drop(in_rx);
                                         sess.close_stream(stream_id);
                                         if !remote_reset && !half_closed {
                                             let _ = sess.tx.send((FRAME_RESET, stream_id, Vec::new())).await;
@@ -3417,19 +3453,25 @@ fn start_instance(
                                     let _ = write_done_tx.send(true);
                                     let _ = wr.shutdown().await;
                                 });
-                                let mut ping_interval =
-                                    tokio::time::interval(Duration::from_secs(15));
-                                ping_interval.set_missed_tick_behavior(
-                                    tokio::time::MissedTickBehavior::Delay,
-                                );
-                                ping_interval.tick().await;
+                                let tx_ping = tx.clone();
+                                let ping_task = tokio::spawn(async move {
+                                    let mut ping_interval =
+                                        tokio::time::interval(Duration::from_secs(15));
+                                    ping_interval.set_missed_tick_behavior(
+                                        tokio::time::MissedTickBehavior::Delay,
+                                    );
+                                    ping_interval.tick().await;
+                                    loop {
+                                        ping_interval.tick().await;
+                                        if tx_ping.try_send((FRAME_PING, 0, Vec::new())).is_err() {
+                                            let _ = tx_ping.send((FRAME_PING, 0, Vec::new())).await;
+                                        }
+                                    }
+                                });
                                 loop {
                                     tokio::select! {
                                         _ = rx.changed() => break,
                                         _ = write_done_rx.changed() => break,
-                                        _ = ping_interval.tick() => {
-                                            let _ = tx.try_send((FRAME_PING, 0, Vec::new()));
-                                        }
                                         frame = tokio::time::timeout(Duration::from_secs(45), read_frame(&mut rd)) => {
                                             let Ok(Ok((kind, id, payload))) = frame else { break };
                                             match kind {
@@ -3474,11 +3516,12 @@ fn start_instance(
                                                         }
                                                     }
                                                 }
-                                                _ => {}
+                                                _ => break,
                                             }
                                         }
                                     }
                                 }
+                                ping_task.abort();
                                 write_task.abort();
                                 streams_map.lock().unwrap().clear();
                                 if workers_ref.fetch_sub(1, Ordering::SeqCst) == 1 {
@@ -3544,11 +3587,23 @@ async fn resolve_socket_addrs(host: &str, port: i64) -> Result<Vec<SocketAddr>, 
     if let Ok(sa) = addr_str.parse::<SocketAddr>() {
         return Ok(vec![sa]);
     }
-    let addrs: Vec<SocketAddr> = tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(&addr_str))
-        .await
-        .map_err(|_| format!("dns lookup timeout for {}", addr_str))?
-        .map_err(|e| e.to_string())?
-        .collect();
+    let addrs: Vec<SocketAddr> =
+        match tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(&addr_str)).await
+        {
+            Ok(Ok(iter)) => {
+                let v: Vec<SocketAddr> = iter.collect();
+                if v.is_empty() {
+                    crate::node::udp_dns_lookup_addrs(&addr_str)
+                        .await
+                        .map_err(|e| format!("{:?}", e))?
+                } else {
+                    v
+                }
+            }
+            _ => crate::node::udp_dns_lookup_addrs(&addr_str)
+                .await
+                .map_err(|e| format!("{:?}", e))?,
+        };
     if addrs.is_empty() {
         return Err(format!("unable to resolve {}", addr_str));
     }
@@ -3862,6 +3917,7 @@ fn handle_client_frame_open(
             } else {
                 read_target.abort();
             }
+            drop(srx);
             streams_done.lock().unwrap().remove(&id);
             if !peer_reset && !half_closed {
                 let _ = tx_back.send((FRAME_RESET, id, Vec::new())).await;
