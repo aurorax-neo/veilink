@@ -1,6 +1,11 @@
 import type { InjectionKey } from 'vue'
 import type { Audit, Mapping, Node, PageId, TrafficRow } from './types'
 
+export interface NoticeUndo {
+  label?: string
+  run: () => void | Promise<void>
+}
+
 export interface Desk {
   nodes: Node[]
   mappings: Mapping[]
@@ -14,9 +19,10 @@ export interface Desk {
   error: string
   notice: string
   noticeBad: boolean
+  noticeUndo?: NoticeUndo | null
   reloadNodes: (id: string) => Promise<void>
   reload: (options?: { silent?: boolean }) => Promise<void>
-  notify: (text: string, bad?: boolean) => void
+  notify: (text: string, bad?: boolean, undo?: NoticeUndo | null) => void
   dismissNotice: () => void
 }
 

@@ -5,8 +5,27 @@ const props = defineProps<{ error: string; busy: boolean }>()
 const emit = defineEmits<{ submit: [apiKey: string] }>()
 const apiKey = ref('')
 const localError = ref('')
+const composing = ref(false)
+const compositionEndedAt = ref(0)
+
+function onCompositionStart() {
+  composing.value = true
+}
+
+function onCompositionEnd() {
+  composing.value = false
+  compositionEndedAt.value = Date.now()
+}
+
+function onInputKeydown(event: KeyboardEvent) {
+  if (event.key !== 'Enter') return
+  if (composing.value || event.isComposing || event.keyCode === 229 || (compositionEndedAt.value > 0 && Date.now() - compositionEndedAt.value < 500)) {
+    event.preventDefault()
+  }
+}
 
 function onSubmit() {
+  if (composing.value || (compositionEndedAt.value > 0 && Date.now() - compositionEndedAt.value < 500)) return
   localError.value = ''
   const key = apiKey.value.trim()
   if (!key) { localError.value = '请输入 API Key'; return }
@@ -29,9 +48,11 @@ function onSubmit() {
             type="password"
             autocomplete="off"
             spellcheck="false"
-            placeholder="vlk_..."
             required
             :disabled="busy"
+            @compositionstart="onCompositionStart"
+            @compositionend="onCompositionEnd"
+            @keydown="onInputKeydown"
           />
         </div>
         <p v-if="localError || error" class="error" role="alert">{{ localError || error }}</p>

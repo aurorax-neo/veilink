@@ -54,6 +54,40 @@ XHTTP + REALITY 覆盖 TCP → REALITY → Veilink 原生 XHTTP；`auto` 的模�
 
 - 本轮矩阵覆盖 75/75 组合；标准 Hysteria2 认证使用每绑定 UUID 作为 `Hysteria-Auth` password，不经过 VLESS Encryption 或 VLESS 请求头。`TestHysteriaNativeSessionAuthorization` 额外覆盖共享服务器密码、跨绑定凭据、跨绑定目标、错误凭据、非法目标和 forward-proxy 拒绝；`TestHysteriaGracefulCleanupBounded` 继续覆盖对端结束、运行取消、超时释放路径。
 
+## Rust 全协议栈 120 项端到端矩阵与三端实机验证（2026-11）
+
+在 `backend/src/tunnel/mod.rs` 的 `test_full_protocol_matrix_round_trip` 以及 Linux x86_64 实机三端进程（`master` + `server` + `client`）测试中，已完成 **24 种外层传输/安全/加密/流控组合 × 5 种映射业务模式（`off` / `smux` / `yamux` / `h2mux` / `udp` XUDP）= 120 项组合** 100% 端到端往返验证：
+
+| 序号 | 外层协议与传输组合 | 外层安全 / 证书 | 附加特性 | `off` | `smux` | `yamux` | `h2mux` | `udp` (XUDP) |
+| ---: | --- | --- | --- | :---: | :---: | :---: | :---: | :---: |
+| 01 | `vless-tcp-tls` | TLS 1.3 (X.509 SAN) | - | PASS | PASS | PASS | PASS | PASS |
+| 02 | `vless-tcp-tls-enc` | TLS 1.3 | VLESS Encryption (X25519) | PASS | PASS | PASS | PASS | PASS |
+| 03 | `vless-tcp-tls-pq` | TLS 1.3 | VLESS Encryption (ML-KEM-768) | PASS | PASS | PASS | PASS | PASS |
+| 04 | `vless-tcp-tls-vision` | TLS 1.3 | Vision (`xtls-rprx-vision`) | PASS | PASS | PASS | PASS | PASS |
+| 05 | `vless-tcp-tls-enc-vision` | TLS 1.3 | X25519 Encryption + Vision | PASS | PASS | PASS | PASS | PASS |
+| 06 | `vless-tcp-reality` | REALITY TLS 1.3 (X25519) | 回落保护 + ShortID 认证 | PASS | PASS | PASS | PASS | PASS |
+| 07 | `vless-tcp-reality-enc` | REALITY TLS 1.3 | VLESS Encryption (X25519) | PASS | PASS | PASS | PASS | PASS |
+| 08 | `vless-tcp-reality-pq` | REALITY TLS 1.3 | VLESS Encryption (ML-KEM-768) | PASS | PASS | PASS | PASS | PASS |
+| 09 | `vless-tcp-reality-vision` | REALITY TLS 1.3 | Vision (`xtls-rprx-vision`) | PASS | PASS | PASS | PASS | PASS |
+| 10 | `vless-tcp-reality-enc-vision` | REALITY TLS 1.3 | X25519 Encryption + Vision | PASS | PASS | PASS | PASS | PASS |
+| 11 | `vless-tcp-plain-enc` | Plain TCP | VLESS Encryption (X25519) | PASS | PASS | PASS | PASS | PASS |
+| 12 | `hysteria2` | QUIC + TLS 1.3 (`quinn`) | HTTP/3 QPACK `/auth` `233` | PASS | PASS | PASS | PASS | PASS |
+| 13 | `xhttp-https` | TLS 1.3 | XHTTP `packet-up` | PASS | PASS | PASS | PASS | PASS |
+| 14 | `xhttp-reality` | REALITY TLS 1.3 | XHTTP `packet-up` | PASS | PASS | PASS | PASS | PASS |
+| 15 | `xhttp-http` | Plain TCP + VLESS Enc | XHTTP `packet-up` | PASS | PASS | PASS | PASS | PASS |
+| 16 | `xhttp-https-stream-one` | TLS 1.3 | XHTTP `stream-one` 全双工流 | PASS | PASS | PASS | PASS | PASS |
+| 17 | `xhttp-https-stream-up` | TLS 1.3 | XHTTP `stream-up` 流式上下行 | PASS | PASS | PASS | PASS | PASS |
+| 18 | `xhttp-https-auto` | TLS 1.3 | XHTTP `auto` (-> `packet-up`) | PASS | PASS | PASS | PASS | PASS |
+| 19 | `xhttp-https-auto-download-ep` | TLS 1.3 | XHTTP `auto` + 双端点 (-> `stream-up`) | PASS | PASS | PASS | PASS | PASS |
+| 20 | `xhttp-reality-stream-one` | REALITY TLS 1.3 | XHTTP `stream-one` 全双工流 | PASS | PASS | PASS | PASS | PASS |
+| 21 | `xhttp-reality-stream-up` | REALITY TLS 1.3 | XHTTP `stream-up` 流式上下行 | PASS | PASS | PASS | PASS | PASS |
+| 22 | `xhttp-reality-auto` | REALITY TLS 1.3 | XHTTP `auto` (-> `stream-one`) | PASS | PASS | PASS | PASS | PASS |
+| 23 | `xhttp-http-auto` | Plain TCP + VLESS Enc | XHTTP `auto` (-> `packet-up`) | PASS | PASS | PASS | PASS | PASS |
+| 24 | `vless-tcp-reality-mldsa65` | REALITY TLS 1.3 + ML-DSA-65 | 后量子证书扩展签名 + Vision | PASS | PASS | PASS | PASS | PASS |
+
+- 本地 `cargo test --manifest-path backend/Cargo.toml`：120/120 组合通过（每项 3 并发 peer，TCP 64 KiB + CloseWrite，UDP 1 KiB XUDP），用时 13.8 秒。
+- Linux x86_64 实机三端独立进程（`master` + `server` + `client`）动态热切换测试：120/120 组合全部通过，总耗时 19.05 秒。
+
 ## XHTTP 扩展
 
 XHTTP 的 15 个组合使用 HTTP/1.1 packet-up。每组同样执行 3 个并发 peer，TCP 每 peer 64 KiB 加 CloseWrite，UDP 每 peer 1 KiB；保持 off/smux/yamux/h2mux 与授权 XUDP，不新增公开绑定管理。HTTPS 和 HTTP 分别验证对应监听；CDN TLS 终止/HTTP 回源另由 `internal/tunnel/xhttp_test.go` 的反向代理用例覆盖。

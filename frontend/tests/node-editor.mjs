@@ -766,22 +766,24 @@ test('XHTTP server request header cap persists, defaults safely, and rejects out
   assert.equal(e.draft.xhttpMaxHeaderBytes, 8192)
 })
 
-test('XHTTP uplink method defaults to POST and preserves PUT across all modes', async () => {
+test('XHTTP uplink method defaults to POST and preserves PUT and OPTIONS across all modes', async () => {
   assert.match(editorSource, /id="node-xhttp-uplink-method" v-model="draft.xhttpUplinkMethod"/)
   const e = setup()
   e.draft.transport = 'xhttp'
   await e.save()
   assert.equal(payload(e).xhttp.uplink_http_method, undefined)
-  for (const mode of ['packet-up', 'stream-up', 'stream-one']) {
-    e.draft.xhttpMode = mode
-    e.draft.xhttpUplinkMethod = 'PUT'
-    await e.save()
-    assert.equal(payload(e).xhttp.uplink_http_method, 'PUT')
-    e.open({ id: 'server', name: 'Server', tunnel: payload(e) })
-    assert.equal(e.draft.xhttpUplinkMethod, 'PUT')
+  for (const method of ['PUT', 'OPTIONS']) {
+    for (const mode of ['packet-up', 'stream-up', 'stream-one']) {
+      e.draft.xhttpMode = mode
+      e.draft.xhttpUplinkMethod = method
+      await e.save()
+      assert.equal(payload(e).xhttp.uplink_http_method, method)
+      e.open({ id: 'server', name: 'Server', tunnel: payload(e) })
+      assert.equal(e.draft.xhttpUplinkMethod, method)
+    }
   }
   e.draft.xhttpUplinkMethod = 'GET'
-  await assert.rejects(e.save(), /上行方法仅支持 POST 或 PUT/)
+  await assert.rejects(e.save(), /上行方法仅支持 POST、PUT 或 OPTIONS/)
   e.open()
   assert.equal(e.draft.xhttpUplinkMethod, 'POST')
 })
@@ -1247,11 +1249,14 @@ test('XHTTP REALITY auto serializes effective stream mode and keeps inactive pac
   assert.match(editorSource, /:required="draft.security === 'encryption' \|\| draft.transport === 'xhttp' && !draft.xhttpTLS && draft.security !== 'reality'"/)
   const e = setup()
   Object.assign(e.draft, { transport: 'xhttp', security: 'reality', xhttpMode: 'auto', xhttpVersion: '2', xhttpDataPlacement: 'header', xhttpChunkSize: 64, xhttpMaxBufferedPosts: 4, xhttpMaxConcurrentPosts: 4, xhttpSessionPlacement: 'query', xhttpSessionKey: 'sid', xhttpSeqPlacement: 'query', xhttpSeqKey: 'seq', xhttpNoGRPCHeader: true })
+  Object.assign(e.draft, { xhttpPaddingObfs: true, xhttpPaddingPlacement: 'query', xhttpPaddingKey: 'sid' })
   await e.save()
   const x = payload(e).xhttp
   assert.equal(x.mode, 'auto')
   assert.equal(x.tls, false)
   assert.equal(x.no_grpc_header, true)
+  assert.equal(x.padding_key, 'sid')
+  Object.assign(e.draft, { xhttpPaddingObfs: false, xhttpPaddingPlacement: 'query_in_header', xhttpPaddingKey: 'x_padding' })
   for (const field of ['max_each_post_bytes', 'uplink_data_placement', 'uplink_chunk_size', 'max_buffered_posts', 'max_concurrent_posts', 'session_id_placement', 'session_id_key', 'seq_placement', 'seq_key']) assert.equal(x[field], undefined)
   e.addEndpoint('download.example.com', 443)
   e.endpoints[1].id = 'down'
@@ -1289,4 +1294,36 @@ test('XHTTP data keys reject session, sequence and padding collisions before API
   }
   assert.match(editorSource, /<template v-if="xhttpEffectiveMode !== 'stream-one'">/)
   assert.match(editorSource, /<div v-if="draft.xhttpMode !== 'stream-one'"><label for="node-xhttp-download-endpoint">/)
+})
+
+test('opening a node restores stored VLESS options, certificate TTL days, flow, and XHTTP defaults', () => {
+  const e = setup()
+  const cert365 = '-----BEGIN CERTIFICATE-----\nMB4XDTI2MTEwNDEzMTgxMFoXDTI3MTEwNDEzMTgxMFow\n-----END CERTIFICATE-----'
+  const pqXorpubDec = 'mlkem768x25519plus.xorpub.600s.' + 'A'.repeat(86)
+  e.draft.protocol = 'hysteria2'
+  e.open({
+    id: 'srv-stored',
+    name: 'Stored Server',
+    role: 'server',
+    address: '127.0.0.1',
+    port: 28443,
+    tunnel: {
+      protocol: 'vless',
+      transport_security: 'tls',
+      cert_pem: cert365,
+      key_pem: key,
+      flow: 'xtls-rprx-vision',
+      decryption: pqXorpubDec,
+      xhttp: { path: '/veilink/', mode: 'auto', tls: true },
+    },
+  })
+  assert.equal(e.options.ttl, 365)
+  assert.equal(e.options.mode, 'xorpub')
+  assert.equal(e.options.authentication, 'mlkem768')
+  assert.equal(e.draft.protocol, 'vless')
+  assert.equal(e.draft.transport, 'xhttp')
+  assert.equal(e.draft.security, 'tls')
+  assert.equal(e.draft.xhttpMode, 'auto')
+  assert.equal(e.draft.xhttpPadding, 100)
+  assert.equal(e.draft.xhttpPaddingMax, 1000)
 })

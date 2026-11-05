@@ -80,7 +80,17 @@ export async function api<T>(path: string, method = 'GET', data?: unknown): Prom
   if (res.status === 204) return null as T;
   const text = await res.text();
   if (!text) return null as T;
-  return JSON.parse(text) as T;
+  const parsed = JSON.parse(text);
+  const nowSec = Math.floor(Date.now() / 1000);
+  const clampLastSeen = (item: unknown) => {
+    if (item && typeof item === 'object' && typeof (item as Record<string, unknown>).last_seen === 'number') {
+      const rec = item as Record<string, number>;
+      if (rec.last_seen > nowSec) rec.last_seen = nowSec;
+    }
+  };
+  if (Array.isArray(parsed)) parsed.forEach(clampLastSeen);
+  else clampLastSeen(parsed);
+  return parsed as T;
 }
 
 export interface VersionInfo {

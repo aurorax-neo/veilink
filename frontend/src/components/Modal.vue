@@ -34,8 +34,58 @@ const visible = ref(false)
 const error = ref('')
 const busy = ref(false)
 const sheetSnap = ref<'30' | '60' | '80'>('80')
+const dragOffsetY = ref(0)
+const draggingSheet = ref(false)
+let dragStartY = 0
+let composing = false
+let compositionEndedAt = 0
 const isAlert = computed(() => props.danger)
 const isDrawer = computed(() => props.variant === 'drawer' && !props.danger)
+
+function onCompositionStart() {
+  composing = true
+}
+
+function onCompositionEnd() {
+  composing = false
+  compositionEndedAt = Date.now()
+}
+
+function onFormKeydown(event: KeyboardEvent) {
+  if (event.key !== 'Enter') return
+  if (composing || event.isComposing || event.keyCode === 229 || (compositionEndedAt > 0 && Date.now() - compositionEndedAt < 500)) {
+    event.preventDefault()
+  }
+}
+
+function onSheetPointerDown(event: PointerEvent) {
+  if (!isDrawer.value) return
+  draggingSheet.value = true
+  dragStartY = event.clientY
+  dragOffsetY.value = 0
+  ;(event.currentTarget as HTMLElement | null)?.setPointerCapture?.(event.pointerId)
+}
+
+function onSheetPointerMove(event: PointerEvent) {
+  if (!draggingSheet.value) return
+  const delta = event.clientY - dragStartY
+  // Damped resistance (Spec 6.8 over-damped drag feel)
+  dragOffsetY.value = delta > 0 ? delta * 0.65 : delta * 0.25
+}
+
+function onSheetPointerUp() {
+  if (!draggingSheet.value) return
+  const delta = dragOffsetY.value
+  draggingSheet.value = false
+  dragOffsetY.value = 0
+  const order: Array<'30' | '60' | '80'> = ['30', '60', '80']
+  const idx = order.indexOf(sheetSnap.value)
+  if (delta > 36 && idx > 0) {
+    sheetSnap.value = order[idx - 1]!
+  } else if (delta < -36 && idx < order.length - 1) {
+    sheetSnap.value = order[idx + 1]!
+  }
+}
 
 function onKeydown(event: KeyboardEvent) {
   if (!visible.value) return
@@ -75,6 +125,7 @@ function onBackdropClick() {
 
 async function onSubmit() {
   if (!props.submit || busy.value || props.hideSave || props.disabled) return
+  if (composing || (compositionEndedAt > 0 && Date.now() - compositionEndedAt < 500)) return
   busy.value = true
   error.value = ''
   try {
@@ -106,18 +157,30 @@ defineExpose({ open, close })
         :class="[
           isDrawer ? 'drawer-panel' : `modal-${size}`,
           isDrawer ? `sheet-snap-${sheetSnap}` : '',
-          { 'modal-danger': danger },
+          { 'modal-danger': danger, 'is-sheet-dragging': draggingSheet },
         ]"
+        :style="isDrawer && dragOffsetY ? { transform: `translateY(${Math.round(dragOffsetY)}px)` } : undefined"
         :role="isAlert ? 'alertdialog' : 'dialog'"
         aria-modal="true"
         :aria-labelledby="titleId"
       >
-        <div v-if="isDrawer" class="sheet-handle-bar" aria-label="面板高度档位">
-          <button type="button" class="sheet-pill" :class="{ active: sheetSnap === '30' }" @click="sheetSnap = '30'">30%</button>
-          <button type="button" class="sheet-pill" :class="{ active: sheetSnap === '60' }" @click="sheetSnap = '60'">60%</button>
-          <button type="button" class="sheet-pill" :class="{ active: sheetSnap === '80' }" @click="sheetSnap = '80'">80%</button>
+        <div
+          v-if="isDrawer"
+          class="sheet-handle-bar"
+          aria-label="面板高度档位"
+          @pointerdown="onSheetPointerDown"
+          @pointermove="onSheetPointerMove"
+          @pointerup="onSheetPointerUp"
+          @pointercancel="onSheetPointerUp"
+        >
+          <span class="sheet-drag-grip" aria-hidden="true"></span>
+          <div class="sheet-pill-group">
+            <button type="button" class="sheet-pill" :class="{ active: sheetSnap === '30' }" @click="sheetSnap = '30'">30%</button>
+            <button type="button" class="sheet-pill" :class="{ active: sheetSnap === '60' }" @click="sheetSnap = '60'">60%</button>
+            <button type="button" class="sheet-pill" :class="{ active: sheetSnap === '80' }" @click="sheetSnap = '80'">80%</button>
+          </div>
         </div>
-        <form @submit.prevent="onSubmit">
+        <form @submit.prevent="onSubmit" @compositionstart="onCompositionStart" @compositionend="onCompositionEnd" @keydown="onFormKeydown">
           <header class="modal-head">
             <div class="modal-title-group">
               <p v-if="kicker || isAlert" class="kicker" :class="{ 'kicker-danger': isAlert }">

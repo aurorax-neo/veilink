@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref } from 'vue'
 import { api } from '../api'
-import { copyText } from '../format'
+import { copyText, formatTime } from '../format'
 import type { Node } from '../types'
 import Modal from './Modal.vue'
 
@@ -14,6 +14,7 @@ const masterURL = ref(location.origin)
 const result = ref<JoinResult | null>(null)
 const status = ref('')
 const copyError = ref('')
+const copied = ref(false)
 const showHelp = ref(false)
 const showDanger = ref(false)
 const now = ref(Date.now())
@@ -29,7 +30,7 @@ function open(value: Node) {
   showDanger.value = false
   modal.value?.open()
 }
-function clear() { result.value = null; status.value = ''; copyError.value = '' }
+function clear() { result.value = null; status.value = ''; copyError.value = ''; copied.value = false }
 async function generate() {
   if (node.value?.embedded) throw new Error('内置节点不支持快捷接入。')
   let url: URL
@@ -44,7 +45,12 @@ async function generate() {
 }
 async function copy(value: string, label: string) {
   copyError.value = ''
-  try { await copyText(value); status.value = `${label}已复制。` }
+  try {
+    await copyText(value)
+    status.value = `${label}已复制。`
+    copied.value = true
+    globalThis.window?.setTimeout?.(() => { copied.value = false }, 2500)
+  }
   catch { copyError.value = `${label}复制失败，请手动选择命令。` }
 }
 async function revoke() {
@@ -73,10 +79,10 @@ defineExpose({ open })
     <small class="help">填写节点可访问的 Master 地址（含端口）；HTTPS 证书须匹配主机名。</small>
     <p v-if="result?.warning" class="warning" role="note">{{ result.warning }}</p>
     <template v-if="result">
-      <div class="command-heading"><label for="join-command">Docker 接入命令</label><button type="button" class="btn small primary" :disabled="expired" @click="copy(result.command, '接入命令')">复制接入命令</button></div>
+      <div class="command-heading"><label for="join-command">Docker 接入命令</label><button type="button" class="btn small primary fit" :class="{ 'copy-bounce': copied }" :disabled="expired" @click="copy(result.command, '接入命令')"><span class="fit-sizer" aria-hidden="true">✓ 已复制命令</span><span class="fit-sizer" aria-hidden="true">复制接入命令</span><span class="fit-value">{{ copied ? '✓ 已复制命令' : '复制接入命令' }}</span></button></div>
       <textarea id="join-command" class="command-block secret" :value="result.command" readonly rows="5" spellcheck="false" />
       <div class="token-meta">
-        <small class="help live-number" :class="{ bad: expired }">{{ expired ? '令牌已过期' : '令牌到期' }} · {{ new Date(result.expires_at * 1000).toLocaleString('zh-CN', { hour12: false }) }}</small>
+        <small class="help live-number" :class="{ bad: expired }">{{ expired ? '令牌已过期' : '令牌到期' }} · {{ formatTime(result.expires_at * 1000) }}</small>
         <button v-if="expired" type="button" class="btn small" @click="clear">重新生成</button>
         <button v-else type="button" class="btn small quiet danger revoke-token" style="margin-top: 0;" @click="revokeModal?.open()">撤销此接入令牌</button>
       </div>

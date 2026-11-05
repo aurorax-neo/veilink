@@ -31,57 +31,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: backend/go.mod
-          cache-dependency-path: backend/go.sum
+      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-      - name: Go package tests
+      - name: Rust backend tests
         working-directory: backend
         run: |
-          failed=0
-          while IFS= read -r pkg; do
-            echo "::group::go test ${pkg}"
-            log_file="$(mktemp)"
-            if go test -count=1 "$pkg" -timeout=5m >"$log_file" 2>&1; then
-              cat "$log_file"
-            else
-              cat "$log_file"
-              details="$(tail -n 12 "$log_file" | tr '\r\n' ' ' | cut -c1-1000)"
-              echo "::error title=Go package test failed::${pkg}: ${details}"
-              failed=1
-            fi
-            echo "::endgroup::"
-          done < <(go list ./... | grep -v '^veilink/internal/tunnel$')
-          exit "$failed"
-      - name: Tunnel regression tests
-        working-directory: backend
-        run: |
-          go test ./internal/tunnel \
-            -skip '^(TestProtocolMatrixRoundTrip|TestXHTTPCombinationMatrix)$' \
-            -count=1 -timeout=5m
-      - name: Protocol matrix
-        working-directory: backend
-        run: go test ./internal/tunnel -run '^TestProtocolMatrixRoundTrip$' -count=1 -timeout=5m
-      - name: XHTTP matrix
-        working-directory: backend
-        run: go test ./internal/tunnel -run '^TestXHTTPCombinationMatrix$' -count=1 -timeout=5m
-      - name: Go vet
-        working-directory: backend
-        run: |
-          go vet ./...
-      - name: Go race checks
-        working-directory: backend
-        run: |
-          go test -race ./internal/store ./internal/config ./internal/cli
-      - name: Integration tests
-        working-directory: backend
-        run: |
-          go test -tags integration ./tests/integration -count=1
+          cargo test --locked
       - name: Frontend checks and shared Web assets
         working-directory: frontend
         run: |
@@ -100,45 +59,36 @@ jobs:
     needs: checks
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        goos: [linux, darwin, windows]
-        goarch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: backend/go.mod
+      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/download-artifact@v4
         with:
           name: shared-web
           path: backend/internal/webui/dist
       - name: Build one executable for all roles and package
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: '0'
+          VEILINK_VERSION: dev
+          VEILINK_COMMIT: ${{ github.sha }}
         run: |
-          suffix=''
-          if [[ "$GOOS" == windows ]]; then suffix='.exe'; fi
           mkdir -p bundle
           cd backend
           test -s internal/webui/dist/index.html
-          go build -trimpath -ldflags="-s -w -X veilink/internal/buildinfo.Version=dev -X veilink/internal/buildinfo.Commit=${GITHUB_SHA}" -o "../bundle/veilink${suffix}" ./cmd/veilink
+          cargo build --release --locked
+          cp target/release/veilink ../bundle/veilink
           cp ../LICENSE ../NOTICE ../THIRD_PARTY_NOTICES.md ../README.md ../bundle/
           printf '%s\n' "Source: https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}" \
             'Unified executable: master|server|client subcommands; no role-specific packages.' \
             'Development archive, not a host production deployment guide.' \
             'Master Web assets are embedded in the veilink binary; default management transport is HTTP, TLS is optional.' > ../bundle/BUILD.txt
           mkdir -p ../dist
-          tar -czf "../dist/veilink-${GOOS}-${GOARCH}.tar.gz" -C ../bundle .
+          tar -czf "../dist/veilink-linux-amd64.tar.gz" -C ../bundle .
           (cd ../dist && sha256sum ./*.tar.gz > SHA256SUMS)
       - uses: actions/upload-artifact@v4
         with:
-          name: package-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: package-linux-amd64
           path: dist/
           if-no-files-found: error
           retention-days: 14
@@ -178,7 +128,6 @@ jobs:
             VERSION=dev
             COMMIT=${{ github.sha }}
             SOURCE_URL=https://github.com/${{ github.repository }}
-            GOPROXY=https://proxy.golang.org,direct
             NPM_REGISTRY=https://registry.npmjs.org
             APK_MIRROR=https://dl-cdn.alpinelinux.org/alpine
           cache-from: type=gha

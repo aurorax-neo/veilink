@@ -96,3 +96,4 @@ export class VeilinkStream {
 
 // 单例
 export const stream = new VeilinkStream();
+(globalThis as Record<string, unknown>).__veilinkStream = stream;

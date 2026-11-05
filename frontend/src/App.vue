@@ -3,6 +3,7 @@ import { onMounted, onUnmounted, provide, reactive, ref, watch } from 'vue'
 import { api, ApiError, getApiKey, setApiKey, clearApiKey, setUnauthorized, checkApiCompatibility } from './api'
 import { deskKey, navigateKey, type Desk } from './desk'
 import { pageFromHash, pages, type Audit, type Mapping, type Node, type PageId } from './types'
+import './stream'
 import ConsoleView from './views/ConsoleView.vue'
 import LoginView from './views/LoginView.vue'
 
@@ -19,6 +20,7 @@ function dismissNotice() {
   noticeTimer = undefined
   desk.notice = ''
   desk.noticeBad = false
+  desk.noticeUndo = null
 }
 
 const desk = reactive<Desk>({
@@ -34,6 +36,7 @@ const desk = reactive<Desk>({
   error: '',
   notice: '',
   noticeBad: false,
+  noticeUndo: null,
   async reloadNodes(id: string) {
     const ticket = generation
     const previous = desk.nodes.find(node => node.id === id)
@@ -80,12 +83,13 @@ const desk = reactive<Desk>({
       if (ticket === generation && !options?.silent) desk.loading = false
     }
   },
-  notify(text: string, bad = false) {
+  notify(text: string, bad = false, undo = null) {
     dismissNotice()
     if (!text) return
     noticeKey.value += 1
     desk.noticeBad = bad
     desk.notice = text
+    desk.noticeUndo = undo
     noticeTimer = window.setTimeout(dismissNotice, bad ? 8000 : 4000)
   },
   dismissNotice,
@@ -122,6 +126,7 @@ function resetDesk() {
 function navigate(next: PageId) {
   page.value = next
   const hash = `#/${next}`
+  pageFromHash(hash)
   if (location.hash !== hash) location.hash = hash
   const stage = document.getElementById('main')
   if (stage) stage.scrollTop = 0
@@ -136,10 +141,21 @@ function onHash() {
 provide(deskKey, desk)
 provide(navigateKey, navigate)
 
+type StreamBus = {
+  connect: (types?: string[]) => Promise<void>
+  disconnect: () => void
+  on: (type: string, fn: (data: unknown) => void) => () => void
+}
+function getStreamBus(): StreamBus | undefined {
+  if (typeof EventSource === 'undefined') return undefined
+  return (globalThis as Record<string, unknown>).__veilinkStream as StreamBus | undefined
+}
+
 async function enter() {
   phase.value = 'app'
   loginError.value = ''
   document.title = `Veilink · ${pages[page.value].title}`
+  void getStreamBus()?.connect(['node', 'tunnel', 'stats', 'log']).catch(() => {})
   try {
     await desk.reload()
   } catch {
@@ -164,6 +180,7 @@ async function submitLogin(apiKey: string) {
 }
 
 function logout() {
+  getStreamBus()?.disconnect()
   clearApiKey()
   resetDesk()
   phase.value = 'login'
@@ -177,6 +194,8 @@ watch(page, (next) => {
 
 let liveTimer: ReturnType<typeof setInterval> | undefined
 let liveBusy = false
+let offStreamNode: (() => void) | undefined
+let offStreamTunnel: (() => void) | undefined
 async function refreshLive() {
   if (phase.value !== 'app' || document.visibilityState === 'hidden' || desk.loading || desk.refreshing || liveBusy) return
   liveBusy = true
@@ -190,6 +209,7 @@ async function refreshLive() {
 function onVisible() { if (document.visibilityState === 'visible') void refreshLive() }
 onMounted(async () => {
   setUnauthorized(() => {
+    getStreamBus()?.disconnect()
     clearApiKey()
     resetDesk()
     phase.value = 'login'
@@ -199,6 +219,8 @@ onMounted(async () => {
   window.addEventListener('hashchange', onHash)
   window.addEventListener('visibilitychange', onVisible)
   liveTimer = window.setInterval(() => { void refreshLive() }, 5000)
+  offStreamNode = getStreamBus()?.on('node', () => { void refreshLive() })
+  offStreamTunnel = getStreamBus()?.on('tunnel', () => { void refreshLive() })
 
   // 启动时检查 API 契约版本
   try {
@@ -225,6 +247,9 @@ onUnmounted(() => {
   window.removeEventListener('hashchange', onHash)
   window.removeEventListener('visibilitychange', onVisible)
   if (liveTimer) window.clearInterval(liveTimer)
+  offStreamNode?.()
+  offStreamTunnel?.()
+  getStreamBus()?.disconnect()
   dismissNotice()
 })
 </script>

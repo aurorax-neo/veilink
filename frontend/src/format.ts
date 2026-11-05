@@ -5,12 +5,37 @@ export type Tone = '' | 'good' | 'warn' | 'bad'
 const actions: Record<string, string> = {
   'node.save': '保存节点',
   'node.revoke': '吊销或删除节点',
+  'node.enroll.token': '签发接入令牌',
+  'node.enroll.revoke': '撤销接入令牌',
+  'node.credential.reset': '重置节点凭证',
   'mapping.save': '保存映射',
   'mapping.delete': '删除映射',
 }
 
 export function actionLabel(action: string): string {
   return actions[action] || action
+}
+
+export function actionTone(action: string): Tone {
+  if (action === 'node.revoke' || action === 'mapping.delete') return 'bad'
+  if (action === 'node.enroll.revoke' || action === 'node.credential.reset') return 'warn'
+  if (action === 'node.save' || action === 'mapping.save' || action === 'node.enroll.token') return 'good'
+  return ''
+}
+
+export function formatTime(value: number | string | Date): string {
+  const date = value instanceof Date ? value : new Date(value)
+  if (Number.isNaN(date.getTime())) return String(value)
+  return date.toLocaleString('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    hour12: false,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })
 }
 
 export function endpoint(host: string, port: number): string {
@@ -64,7 +89,7 @@ export function needsAttention(node: Node, now = Date.now()): boolean {
 
 export function seenText(unix: number, now = Date.now(), relative = true): string {
   if (!unix) return '尚未上报'
-  const abs = new Date(unix * 1000).toLocaleString('zh-CN', { hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+  const abs = formatTime(unix * 1000)
   if (!relative) return abs
   const delta = Math.round(now / 1000 - unix)
   if (delta < -5) return `${abs}（比本机时钟晚 ${-delta} 秒）`
@@ -220,4 +245,34 @@ export function logLevelTone(level: string): Tone {
     case 'WARN': return 'warn'
     default: return 'good'
   }
+}
+
+// Spec 7.6: Keep file extension visible when truncating long filenames (e.g. "2025年度财务报告-最终版...pdf").
+export function truncateFileName(name: string, maxStem = 16): string {
+  const trimmed = (name || '').trim()
+  if (!trimmed) return ''
+  const dotIndex = trimmed.lastIndexOf('.')
+  if (dotIndex <= 0 || dotIndex === trimmed.length - 1) {
+    return trimmed.length > maxStem + 4 ? `${trimmed.slice(0, maxStem)}...` : trimmed
+  }
+  const stem = trimmed.slice(0, dotIndex)
+  const ext = trimmed.slice(dotIndex + 1)
+  if (stem.length <= maxStem) return trimmed
+  return `${stem.slice(0, maxStem)}...${ext}`
+}
+
+// Spec 7.1: Block Enter while IME is composing or within 500ms after compositionend (Safari quirk).
+export function isImeComposingEnter(event: KeyboardEvent, lastCompositionEndAt = 0, now = Date.now()): boolean {
+  if (event.key !== 'Enter') return false
+  if (event.isComposing || event.keyCode === 229) return true
+  return lastCompositionEndAt > 0 && now - lastCompositionEndAt < 500
+}
+
+// Spec 4.4: Lightweight tactile feedback on supported mobile platforms without throwing on desktop.
+export function triggerHaptic(durationMs = 12): void {
+  try {
+    if (typeof globalThis.navigator !== 'undefined' && typeof globalThis.navigator.vibrate === 'function') {
+      globalThis.navigator.vibrate(durationMs)
+    }
+  } catch { /* ignore */ }
 }

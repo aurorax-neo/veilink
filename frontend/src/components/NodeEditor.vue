@@ -9,7 +9,7 @@ import SecretField from './SecretField.vue'
 const props = defineProps<{ role: 'server' | 'client'; saved: () => Promise<void>; defaultName?: string }>()
 const modal = ref<InstanceType<typeof Modal> | null>(null)
 const server = computed(() => props.role === 'server')
-const draft = reactive({ id: '', name: '', address: '', port: '443', listenPort: '443', protocol: 'vless' as 'vless' | 'hysteria2', transport: 'tcp' as 'tcp' | 'xhttp' | 'quic' | 'hysteria2', security: 'tls', flow: '', enc: '', cert: '', key: '', ca: '', listen: '', dest: '', privateKey: '', shortIDs: '', names: '', password: '', spiderX: '', spiderY: '', mldsa65Verify: '', mldsa65Seed: '', xhttpPath: '/veilink/', xhttpDownloadEndpoint: '', xhttpHost: '', xhttpHeaders: '', xhttpMode: 'packet-up' as 'packet-up' | 'stream-up' | 'stream-one' | 'auto', xhttpVersion: '' as '' | '1.1' | '2' | '3', xhttpTLS: true, xhttpPostBytes: 32768, xhttpPostBytesMax: 0, xhttpPostInterval: 0, xhttpPostIntervalMax: 0, xhttpMaxBufferedPosts: 0, xhttpMaxConcurrentPosts: 0, xhttpDataPlacement: 'body' as 'body' | 'header' | 'cookie', xhttpDataKey: '', xhttpChunkSize: 0, xhttpMuxConcurrency: 0, xhttpMuxConnections: 0, xhttpMuxReuse: 0, xhttpMuxRequests: 0, xhttpMuxSeconds: 0, xhttpMuxKeepAlive: 0, xhttpTimeout: 15, xhttpPadding: 100, xhttpPaddingMax: 1000, xhttpPaddingObfs: false, xhttpPaddingPlacement: 'query_in_header' as 'query_in_header' | 'query' | 'header' | 'cookie', xhttpPaddingKey: 'x_padding', xhttpPaddingHeader: 'Referer', xhttpPaddingMethod: 'repeat-x' as 'repeat-x' | 'tokenish', xhttpNoGRPCHeader: false, xhttpNoSSEHeader: false, xhttpMaxHeaderBytes: 8192, xhttpUplinkMethod: 'POST' as 'POST' | 'PUT', xhttpSessionPlacement: 'path' as MetaPlacement, xhttpSessionKey: '', xhttpSeqPlacement: 'path' as MetaPlacement, xhttpSeqKey: '', xhttpSessionTable: '', xhttpSessionLength: 0 })
+const draft = reactive({ id: '', name: '', address: '', port: '443', listenPort: '443', protocol: 'vless' as 'vless' | 'hysteria2', transport: 'tcp' as 'tcp' | 'xhttp' | 'quic' | 'hysteria2', security: 'tls', flow: '', enc: '', cert: '', key: '', ca: '', listen: '', dest: '', privateKey: '', shortIDs: '', names: '', password: '', spiderX: '', spiderY: '', mldsa65Verify: '', mldsa65Seed: '', xhttpPath: '/veilink/', xhttpDownloadEndpoint: '', xhttpHost: '', xhttpHeaders: '', xhttpMode: 'packet-up' as 'packet-up' | 'stream-up' | 'stream-one' | 'auto', xhttpVersion: '' as '' | '1.1' | '2' | '3', xhttpTLS: true, xhttpPostBytes: 32768, xhttpPostBytesMax: 0, xhttpPostInterval: 0, xhttpPostIntervalMax: 0, xhttpMaxBufferedPosts: 0, xhttpMaxConcurrentPosts: 0, xhttpDataPlacement: 'body' as 'body' | 'header' | 'cookie', xhttpDataKey: '', xhttpChunkSize: 0, xhttpMuxConcurrency: 0, xhttpMuxConnections: 0, xhttpMuxReuse: 0, xhttpMuxRequests: 0, xhttpMuxSeconds: 0, xhttpMuxKeepAlive: 0, xhttpTimeout: 15, xhttpPadding: 100, xhttpPaddingMax: 1000, xhttpPaddingObfs: false, xhttpPaddingPlacement: 'query_in_header' as 'query_in_header' | 'query' | 'header' | 'cookie', xhttpPaddingKey: 'x_padding', xhttpPaddingHeader: 'Referer', xhttpPaddingMethod: 'repeat-x' as 'repeat-x' | 'tokenish', xhttpNoGRPCHeader: false, xhttpNoSSEHeader: false, xhttpMaxHeaderBytes: 8192, xhttpUplinkMethod: 'POST' as 'POST' | 'PUT' | 'OPTIONS', xhttpSessionPlacement: 'path' as MetaPlacement, xhttpSessionKey: '', xhttpSeqPlacement: 'path' as MetaPlacement, xhttpSeqKey: '', xhttpSessionTable: '', xhttpSessionLength: 0 })
 const streamUpPeriod = reactive({ min: '' as number | '', max: '' as number | '' })
 type MetaPlacement = 'path' | 'query' | 'header' | 'cookie'
 type MetaField = 'session' | 'seq'
@@ -80,7 +80,8 @@ function xhttpPaddingFields(): Partial<NonNullable<TunnelConfig['xhttp']>> {
   }
   const sessionKey = draft.xhttpSessionKey || (draft.xhttpSessionPlacement === 'header' ? 'X-Veilink-Session' : 'x_session')
   const seqKey = draft.xhttpSeqKey || (draft.xhttpSeqPlacement === 'header' ? 'X-Veilink-Seq' : 'x_seq')
-  for (const [position, configured] of [[draft.xhttpSessionPlacement, sessionKey], ...(xhttpEffectiveMode.value === 'packet-up' ? [[draft.xhttpSeqPlacement, seqKey]] : [])]) {
+  const activeMeta = xhttpEffectiveMode.value === 'stream-one' ? [] : [[draft.xhttpSessionPlacement, sessionKey], ...(xhttpEffectiveMode.value === 'packet-up' ? [[draft.xhttpSeqPlacement, seqKey]] : [])]
+  for (const [position, configured] of activeMeta) {
     if (position === placement && (placement === 'cookie' || placement === 'query') && configured === key) throw new Error('XHTTP 填充键名不能覆盖会话或序号。')
     if (position === 'header' && (placement === 'header' || placement === 'query_in_header') && configured.toLowerCase() === header.toLowerCase()) throw new Error('XHTTP 填充请求头不能覆盖会话或序号。')
   }
@@ -166,15 +167,57 @@ watch(() => draft.listenPort, value => {
 type PEMField = 'cert' | 'key' | 'ca'
 const pemLabels = { cert: '证书 PEM', key: '私钥 PEM', ca: 'CA PEM（可选）' }
 const pemFields = computed<PEMField[]>(() => !server.value ? [] : (draft.protocol === 'hysteria2' || draft.security === 'tls') ? ['cert', 'key', 'ca'] : draft.transport === 'xhttp' && draft.xhttpTLS ? ['ca'] : [])
-const uploads = reactive<Record<PEMField, { busy: boolean; error: string; status: string; revision: number }>>({
-  cert: { busy: false, error: '', status: '', revision: 0 }, key: { busy: false, error: '', status: '', revision: 0 }, ca: { busy: false, error: '', status: '', revision: 0 },
+const uploads = reactive<Record<PEMField, { busy: boolean; error: string; status: string; fileName?: string; revision: number }>>({
+  cert: { busy: false, error: '', status: '', fileName: '', revision: 0 }, key: { busy: false, error: '', status: '', fileName: '', revision: 0 }, ca: { busy: false, error: '', status: '', fileName: '', revision: 0 },
 })
+function formatUploadFileName(raw?: string): string {
+  const trimmed = (raw || '').trim()
+  if (!trimmed) return ''
+  const dot = trimmed.lastIndexOf('.')
+  if (dot <= 0 || dot === trimmed.length - 1) return trimmed.length > 20 ? `${trimmed.slice(0, 16)}...` : trimmed
+  const stem = trimmed.slice(0, dot)
+  const ext = trimmed.slice(dot + 1)
+  return stem.length <= 16 ? trimmed : `${stem.slice(0, 16)}...${ext}`
+}
 const reading = computed(() => Object.values(uploads).some(state => state.busy))
 const uploadError = computed(() => pemFields.value.map(field => uploads[field].error).find(Boolean))
 type GenerateKind = 'reality' | 'short_id' | 'mldsa65' | 'vless' | 'hysteria2' | 'certificate'
 const generation = reactive({ busy: '' as GenerateKind | '', error: '', status: '', revision: 0 })
 const options = reactive({ mode: 'native', authentication: 'x25519', ttl: 30 })
-function clearUpload(field: PEMField) { Object.assign(uploads[field], { busy: false, error: '', status: '', revision: uploads[field].revision + 1 }) }
+function inferVlessOptions(dec?: string): { mode: string; authentication: string } {
+  const parts = (dec || '').trim().split('.')
+  if (parts.length >= 4 && parts[0] === 'mlkem768x25519plus') {
+    const mode = ['native', 'xorpub', 'random'].includes(parts[1]) ? parts[1] : 'native'
+    const authentication = parts[3] && parts[3].length > 50 ? 'mlkem768' : 'x25519'
+    return { mode, authentication }
+  }
+  return { mode: 'native', authentication: 'x25519' }
+}
+function inferCertTtlDays(pem?: string): number {
+  const body = (pem || '').replace(/-----BEGIN CERTIFICATE-----|-----END CERTIFICATE-----|\s+/g, '')
+  if (!body) return 30
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+  let bits = 0, value = 0, raw = ''
+  for (let i = 0; i < body.length; i++) {
+    const idx = alphabet.indexOf(body[i])
+    if (idx < 0) continue
+    value = (value << 6) | idx
+    bits += 6
+    if (bits >= 8) {
+      bits -= 8
+      raw += String.fromCharCode((value >>> bits) & 0xff)
+    }
+  }
+  const toMs = (tag: number, str: string): number => {
+    const full = tag === 0x17 ? `${Number(str.slice(0, 2)) >= 50 ? '19' : '20'}${str}` : str
+    return Date.UTC(Number(full.slice(0, 4)), Number(full.slice(4, 6)) - 1, Number(full.slice(6, 8)), Number(full.slice(8, 10)), Number(full.slice(10, 12)), Number(full.slice(12, 14)))
+  }
+  const match = raw.match(/([\x17\x18])[\x0d\x0f](\d{12,14}Z)([\x17\x18])[\x0d\x0f](\d{12,14}Z)/)
+  if (!match) return 30
+  const days = Math.round((toMs(match[3].charCodeAt(0), match[4]) - toMs(match[1].charCodeAt(0), match[2])) / 86_400_000)
+  return days >= 1 && days <= 365 ? days : 30
+}
+function clearUpload(field: PEMField) { Object.assign(uploads[field], { busy: false, error: '', status: '', fileName: '', revision: uploads[field].revision + 1 }) }
 function clearSecrets() {
   session.value++
   for (const field of ['cert', 'key', 'ca'] as const) { clearUpload(field); draft[field] = '' }
@@ -196,7 +239,9 @@ async function uploadPEM(event: Event, field: PEMField) {
     if (state.revision !== revision) return
     const problem = validatePEM(text, field) || (!text.trim() ? '文件为空，请选择 PEM 文件。' : '')
     if (problem) { state.error = problem; return }
-    draft[field] = text.trim(); state.status = '已载入，保存后生效。'
+    draft[field] = text.trim()
+    state.fileName = formatUploadFileName((file as { name?: string }).name)
+    state.status = '已载入，保存后生效。'
   } catch { if (state.revision === revision) state.error = '读取失败，请重试或粘贴 PEM。' }
   finally { if (state.revision === revision) state.busy = false }
 }
@@ -241,20 +286,30 @@ function open(node?: Node) {
   clearSecrets()
   original = structuredClone(node?.tunnel ? JSON.parse(JSON.stringify(node.tunnel)) : {})
   const t = original
+  const vlessOpts = inferVlessOptions(t.decryption)
+  options.mode = vlessOpts.mode
+  options.authentication = vlessOpts.authentication
+  options.ttl = inferCertTtlDays(t.cert_pem)
   const listenPort = String(t.listen_port || node?.port || 443)
   const savedEndpoints = node?.connect_endpoints?.length ? node.connect_endpoints : node?.address ? [{ id: 'primary', name: '首选地址', host: node.address, port: node.port || 443, enabled: true }] : []
   endpoints.splice(0, endpoints.length, ...savedEndpoints.map(endpoint => ({ ...endpoint })))
   endpointPortAuto = !node && !savedEndpoints.length
   endpointPortDefault = listenPort
+  const nextProtocol = t.protocol || (t.hysteria2?.password ? 'hysteria2' : 'vless')
+  const nextTransport = t.protocol === 'hysteria2' || (!t.protocol && t.hysteria2?.password) ? 'quic' : t.xhttp?.path ? 'xhttp' : 'tcp'
+  const nextSecurity = t.protocol === 'hysteria2' || t.hysteria2?.password ? 'tls' : t.reality && Object.values(t.reality).some(Boolean) ? 'reality' : t.transport_security === 'plain' ? 'encryption' : 'tls'
+  draft.protocol = nextProtocol
+  draft.transport = nextTransport
+  draft.security = nextSecurity
   Object.assign(draft, {
     id: node?.id || '', name: node?.name || (props.defaultName || '1'), address: node?.address || '', port: String(node?.port || 443), listenPort,
-    protocol: t.protocol || (t.hysteria2?.password ? 'hysteria2' : 'vless'),
-    transport: t.protocol === 'hysteria2' || (!t.protocol && t.hysteria2?.password) ? 'quic' : t.xhttp?.path ? 'xhttp' : 'tcp',
-    security: t.protocol === 'hysteria2' || t.hysteria2?.password ? 'tls' : t.reality && Object.values(t.reality).some(Boolean) ? 'reality' : t.transport_security === 'plain' ? 'encryption' : 'tls',
+    protocol: nextProtocol,
+    transport: nextTransport,
+    security: nextSecurity,
     flow: t.flow || '', enc: t.decryption || '', cert: t.cert_pem || '', key: t.key_pem || '', ca: t.ca_pem || '', listen: node ? (t.listen_host || '') : '0.0.0.0',
     dest: t.reality?.dest || '', privateKey: t.reality?.private_key || '',
-    shortIDs: t.reality?.short_ids || '', names: t.reality?.server_names || '', spiderX: t.reality?.spider_x || '', spiderY: t.reality?.spider_y || '', mldsa65Verify: t.reality?.mldsa65_verify || '', mldsa65Seed: t.reality?.mldsa65_seed || '', password: t.hysteria2?.password || '',
-    xhttpPath: t.xhttp?.path || '/veilink/', xhttpDownloadEndpoint: t.xhttp?.download_endpoint_id || '', xhttpHost: t.xhttp?.host || '', xhttpHeaders: t.xhttp?.headers ? JSON.stringify(t.xhttp.headers) : '', xhttpMode: t.xhttp?.mode || 'packet-up', xhttpVersion: t.xhttp?.http_version || '', xhttpTLS: t.xhttp?.tls ?? true, xhttpPostBytes: t.xhttp?.max_each_post_bytes || 32768, xhttpPostBytesMax: t.xhttp?.post_bytes_max || 0, xhttpPostInterval: t.xhttp?.min_posts_interval_ms || 0, xhttpPostIntervalMax: t.xhttp?.max_posts_interval_ms || 0, xhttpTimeout: t.xhttp?.request_timeout_seconds || 15, xhttpPadding: t.xhttp?.padding_bytes || 100, xhttpPaddingMax: t.xhttp?.padding_max_bytes || (t.xhttp ? (t.xhttp.padding_bytes || 100) : 1000), xhttpPaddingObfs: t.xhttp?.padding_obfs_mode || false, xhttpPaddingPlacement: t.xhttp?.padding_placement || 'query_in_header', xhttpPaddingKey: t.xhttp?.padding_key || 'x_padding', xhttpPaddingHeader: t.xhttp?.padding_header || (t.xhttp?.padding_placement === 'header' ? 'X-Padding' : 'Referer'), xhttpPaddingMethod: t.xhttp?.padding_method || 'repeat-x', xhttpNoGRPCHeader: t.xhttp?.no_grpc_header || false, xhttpNoSSEHeader: t.xhttp?.no_sse_header || false, xhttpMaxHeaderBytes: t.xhttp?.server_max_header_bytes || 8192, xhttpUplinkMethod: t.xhttp?.uplink_http_method || 'POST', xhttpSessionPlacement: t.xhttp?.session_id_placement || 'path', xhttpSessionKey: t.xhttp?.session_id_key || '', xhttpSeqPlacement: t.xhttp?.seq_placement || 'path', xhttpSeqKey: t.xhttp?.seq_key || '', xhttpSessionTable: t.xhttp?.session_id_table || '', xhttpSessionLength: t.xhttp?.session_id_length || 0,
+    shortIDs: t.reality?.short_ids || t.reality?.short_id || '', names: t.reality?.server_names || '', spiderX: t.reality?.spider_x || '', spiderY: t.reality?.spider_y || '', mldsa65Verify: t.reality?.mldsa65_verify || '', mldsa65Seed: t.reality?.mldsa65_seed || '', password: t.hysteria2?.password || '',
+    xhttpPath: t.xhttp?.path || '/veilink/', xhttpDownloadEndpoint: t.xhttp?.download_endpoint_id || '', xhttpHost: t.xhttp?.host || '', xhttpHeaders: t.xhttp?.headers ? (typeof t.xhttp.headers === 'string' ? t.xhttp.headers : JSON.stringify(t.xhttp.headers)) : '', xhttpMode: t.xhttp?.mode || 'packet-up', xhttpVersion: t.xhttp?.http_version || '', xhttpTLS: t.xhttp?.tls ?? (nextSecurity !== 'reality'), xhttpPostBytes: t.xhttp?.max_each_post_bytes || 32768, xhttpPostBytesMax: t.xhttp?.post_bytes_max || 0, xhttpPostInterval: t.xhttp?.min_posts_interval_ms || 0, xhttpPostIntervalMax: t.xhttp?.max_posts_interval_ms || 0, xhttpTimeout: t.xhttp?.request_timeout_seconds || 15, xhttpPadding: t.xhttp?.padding_bytes || 100, xhttpPaddingMax: t.xhttp?.padding_max_bytes || (t.xhttp?.padding_bytes ? t.xhttp.padding_bytes : 1000), xhttpPaddingObfs: t.xhttp?.padding_obfs_mode || false, xhttpPaddingPlacement: t.xhttp?.padding_placement || 'query_in_header', xhttpPaddingKey: t.xhttp?.padding_key || 'x_padding', xhttpPaddingHeader: t.xhttp?.padding_header || (t.xhttp?.padding_placement === 'header' ? 'X-Padding' : 'Referer'), xhttpPaddingMethod: t.xhttp?.padding_method || 'repeat-x', xhttpNoGRPCHeader: t.xhttp?.no_grpc_header || false, xhttpNoSSEHeader: t.xhttp?.no_sse_header || false, xhttpMaxHeaderBytes: t.xhttp?.server_max_header_bytes || 8192, xhttpUplinkMethod: t.xhttp?.uplink_http_method || 'POST', xhttpSessionPlacement: t.xhttp?.session_id_placement || 'path', xhttpSessionKey: t.xhttp?.session_id_key || '', xhttpSeqPlacement: t.xhttp?.seq_placement || 'path', xhttpSeqKey: t.xhttp?.seq_key || '', xhttpSessionTable: t.xhttp?.session_id_table || '', xhttpSessionLength: t.xhttp?.session_id_length || 0,
   })
   draft.xhttpMaxBufferedPosts = t.xhttp?.max_buffered_posts ?? 0
   draft.xhttpMaxConcurrentPosts = t.xhttp?.max_concurrent_posts ?? 0
@@ -345,7 +400,7 @@ async function save() {
       if (!Number.isInteger(draft.xhttpTimeout) || draft.xhttpTimeout < 5 || draft.xhttpTimeout > 60) throw new Error('XHTTP 请求超时须为 5–60 秒。')
       if (!Number.isInteger(draft.xhttpPadding) || draft.xhttpPadding < 1 || draft.xhttpPadding > 1000) throw new Error('XHTTP 填充最小值须为 1–1000 字节。')
       if (!Number.isInteger(draft.xhttpPaddingMax) || draft.xhttpPaddingMax < draft.xhttpPadding || draft.xhttpPaddingMax > 1000) throw new Error('XHTTP 填充最大值须不小于最小值且不超过 1000 字节。')
-      if (!['POST', 'PUT'].includes(draft.xhttpUplinkMethod)) throw new Error('XHTTP 上行方法仅支持 POST 或 PUT。')
+      if (!['POST', 'PUT', 'OPTIONS'].includes(draft.xhttpUplinkMethod)) throw new Error('XHTTP 上行方法仅支持 POST、PUT 或 OPTIONS。')
       if (!Number.isInteger(draft.xhttpMaxHeaderBytes) || draft.xhttpMaxHeaderBytes < 8192 || draft.xhttpMaxHeaderBytes > 32768) throw new Error('XHTTP 服务端请求头上限须为 8192–32768 字节。')
       const headers = checkXHTTPHeaders()
       tunnel.xhttp = { path, ...(draft.xhttpDownloadEndpoint ? { download_endpoint_id: draft.xhttpDownloadEndpoint } : {}), ...(httpHost ? { host: httpHost } : {}), ...(headers ? { headers } : {}), mode: draft.xhttpMode, tls: draft.xhttpTLS, ...(draft.xhttpVersion ? { http_version: draft.xhttpVersion } : {}), ...(xhttpEffectiveMode.value === 'packet-up' ? { max_each_post_bytes: draft.xhttpPostBytes, ...(draft.xhttpPostBytesMax ? { post_bytes_max: draft.xhttpPostBytesMax } : {}), ...(draft.xhttpPostInterval ? { min_posts_interval_ms: draft.xhttpPostInterval } : {}), ...(draft.xhttpPostIntervalMax ? { max_posts_interval_ms: draft.xhttpPostIntervalMax } : {}) } : {}), request_timeout_seconds: draft.xhttpTimeout, padding_bytes: draft.xhttpPadding, ...(draft.xhttpPaddingMax !== draft.xhttpPadding ? { padding_max_bytes: draft.xhttpPaddingMax } : {}), ...xhttpPaddingFields(), ...(['stream-up', 'stream-one'].includes(xhttpEffectiveMode.value) && draft.xhttpNoGRPCHeader ? { no_grpc_header: true } : {}), ...(draft.xhttpNoSSEHeader ? { no_sse_header: true } : {}), ...(draft.xhttpMaxHeaderBytes !== 8192 ? { server_max_header_bytes: draft.xhttpMaxHeaderBytes } : {}), ...(draft.xhttpUplinkMethod !== 'POST' ? { uplink_http_method: draft.xhttpUplinkMethod } : {}), ...xhttpMetaFields(), ...((xhttpEffectiveMode.value === 'packet-up') && draft.xhttpDataPlacement !== 'body' ? { uplink_data_placement: draft.xhttpDataPlacement, ...(draft.xhttpDataKey ? { uplink_data_key: draft.xhttpDataKey } : {}), ...(draft.xhttpChunkSize ? { uplink_chunk_size: draft.xhttpChunkSize } : {}) } : {}), ...((draft.xhttpMuxConcurrency || draft.xhttpMuxConnections || draft.xhttpMuxReuse || draft.xhttpMuxRequests || draft.xhttpMuxSeconds || draft.xhttpMuxKeepAlive) ? { xmux: { ...(draft.xhttpMuxConcurrency ? { max_concurrency: draft.xhttpMuxConcurrency } : {}), ...(draft.xhttpMuxConnections ? { max_connections: draft.xhttpMuxConnections } : {}), ...(draft.xhttpMuxReuse ? { c_max_reuse_times: draft.xhttpMuxReuse } : {}), ...(draft.xhttpMuxRequests ? { h_max_request_times: draft.xhttpMuxRequests } : {}), ...(draft.xhttpMuxSeconds ? { h_max_reusable_secs: draft.xhttpMuxSeconds } : {}), ...(draft.xhttpMuxKeepAlive ? { keep_alive_period: draft.xhttpMuxKeepAlive } : {}) } } : {}) }
@@ -392,7 +447,7 @@ defineExpose({ open })
 </script>
 
 <template>
-  <Modal ref="modal" variant="drawer" :title="`${draft.id ? '编辑' : '新建'}${server ? '服务端' : '客户端'}`" :submit="save" :disabled="reading || !!uploadError || !!generation.busy" @close="clearSecrets">
+  <Modal ref="modal" size="large" :title="`${draft.id ? '编辑' : '新建'}${server ? '服务端' : '客户端'}`" :submit="save" :disabled="reading || !!uploadError || !!generation.busy" @close="clearSecrets">
     <label for="node-name">名称</label><input id="node-name" v-model="draft.name" maxlength="128" required />
     <p v-if="!server" class="help">客户端仅可修改名称。有效隧道配置由管理中心按映射服务端统一下发；在节点详情查看来源，不支持本地覆盖。</p>
     <template v-else>
@@ -414,14 +469,41 @@ defineExpose({ open })
         <button type="button" class="btn small" @click="addEndpoint()">添加连接地址</button>
         <small class="warning">TCP / Hysteria2 须 L4 透传；XHTTP packet-up 可走 HTTP/HTTPS CDN，允许边缘终止 TLS，但须路径透传、禁用缓存、流式下行及足够的超时。HTTP/3 需要 UDP 端口直连、HTTPS 和 TLS 回源；流模式须直连 HTTP/2 或 HTTP/3。不保证任意公网 CDN 可用。</small>
         <div class="grid-2">
-          <div><label for="node-protocol">协议</label><select id="node-protocol" v-model="draft.protocol"><option value="vless">VLESS</option><option value="hysteria2">Hysteria2</option></select></div>
-          <div><label for="node-security">{{ draft.protocol === 'vless' && draft.transport === 'xhttp' ? 'Server 回源监听安全' : '安全' }}</label><select id="node-security" :value="draft.protocol === 'hysteria2' ? 'tls' : draft.security" :disabled="draft.protocol === 'hysteria2'" @change="draft.security = ($event.target as HTMLSelectElement).value"><option value="tls">TLS</option><option v-if="draft.protocol === 'vless'" value="reality">REALITY</option><option v-if="draft.protocol === 'vless'" value="encryption">Encryption（无 TLS）</option></select></div>
+          <div>
+            <label for="node-protocol">协议</label>
+            <div class="seg-pills" role="group" aria-label="协议">
+              <button type="button" :aria-pressed="draft.protocol === 'vless'" @click="draft.protocol = 'vless'">VLESS</button>
+              <button type="button" :aria-pressed="draft.protocol === 'hysteria2'" @click="draft.protocol = 'hysteria2'">Hysteria2</button>
+            </div>
+            <select id="node-protocol" class="sr-only-select" v-model="draft.protocol"><option value="vless">VLESS</option><option value="hysteria2">Hysteria2</option></select>
+          </div>
+          <div>
+            <label for="node-security">{{ draft.protocol === 'vless' && draft.transport === 'xhttp' ? 'Server 回源监听安全' : '安全' }}</label>
+            <div class="seg-pills" role="group" aria-label="安全模式">
+              <button type="button" :aria-pressed="(draft.protocol === 'hysteria2' ? 'tls' : draft.security) === 'tls'" @click="draft.security = 'tls'">TLS</button>
+              <button v-if="draft.protocol === 'vless'" type="button" :aria-pressed="draft.security === 'reality'" @click="draft.security = 'reality'">REALITY</button>
+              <button v-if="draft.protocol === 'vless'" type="button" :aria-pressed="draft.security === 'encryption'" @click="draft.security = 'encryption'">Encryption</button>
+            </div>
+            <select id="node-security" class="sr-only-select" :value="draft.protocol === 'hysteria2' ? 'tls' : draft.security" :disabled="draft.protocol === 'hysteria2'" @change="draft.security = ($event.target as HTMLSelectElement).value"><option value="tls">TLS</option><option v-if="draft.protocol === 'vless'" value="reality">REALITY</option><option v-if="draft.protocol === 'vless'" value="encryption">Encryption（无 TLS）</option></select>
+          </div>
         </div>
-        <div><label for="node-transport">传输</label><select id="node-transport" v-model="draft.transport" :disabled="draft.protocol === 'hysteria2'"><option value="tcp">TCP</option><option v-if="draft.protocol === 'vless'" value="xhttp">XHTTP</option><option v-if="draft.protocol === 'hysteria2'" value="quic">QUIC</option></select></div>
+        <div>
+          <label for="node-transport">传输</label>
+          <div class="seg-pills" role="group" aria-label="传输方式">
+            <button v-if="draft.protocol === 'vless'" type="button" :aria-pressed="draft.transport === 'tcp'" @click="draft.transport = 'tcp'">TCP</button>
+            <button v-if="draft.protocol === 'vless'" type="button" :aria-pressed="draft.transport === 'xhttp'" @click="draft.transport = 'xhttp'">XHTTP</button>
+            <button v-if="draft.protocol === 'hysteria2'" type="button" aria-pressed="true" disabled>QUIC</button>
+          </div>
+          <select id="node-transport" class="sr-only-select" v-model="draft.transport" :disabled="draft.protocol === 'hysteria2'"><option value="tcp">TCP</option><option v-if="draft.protocol === 'vless'" value="xhttp">XHTTP</option><option v-if="draft.protocol === 'hysteria2'" value="quic">QUIC</option></select>
+        </div>
         <template v-if="draft.protocol === 'vless' && draft.transport === 'xhttp'">
-          <label for="node-xhttp-mode">XHTTP 模式</label><select id="node-xhttp-mode" v-model="draft.xhttpMode"><option value="packet-up">packet-up</option><option value="stream-up">stream-up</option><option value="stream-one">stream-one</option><option value="auto">auto</option></select>
+          <label for="node-xhttp-mode">XHTTP 模式</label>
+          <div class="seg-pills" role="group" aria-label="XHTTP 模式">
+            <button v-for="m in ['packet-up', 'stream-up', 'stream-one', 'auto'] as const" :key="m" type="button" :aria-pressed="draft.xhttpMode === m" @click="draft.xhttpMode = m">{{ m }}</button>
+          </div>
+          <select id="node-xhttp-mode" v-model="draft.xhttpMode" class="sr-only-select"><option value="packet-up">packet-up</option><option value="stream-up">stream-up</option><option value="stream-one">stream-one</option><option value="auto">auto</option></select>
           <label for="node-xhttp-version">HTTP 版本</label><select id="node-xhttp-version" v-model="draft.xhttpVersion"><option value="">默认协商</option><option v-if="xhttpEffectiveMode === 'packet-up'" value="1.1">HTTP/1.1</option><option value="2">HTTP/2（HTTPS 或加密 h2c）</option><option value="3">HTTP/3（UDP 直连）</option></select>
-          <label for="node-xhttp-uplink-method">上行 HTTP 方法</label><select id="node-xhttp-uplink-method" v-model="draft.xhttpUplinkMethod"><option value="POST">POST（默认）</option><option value="PUT">PUT</option></select>
+          <label for="node-xhttp-uplink-method">上行 HTTP 方法</label><select id="node-xhttp-uplink-method" v-model="draft.xhttpUplinkMethod"><option value="POST">POST（默认）</option><option value="PUT">PUT</option><option value="OPTIONS">OPTIONS</option></select>
           <label for="node-xhttp-path">XHTTP 路径</label><input id="node-xhttp-path" v-model="draft.xhttpPath" maxlength="256" placeholder="/veilink/" required />
           <label for="node-xhttp-host">HTTP Host 覆写（可选）</label><input id="node-xhttp-host" v-model="draft.xhttpHost" maxlength="253" placeholder="edge.example.com" /><small class="help">仅改变 HTTP Host，Server 校验该值；连接地址和 TLS 证书验证名不变，前置代理须保留 Host。</small>
           <label for="node-xhttp-headers">请求头（JSON 对象，可选）</label><textarea id="node-xhttp-headers" v-model="draft.xhttpHeaders" class="mono" rows="4" :spellcheck="false" :aria-invalid="!!xhttpHeadersError" aria-describedby="node-xhttp-headers-error" placeholder='{"User-Agent":"Veilink","X-Custom-Route":"east"}' @input="xhttpHeadersError = ''" /><small v-if="xhttpHeadersError" id="node-xhttp-headers-error" class="detail-error" role="alert">{{ xhttpHeadersError }}</small>
@@ -469,13 +551,20 @@ defineExpose({ open })
         <small v-else-if="draft.security === 'reality'" class="help">REALITY 使用 TCP：填写可达的回落目标与允许的伪装域名，生成密钥对和 Short ID。客户端公钥、Short ID 与域名须匹配；不要同时填写 TLS PEM。</small>
         <small v-else class="help">plain 使用 TCP 且没有外层 TLS，必须启用 VLESS Encryption；不接受证书 PEM、REALITY、Hysteria2 或 Vision。请生成配对配置后保存，而非填 none。</small>
         <template v-if="pemFields.includes('cert')">
-          <div class="field-actions config-switch"><div><label for="cert-ttl">自签证书有效天数</label><input id="cert-ttl" v-model="options.ttl" type="number" min="1" max="365" /></div><button type="button" class="btn small" :disabled="!!generation.busy || reading" @click="generate('certificate')">生成自签证书</button></div>
+          <label for="cert-ttl">自签证书有效天数</label>
+          <div class="field-actions config-switch"><input id="cert-ttl" v-model="options.ttl" type="number" min="1" max="365" /><button type="button" class="btn small" :disabled="!!generation.busy || reading" @click="generate('certificate')">生成自签证书</button></div>
           <small class="warning">非公共 CA 证书。生成的 CA 会配对下发以建立信任；请核对 TLS 名称。</small>
         </template>
         <template v-for="field in pemFields" :key="field">
           <SecretField v-if="field === 'key'" id="node-key" v-model="draft.key" label="私钥 PEM" multiline required @update:model-value="clearUpload('key')" />
           <template v-else><label :for="`node-${field}`">{{ pemLabels[field] }}</label><textarea :id="`node-${field}`" v-model="draft[field]" class="mono" rows="3" :required="field === 'cert'" :spellcheck="false" autocomplete="off" :aria-invalid="!!uploads[field].error" @input="clearUpload(field)" /></template>
-          <input :id="`node-${field}-upload`" type="file" accept=".pem,.crt,.key" :aria-label="`上传${pemLabels[field]}`" :disabled="uploads[field].busy || !!generation.busy" @change="uploadPEM($event, field)" />
+          <div class="file-upload-row">
+            <label :for="`node-${field}-upload`" class="btn small file-upload-btn" :class="{ disabled: uploads[field].busy || !!generation.busy }">
+              <span>选择 {{ pemLabels[field] }} 文件</span>
+              <code v-if="uploads[field].fileName" class="file-ext-badge">{{ uploads[field].fileName }}</code>
+            </label>
+            <input :id="`node-${field}-upload`" class="sr-only-file" type="file" accept=".pem,.crt,.key" :aria-label="`上传${pemLabels[field]}`" :disabled="uploads[field].busy || !!generation.busy" @change="uploadPEM($event, field)" />
+          </div>
           <small class="help">{{ field === 'ca' ? '用于客户端信任此服务端；留空使用系统根证书。' : '粘贴或上传 PEM，单项最多 64 KiB。' }}</small>
           <small class="help" :class="{ 'detail-error': uploads[field].error }" role="status">{{ uploads[field].busy ? '读取中…' : uploads[field].error || uploads[field].status }}</small>
         </template>
@@ -493,8 +582,30 @@ defineExpose({ open })
         <template v-if="draft.protocol === 'vless'">
           <SecretField id="node-encryption" v-model="draft.enc" label="VLESS 解密配置" :required="draft.security === 'encryption' || draft.transport === 'xhttp' && !draft.xhttpTLS && draft.security !== 'reality'"><button type="button" class="btn small" :disabled="!!generation.busy || reading" @click="generate('vless')">生成配对配置</button><button type="button" class="btn small" :disabled="!!generation.busy || reading || !draft.enc || draft.security === 'encryption' || draft.transport === 'xhttp' && !draft.xhttpTLS && draft.security !== 'reality'" @click="draft.enc = ''">关闭 Encryption</button></SecretField>
           <small class="help">VLESS Encryption：服务端保存 decryption，客户端只接收配对 encryption，不能互换。TLS、REALITY 下可选，plain 下必填；重新生成后须保存并等待双方应用新修订。</small>
-          <div class="grid-2"><div><label for="vless-mode">生成模式</label><select id="vless-mode" v-model="options.mode"><option v-for="mode in ['native', 'xorpub', 'random']" :key="mode">{{ mode }}</option></select></div><div><label for="vless-auth">认证算法</label><select id="vless-auth" v-model="options.authentication"><option>x25519</option><option>mlkem768</option></select></div></div>
-          <template v-if="flowAllowed"><label for="node-flow">Flow</label><select id="node-flow" v-model="draft.flow"><option value="">无</option><option>xtls-rprx-vision</option></select></template>
+          <div class="grid-2">
+            <div>
+              <label for="vless-mode">生成模式</label>
+              <div class="seg-pills" role="group" aria-label="生成模式">
+                <button v-for="mode in ['native', 'xorpub', 'random']" :key="mode" type="button" :aria-pressed="options.mode === mode" @click="options.mode = mode">{{ mode }}</button>
+              </div>
+              <select id="vless-mode" class="sr-only-select" v-model="options.mode"><option v-for="mode in ['native', 'xorpub', 'random']" :key="mode">{{ mode }}</option></select>
+            </div>
+            <div>
+              <label for="vless-auth">认证算法</label>
+              <div class="seg-pills" role="group" aria-label="认证算法">
+                <button v-for="auth in ['x25519', 'mlkem768']" :key="auth" type="button" :aria-pressed="options.authentication === auth" @click="options.authentication = auth">{{ auth }}</button>
+              </div>
+              <select id="vless-auth" class="sr-only-select" v-model="options.authentication"><option>x25519</option><option>mlkem768</option></select>
+            </div>
+          </div>
+          <template v-if="flowAllowed">
+            <label for="node-flow">Flow</label>
+            <div class="seg-pills" role="group" aria-label="Flow">
+              <button type="button" :aria-pressed="draft.flow === ''" @click="draft.flow = ''">无</button>
+              <button type="button" :aria-pressed="draft.flow === 'xtls-rprx-vision'" @click="draft.flow = 'xtls-rprx-vision'">xtls-rprx-vision</button>
+            </div>
+            <select id="node-flow" class="sr-only-select" v-model="draft.flow"><option value="">无</option><option>xtls-rprx-vision</option></select>
+          </template>
           <small class="help">Vision 仅用于 VLESS TCP + TLS/REALITY。只有独立已认证连接内、满足结构和记录边界的 TLS 1.3 才直拷；启用 Encryption 或无法安全识别时保留加密回退，mux、控制与 UDP 不裸传。</small>
         </template>
       </section>

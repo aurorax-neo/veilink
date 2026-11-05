@@ -48,3 +48,41 @@ test('mapping rows retain Pool cell so status, traffic and actions align with he
  const row=source.match(/<tbody><tr v-for="mapping in rows"[\s\S]*?<\/tr>/)[0]
  assert.equal((row.match(/<td[ >]/g)||[]).length,7)
 })
+
+test('design spec refinements: 40px hit areas, Popconfirm, Snackbar undo, 264px searchable dropdown, IME guard, and extension-preserving filenames', () => {
+  const proxies = readFileSync(new URL('../src/views/ProxiesView.vue', import.meta.url), 'utf8')
+  const nodes = readFileSync(new URL('../src/components/NodesTable.vue', import.meta.url), 'utf8')
+  const modal = readFileSync(new URL('../src/components/Modal.vue', import.meta.url), 'utf8')
+  const logs = readFileSync(new URL('../src/views/LogsView.vue', import.meta.url), 'utf8')
+  const login = readFileSync(new URL('../src/views/LoginView.vue', import.meta.url), 'utf8')
+  const format = readFileSync(new URL('../src/format.ts', import.meta.url), 'utf8')
+
+  // Spec 4.1: 40px minimum hit area on icon buttons
+  assert.match(rule('.icon-btn'), /min-width: 40px; min-height: 40px/)
+  // Spec 2.2 & 2.4: Popconfirm anchored to row action + Snackbar undo
+  assert.match(proxies, /class="popconfirm" role="dialog"/)
+  assert.match(nodes, /class="popconfirm" role="dialog"/)
+  assert.match(view, /class="btn small toast-undo"/)
+  // Spec 2.5: Form draft recovery banner
+  assert.match(proxies, /class="draft-banner"/)
+  // Spec 2.6: Bottom sheet drag grip & damped gesture
+  assert.match(modal, /onSheetPointerDown/)
+  assert.match(modal, /class="sheet-drag-grip"/)
+  // Spec 3.2: Flat segmented pills for 2-4 options & max-height 264px searchable dropdown for >10 options
+  assert.match(css, /\.seg-pills \{/)
+  assert.match(css, /\.select-dropdown-panel \{[^}]*max-height: 264px/)
+  // Spec 6.4 & 7.2: Streaming log fade and jump-to-latest button
+  assert.match(logs, /jump-latest-btn/)
+  assert.match(css, /@keyframes stream-fade \{ from \{ opacity: 0; filter: blur\(6px\); \}/)
+  // Spec 6.8: Copy bounce animation
+  assert.match(css, /\.copy-bounce \{/)
+  // Spec 7.1: IME composition Enter guard
+  assert.match(login, /@compositionstart="onCompositionStart"/)
+  assert.match(modal, /@compositionstart="onCompositionStart"/)
+  // Spec 7.6: Truncate filename preserving extension
+  assert.match(format, /export function truncateFileName/)
+  // Node and Mapping editors use centered modal dialogs rather than right-side drawers
+  const nodeEditor = readFileSync(new URL('../src/components/NodeEditor.vue', import.meta.url), 'utf8')
+  assert.doesNotMatch(nodeEditor, /variant="drawer"/)
+  assert.doesNotMatch(proxies, /variant="drawer"/)
+})

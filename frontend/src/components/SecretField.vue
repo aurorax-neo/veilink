@@ -5,11 +5,21 @@ const props = defineProps<{ id: string; label: string; modelValue: string; reado
 const emit = defineEmits<{ 'update:modelValue': [value: string] }>()
 const revealed = ref(false)
 const status = ref('')
+const copied = ref(false)
 let revision = 0
-watch(() => props.modelValue, value => { if (!value) revealed.value = false; status.value = ''; revision++ })
+let copyTimer: ReturnType<typeof setTimeout> | undefined
+watch(() => props.modelValue, value => { if (!value) revealed.value = false; status.value = ''; copied.value = false; revision++ })
 async function copy() {
   const current = revision
-  try { await copyText(props.modelValue); if (current === revision) status.value = '已复制，请妥善保管剪贴板内容。' }
+  try {
+    await copyText(props.modelValue)
+    if (current === revision) {
+      status.value = '已复制，请妥善保管剪贴板内容。'
+      copied.value = true
+      if (copyTimer) globalThis.clearTimeout?.(copyTimer)
+      copyTimer = globalThis.setTimeout?.(() => { copied.value = false }, 2500)
+    }
+  }
   catch { if (current === revision) status.value = '复制失败，请显示后手动复制。' }
 }
 </script>
@@ -21,7 +31,7 @@ async function copy() {
       <input v-else :id="id" :value="modelValue" :type="revealed ? 'text' : 'password'" :readonly="readonly || multiline" :required="required" autocomplete="off" :spellcheck="false" @input="emit('update:modelValue', ($event.target as HTMLInputElement).value)" />
       <div class="actions">
         <button type="button" class="btn small" :aria-pressed="revealed" :aria-controls="id" @click="revealed = !revealed">{{ revealed ? '隐藏' : '显示' }}</button>
-        <button type="button" class="btn small" :disabled="!modelValue" @click="copy">复制</button>
+        <button type="button" class="btn small fit" :class="{ 'copy-bounce': copied }" :disabled="!modelValue" @click="copy"><span class="fit-sizer" aria-hidden="true">✓ 已复制</span><span class="fit-sizer" aria-hidden="true">复制</span><span class="fit-value">{{ copied ? '✓ 已复制' : '复制' }}</span></button>
         <slot />
       </div>
     </div>

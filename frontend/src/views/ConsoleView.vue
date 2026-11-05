@@ -55,6 +55,14 @@ async function refresh() {
     await runPageRefresh()
   } catch { /* desk displays the error. */ } finally { desk.refreshing = false }
 }
+async function runUndo() {
+  const undo = desk.noticeUndo
+  desk.dismissNotice()
+  if (!undo) return
+  try {
+    await undo.run()
+  } catch { /* desk displays any error */ }
+}
 </script>
 
 <template>
@@ -118,7 +126,7 @@ async function refresh() {
           <span class="who">API Key</span>
           <button type="button" class="btn quiet" @click="emit('logout')">
             <Icon name="logout" :size="15" />
-            <span>断开连接</span>
+            <span>注销登录</span>
           </button>
         </div>
       </header>
@@ -130,9 +138,10 @@ async function refresh() {
           <button type="button" class="btn fit" :disabled="desk.loading || desk.refreshing" @click="refresh"><span class="fit-sizer" aria-hidden="true">刷新中…</span><span class="fit-sizer" aria-hidden="true">刷新</span><span class="fit-value">{{ desk.loading || desk.refreshing ? '刷新中…' : '刷新' }}</span></button>
         </div>
         <div class="notice-layer" aria-live="polite" aria-atomic="true">
-          <div v-if="desk.notice" :key="noticeKey" class="notice toast" :class="{ bad: desk.noticeBad }" :role="desk.noticeBad ? 'alert' : undefined">
+          <div v-if="desk.notice" :key="noticeKey" class="notice toast" :class="{ bad: desk.noticeBad, snackbar: !!desk.noticeUndo }" :role="desk.noticeBad ? 'alert' : undefined">
             <span class="toast-mark" aria-hidden="true">{{ desk.noticeBad ? '!' : '✓' }}</span>
             <span class="toast-text">{{ desk.notice }}</span>
+            <button v-if="desk.noticeUndo" type="button" class="btn small toast-undo" @click="runUndo">{{ desk.noticeUndo.label || '撤销' }}</button>
             <button type="button" class="icon-btn" aria-label="关闭提示" @click="desk.dismissNotice()">×</button>
           </div>
         </div>

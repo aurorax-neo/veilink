@@ -21,6 +21,7 @@ Thumbs.db
 /release-packages/
 /backend/internal/webui/dist/*
 !/backend/internal/webui/dist/index.html
+/backend/target/
 /veilink
 /veilink.exe
 go.work

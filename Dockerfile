@@ -1,5 +1,4 @@
 ARG NPM_REGISTRY=https://registry.npmjs.org
-ARG GOPROXY=https://proxy.golang.org,direct
 ARG APK_MIRROR=https://dl-cdn.alpinelinux.org/alpine
 
 # ============ 前端构建 ============
@@ -13,12 +12,11 @@ COPY frontend/ ./
 RUN npm run build
 
 # ============ 后端构建 ============
-FROM --platform=$BUILDPLATFORM golang:1.27-alpine3.23 AS build-backend
+FROM rust:alpine3.21 AS build-backend
 WORKDIR /src/backend
-ARG GOPROXY
-ENV GOPROXY=${GOPROXY}
-COPY backend/go.mod backend/go.sum ./
-RUN go mod download
+ARG APK_MIRROR
+RUN if [ -n "$APK_MIRROR" ] && [ "$APK_MIRROR" != "https://dl-cdn.alpinelinux.org/alpine" ]; then printf '%s/v3.21/main\n%s/v3.21/community\n' "$APK_MIRROR" "$APK_MIRROR" > /etc/apk/repositories; fi \
+ && apk add --no-cache build-base musl-dev pkgconfig
 COPY backend/ ./
 COPY --from=build-web /src/frontend/dist ./internal/webui/dist/
 ARG TARGETOS
@@ -26,7 +24,9 @@ ARG TARGETARCH
 ARG VERSION=dev
 ARG COMMIT=unknown
 ARG SOURCE_URL=unknown
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w -X veilink/internal/buildinfo.Version=${VERSION} -X veilink/internal/buildinfo.Commit=${COMMIT}" -o /out/veilink ./cmd/veilink
+RUN VEILINK_VERSION=${VERSION} VEILINK_COMMIT=${COMMIT} cargo build --release --locked \
+ && mkdir -p /out \
+ && cp target/release/veilink /out/veilink
 
 # ============ 统一镜像运行环境 ============
 FROM alpine:3.23 AS backend

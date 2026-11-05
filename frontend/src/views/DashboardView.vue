@@ -13,9 +13,12 @@ const onlineClients = computed(() => desk.nodes.filter(n => n.role === 'client' 
 const activeMappings = computed(() => desk.mappings.filter(m => m.enabled).length)
 const attention = computed(() => desk.nodes.filter(n => attentionReasons(n).length).sort(byNameAndId))
 const servers = computed(() => desk.nodes.filter(n => n.role === 'server').sort(byNameAndId))
+const clients = computed(() => desk.nodes.filter(n => n.role === 'client').sort(byNameAndId))
 const totalBindings = computed(() => new Set(desk.mappings.map(m => `${m.server_id}:${m.client_id}`)).size)
 function clientCount(id: string) { return new Set(desk.mappings.filter(m => m.server_id === id).map(m => m.client_id)).size }
 function mappingCount(id: string) { return desk.mappings.filter(m => m.server_id === id).length }
+function clientServerCount(id: string) { return new Set(desk.mappings.filter(m => m.client_id === id).map(m => m.server_id)).size }
+function clientMappingCount(id: string) { return desk.mappings.filter(m => m.client_id === id).length }
 let active = true
 let unregister = () => {}
 onMounted(() => {
@@ -35,11 +38,11 @@ onUnmounted(() => { active = false; unregister() })
   <EmptyState v-else-if="!desk.loaded" title="加载失败" :text="desk.error" />
   <div v-else class="stack">
     <section class="metrics" aria-label="概览">
-      <article class="metric"><span>在线服务端</span><strong>{{ onlineServers }}</strong></article>
-      <article class="metric"><span>在线客户端</span><strong>{{ onlineClients }}</strong></article>
-      <article class="metric"><span>绑定关系</span><strong>{{ totalBindings }}</strong></article>
-      <article class="metric"><span>启用映射</span><strong>{{ activeMappings }}</strong></article>
-      <article class="metric"><span>待处理节点</span><strong>{{ attention.length }}</strong></article>
+      <article class="metric metric-interactive" role="button" tabindex="0" @click="navigate('servers')" @keydown.enter.prevent="navigate('servers')"><span>在线服务端</span><strong>{{ onlineServers }}</strong></article>
+      <article class="metric metric-interactive" role="button" tabindex="0" @click="navigate('clients')" @keydown.enter.prevent="navigate('clients')"><span>在线客户端</span><strong>{{ onlineClients }}</strong></article>
+      <article class="metric metric-interactive" role="button" tabindex="0" @click="navigate('proxies')" @keydown.enter.prevent="navigate('proxies')"><span>绑定关系</span><strong>{{ totalBindings }}</strong></article>
+      <article class="metric metric-interactive" role="button" tabindex="0" @click="navigate('proxies')" @keydown.enter.prevent="navigate('proxies')"><span>启用映射</span><strong>{{ activeMappings }}</strong></article>
+      <article class="metric" :class="{ 'metric-warn': attention.length > 0 }"><span>待处理节点</span><strong>{{ attention.length }}</strong></article>
     </section>
     <section class="panel">
       <header class="panel-head"><h2>服务端</h2><button type="button" class="btn small" @click="navigate('servers')">管理</button></header>
@@ -49,6 +52,14 @@ onUnmounted(() => { active = false; unregister() })
         </table>
       </div>
       <EmptyState v-else title="暂无服务端" text="" />
+    </section>
+    <section v-if="clients.length" class="panel">
+      <header class="panel-head"><h2>客户端</h2><button type="button" class="btn small" @click="navigate('clients')">管理</button></header>
+      <div class="table-scroll" tabindex="0" role="region" aria-label="客户端概览">
+        <table><thead><tr><th scope="col">名称</th><th scope="col">状态</th><th scope="col">关联服务端</th><th scope="col">映射</th><th scope="col">配置</th></tr></thead>
+          <tbody><tr v-for="node in clients" :key="node.id"><td>{{ node.name }}</td><td><Badge :text="presence(node).text" :tone="presence(node).tone" /></td><td>{{ clientServerCount(node.id) }}</td><td>{{ clientMappingCount(node.id) }}</td><td><Badge :text="revisionState(node).text" :tone="revisionState(node).tone" /></td></tr></tbody>
+        </table>
+      </div>
     </section>
     <section v-if="attention.length" class="panel">
       <header class="panel-head"><h2>待处理</h2></header>

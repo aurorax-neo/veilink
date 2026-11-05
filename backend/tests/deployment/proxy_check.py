@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real nginx TLS termination -> HTTP API and h2c bidirectional gRPC check."""
+"""Real nginx TLS termination -> HTTP API and HTTP control plane check."""
 import argparse
 import json
 import os
@@ -60,12 +60,6 @@ http {
   server_name panel.test;
   ssl_certificate /certs/cert.pem;
   ssl_certificate_key /certs/key.pem;
-  location /veilink.control.v1.Control/ {
-   grpc_pass grpc://master:8443;
-   grpc_set_header Host panel.test;
-   grpc_read_timeout 3600s;
-   grpc_send_timeout 3600s;
-  }
   location / {
    proxy_pass http://master:8443;
    proxy_http_version 1.1;
@@ -73,6 +67,8 @@ http {
    proxy_set_header Origin $veilink_origin;
    proxy_set_header X-Forwarded-Proto $scheme;
    proxy_set_header X-Forwarded-For $remote_addr;
+   proxy_read_timeout 3600s;
+   proxy_send_timeout 3600s;
    proxy_cookie_flags veilink_session secure httponly samesite=strict;
   }
  }
@@ -129,14 +125,14 @@ http {
         assert b'<html' in html
         untrusted = command('docker', 'exec', names['master'], 'curl', '--noproxy', '*', '-fsS', 'https://panel.test/api/version', check=False)
         assert untrusted.returncode == 60
-        cert = request('/api/nodes/generate', {'role': 'server', 'kind': 'certificate', 'host': 'server', 'ttl_days': 1})
+        cert = request('/api/v1/nodes/generate', {'role': 'server', 'kind': 'certificate', 'host': 'server', 'ttl_days': 1})
         for role in ('server', 'client'):
             body = {'name': 'proxy-' + role, 'role': role}
             if role == 'server':
                 body.update(address='server', port=18444, tunnel=dict(transport_security='tls', listen_host='0.0.0.0', listen_port=18444,
                             **{k: cert[k] for k in ('cert_pem', 'key_pem', 'ca_pem')}))
             n = request('/api/v1/nodes', body)
-            join = request('/api/nodes/' + n['id'] + '/join', {'master_url': 'https://panel.test', 'ttl_seconds': 3600})
+            join = request('/api/v1/nodes/' + n['id'] + '/join', {'master_url': 'https://panel.test', 'ttl_seconds': 3600})
             # Consume actual shortcut role flags, not a hand-constructed enrollment request.
             words = shlex.split(join['command'])
             image_index = next((i for i, word in enumerate(words) if word.endswith('/veilink:latest') or word == 'veilink:latest'), None)
@@ -156,7 +152,7 @@ http {
                 break
             time.sleep(2)
         else:
-            raise RuntimeError('gRPC enrollment/heartbeat/application through nginx timed out')
+            raise RuntimeError('HTTP control-plane enrollment/heartbeat/application through nginx timed out')
         before = {n['id']: n['last_seen'] for n in nodes}
         time.sleep(12)
         nodes = [n for n in request('/api/v1/nodes') if n['role'] in ('server', 'client') and not n.get('embedded')]
@@ -185,7 +181,7 @@ http {
                 break
             time.sleep(2)
         else:
-            raise RuntimeError('gRPC reconnect after certificate renewal timed out')
+            raise RuntimeError('HTTP control-plane reconnect after certificate renewal timed out')
         result.update(invalid_certificate_candidate_rejected=True, certificate_reload=True,
                       renewed_serial_verified=True, h2c_reconnect_after_reload=True)
         result.update(passed=True, tls_verification=True, untrusted_ca_rejected=True, api_key_auth=True,

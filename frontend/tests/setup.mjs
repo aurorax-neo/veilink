@@ -131,7 +131,7 @@ test('login view renders API key without a configurable server address', () => {
   const view = readFileSync(new URL('../src/views/LoginView.vue', import.meta.url), 'utf8')
   assert.doesNotMatch(view, /server-url|服务地址|恢复默认/)
   assert.match(view, /<label for="apikey">API Key<\/label>/)
-  assert.match(view, /placeholder="vlk_\.\.\."/)
+  assert.doesNotMatch(view, /placeholder=/)
   assert.match(view, /进入控制台/)
 })
 

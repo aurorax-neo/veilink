@@ -3,7 +3,7 @@ import { computed, inject, onMounted, onUnmounted, ref } from 'vue'
 import { api } from '../api'
 import { deskKey } from '../desk'
 import { registerPageRefresh } from '../pageRefresh'
-import { byNameAndId, endpoint, needsAttention, presence, revisionState, seenText } from '../format'
+import { byNameAndId, copyText, endpoint, needsAttention, presence, revisionState, seenText } from '../format'
 import type { Node } from '../types'
 import Badge from './Badge.vue'
 import EmptyState from './EmptyState.vue'
@@ -22,6 +22,9 @@ const pending = ref<Node | null>(null)
 const configModal = ref<InstanceType<typeof Modal> | null>(null)
 const configNode = ref<Node | null>(null)
 const action = ref<'revoke' | 'delete' | 'disable' | 'enable'>('delete')
+const popconfirmId = ref('')
+const togglingBusy = ref(false)
+const copiedId = ref('')
 const label = computed(() => props.role === 'server' ? '服务端' : '客户端')
 const refreshing = ref(new Set<string>())
 const pendingRefresh = ref<Record<string, { seen: number; revision: number; error: string; until: number }>>({})
@@ -31,6 +34,7 @@ let active = true
 let settling = false
 let clockTimer: ReturnType<typeof setInterval> | undefined
 let unregisterPageRefresh: (() => void) | undefined
+let offStreamNode: (() => void) | undefined
 const now = ref(Date.now())
 onMounted(() => {
   clockTimer = setInterval(() => {
@@ -41,12 +45,26 @@ onMounted(() => {
     }
     return settleRefresh()
   }, 1000)
+  const bus = (globalThis as Record<string, unknown>).__veilinkStream as { on?: (type: string, fn: (data?: { node_id?: string }) => void) => () => void } | undefined
+  offStreamNode = bus?.on?.('node', (data) => {
+    const nid = data?.node_id
+    if (nid && pendingRefresh.value[nid]) {
+      delete pendingRefresh.value[nid]
+      delete refreshFeedback.value[nid]
+      lastRefreshedAt.value[nid] = Date.now()
+      void desk.reloadNodes(nid)
+      return
+    }
+    void settleRefresh()
+  })
   unregisterPageRefresh = registerPageRefresh(refreshRole)
 })
 onUnmounted(() => {
   active = false
   unregisterPageRefresh?.()
   unregisterPageRefresh = undefined
+  offStreamNode?.()
+  offStreamNode = undefined
   if (clockTimer) clearInterval(clockTimer)
   clockTimer = undefined
 })
@@ -56,7 +74,10 @@ const defaultName = computed(() => {
   while (used.has(String(number))) number++
   return String(number)
 })
-const rows = computed(() => desk.nodes.filter(n => n.role === props.role && [n.name, n.id, n.address, n.error].join(' ').toLowerCase().includes(query.value.trim().toLowerCase())).sort((a, b) => Number(needsAttention(b, now.value)) - Number(needsAttention(a, now.value)) || byNameAndId(a, b)))
+const rows = computed(() => {
+  const currentNow = Math.max(now.value, Date.now())
+  return desk.nodes.filter(n => n.role === props.role && [n.name, n.id, n.address, n.error].join(' ').toLowerCase().includes(query.value.trim().toLowerCase())).sort((a, b) => Number(needsAttention(b, currentNow)) - Number(needsAttention(a, currentNow)) || byNameAndId(a, b))
+})
 const selected = computed(() => desk.nodes.find(n => n.id === selectedId.value))
 function mappings(id: string) { return desk.mappings.filter(m => props.role === 'server' ? m.server_id === id : m.client_id === id) }
 function effectiveSources(node: Node) {
@@ -80,7 +101,38 @@ function localListen(node: Node) { return endpoint(node.tunnel?.listen_host || '
 function connectList(node: Node) { return (node.connect_endpoints || []).filter(item => item.enabled) }
 function openConfig(node: Node) { configNode.value = node; configModal.value?.open() }
 async function saved() { await desk.reload(); desk.notify('节点已保存，配置等待节点上报确认应用状态。') }
-function ask(node: Node, operation: 'revoke' | 'delete' | 'disable' | 'enable') { if (node.embedded && operation !== 'disable' && operation !== 'enable') return; pending.value = node; action.value = operation; confirm.value?.open() }
+function ask(node: Node, operation: 'revoke' | 'delete' | 'disable' | 'enable') {
+  if (node.embedded && operation !== 'disable' && operation !== 'enable') return
+  pending.value = node
+  action.value = operation
+  if (operation === 'disable' || operation === 'enable') {
+    popconfirmId.value = popconfirmId.value === node.id ? '' : node.id
+  } else {
+    popconfirmId.value = ''
+    confirm.value?.open()
+  }
+}
+async function confirmInlineNodeToggle() {
+  if (togglingBusy.value) return
+  togglingBusy.value = true
+  try {
+    await run()
+    popconfirmId.value = ''
+  } catch (reason) {
+    desk.notify(reason instanceof Error ? reason.message : '操作失败', true)
+  } finally {
+    togglingBusy.value = false
+  }
+}
+async function copyNodeId(id: string) {
+  try {
+    await copyText(id)
+    copiedId.value = id
+    globalThis.setTimeout?.(() => {
+      if (copiedId.value === id) copiedId.value = ''
+    }, 2500)
+  } catch { /* ignore */ }
+}
 function revisionLabel(node: Node) {
   if (node.revoked) return '不再同步'
   if (node.error) return '应用失败'
@@ -144,7 +196,7 @@ async function refreshNode(node: Node) {
     return
   }
   const recent = lastRefreshedAt.value[node.id] || 0
-  if (Date.now() - recent < 2000) {
+  if (Date.now() - recent < 300) {
     setRefreshing(node.id, true)
     try {
       await desk.reloadNodes(node.id)
@@ -157,17 +209,18 @@ async function refreshNode(node: Node) {
   delete refreshFeedback.value[node.id]
   const baseline = { seen: node.last_seen, revision: node.applied_revision, error: node.error || '', until: Date.now() + 6000 }
   try {
-    const result = await api<{ connected: boolean }>(`/nodes/${encodeURIComponent(node.id)}/refresh`, 'POST', {})
+    const result = await api<{ connected: boolean; reported?: boolean }>(`/nodes/${encodeURIComponent(node.id)}/refresh`, 'POST', {})
     if (!active) return
     if (!result || typeof result.connected !== 'boolean') throw new Error('刷新响应无效，请重试。')
     await desk.reloadNodes(node.id)
+    now.value = Math.max(now.value, Date.now())
     if (!active) return
     if (!result.connected) {
       refreshFeedback.value[node.id] = { text: '推送通道未连接，重连后自动同步', bad: false, hideAt: Date.now() + 2000 }
       return
     }
     pendingRefresh.value[node.id] = baseline
-    if (changedSinceRefresh(node.id)) {
+    if (result.reported === true || changedSinceRefresh(node.id)) {
       delete pendingRefresh.value[node.id]
       lastRefreshedAt.value[node.id] = Date.now()
       return
@@ -187,13 +240,28 @@ async function refreshRole() {
 }
 async function run() {
   if (!pending.value || (pending.value.embedded && action.value !== 'disable' && action.value !== 'enable')) return false
-  const path = `/nodes/${encodeURIComponent(pending.value.id)}`
+  const targetNode = pending.value
+  const path = `/nodes/${encodeURIComponent(targetNode.id)}`
+  popconfirmId.value = ''
   if (action.value === 'disable' || action.value === 'enable') {
     const disabling = action.value === 'disable'
     const result = await api<{ connected: boolean }>(`${path}/disabled`, 'POST', { disabled: disabling })
     if (!result || typeof result.connected !== 'boolean') throw new Error('停用响应无效')
     await desk.reload()
-    desk.notify(!result.connected ? (disabling ? '节点未连接，重连后才会停止。' : '节点未连接，重连后才会恢复。') : (disabling ? '节点已停用。' : '节点已启用。'))
+    desk.notify(
+      !result.connected
+        ? (disabling ? '节点未连接，重连后才会停止。' : '节点未连接，重连后才会恢复。')
+        : (disabling ? '节点已停用。' : '节点已启用。'),
+      false,
+      {
+        label: '撤销',
+        run: async () => {
+          await api(`${path}/disabled`, 'POST', { disabled: !disabling })
+          await desk.reload()
+          desk.notify(!disabling ? '已重新停用节点。' : '已重新启用节点。')
+        },
+      },
+    )
     return true
   }
   await api(action.value === 'revoke' ? `${path}/revoke` : path, action.value === 'revoke' ? 'POST' : 'DELETE', action.value === 'revoke' ? {} : undefined)
@@ -217,17 +285,32 @@ async function run() {
         <thead><tr><th scope="col">名称 / 软件版本</th><th scope="col">状态</th><th v-if="role === 'server'" scope="col">本地监听 / 客户端连接地址</th><th v-if="role === 'server'" scope="col">隧道</th><th scope="col">映射</th><th scope="col">配置是否最新</th><th scope="col">操作</th></tr></thead>
         <tbody><tr v-for="node in rows" :key="node.id" :class="{ selected: selectedId === node.id }">
           <td><button type="button" class="text-btn" :aria-expanded="selectedId === node.id" @click="selectedId = selectedId === node.id ? '' : node.id">{{ node.name }}</button><small class="node-id" :title="node.id">{{ node.id }}</small><small v-if="node.embedded">内置节点</small><small class="software-version" :title="node.software_version || '等待节点上报运行版本'">软件：{{ node.software_version || '未上报' }}</small></td>
-          <td><div class="node-presence"><Badge reserve="尚未连接" :text="presence(node, now).text" :tone="presence(node, now).tone" /><button type="button" class="icon-btn refresh-node" :disabled="node.revoked || refreshing.has(node.id)" @click="refreshNode(node)" :class="{ spinning: refreshing.has(node.id) }" :aria-busy="refreshing.has(node.id)" title="请求节点刷新状态" :aria-label="`刷新节点 ${node.name}`"><span aria-hidden="true">↻</span></button></div><small class="last-seen fit" :class="{ 'node-refresh-feedback': !!refreshFeedback[node.id]?.text, bad: !!refreshFeedback[node.id]?.bad }" :role="refreshFeedback[node.id]?.text ? 'status' : undefined"><span class="fit-sizer" aria-hidden="true">最后上报：尚未上报</span><span class="fit-sizer" aria-hidden="true">最后上报：{{ seenText(node.last_seen, now, false) }}</span><span class="fit-sizer" aria-hidden="true">请求节点更新状态失败，请稍后重试。</span><span class="fit-sizer" aria-hidden="true">推送通道未连接，重连后自动同步</span><span class="fit-sizer" aria-hidden="true">已请求上报，等待节点反馈</span><span class="fit-sizer" aria-hidden="true">节点尚未上报新状态</span><span class="fit-sizer" aria-hidden="true">刷新响应无效，请重试。</span><span v-if="refreshFeedback[node.id]?.text" class="fit-sizer" aria-hidden="true">{{ refreshFeedback[node.id].text }}</span><span class="fit-value">{{ statusLine(node) }}</span></small></td>
+          <td><div class="node-presence"><Badge reserve="尚未连接" :text="presence(node, Math.max(now, Date.now())).text" :tone="presence(node, Math.max(now, Date.now())).tone" /><button type="button" class="icon-btn refresh-node" :disabled="node.revoked || refreshing.has(node.id)" @click="refreshNode(node)" :class="{ spinning: refreshing.has(node.id) }" :aria-busy="refreshing.has(node.id)" title="请求节点刷新状态" :aria-label="`刷新节点 ${node.name}`"><span aria-hidden="true">↻</span></button></div><small class="last-seen fit" :class="{ 'node-refresh-feedback': !!refreshFeedback[node.id]?.text, bad: !!refreshFeedback[node.id]?.bad }" :role="refreshFeedback[node.id]?.text ? 'status' : undefined"><span class="fit-sizer" aria-hidden="true">最后上报：尚未上报</span><span class="fit-sizer" aria-hidden="true">最后上报：{{ seenText(node.last_seen, now, false) }}</span><span class="fit-sizer" aria-hidden="true">请求节点更新状态失败，请稍后重试。</span><span class="fit-sizer" aria-hidden="true">推送通道未连接，重连后自动同步</span><span class="fit-sizer" aria-hidden="true">已请求上报，等待节点反馈</span><span class="fit-sizer" aria-hidden="true">节点尚未上报新状态</span><span class="fit-sizer" aria-hidden="true">刷新响应无效，请重试。</span><span v-if="refreshFeedback[node.id]?.text" class="fit-sizer" aria-hidden="true">{{ refreshFeedback[node.id].text }}</span><span class="fit-value">{{ statusLine(node) }}</span></small></td>
           <td v-if="role === 'server'"><small v-if="released(node)">未监听</small><small v-else>监听：{{ localListen(node) }} · {{ node.tunnel?.protocol === 'hysteria2' || node.tunnel?.hysteria2?.password ? 'UDP' : 'TCP' }}</small><small v-for="item in connectList(node)" :key="item.id">{{ item.name }} · {{ endpoint(item.host, item.port) }}</small></td>
           <td v-if="role === 'server'">{{ tunnelLabel(node) }}</td><td>{{ mappings(node.id).length }}</td>
           <td><div class="revision-status" role="group" :title="revisionDescription(node)" :aria-label="revisionDescription(node)"><Badge reserve="尚无配置" :text="revisionLabel(node)" :tone="revisionState(node).tone" /></div></td>
-          <td><div class="actions"><button type="button" class="btn small" :disabled="node.revoked" @click="editor?.open(node)">编辑</button><button type="button" class="btn small" :disabled="node.revoked" @click="ask(node, node.disabled ? 'enable' : 'disable')">{{ node.disabled ? '启用' : '停用' }}</button><button v-if="role === 'client'" type="button" class="btn small" :disabled="node.revoked || node.disabled || !effectiveSources(node).length" @click="openConfig(node)">查看配置</button><button v-if="!node.embedded" type="button" class="btn small" :disabled="node.revoked" @click="onboarding?.open(node)">快捷接入</button><button v-if="!node.embedded" type="button" class="btn small danger" @click="ask(node, 'delete')">删除</button></div></td>
+          <td>
+            <div class="actions popconfirm-anchor">
+              <button type="button" class="btn small" :disabled="node.revoked" @click="editor?.open(node)">编辑</button>
+              <button type="button" class="btn small" :disabled="node.revoked" :aria-expanded="popconfirmId === node.id && (action === 'disable' || action === 'enable')" @click="ask(node, node.disabled ? 'enable' : 'disable')">{{ node.disabled ? '启用' : '停用' }}</button>
+              <button v-if="role === 'client'" type="button" class="btn small" :disabled="node.revoked || node.disabled || !effectiveSources(node).length" @click="openConfig(node)">查看配置</button>
+              <button v-if="!node.embedded" type="button" class="btn small" :disabled="node.revoked" @click="onboarding?.open(node)">快捷接入</button>
+              <button v-if="!node.embedded" type="button" class="btn small danger" @click="ask(node, 'delete')">删除</button>
+              <div v-if="popconfirmId === node.id && (action === 'disable' || action === 'enable')" class="popconfirm" role="dialog" :aria-label="`${node.disabled ? '启用' : '停用'}节点确认`">
+                <p class="popconfirm-title">确认{{ node.disabled ? '启用' : '停用' }}「{{ node.name }}」？</p>
+                <div class="popconfirm-actions">
+                  <button type="button" class="btn small quiet" :disabled="togglingBusy" @click="popconfirmId = ''">保留当前</button>
+                  <button type="button" class="btn small primary" :disabled="togglingBusy" @click="confirmInlineNodeToggle">{{ togglingBusy ? '处理中…' : `确认${node.disabled ? '启用' : '停用'}` }}</button>
+                </div>
+              </div>
+            </div>
+          </td>
         </tr></tbody>
       </table>
     </div>
     <section v-if="selected" class="node-detail" aria-label="节点详情">
       <header class="panel-head"><h2>{{ selected.name }}</h2><button class="btn quiet" type="button" @click="selectedId = ''">收起</button></header>
-      <dl class="detail-grid"><div><dt>ID</dt><dd><code>{{ selected.id }}</code></dd></div><div><dt>最近上报</dt><dd>{{ seenText(selected.last_seen, now, false) }}</dd></div></dl>
+      <dl class="detail-grid"><div><dt>ID</dt><dd class="detail-id-row"><code>{{ selected.id }}</code><button type="button" class="btn small quiet fit" :class="{ 'copy-bounce': copiedId === selected.id }" @click="copyNodeId(selected.id)"><span class="fit-sizer" aria-hidden="true">✓ 已复制</span><span class="fit-sizer" aria-hidden="true">复制</span><span class="fit-value">{{ copiedId === selected.id ? '✓ 已复制' : '复制' }}</span></button></dd></div><div><dt>最近上报</dt><dd>{{ seenText(selected.last_seen, now, false) }}</dd></div></dl>
       <dl class="detail-grid"><div><dt>软件版本（节点上报，未验真）</dt><dd>{{ selected.software_version || '未上报' }}</dd></div><div><dt>构建提交（节点上报）</dt><dd><code>{{ selected.software_commit || '未上报' }}</code></dd></div></dl>
       <p class="help">上报信息不等于二进制验真。请通过可信 Docker 管理通道运行 tools/verify-node.py，对照独立可信的发布 SHA-256、实际运行文件与管理 API；结果仅代表核验时刻。</p>
       <p v-if="selected.error" class="detail-error" role="status">{{ selected.error }}</p>

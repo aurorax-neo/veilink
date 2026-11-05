@@ -8,6 +8,34 @@ Release。
 
 ## [Unreleased]
 
+## [0.4.14] - 2026-11-05
+
+### Features
+
+- 后端全量迁移至 Rust（Tokio + Axum + Hyper + Rustls + Quinn），移除全部 Go 代码；单二进制通过 `rust-embed` 内嵌 Web 静态资源，统一承载 `master`、`server`、`client` 三种角色，100% 兼容既有 `veilink.db`、`master.key` 与节点 `state.json` 永久凭证。
+- 控制面由 gRPC 切换为纯 HTTP JSON（`/api/control/{enroll,pull,events}`，支持 `?wait_ms=` 长轮询即时唤醒），天然兼容 Nginx / Caddy 等标准 HTTP 反向代理，无需配置 `grpc_pass`。
+- 管理台接入服务端事件流 SSE（`/api/v1/events`），节点心跳、隧道状态、流量统计与日志变更实时推送至前端并按需增量刷新，显著降低操作与状态感知延迟。
+- 原生 Rust 实现完整隧道与安全协议栈：VLESS、REALITY（TLS 1.3 + X25519 + ShortID + 回落保护 + ML-DSA-65 后量子证书签名 + Chrome/Firefox/iOS ClientHello 指纹）、VLESS Encryption（X25519 / ML-KEM-768 0-RTT/1-RTT + native/xorpub/random）、Vision（零任务状态机）、Hysteria2（QUIC/HTTP3 QPACK `/auth` `233`）、XHTTP（`packet-up` / `stream-one` / `stream-up` / `auto` 及分离下行端点）与多路复用（`smux` / `yamux` / `h2mux` / `XUDP`）。
+- 优化 Web 控制台交互：节点与映射编辑器统一采用居中弹窗，打开已配置节点时自动解析并完整回填已存储配置（从 X.509 证书反推有效期天数、自动识别 VLESS Encryption 模式、恢复 Flow 与 XHTTP 参数）；优化设置页、审计页（分类筛选、检索与 100 条分批加载）与登录页（移除密钥框提示并将退出按钮改为“注销登录”）。
+- 补齐节点接入令牌签发（`node.enroll.token`）、撤销（`node.enroll.revoke`）与凭证重置（`node.credential.reset`）的数据库审计记录及前端中文标签，并支持通过 `VEILINK_TRUSTED_PROXIES` 配置受信任反代 IP。
+
+### Bug Fixes
+
+- 对齐 Xray-core 的 XHTTP `auto` 模式选择策略（REALITY 默认选 `stream-one`、配置下载端点选 `stream-up`、非 REALITY 选 `packet-up`），修复 REALITY + XHTTP `auto` 组合校验并在前端编辑器自动显示为只读有效模式。
+- 统一前后端时区为 `Asia/Shanghai`（`UTC+8`），并在前端同步服务端响应头时钟偏移，彻底消除浏览器与服务端微小时间差导致的“时钟超前”误报。
+- 修复 `VisionStream` 与 `RealityTlsStream` 在底层连接返回 `Poll::Pending` 时的帧缓冲背压跟踪，防止高负载网络背压下重复编码发送或缓冲滞留。
+- 为 Master 控制面 TCP/TLS 连接增加 75 秒读写空闲超时回收（`IdleTimeoutIo`）与 HTTP/2 Keep-Alive 探测，防止空闲连接长期占用连接池信号量。
+- 修复删除旧 API Key 后新建未命名 Key 触发 `UNIQUE` 约束冲突的问题；修复多路复用流 ID 回绕时跳过保留 ID `0` 与活跃流 ID；将 `RealityReplayCache` 升级为 `HashMap + VecDeque` 实现 $O(1)$ 满容量淘汰；支持节点拨号与目标转发的 IPv4/IPv6 双栈 DNS 回退。
+- 移除 Hysteria2 客户端 `SkipServerVerification`，未配置自定义 CA 时默认使用 `webpki-roots` 系统根证书池，非空无效 `ca_pem` 直接报错拒绝。
+- 加固 XHTTP 服务端会话表：校验 `sid` 合法性、限制并发会话上限为 1024、采用 64 包有界通道与乱序窗口、增加 15 秒请求头读取超时与 4 MiB 请求体上限，并自动清理孤儿会话。
+- 控制面接入 `auth_fails` 防爆破限流并增加 `X-Veilink-Auth-Rejected: 1` 认证拒绝响应头，防止反向代理或 WAF 返回的 401/403 误触发节点擦除本地永久凭证。
+- 强化隧道加密初始化错误传播（禁止异常配置静默降级为明文）、服务端监听并发上限信号量、UDP `peer_streams` 回收、多路复用子流 10 秒阻塞超时、客户端异步 DNS 解析与指数退避重连，以及旧版 4032 字节 ML-DSA-65 私钥配对校验。
+
+### Maintenance
+
+- 对标 `clash-rs` 与 `meow-rs` 优化数据面热路径（REALITY 原地加解密与游标读取、VLESS AEAD 批量封装、XHTTP 单缓冲 chunked 写入与流水线、多路复用 16 KiB 对齐聚合读写），120 项全协议矩阵往返耗时缩短 40%~52%，单流吞吐最高提升 157%。
+- 收敛 `.github/workflows/release.yml` 最小权限并补齐 `aarch64-unknown-linux-musl` 交叉编译链接器配置，更新 `README.md` 与 `THIRD_PARTY_NOTICES.md`。
+
 ## [0.4.13] - 2026-11-04
 
 ### Features
