@@ -8,6 +8,21 @@ Release。
 
 ## [Unreleased]
 
+## [0.4.16] - 2026-11-05
+
+### Bug Fixes
+
+- 修复端口映射限速（`bandwidth_limit`）在高带宽（`>130Mbps`）或小分片下因 `sleep_us > 1000` 阈值截断失效以及多并发连接未共享配额的问题：引入映射级共享令牌桶 `BandwidthLimiter`（50ms 突发窗口 + 动态读取分片），将上行/下行限速置于流读取侧，并补齐 UDP 映射限速。
+- 修复各节点状态刷新与事件上报不及时的问题：为 `Ring` 与 `tunnel::Runtime` 增加异步状态变更通知（`Notify`），移除 `refresh` 时多余的快照重拉取（`PATH_PULL`），在控制面 SSE `node` 事件中补齐 `node_id` 字段并优化刷新等待窗口，使节点链路建立/断开、日志与手动刷新在单次 RTT 内即时上报。
+- 提升隧道在持续流量与高并发下的稳定性：为服务端与客户端隧道会话增加 15 秒 `FRAME_PING` 保活与 45 秒读空闲超时检测，移除收到 `FRAME_HALF` 后 10 秒强制中断活跃对端传输的逻辑，消除 `FRAME_PING` 回复与分流通道阻塞，并修复 XHTTP `packet-up` 会话按创建时间误淘汰活跃连接及上行连接断开后自动重连重放。
+
+## [0.4.15] - 2026-11-05
+
+### Bug Fixes
+
+- 修复节点通过 HTTPS/反向代理连接 Master 控制面时偶发 `Connection reset by peer (os error 104)` 的问题：支持 TLS `h2` / `http/1.1` ALPN 协商与回退、持久连接池复用、TCP Keepalive、IPv4 优先双栈拨号及瞬时传输错误自动重试。
+- 修复内嵌 `default` 节点心跳排空 Master 全局日志环形缓冲区导致远程节点与 Master 日志被覆盖为 `default` 的问题，并将 `Ring` 日志注入 `tunnel::Runtime` 以完整采集各节点隧道事件。
+
 ## [0.4.14] - 2026-11-05
 
 ### Features
