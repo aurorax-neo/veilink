@@ -25,22 +25,37 @@ const result = ref<JoinResult | null>(null)
 const status = ref('')
 const copyError = ref('')
 const copied = ref(false)
+const copiedOffline = ref(false)
+const offlineTab = ref<'docker' | 'binary' | 'state'>('docker')
 const showHelp = ref(false)
 const showDanger = ref(false)
 const now = ref(Date.now())
 const timer = window.setInterval(() => { now.value = Date.now() }, 1000)
 onUnmounted(() => window.clearInterval(timer))
 const expired = computed(() => !!result.value && result.value.expires_at * 1000 <= now.value)
+const hasOffline = computed(() => !!(result.value?.offline_command || result.value?.offline_binary_command || result.value?.state_json))
+const offlineValue = computed(() => {
+  if (!result.value) return ''
+  if (offlineTab.value === 'binary') return result.value.offline_binary_command || ''
+  if (offlineTab.value === 'state') return result.value.state_json || ''
+  return result.value.offline_command || ''
+})
+const offlineCopyLabel = computed(() => {
+  if (offlineTab.value === 'binary') return '脱机二进制命令'
+  if (offlineTab.value === 'state') return 'state.json 脱机配置'
+  return '脱机 Docker 命令'
+})
 function open(value: Node) {
   if (value.embedded) { node.value = null; clear(); return }
   node.value = value
   masterURL.value = location.origin
   clear()
+  offlineTab.value = 'docker'
   showHelp.value = false
   showDanger.value = false
   modal.value?.open()
 }
-function clear() { result.value = null; status.value = ''; copyError.value = ''; copied.value = false }
+function clear() { result.value = null; status.value = ''; copyError.value = ''; copied.value = false; copiedOffline.value = false }
 async function generate() {
   if (node.value?.embedded) throw new Error('内置节点不支持快捷接入。')
   let url: URL
@@ -58,8 +73,13 @@ async function copy(value: string, label: string) {
   try {
     await copyText(value)
     status.value = `${label}已复制。`
-    copied.value = true
-    globalThis.window?.setTimeout?.(() => { copied.value = false }, 2500)
+    if (label === '接入命令') {
+      copied.value = true
+      globalThis.window?.setTimeout?.(() => { copied.value = false }, 2500)
+    } else {
+      copiedOffline.value = true
+      globalThis.window?.setTimeout?.(() => { copiedOffline.value = false }, 2500)
+    }
   }
   catch { copyError.value = `${label}复制失败，请手动选择命令。` }
 }
@@ -99,33 +119,32 @@ defineExpose({ open })
   <Modal ref="modal" :title="`快捷接入 · ${node?.name || ''}`" save-label="生成接入命令" :hide-save="!!result" :submit="generate" @close="clear">
     <label for="join-master">管理地址</label>
     <input id="join-master" v-model="masterURL" type="url" required :disabled="!!result" placeholder="https://master.example.com:8443" />
-    <small class="help">填写节点可访问的 Master 地址（含端口）；HTTPS 证书须匹配主机名。</small>
-    <p v-if="result?.warning" class="warning" role="note">{{ result.warning }}</p>
     <template v-if="result">
       <div class="command-heading"><label for="join-command">Docker 接入命令</label><button type="button" class="btn small primary fit" :class="{ 'copy-bounce': copied }" :disabled="expired" @click="copy(result.command, '接入命令')"><span class="fit-sizer" aria-hidden="true">✓ 已复制命令</span><span class="fit-sizer" aria-hidden="true">复制接入命令</span><span class="fit-value">{{ copied ? '✓ 已复制命令' : '复制接入命令' }}</span></button></div>
-      <textarea id="join-command" class="command-block secret" :value="result.command" readonly rows="5" spellcheck="false" />
+      <textarea id="join-command" class="command-block secret" :value="result.command" readonly rows="4" spellcheck="false" />
       <div class="token-meta">
         <small class="help live-number" :class="{ bad: expired }">{{ expired ? '令牌已过期' : '令牌到期' }} · {{ formatTime(result.expires_at * 1000) }}</small>
         <button v-if="expired" type="button" class="btn small" @click="clear">重新生成</button>
-        <button v-else type="button" class="btn small quiet danger revoke-token" style="margin-top: 0;" @click="revokeModal?.open()">撤销此接入令牌</button>
+        <button v-else type="button" class="btn small quiet danger revoke-token" @click="revokeModal?.open()">撤销此接入令牌</button>
       </div>
-      <template v-if="result.offline_command">
-        <div class="command-heading" style="margin-top: 12px;">
-          <label for="join-offline-command">脱机含参 Docker 启动命令（兼容无法连接 Hub）</label>
-          <button type="button" class="btn small primary" @click="copy(result.offline_command, '脱机 Docker 命令')">复制脱机 Docker 命令</button>
+      <div v-if="hasOffline" class="offline-box">
+        <div class="command-heading offline-heading">
+          <label for="join-offline-output">脱机运行参数（兼容无法连接 Hub）</label>
+          <div class="offline-actions">
+            <button v-if="result.state_json" type="button" class="btn small quiet" @click="downloadStateJson">导出 state.json</button>
+            <button type="button" class="btn small fit" :class="{ 'copy-bounce': copiedOffline }" @click="copy(offlineValue, offlineCopyLabel)">
+              <span class="fit-sizer" aria-hidden="true">✓ 已复制</span>
+              <span class="fit-sizer" aria-hidden="true">复制当前项</span>
+              <span class="fit-value">{{ copiedOffline ? '✓ 已复制' : '复制当前项' }}</span>
+            </button>
+          </div>
         </div>
-        <textarea id="join-offline-command" class="command-block secret" :value="result.offline_command" readonly rows="4" spellcheck="false" />
-      </template>
-      <template v-if="result.offline_binary_command">
-        <div class="command-heading" style="margin-top: 12px;">
-          <label for="join-offline-binary">脱机含参单二进制启动命令（兼容无法连接 Hub）</label>
-          <button type="button" class="btn small" @click="copy(result.offline_binary_command, '脱机二进制命令')">复制脱机二进制命令</button>
+        <div class="seg-pills offline-tabs" role="group" aria-label="脱机启动方式">
+          <button type="button" :aria-pressed="offlineTab === 'docker'" @click="offlineTab = 'docker'">Docker 含参</button>
+          <button type="button" :aria-pressed="offlineTab === 'binary'" @click="offlineTab = 'binary'">二进制含参</button>
+          <button type="button" :aria-pressed="offlineTab === 'state'" @click="offlineTab = 'state'">state.json</button>
         </div>
-        <textarea id="join-offline-binary" class="command-block secret" :value="result.offline_binary_command" readonly rows="3" spellcheck="false" />
-      </template>
-      <div v-if="result.state_json" class="actions" style="margin-top: 10px;">
-        <button type="button" class="btn small" @click="downloadStateJson">导出 state.json 脱机文件</button>
-        <button type="button" class="btn small quiet" @click="copy(result.state_json, 'state.json 脱机配置')">复制 state.json 内容</button>
+        <textarea id="join-offline-output" class="command-block secret" :value="offlineValue" readonly rows="4" spellcheck="false" />
       </div>
     </template>
     <div class="help-details">
@@ -135,6 +154,8 @@ defineExpose({ open })
       </button>
       <div class="collapsible" :data-open="showHelp ? 'true' : 'false'">
         <div class="help-content">
+          <p class="help">填写节点可访问的 Master 地址（含端口）；HTTPS 证书须匹配主机名。当节点无法连接 Hub 时，可使用「脱机运行参数」直接加载完整隧道与端口映射配置启动，待网络恢复后自动同步。</p>
+          <p v-if="result?.warning" class="warning" role="note">{{ result.warning }}</p>
           <p class="help">命令使用统一镜像 ghcr.io/aurorax-neo/veilink:latest，以 server 或 client 子命令选择角色。接入令牌在有效期内可重复用于此节点，重新生成会替换旧令牌。</p>
           <p class="help">HTTP/h2c 不加密，仅用于可信网络；接入命令只设置管理连接，-control-ca 仅信任 Master HTTPS。客户端不加本地隧道 flags。节点在线仅代表心跳，仍需确认应用修订及映射目标可达。</p>
         </div>

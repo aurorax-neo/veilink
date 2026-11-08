@@ -8,6 +8,13 @@ Release。
 
 ## [Unreleased]
 
+## [0.4.19] - 2026-11-08
+
+### Bug Fixes & UI Refinements
+
+- 优化“快捷接入”弹窗布局与统一视觉风格：将参数与证书告警说明全部收纳进折叠面板，采用统一分段切换器（`Docker 含参` / `二进制含参` / `state.json`）展示脱机运行参数，并增加按钮与命令文本框及相邻操作按钮之间的间距。
+- 修复移动端与窄视口下服务端表格中“隧道”列（如 `VLESS / TCP · REALITY + Encryption`）与“连接地址”列被逐字符折行挤压的问题。
+
 ## [0.4.18] - 2026-11-08
 
 ### Features & Improvements
