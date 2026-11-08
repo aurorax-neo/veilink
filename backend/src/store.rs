@@ -597,6 +597,7 @@ impl Store {
                     }
                 }
                 st.secrets.remove(&enrollment_credential_key(id));
+                st.secrets.remove(&enrollment_token_key(id));
                 Ok(())
             },
             Some(Box::new(|tx: &Transaction| {
@@ -616,6 +617,13 @@ impl Store {
         let g = self.inner.lock();
         let mut conn = g.db.lock();
         let tx = conn.transaction()?;
+        let raw: Vec<u8> = tx.query_row("SELECT data FROM config WHERE id=1", [], |r| r.get(0))?;
+        let mut st: State =
+            serde_json::from_slice(&raw).map_err(|e| StoreError::Other(e.to_string()))?;
+        if st.secrets.remove(&enrollment_token_key(id)).is_some() {
+            let body = serde_json::to_vec(&st).map_err(|e| StoreError::Other(e.to_string()))?;
+            tx.execute("UPDATE config SET data=?1 WHERE id=1", params![&body])?;
+        }
         tx.execute("DELETE FROM enroll WHERE node=?1", params![id])?;
         tx.execute(
             "INSERT INTO audit VALUES(?1,?2,?3)",
@@ -628,21 +636,51 @@ impl Store {
     pub fn enroll_token(&self, id: &str, ttl: Duration) -> Result<String, StoreError> {
         let g = self.inner.lock();
         let mut conn = g.db.lock();
-        let st = load_from_conn(&conn)?;
+        let tx = conn.transaction()?;
+        let raw: Vec<u8> = tx.query_row("SELECT data FROM config WHERE id=1", [], |r| r.get(0))?;
+        let mut st: State =
+            serde_json::from_slice(&raw).map_err(|e| StoreError::Other(e.to_string()))?;
         let Some(n) = st.nodes.get(id) else {
             return Err(StoreError::Invalid(String::new()));
         };
         if n.revoked || ttl.is_zero() || ttl > Duration::from_secs(7 * 86400) {
             return Err(StoreError::Invalid(String::new()));
         }
-        let tok = auth::token();
         let now = Utc::now().timestamp();
-        let expires = now + ttl.as_secs() as i64;
-        let tx = conn.transaction()?;
-        tx.execute(
-            "INSERT OR REPLACE INTO enroll VALUES(?1,?2,?3)",
-            params![id, auth::hash(&tok), expires],
-        )?;
+        let expires = i64::MAX;
+        let existing_hash: Option<String> = tx
+            .query_row(
+                "SELECT hash FROM enroll WHERE node=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let mut reused = None;
+        if let Some(sealed) = st.secrets.get(&enrollment_token_key(id)) {
+            if let Ok(opened) = auth::open(&g.key, sealed) {
+                if existing_hash.as_deref() == Some(&auth::hash(&opened)) {
+                    reused = Some(opened);
+                }
+            }
+        }
+        let tok = if let Some(tok) = reused {
+            tx.execute(
+                "UPDATE enroll SET expires=?2 WHERE node=?1",
+                params![id, expires],
+            )?;
+            tok
+        } else {
+            let tok = auth::token();
+            let sealed = auth::seal(&g.key, &tok)?;
+            st.secrets.insert(enrollment_token_key(id), sealed);
+            let body = serde_json::to_vec(&st).map_err(|e| StoreError::Other(e.to_string()))?;
+            tx.execute("UPDATE config SET data=?1 WHERE id=1", params![&body])?;
+            tx.execute(
+                "INSERT OR REPLACE INTO enroll VALUES(?1,?2,?3)",
+                params![id, auth::hash(&tok), expires],
+            )?;
+            tok
+        };
         tx.execute(
             "INSERT INTO audit VALUES(?1,?2,?3)",
             params![now, "node.enroll.token", id],
@@ -680,18 +718,20 @@ impl Store {
         tx.execute("DELETE FROM credentials WHERE node=?1", params![id])?;
         tx.execute("DELETE FROM enroll WHERE node=?1", params![id])?;
         st.secrets.remove(&enrollment_credential_key(id));
-        let body = serde_json::to_vec(&st).map_err(|e| StoreError::Other(e.to_string()))?;
-        tx.execute("UPDATE config SET data=?1 WHERE id=1", params![&body])?;
+        st.secrets.remove(&enrollment_token_key(id));
         let mut tok = String::new();
         let now = Utc::now().timestamp();
-        if let Some(d) = ttl {
+        if ttl.is_some() {
             tok = auth::token();
-            let expires = now + d.as_secs() as i64;
+            let sealed = auth::seal(&g.key, &tok)?;
+            st.secrets.insert(enrollment_token_key(id), sealed);
             tx.execute(
                 "INSERT OR REPLACE INTO enroll VALUES(?1,?2,?3)",
-                params![id, auth::hash(&tok), expires],
+                params![id, auth::hash(&tok), i64::MAX],
             )?;
         }
+        let body = serde_json::to_vec(&st).map_err(|e| StoreError::Other(e.to_string()))?;
+        tx.execute("UPDATE config SET data=?1 WHERE id=1", params![&body])?;
         tx.execute(
             "INSERT INTO audit VALUES(?1,?2,?3)",
             params![now, "node.credential.reset", id],
@@ -704,12 +744,20 @@ impl Store {
         let g = self.inner.lock();
         let mut conn = g.db.lock();
         let tx = conn.transaction()?;
-        let now = Utc::now().timestamp();
-        let count = tx.execute(
-            "UPDATE enroll SET hash=hash WHERE node=?1 AND hash=?2 AND expires>?3",
-            params![id, auth::hash(token), now],
+        let token_hash = auth::hash(token);
+        let enroll_count = tx.execute(
+            "UPDATE enroll SET hash=hash WHERE node=?1 AND hash=?2",
+            params![id, &token_hash],
         )?;
-        if count != 1 {
+        let cred_count = if enroll_count != 1 {
+            tx.execute(
+                "UPDATE credentials SET hash=hash WHERE node=?1 AND hash=?2",
+                params![id, &token_hash],
+            )?
+        } else {
+            0
+        };
+        if enroll_count != 1 && cred_count != 1 {
             return Err(StoreError::Auth);
         }
         let raw: Vec<u8> = tx.query_row("SELECT data FROM config WHERE id=1", [], |r| r.get(0))?;
@@ -1656,6 +1704,10 @@ fn notify_locked(
 
 fn enrollment_credential_key(id: &str) -> String {
     format!("credential:{id}")
+}
+
+fn enrollment_token_key(id: &str) -> String {
+    format!("enroll:{id}")
 }
 
 fn valid_software_label(s: &str) -> bool {

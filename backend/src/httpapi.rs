@@ -1475,7 +1475,7 @@ impl Api {
             " -bootstrap-state {}",
             shell_quote(&bootstrap_state)
         ));
-        let mut warning = "命令包含可重复使用的接入令牌，可能出现在 shell 历史和 Docker inspect 的容器参数中；请勿分享或记录日志。不再需要注册时请撤销令牌。接入成功后保留 /data 状态并重建不带令牌的容器，删除原容器前妥善保护主机访问。".to_string();
+        let mut warning = "命令包含持久有效的节点接入令牌，可能出现在 shell 历史和 Docker inspect 的容器参数中；请勿分享或记录日志。".to_string();
         if server_name.is_empty() {
             warning.push_str("HTTP/h2c 管理连接不加密，仅用于可信网络；必须填写节点实际可达的 Master 地址，不能用另一台主机的 127.0.0.1。");
         } else {
@@ -2038,6 +2038,10 @@ mod tests {
         let token = store
             .enroll_token(&node.id, Duration::from_secs(3600))
             .unwrap();
+        let token_again = store
+            .enroll_token(&node.id, Duration::from_secs(3600))
+            .unwrap();
+        assert_eq!(token, token_again, "repeated enroll_token calls must return the persistent token");
         let audits = store.audit().unwrap();
         assert!(audits.iter().any(|a| a.action == "node.enroll.token" && a.object == node.id));
 

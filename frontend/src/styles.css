@@ -323,12 +323,21 @@ tbody tr:hover td { background: var(--surface-2); }
 .field-actions.config-switch > input { flex: 0 1 180px; }
 .field-actions .btn.small { min-height: 40px; padding-inline: 14px; border-radius: var(--radius-inner); }
 .secret, .command-block { margin: 0 0 8px; padding: 12px; background: var(--input-bg); border-radius: var(--radius-inner); white-space: pre-wrap; overflow-wrap: anywhere; user-select: all; font: 12px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace; }
-.command-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 16px 0 10px; } .command-heading label { margin: 0; } .command-heading .btn { flex: none; }
-.revoke-token { justify-self: start; margin-top: 0; }
-.offline-box { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line); }
-.offline-heading { margin: 0 0 10px; }
-.offline-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.offline-tabs { margin-bottom: 10px; }
+.onboarding-field > label { margin-top: 0; }
+.master-input-row { display: flex; align-items: center; gap: 8px; }
+.master-input-row > input { flex: 1 1 auto; min-width: 0; }
+.master-refresh-btn { flex: none; min-height: 40px; padding-inline: 12px; white-space: nowrap; }
+.onboarding-command-card { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 10px; }
+.command-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0; flex-wrap: nowrap; }
+.command-heading label { margin: 0; white-space: nowrap; }
+.command-heading .btn { flex: none; }
+.command-title-group { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.token-badge { display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 999px; background: var(--accent-soft); color: var(--accent-strong); font-size: 11px; font-weight: var(--fw-medium); white-space: nowrap; }
+.command-actions { display: flex; align-items: center; gap: 6px; flex: none; }
+.offline-tabs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; margin: 0; }
+.offline-tabs button { padding: 4px 6px; white-space: nowrap; text-align: center; }
+.command-mode-hint { margin: 0; font-size: 12px; color: var(--muted); line-height: 1.45; }
+.onboarding-command-card .command-block { margin: 0; line-height: 1.55; max-height: 140px; overflow-y: auto; }
 
 /* Grid 0fr -> 1fr 折叠动画（规范 6.7） */
 .collapsible { display: grid; grid-template-rows: 0fr; transition: grid-template-rows 200ms ease; }
@@ -428,7 +437,7 @@ tbody tr:hover td { background: var(--surface-2); }
   .build-version { position: static; }
   .build-details { inset-inline-end: 12px; top: 100%; }
 }
-@media (max-width: 420px) { .command-heading { align-items: stretch; flex-direction: column; gap: 8px; } .offline-actions { justify-content: flex-end; } }
+@media (max-width: 440px) { .token-badge { display: none; } .offline-tabs button { font-size: 11.5px; padding: 4px 2px; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
 .node-refresh-feedback { color: var(--warn); }
 td small.node-refresh-feedback { color: var(--warn); }

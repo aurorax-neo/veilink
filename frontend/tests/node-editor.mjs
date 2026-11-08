@@ -428,7 +428,7 @@ test('onboarding displays role-specific flag commands and accepts HTTP only for 
   const requests = []; let opens = 0
   const onboardingScript = source('../src/components/NodeOnboarding.vue').match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import .*$/gm, '')
   const context = vm.createContext({
-    exports: {}, computed, ref, URL, location: { origin: 'https://master.example.com' },
+    exports: {}, computed, nextTick: fn => Promise.resolve().then(fn), ref, URL, location: { origin: 'https://master.example.com' },
     window: { setInterval: () => 1, clearInterval: () => {} }, onUnmounted: () => {}, defineExpose: () => {},
     api: async (...args) => { requests.push(args); return { prepare: "mkdir -p '/opt/docker/veilink-client-demo/config' '/opt/docker/veilink-client-demo/data' && chown -R 65532:65532 '/opt/docker/veilink-client-demo/config' '/opt/docker/veilink-client-demo/data' && chmod 700 '/opt/docker/veilink-client-demo/config' '/opt/docker/veilink-client-demo/data'", command: "docker run -itd --restart unless-stopped --name 'veilink-client-demo' -v '/opt/docker/veilink-client-demo/config:/config:ro' -v '/opt/docker/veilink-client-demo/data:/data' -e TZ=Asia/Shanghai ghcr.io/aurorax-neo/veilink:latest client -master-addr 'master.example.com:443' -node-id 'remote/id' -enroll-token 'token' -state-dir '/data/state' -control-server-name 'master.example.com'", token: 'token', expires_at: 2000000000, warning: '私有 Master CA 时，在角色子命令后添加 -control-ca /config/ca.pem。' } },
   })
@@ -448,16 +448,16 @@ test('onboarding displays role-specific flag commands and accepts HTTP only for 
   assert.equal(opens, 1)
   assert.equal(requests[0][0], '/nodes/remote%2Fid/join')
   assert.equal(JSON.stringify(requests[0][2]), JSON.stringify({ master_url: 'https://master.example.com' }))
-  assert.match(source('../src/components/NodeOnboarding.vue'), /接入令牌在有效期内可重复用于此节点/)
+  assert.match(source('../src/components/NodeOnboarding.vue'), /节点接入令牌持久有效，多次生成接入命令不会使原有令牌失效/)
   assert.doesNotMatch(source('../src/components/NodeOnboarding.vue'), /ttl_seconds|join-ttl|有效期（秒）/)
-  assert.match(source('../src/components/NodeOnboarding.vue'), /不影响已接入节点的有效凭据/)
+  assert.doesNotMatch(source('../src/components/NodeOnboarding.vue'), /撤销此接入令牌|重置节点永久凭据/)
   assert.equal(e.result.value.token, 'token')
   assert.equal(e.result.value.command, "docker run -itd --restart unless-stopped --name 'veilink-client-demo' -v '/opt/docker/veilink-client-demo/config:/config:ro' -v '/opt/docker/veilink-client-demo/data:/data' -e TZ=Asia/Shanghai ghcr.io/aurorax-neo/veilink:latest client -master-addr 'master.example.com:443' -node-id 'remote/id' -enroll-token 'token' -state-dir '/data/state' -control-server-name 'master.example.com'")
   assert.match(e.result.value.prepare, /chown -R 65532:65532/)
   assert.match(e.result.value.warning, /-control-ca \/config\/ca.pem/)
   assert.match(source('../src/components/NodeOnboarding.vue'), /统一镜像 ghcr.io\/aurorax-neo\/veilink:latest.*server 或 client 子命令/)
   assert.doesNotMatch(source('../src/components/NodeOnboarding.vue'), /id="join-prepare"|目录准备命令/)
-  assert.match(source('../src/components/NodeOnboarding.vue'), /id="join-command"[^>]+:value="result.command"/)
+  assert.match(source('../src/components/NodeOnboarding.vue'), /id="join-command"[^>]+:value="activeCommand"/)
   e.masterURL.value = 'http://192.168.1.10:8443'
   await e.generate()
   assert.equal(JSON.stringify(requests[1][2]), JSON.stringify({ master_url: 'http://192.168.1.10:8443' }))
