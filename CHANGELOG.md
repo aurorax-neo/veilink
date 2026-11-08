@@ -8,6 +8,14 @@ Release。
 
 ## [Unreleased]
 
+## [0.4.18] - 2026-11-08
+
+### Features & Improvements
+
+- 支持 `server` / `client` 节点在无法连接 Hub（Master）时通过 Hub 直接导出含完整运行参数的脱机/混合版本：
+  - Hub 的 `/api/v1/nodes/{id}/join` 接口及前端“快捷接入”弹窗新增一键复制 **脱机含参 Docker 启动命令**、**脱机含参单二进制启动命令**，并支持一键导出/复制 `state.json` 脱机配置文件。
+  - `server` 与 `client` 子命令新增 `-bootstrap-state`（兼容 `-offline-state`）参数，支持传入 Base64 编码参数、JSON 字符串或脱机文件路径；首次启动即刻应用内嵌的隧道、绑定与端口映射配置，无需依赖 Hub 网络可达，且在网络恢复时自动使用预置长期凭据与 Hub 同步。
+
 ## [0.4.17] - 2026-11-05
 
 ### Bug Fixes

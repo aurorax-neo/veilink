@@ -5,7 +5,17 @@ import { copyText, formatTime } from '../format'
 import type { Node } from '../types'
 import Modal from './Modal.vue'
 
-interface JoinResult { prepare?: string; command: string; expires_at: number; token: string; warning: string }
+interface JoinResult {
+  prepare?: string
+  command: string
+  offline_command?: string
+  offline_binary_command?: string
+  bootstrap_state?: string
+  state_json?: string
+  expires_at: number
+  token: string
+  warning: string
+}
 const modal = ref<InstanceType<typeof Modal> | null>(null)
 const revokeModal = ref<InstanceType<typeof Modal> | null>(null)
 const resetModal = ref<InstanceType<typeof Modal> | null>(null)
@@ -53,6 +63,19 @@ async function copy(value: string, label: string) {
   }
   catch { copyError.value = `${label}复制失败，请手动选择命令。` }
 }
+function downloadStateJson() {
+  if (!result.value?.state_json) return
+  const blob = new Blob([result.value.state_json], { type: 'application/json;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = 'state.json'
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+  status.value = 'state.json 脱机配置已导出。'
+}
 async function revoke() {
   if (!node.value) throw new Error('未选择节点。')
   if (node.value.embedded) throw new Error('内置节点不支持快捷接入。')
@@ -85,6 +108,24 @@ defineExpose({ open })
         <small class="help live-number" :class="{ bad: expired }">{{ expired ? '令牌已过期' : '令牌到期' }} · {{ formatTime(result.expires_at * 1000) }}</small>
         <button v-if="expired" type="button" class="btn small" @click="clear">重新生成</button>
         <button v-else type="button" class="btn small quiet danger revoke-token" style="margin-top: 0;" @click="revokeModal?.open()">撤销此接入令牌</button>
+      </div>
+      <template v-if="result.offline_command">
+        <div class="command-heading" style="margin-top: 12px;">
+          <label for="join-offline-command">脱机含参 Docker 启动命令（兼容无法连接 Hub）</label>
+          <button type="button" class="btn small primary" @click="copy(result.offline_command, '脱机 Docker 命令')">复制脱机 Docker 命令</button>
+        </div>
+        <textarea id="join-offline-command" class="command-block secret" :value="result.offline_command" readonly rows="4" spellcheck="false" />
+      </template>
+      <template v-if="result.offline_binary_command">
+        <div class="command-heading" style="margin-top: 12px;">
+          <label for="join-offline-binary">脱机含参单二进制启动命令（兼容无法连接 Hub）</label>
+          <button type="button" class="btn small" @click="copy(result.offline_binary_command, '脱机二进制命令')">复制脱机二进制命令</button>
+        </div>
+        <textarea id="join-offline-binary" class="command-block secret" :value="result.offline_binary_command" readonly rows="3" spellcheck="false" />
+      </template>
+      <div v-if="result.state_json" class="actions" style="margin-top: 10px;">
+        <button type="button" class="btn small" @click="downloadStateJson">导出 state.json 脱机文件</button>
+        <button type="button" class="btn small quiet" @click="copy(result.state_json, 'state.json 脱机配置')">复制 state.json 内容</button>
       </div>
     </template>
     <div class="help-details">

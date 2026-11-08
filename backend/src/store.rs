@@ -755,6 +755,63 @@ impl Store {
         Ok(credential)
     }
 
+    pub fn ensure_credential_and_snapshot(
+        &self,
+        id: &str,
+    ) -> Result<(String, Snapshot), StoreError> {
+        let credential = {
+            let g = self.inner.lock();
+            let mut conn = g.db.lock();
+            let tx = conn.transaction()?;
+            let raw: Vec<u8> =
+                tx.query_row("SELECT data FROM config WHERE id=1", [], |r| r.get(0))?;
+            let mut st: State =
+                serde_json::from_slice(&raw).map_err(|e| StoreError::Other(e.to_string()))?;
+            let Some(n) = st.nodes.get(id) else {
+                return Err(StoreError::Invalid(String::new()));
+            };
+            if n.revoked || n.embedded || (n.role != "server" && n.role != "client") {
+                return Err(StoreError::Invalid(String::new()));
+            }
+            let existing_cred: Option<(String, i64)> = tx
+                .query_row(
+                    "SELECT hash,expires FROM credentials WHERE node=?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let mut reused = None;
+            if let Some((cred_hash, _)) = existing_cred {
+                if let Some(sealed) = st.secrets.get(&enrollment_credential_key(id)) {
+                    if let Ok(opened) = auth::open(&g.key, sealed) {
+                        if auth::hash(&opened) == cred_hash {
+                            reused = Some(opened);
+                        }
+                    }
+                }
+            }
+            if let Some(cred) = reused {
+                tx.commit()?;
+                cred
+            } else {
+                let cred = auth::token();
+                let sealed = auth::seal(&g.key, &cred)?;
+                st.secrets.insert(enrollment_credential_key(id), sealed);
+                tx.execute(
+                    "INSERT OR REPLACE INTO credentials(node,hash,expires) VALUES(?1,?2,0)",
+                    params![id, auth::hash(&cred)],
+                )?;
+                let body =
+                    serde_json::to_vec(&st).map_err(|e| StoreError::Other(e.to_string()))?;
+                tx.execute("UPDATE config SET data=?1 WHERE id=1", params![&body])?;
+                tx.commit()?;
+                cred
+            }
+        };
+        let snap = self.snapshot(id, &credential)?;
+        Ok((credential, snap))
+    }
+
     pub fn snapshot(&self, id: &str, credential: &str) -> Result<Snapshot, StoreError> {
         let g = self.inner.lock();
         let conn = g.db.lock();

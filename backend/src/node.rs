@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
@@ -800,13 +801,86 @@ pub async fn run(cancel: CancellationToken, c: Config, role: &str) -> Result<(),
     run_with_ring(cancel, c, role, None).await
 }
 
+pub fn parse_bootstrap_state(raw: &str) -> Result<DiskState, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("empty bootstrap state".to_string());
+    }
+    let bytes = if trimmed.starts_with('{') {
+        trimmed.as_bytes().to_vec()
+    } else if Path::new(trimmed).is_file() {
+        let file_bytes =
+            fs::read(trimmed).map_err(|e| format!("read bootstrap state file: {}", e))?;
+        let file_str = String::from_utf8_lossy(&file_bytes);
+        let ft = file_str.trim();
+        if ft.starts_with('{') {
+            ft.as_bytes().to_vec()
+        } else {
+            decode_base64_flexible(ft)?
+        }
+    } else {
+        decode_base64_flexible(trimmed)?
+    };
+    if let Ok(mut ds) = serde_json::from_slice::<DiskState>(&bytes) {
+        if ds.node_id.is_empty() {
+            if let Some(ref snap) = ds.snapshot {
+                ds.node_id = snap.node.id.clone();
+            }
+        }
+        if !ds.node_id.is_empty() && ds.snapshot.is_some() {
+            return Ok(ds);
+        }
+    }
+    if let Ok(snap) = serde_json::from_slice::<Snapshot>(&bytes) {
+        if !snap.node.id.is_empty() {
+            return Ok(DiskState {
+                node_id: snap.node.id.clone(),
+                master: String::new(),
+                credential: String::new(),
+                snapshot: Some(snap),
+            });
+        }
+    }
+    Err("invalid bootstrap state payload".to_string())
+}
+
+fn decode_base64_flexible(s: &str) -> Result<Vec<u8>, String> {
+    let compact: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&compact)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(&compact))
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&compact))
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(&compact))
+        .map_err(|e| format!("invalid base64 bootstrap state: {}", e))
+}
+
 pub async fn run_with_ring(
     cancel: CancellationToken,
-    c: Config,
+    mut c: Config,
     role: &str,
     external_ring: Option<Arc<Ring>>,
 ) -> Result<(), NodeError> {
     c.validate(role).map_err(NodeError::Other)?;
+    let boot_opt = if !c.bootstrap_state.trim().is_empty() {
+        let b = parse_bootstrap_state(&c.bootstrap_state).map_err(NodeError::Other)?;
+        if c.node_id.is_empty() {
+            c.node_id = b.node_id.clone();
+        } else if !b.node_id.is_empty() && b.node_id != c.node_id {
+            return Err(NodeError::Other(
+                "bootstrap state node_id mismatch".to_string(),
+            ));
+        }
+        if c.master_addr.is_empty() && !b.master.is_empty() {
+            c.master_addr = b.master.clone();
+        }
+        Some(b)
+    } else {
+        None
+    };
+    if c.node_id.is_empty() {
+        return Err(NodeError::Other("node_id required".to_string()));
+    }
+
     let is_embedded = external_ring.is_some();
     let ring = external_ring.unwrap_or_else(|| Arc::new(Ring::new(1000)));
     ring.push_entry(
@@ -816,7 +890,14 @@ pub async fn run_with_ring(
         &format!("node starting role={} node_id={}", role, c.node_id),
     );
 
-    let client = HttpControlClient::new(&c).map_err(NodeError::Other)?;
+    let offline_master = c.master_addr.trim().is_empty()
+        || c.master_addr.trim().eq_ignore_ascii_case("offline")
+        || c.master_addr.trim().eq_ignore_ascii_case("none");
+    let client_opt = if offline_master {
+        None
+    } else {
+        Some(HttpControlClient::new(&c).map_err(NodeError::Other)?)
+    };
 
     fs::create_dir_all(&c.state_dir).map_err(|e| NodeError::Other(e.to_string()))?;
     set_mode(Path::new(&c.state_dir), 0o700)
@@ -830,16 +911,47 @@ pub async fn run_with_ring(
         snapshot: None,
     };
     if let Ok(bytes) = fs::read(&state_path) {
-        let parsed: DiskState = serde_json::from_slice(&bytes)
+        let mut parsed: DiskState = serde_json::from_slice(&bytes)
             .map_err(|_| NodeError::Other("local state identity mismatch or corruption".to_string()))?;
-        if parsed.node_id != c.node_id || parsed.master != c.master_addr {
+        if parsed.node_id != c.node_id
+            || (boot_opt.is_none() && !offline_master && parsed.master != c.master_addr)
+        {
             return Err(NodeError::Other(
                 "local state identity mismatch or corruption".to_string(),
             ));
         }
+        if !c.master_addr.is_empty() {
+            parsed.master = c.master_addr.clone();
+        }
         set_mode(&state_path, 0o600)
             .map_err(|e| NodeError::Other(e.to_string()))?;
         st = parsed;
+    }
+    if let Some(boot) = boot_opt {
+        let mut updated = !state_path.exists();
+        if !boot.credential.is_empty() && st.credential.is_empty() {
+            st.credential = boot.credential;
+            updated = true;
+        }
+        if let Some(boot_snap) = boot.snapshot {
+            let should_apply_boot = match st.snapshot.as_ref() {
+                Some(cur) => boot_snap.revision >= cur.revision,
+                None => true,
+            };
+            if should_apply_boot {
+                if st.snapshot.as_ref() != Some(&boot_snap) {
+                    updated = true;
+                }
+                st.snapshot = Some(boot_snap);
+            }
+        }
+        if !c.master_addr.is_empty() && st.master != c.master_addr {
+            st.master = c.master_addr.clone();
+            updated = true;
+        }
+        if updated {
+            save_disk_state(&state_path, &st).map_err(NodeError::Other)?;
+        }
     }
 
     let runtime = Arc::new(Runtime::new(LocalTLS::default()));
@@ -907,9 +1019,43 @@ pub async fn run_with_ring(
 
     let mut backoff = Duration::from_secs(1);
 
+    let Some(client) = client_opt else {
+        if st.snapshot.is_none() {
+            let _ = runtime.close();
+            return Err(NodeError::Other(
+                "offline mode requires bootstrap_state or cached snapshot".to_string(),
+            ));
+        }
+        ring.push_entry(
+            "node",
+            &c.node_id,
+            "INFO",
+            &format!(
+                "running in standalone offline mode with exported runtime configuration role={} node_id={}",
+                role, c.node_id
+            ),
+        );
+        cancel.cancelled().await;
+        let _ = runtime.close();
+        return Ok(());
+    };
+
     while !cancel.is_cancelled() {
         if st.credential.is_empty() {
             if c.enroll_token.is_empty() {
+                if st.snapshot.is_some() {
+                    ring.push_entry(
+                        "node",
+                        &c.node_id,
+                        "INFO",
+                        &format!(
+                            "running with exported snapshot without control credential role={} node_id={}",
+                            role, c.node_id
+                        ),
+                    );
+                    cancel.cancelled().await;
+                    break;
+                }
                 let _ = runtime.close();
                 return Err(NodeError::Other(
                     "enrollment token required for first start".to_string(),
@@ -1390,5 +1536,160 @@ mod tests {
         assert_eq!(resp.revision, 42);
         assert_eq!(sni_rst_count.load(Ordering::SeqCst), 1);
         assert!(client.prefer_no_sni.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_offline_bootstrap_state_runs_tunnel_when_hub_unreachable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("veilink.db");
+        let key_path = tmp.path().join("veilink.key");
+        let store = crate::store::Store::open(
+            db_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+        )
+        .unwrap();
+
+        // Pick free ports for tunnel server, mapping listen, and target echo server
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo_listener.local_addr().unwrap().port() as i64;
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = echo_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    if let Ok(n) = s.read(&mut buf).await {
+                        let _ = s.write_all(&buf[..n]).await;
+                    }
+                });
+            }
+        });
+
+        let tun_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port() as i64
+        };
+        let map_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port() as i64
+        };
+
+        let (dec_str, _, _, _) = crate::tunnel::generate_vless_enc().unwrap();
+        let srv_tunnel = LocalTLS {
+            listen_host: "127.0.0.1".to_string(),
+            listen_port: tun_port,
+            transport_security: "plain".to_string(),
+            decryption: dec_str,
+            ..Default::default()
+        };
+
+        store
+            .save_node(crate::model::Node {
+                id: "srv-offline".to_string(),
+                name: "srv-offline".to_string(),
+                role: "server".to_string(),
+                address: "127.0.0.1".to_string(),
+                port: tun_port,
+                connect_endpoints: vec![crate::model::ConnectEndpoint {
+                    id: "ep-1".to_string(),
+                    name: "local".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: tun_port,
+                    enabled: true,
+                }],
+                tunnel: srv_tunnel,
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .save_node(crate::model::Node {
+                id: "cli-offline".to_string(),
+                name: "cli-offline".to_string(),
+                role: "client".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .save_mapping(crate::model::Mapping {
+                id: "map-offline".to_string(),
+                name: "map-offline".to_string(),
+                server_id: "srv-offline".to_string(),
+                client_id: "cli-offline".to_string(),
+                connect_endpoint_id: "ep-1".to_string(),
+                listen_host: "127.0.0.1".to_string(),
+                listen_port: map_port,
+                target_host: "127.0.0.1".to_string(),
+                target_port: echo_port,
+                network: "tcp".to_string(),
+                pool: 1,
+                enabled: true,
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Export offline bootstrap states from Hub while Hub itself will NOT be reachable by nodes
+        let (srv_cred, srv_snap) = store.ensure_credential_and_snapshot("srv-offline").unwrap();
+        let (cli_cred, cli_snap) = store.ensure_credential_and_snapshot("cli-offline").unwrap();
+
+        let srv_boot = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&DiskState {
+                node_id: "srv-offline".to_string(),
+                master: "http://127.0.0.1:9".to_string(),
+                credential: srv_cred,
+                snapshot: Some(srv_snap),
+            })
+            .unwrap(),
+        );
+        let cli_boot = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&DiskState {
+                node_id: "cli-offline".to_string(),
+                master: "http://127.0.0.1:9".to_string(),
+                credential: cli_cred,
+                snapshot: Some(cli_snap),
+            })
+            .unwrap(),
+        );
+
+        let cancel = CancellationToken::new();
+        let srv_cfg = Config {
+            master_addr: "http://127.0.0.1:9".to_string(),
+            node_id: "srv-offline".to_string(),
+            state_dir: tmp.path().join("srv-state").to_string_lossy().to_string(),
+            bootstrap_state: srv_boot,
+            ..Config::default()
+        };
+        let cli_cfg = Config {
+            master_addr: "http://127.0.0.1:9".to_string(),
+            node_id: "cli-offline".to_string(),
+            state_dir: tmp.path().join("cli-state").to_string_lossy().to_string(),
+            bootstrap_state: cli_boot,
+            ..Config::default()
+        };
+
+        let c1 = cancel.clone();
+        let srv_jh = tokio::spawn(async move { run(c1, srv_cfg, "server").await });
+        let c2 = cancel.clone();
+        let cli_jh = tokio::spawn(async move { run(c2, cli_cfg, "client").await });
+
+        // Wait until tunnel links up and mapped port responds
+        let mut ok = false;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Ok(mut s) = TcpStream::connect(("127.0.0.1", map_port as u16)).await {
+                if s.write_all(b"offline-bootstrap-ping").await.is_ok() {
+                    let mut buf = [0u8; 64];
+                    if let Ok(Ok(n)) =
+                        tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf)).await
+                    {
+                        if &buf[..n] == b"offline-bootstrap-ping" {
+                            ok = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        cancel.cancel();
+        let _ = srv_jh.await;
+        let _ = cli_jh.await;
+        assert!(ok, "tunnel should work via exported bootstrap_state even when hub is unreachable");
     }
 }

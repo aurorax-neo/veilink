@@ -63,6 +63,13 @@ pub struct Config {
         skip_serializing
     )]
     pub enroll_token: String,
+    #[serde(
+        rename = "BootstrapState",
+        alias = "bootstrap_state",
+        default,
+        skip_serializing
+    )]
+    pub bootstrap_state: String,
     #[serde(rename = "EmbeddedServer", alias = "embedded_server", default)]
     pub embedded_server: EmbeddedServerConfig,
 
@@ -292,6 +299,13 @@ pub fn parse_flags_output(
                 c.enroll_token = next_string(inline_val, &mut i)?;
                 c.explicit.insert("enroll_token".to_string(), true);
             }
+            ("server", "bootstrap-state")
+            | ("client", "bootstrap-state")
+            | ("server", "offline-state")
+            | ("client", "offline-state") => {
+                c.bootstrap_state = next_string(inline_val, &mut i)?;
+                c.explicit.insert("bootstrap_state".to_string(), true);
+            }
             _ => {
                 let msg = format!("flag provided but not defined: -{name}");
                 let _ = writeln!(out, "{msg}");
@@ -367,7 +381,10 @@ impl Config {
         if role != "server" && role != "client" {
             return Err("invalid role".to_string());
         }
-        if self.master_addr.is_empty() || self.node_id.is_empty() || self.state_dir.is_empty() {
+        if self.state_dir.is_empty()
+            || (self.bootstrap_state.is_empty()
+                && (self.master_addr.is_empty() || self.node_id.is_empty()))
+        {
             return Err("master_addr, node_id and state_dir required".to_string());
         }
         if !self.cert_file.is_empty()

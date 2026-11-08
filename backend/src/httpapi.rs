@@ -1401,6 +1401,23 @@ impl Api {
                 Err(_) => return failure_response(StatusCode::BAD_REQUEST, true),
             }
         };
+        let (credential, snapshot) = match self.store.ensure_credential_and_snapshot(id) {
+            Ok(v) => v,
+            Err(_) => return failure_response(StatusCode::BAD_REQUEST, true),
+        };
+        let disk_state = crate::node::DiskState {
+            node_id: id.to_string(),
+            master: address.clone(),
+            credential,
+            snapshot: Some(snapshot),
+        };
+        let state_bytes = match serde_json::to_vec(&disk_state) {
+            Ok(b) => b,
+            Err(_) => return failure_response(StatusCode::INTERNAL_SERVER_ERROR, true),
+        };
+        let state_json = serde_json::to_string_pretty(&disk_state).unwrap_or_default();
+        let bootstrap_state =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&state_bytes);
 
         let mut hasher = Sha256::new();
         hasher.update(id.as_bytes());
@@ -1442,6 +1459,22 @@ impl Api {
         if !server_name.is_empty() {
             command.push_str(&format!(" -control-server-name {}", shell_quote(&server_name)));
         }
+        let offline_command = format!("{} -bootstrap-state {}", command, shell_quote(&bootstrap_state));
+        let mut offline_binary_command = format!(
+            "veilink {} -master-addr {} -node-id {} -enroll-token {} -state-dir '/data/state'",
+            node_role,
+            shell_quote(&address),
+            shell_quote(id),
+            shell_quote(&token),
+        );
+        if !server_name.is_empty() {
+            offline_binary_command
+                .push_str(&format!(" -control-server-name {}", shell_quote(&server_name)));
+        }
+        offline_binary_command.push_str(&format!(
+            " -bootstrap-state {}",
+            shell_quote(&bootstrap_state)
+        ));
         let mut warning = "命令包含可重复使用的接入令牌，可能出现在 shell 历史和 Docker inspect 的容器参数中；请勿分享或记录日志。不再需要注册时请撤销令牌。接入成功后保留 /data 状态并重建不带令牌的容器，删除原容器前妥善保护主机访问。".to_string();
         if server_name.is_empty() {
             warning.push_str("HTTP/h2c 管理连接不加密，仅用于可信网络；必须填写节点实际可达的 Master 地址，不能用另一台主机的 127.0.0.1。");
@@ -1457,6 +1490,10 @@ impl Api {
             &serde_json::json!({
                 "prepare": prepare,
                 "command": command,
+                "offline_command": offline_command,
+                "offline_binary_command": offline_binary_command,
+                "bootstrap_state": bootstrap_state,
+                "state_json": state_json,
                 "token": token,
                 "expires_at": expires_at,
                 "warning": warning,
