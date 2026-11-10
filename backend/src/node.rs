@@ -38,6 +38,7 @@ use crate::control::{
     EnrollRequest, EnrollResponse, EventsRequest, EventsResponse, PullRequest, TrafficBytesPayload,
     PATH_ENROLL, PATH_EVENTS, PATH_PULL,
 };
+use crate::tunnel::xhttp::DEFAULT_USER_AGENT;
 use crate::logring::Ring;
 use crate::model::{LocalTLS, Snapshot};
 use crate::tunnel::Runtime;
@@ -558,7 +559,7 @@ impl HttpControlClient {
                     .uri(&uri)
                     .header("Content-Type", "application/json")
                     .header("Accept", "application/json")
-                    .header("User-Agent", "veilink/1.0")
+                    .header("User-Agent", DEFAULT_USER_AGENT)
                     .header("Content-Length", body_bytes.len().to_string())
                     .body(Full::new(Bytes::copy_from_slice(body_bytes)))
                     .map_err(|e| ControlError::Transport(e.to_string()))?;
@@ -574,7 +575,7 @@ impl HttpControlClient {
                     .header("Host", &self.host_header)
                     .header("Content-Type", "application/json")
                     .header("Accept", "application/json")
-                    .header("User-Agent", "veilink/1.0")
+                    .header("User-Agent", DEFAULT_USER_AGENT)
                     .header("Connection", "keep-alive")
                     .header("Content-Length", body_bytes.len().to_string())
                     .body(Full::new(Bytes::copy_from_slice(body_bytes)))

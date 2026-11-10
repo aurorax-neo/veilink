@@ -8,6 +8,13 @@ Release。
 
 ## [Unreleased]
 
+## [0.4.22] - 2026-11-10
+
+### Security & Protocol Camouflage
+
+- 优化默认 `User-Agent` 伪装：将控制面（HTTP/2 与 HTTP/1.1）及 XHTTP 数据面默认的 `veilink/1.0` 统一替换为桌面 Chromium 内嵌客户端标识 `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 Electron/35.1.2`。
+- 补全 XHTTP 自定义请求头透传：在 `stream-one`、`stream-up` 与 `packet-up` 全模式下统一注入 `xhttp.headers` 配置的 `User-Agent`、`Accept-Language` 与 `X-Custom-*` 请求头，并同步更新前端请求头占位示例。
+
 ## [0.4.21] - 2026-11-10
 
 ### Performance & Stability

@@ -17,6 +17,27 @@ use super::{xhttp_effective_mode, BoxStream};
 const MAX_XHTTP_SESSIONS: usize = 1024;
 const MAX_XHTTP_REORDER_WINDOW: usize = 64;
 const MAX_XHTTP_BODY_BYTES: usize = 4 * 1024 * 1024;
+pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 Electron/35.1.2";
+
+fn format_xhttp_headers(local: &LocalTLS) -> String {
+    let mut out = String::new();
+    let mut has_ua = false;
+    if let Ok(entries) = local.xhttp.headers.entries() {
+        for (k, v) in entries {
+            if k.eq_ignore_ascii_case("user-agent") {
+                has_ua = true;
+            }
+            out.push_str(&k);
+            out.push_str(": ");
+            out.push_str(&v);
+            out.push_str("\r\n");
+        }
+    }
+    if !has_ua {
+        out.insert_str(0, &format!("User-Agent: {}\r\n", DEFAULT_USER_AGENT));
+    }
+    out
+}
 
 pub fn is_valid_xhttp_sid(sid: &str) -> bool {
     !sid.is_empty()
@@ -510,13 +531,14 @@ where
         "localhost".to_string()
     };
     let pad = random_xhttp_padding(local.xhttp.padding_bytes, local.xhttp.padding_max_bytes);
+    let up_headers = format_xhttp_headers(local);
 
     if eff_mode == "stream-one" {
         let conn = connect_transport(up_addr, local.clone(), binding.clone()).await?;
         let (mut rd, mut wr) = tokio::io::split(conn);
         let req = format!(
-            "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: veilink/1.0\r\nTransfer-Encoding: chunked\r\nX-Padding: {}\r\n\r\n",
-            up_base, up_host, pad
+            "POST {} HTTP/1.1\r\nHost: {}\r\n{}Transfer-Encoding: chunked\r\nX-Padding: {}\r\n\r\n",
+            up_base, up_host, up_headers, pad
         );
         wr.write_all(req.as_bytes())
             .await
@@ -543,6 +565,7 @@ where
     };
 
     let dn_conn = connect_transport(dn_addr, dn_ep.clone(), binding.clone()).await?;
+    let dn_headers = format_xhttp_headers(&dn_ep);
     let (mut dn_rd, mut dn_wr) = tokio::io::split(dn_conn);
     let get_path = if dn_base == "/" {
         format!("/{}", sid)
@@ -550,8 +573,8 @@ where
         format!("{}/{}", dn_base, sid)
     };
     let get_req = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: veilink/1.0\r\nX-Padding: {}\r\n\r\n",
-        get_path, dn_host, pad
+        "GET {} HTTP/1.1\r\nHost: {}\r\n{}X-Padding: {}\r\n\r\n",
+        get_path, dn_host, dn_headers, pad
     );
     dn_wr
         .write_all(get_req.as_bytes())
@@ -568,8 +591,8 @@ where
             format!("{}/{}", up_base, sid)
         };
         let post_req = format!(
-            "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: veilink/1.0\r\nTransfer-Encoding: chunked\r\nX-Padding: {}\r\n\r\n",
-            post_path, up_host, pad
+            "POST {} HTTP/1.1\r\nHost: {}\r\n{}Transfer-Encoding: chunked\r\nX-Padding: {}\r\n\r\n",
+            post_path, up_host, up_headers, pad
         );
         up_wr
             .write_all(post_req.as_bytes())
@@ -626,14 +649,14 @@ where
             if data.is_empty() {
                 let _ = write!(
                     post_buf,
-                    "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\nConnection: keep-alive\r\nX-Padding: {}\r\n\r\n",
-                    post_path, up_host, pad_s
+                    "POST {} HTTP/1.1\r\nHost: {}\r\n{}Content-Length: 0\r\nConnection: keep-alive\r\nX-Padding: {}\r\n\r\n",
+                    post_path, up_host, up_headers, pad_s
                 );
             } else {
                 let _ = write!(
                     post_buf,
-                    "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\nX-Padding: {}\r\n\r\n",
-                    post_path, up_host, data.len(), pad_s
+                    "POST {} HTTP/1.1\r\nHost: {}\r\n{}Content-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\nX-Padding: {}\r\n\r\n",
+                    post_path, up_host, up_headers, data.len(), pad_s
                 );
                 post_buf.extend_from_slice(data);
             }
@@ -1062,4 +1085,31 @@ fn find_crlf_crlf(buf: &[u8]) -> Option<usize> {
 
 fn find_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\r\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::XHTTPHeaders;
+
+    #[test]
+    fn format_xhttp_headers_uses_default_user_agent_and_respects_override() {
+        let mut local = LocalTLS::default();
+        let default_hdrs = format_xhttp_headers(&local);
+        assert_eq!(
+            default_hdrs,
+            format!("User-Agent: {}\r\n", DEFAULT_USER_AGENT)
+        );
+        assert!(!default_hdrs.contains("veilink/1.0"));
+
+        local.xhttp.headers = XHTTPHeaders::parse_raw(
+            br#"{"User-Agent":"CustomClient/2.0","X-Custom-Route":"east"}"#,
+        )
+        .expect("valid custom headers");
+        let custom_hdrs = format_xhttp_headers(&local);
+        assert_eq!(
+            custom_hdrs,
+            "User-Agent: CustomClient/2.0\r\nX-Custom-Route: east\r\n"
+        );
+    }
 }
