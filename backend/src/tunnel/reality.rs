@@ -1775,6 +1775,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for RealityTlsStream<S> {
                                     if this.read_raw_pos == this.read_raw_buf.len() {
                                         this.read_raw_buf.clear();
                                         this.read_raw_pos = 0;
+                                        if this.read_raw_buf.capacity() > 256 * 1024 {
+                                            this.read_raw_buf.shrink_to(65536);
+                                        }
                                     }
                                     if buf.remaining() == 0
                                         || this.read_plain_pos < this.read_plain_buf.len()
@@ -1833,6 +1836,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for RealityTlsStream<S> {
                 let rem = this.read_raw_buf.len() - this.read_raw_pos;
                 this.read_raw_buf.truncate(rem);
                 this.read_raw_pos = 0;
+                if this.read_raw_buf.capacity() > 256 * 1024 && rem < 16384 {
+                    this.read_raw_buf.shrink_to(65536);
+                }
             }
 
             let mut tmp = [0u8; 32768];

@@ -609,6 +609,12 @@ impl Store {
         if res.is_ok() {
             let mut g = self.inner.lock();
             g.software.remove(id);
+            if remove {
+                g.links.remove(id);
+                g.traffic.remove(id);
+                g.pending_refresh.remove(id);
+                g.refresh_waiting.remove(id);
+            }
         }
         res
     }
@@ -625,10 +631,7 @@ impl Store {
             tx.execute("UPDATE config SET data=?1 WHERE id=1", params![&body])?;
         }
         tx.execute("DELETE FROM enroll WHERE node=?1", params![id])?;
-        tx.execute(
-            "INSERT INTO audit VALUES(?1,?2,?3)",
-            params![Utc::now().timestamp(), "node.enroll.revoke", id],
-        )?;
+        insert_audit(&tx, Utc::now().timestamp(), "node.enroll.revoke", id)?;
         tx.commit()?;
         Ok(())
     }
@@ -681,10 +684,7 @@ impl Store {
             )?;
             tok
         };
-        tx.execute(
-            "INSERT INTO audit VALUES(?1,?2,?3)",
-            params![now, "node.enroll.token", id],
-        )?;
+        insert_audit(&tx, now, "node.enroll.token", id)?;
         tx.commit()?;
         Ok(tok)
     }
@@ -732,10 +732,7 @@ impl Store {
         }
         let body = serde_json::to_vec(&st).map_err(|e| StoreError::Other(e.to_string()))?;
         tx.execute("UPDATE config SET data=?1 WHERE id=1", params![&body])?;
-        tx.execute(
-            "INSERT INTO audit VALUES(?1,?2,?3)",
-            params![now, "node.credential.reset", id],
-        )?;
+        insert_audit(&tx, now, "node.credential.reset", id)?;
         tx.commit()?;
         Ok(tok)
     }
@@ -1387,10 +1384,7 @@ impl Store {
                 ex(&tx)?;
             }
             tx.execute("UPDATE config SET data=?1 WHERE id=1", params![&body])?;
-            tx.execute(
-                "INSERT INTO audit VALUES(?1,?2,?3)",
-                params![Utc::now().timestamp(), action, id],
-            )?;
+            insert_audit(&tx, Utc::now().timestamp(), action, id)?;
             tx.commit()?;
         }
         notify_locked(&g.listeners, rev, &affected);
@@ -1436,6 +1430,25 @@ fn set_file_perm_0600(_path: &Path) -> Result<(), StoreError> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(_path, fs::Permissions::from_mode(0o600))?;
     }
+    Ok(())
+}
+
+const MAX_AUDIT_ROWS: i64 = 2000;
+
+fn insert_audit(
+    tx: &Transaction<'_>,
+    at: i64,
+    action: &str,
+    object: &str,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO audit VALUES(?1,?2,?3)",
+        params![at, action, object],
+    )?;
+    tx.execute(
+        "DELETE FROM audit WHERE rowid <= (SELECT COALESCE(MAX(rowid), 0) - ?1 FROM audit)",
+        params![MAX_AUDIT_ROWS],
+    )?;
     Ok(())
 }
 

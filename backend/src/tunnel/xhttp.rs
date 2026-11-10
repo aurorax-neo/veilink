@@ -72,8 +72,11 @@ impl XhttpServerState {
         }
         let now_ms = self.epoch.elapsed().as_millis() as u64;
         let mut map = self.sessions.lock();
-        if map.len() >= 256 {
+        if map.len() >= 16 {
             map.retain(|_, s| {
+                if s.up_tx.is_closed() {
+                    return false;
+                }
                 let max_idle_ms = if s.dn_taken.load(Ordering::Relaxed) {
                     120_000
                 } else {
@@ -88,6 +91,9 @@ impl XhttpServerState {
         }
         if map.len() >= MAX_XHTTP_SESSIONS {
             map.retain(|_, s| {
+                if s.up_tx.is_closed() {
+                    return false;
+                }
                 let max_idle_ms = if s.dn_taken.load(Ordering::Relaxed) {
                     120_000
                 } else {
@@ -105,12 +111,43 @@ impl XhttpServerState {
         let (up_tx, mut up_rx) = mpsc::channel::<SessionPacket>(64);
         let state_weak = Arc::downgrade(self);
         let sid_owned = sid.to_string();
+        let sess = Arc::new(XhttpSession {
+            up_tx,
+            dn_rx: tokio::sync::Mutex::new(Some(dn_read)),
+            dn_taken: AtomicBool::new(false),
+            last_active_ms: AtomicU64::new(now_ms),
+        });
+        let sess_weak = Arc::downgrade(&sess);
 
         tokio::spawn(async move {
             let mut next_seq = 0u64;
             let mut pending: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
             let mut abort_session = false;
-            while let Some(pkt) = up_rx.recv().await {
+            loop {
+                let pkt = match tokio::time::timeout(Duration::from_secs(15), up_rx.recv()).await {
+                    Ok(Some(p)) => p,
+                    Ok(None) => break,
+                    Err(_) => {
+                        if let (Some(st), Some(s)) = (state_weak.upgrade(), sess_weak.upgrade()) {
+                            let now = st.epoch.elapsed().as_millis() as u64;
+                            let max_idle_ms = if s.dn_taken.load(Ordering::Relaxed) {
+                                120_000
+                            } else {
+                                15_000
+                            };
+                            if now.saturating_sub(s.last_active_ms.load(Ordering::Relaxed))
+                                >= max_idle_ms
+                            {
+                                abort_session = true;
+                                break;
+                            }
+                            continue;
+                        } else {
+                            abort_session = true;
+                            break;
+                        }
+                    }
+                };
                 match pkt {
                     SessionPacket::StreamData(data) => {
                         if up_write.write_all(&data).await.is_err() {
@@ -147,19 +184,17 @@ impl XhttpServerState {
                 }
             }
             let _ = up_write.shutdown().await;
-            if abort_session {
+            let dn_taken = sess_weak
+                .upgrade()
+                .map(|s| s.dn_taken.load(Ordering::Relaxed))
+                .unwrap_or(false);
+            if abort_session || !dn_taken {
                 if let Some(st) = state_weak.upgrade() {
                     st.remove_session(&sid_owned);
                 }
             }
         });
 
-        let sess = Arc::new(XhttpSession {
-            up_tx,
-            dn_rx: tokio::sync::Mutex::new(Some(dn_read)),
-            dn_taken: AtomicBool::new(false),
-            last_active_ms: AtomicU64::new(now_ms),
-        });
         map.insert(sid.to_string(), sess.clone());
         drop(map);
 
@@ -833,8 +868,13 @@ async fn read_http_request_head<R: AsyncRead + Unpin>(
         buf.extend_from_slice(&tmp[..n]);
     };
 
-    let head_bytes: Vec<u8> = buf.drain(..header_end + 4).collect();
-    let head_str = String::from_utf8_lossy(&head_bytes[..header_end]);
+    let head_str = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+    let consumed = header_end + 4;
+    let rem = buf.len() - consumed;
+    if rem > 0 {
+        buf.copy_within(consumed.., 0);
+    }
+    buf.truncate(rem);
     let mut lines = head_str.split("\r\n");
     let req_line = lines.next().unwrap_or("");
     let mut parts = req_line.split_whitespace();
@@ -896,9 +936,15 @@ async fn read_http_response_head<R: AsyncRead + Unpin>(
         }
         buf.extend_from_slice(&tmp[..n]);
     };
-    let head_bytes: Vec<u8> = buf.drain(..header_end + 4).collect();
-    let head_str = String::from_utf8_lossy(&head_bytes[..header_end]);
-    let status_line = head_str.lines().next().unwrap_or("");
+    let head_str = String::from_utf8_lossy(&buf[..header_end]);
+    let status_line = head_str.lines().next().unwrap_or("").to_string();
+    drop(head_str);
+    let consumed = header_end + 4;
+    let rem = buf.len() - consumed;
+    if rem > 0 {
+        buf.copy_within(consumed.., 0);
+    }
+    buf.truncate(rem);
     let status: u16 = status_line
         .split_whitespace()
         .nth(1)
@@ -946,10 +992,19 @@ async fn read_http_chunk<R: AsyncRead + Unpin>(
         buf.extend_from_slice(&tmp[..n]);
     };
 
-    let line_bytes: Vec<u8> = buf.drain(..line_end + 2).collect();
-    let line_str = String::from_utf8_lossy(&line_bytes[..line_end]);
-    let size_hex = line_str.split(';').next().unwrap_or("").trim();
-    let chunk_size = usize::from_str_radix(size_hex, 16)
+    let size_hex = String::from_utf8_lossy(&buf[..line_end])
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let consumed = line_end + 2;
+    let rem = buf.len() - consumed;
+    if rem > 0 {
+        buf.copy_within(consumed.., 0);
+    }
+    buf.truncate(rem);
+    let chunk_size = usize::from_str_radix(&size_hex, 16)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid chunk size"))?;
 
     if chunk_size == 0 {
@@ -972,8 +1027,11 @@ async fn read_exact_with_buf<R: AsyncRead + Unpin>(
     buf: &mut Vec<u8>,
     n: usize,
 ) -> io::Result<Vec<u8>> {
+    if buf.len() < n && n <= MAX_XHTTP_BODY_BYTES {
+        buf.reserve(n - buf.len());
+    }
+    let mut tmp = [0u8; 16384];
     while buf.len() < n {
-        let mut tmp = [0u8; 32768];
         let got = rd.read(&mut tmp).await?;
         if got == 0 {
             return Err(io::Error::new(
@@ -983,7 +1041,19 @@ async fn read_exact_with_buf<R: AsyncRead + Unpin>(
         }
         buf.extend_from_slice(&tmp[..got]);
     }
-    Ok(buf.drain(..n).collect())
+    if buf.len() == n && buf.capacity() <= 256 * 1024 {
+        return Ok(std::mem::take(buf));
+    }
+    let out = buf[..n].to_vec();
+    let rem = buf.len() - n;
+    if rem > 0 {
+        buf.copy_within(n.., 0);
+    }
+    buf.truncate(rem);
+    if buf.capacity() > 256 * 1024 && buf.len() < 16384 {
+        buf.shrink_to(65536);
+    }
+    Ok(out)
 }
 
 fn find_crlf_crlf(buf: &[u8]) -> Option<usize> {

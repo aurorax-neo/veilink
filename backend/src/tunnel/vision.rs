@@ -251,6 +251,9 @@ impl AsyncRead for VisionStream {
                         if this.read_raw_pos == this.read_raw_buf.len() {
                             this.read_raw_buf.clear();
                             this.read_raw_pos = 0;
+                            if this.read_raw_buf.capacity() > 256 * 1024 {
+                                this.read_raw_buf.shrink_to(65536);
+                            }
                         }
                         if direct > 0 {
                             return Poll::Ready(Ok(()));
@@ -258,6 +261,9 @@ impl AsyncRead for VisionStream {
                     } else if this.read_raw_pos == this.read_raw_buf.len() {
                         this.read_raw_buf.clear();
                         this.read_raw_pos = 0;
+                        if this.read_raw_buf.capacity() > 256 * 1024 {
+                            this.read_raw_buf.shrink_to(65536);
+                        }
                     }
                     continue;
                 }
@@ -268,6 +274,9 @@ impl AsyncRead for VisionStream {
                 let rem = this.read_raw_buf.len() - this.read_raw_pos;
                 this.read_raw_buf.truncate(rem);
                 this.read_raw_pos = 0;
+                if this.read_raw_buf.capacity() > 256 * 1024 && rem < 16384 {
+                    this.read_raw_buf.shrink_to(65536);
+                }
             }
 
             let mut tmp = [0u8; 32768];

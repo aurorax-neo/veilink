@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Cursor};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -63,6 +63,16 @@ pub const FRAME_PONG: u8 = 6;
 
 pub const MAX_PAYLOAD: usize = 32 << 10;
 pub const MAX_STREAMS: usize = 512;
+const STREAM_CHAN_CAP: usize = 256;
+const MAX_BINDING_SESSIONS: usize = 64;
+const SESSION_FRESH_RX_MS: u64 = 25_000;
+const SESSION_STALE_RX_MS: u64 = 40_000;
+const STREAM_OPEN_IDLE_MS: u64 = 300_000;
+const STREAM_HALF_CLOSE_IDLE_MS: u64 = 60_000;
+const STREAM_SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+const DEMUX_SEND_TIMEOUT: Duration = Duration::from_secs(3);
+const DNS_CACHE_TTL: Duration = Duration::from_secs(60);
+const MAX_DNS_CACHE_ENTRIES: usize = 1024;
 const FRAME_HDR_LEN: usize = 7;
 const OPTIMAL_DATA_CHUNK: usize = (16 << 10) - FRAME_HDR_LEN;
 
@@ -70,6 +80,15 @@ const FLOW_VISION: &str = "xtls-rprx-vision";
 const VLESS_SCHEME: &str = "mlkem768x25519plus";
 const VLESS_PLAIN: &str = "none";
 const XHTTP_MAX_DATA_CHUNKS: usize = 32;
+
+fn mono_now_ms() -> u64 {
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    60_000
+        + EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
 
 pub struct BandwidthLimiter {
     rate: f64,
@@ -2314,41 +2333,98 @@ struct SessionHandle {
     tx: mpsc::Sender<(u8, u32, Vec<u8>)>,
     streams: Arc<Mutex<HashMap<u32, mpsc::Sender<(u8, Vec<u8>)>>>>,
     next_id: Arc<AtomicU32>,
+    last_rx_ms: Arc<AtomicU64>,
+    active_streams: Arc<AtomicUsize>,
 }
 
 impl SessionHandle {
+    fn new(
+        tx: mpsc::Sender<(u8, u32, Vec<u8>)>,
+        streams: Arc<Mutex<HashMap<u32, mpsc::Sender<(u8, Vec<u8>)>>>>,
+    ) -> Self {
+        Self {
+            tx,
+            streams,
+            next_id: Arc::new(AtomicU32::new(1)),
+            last_rx_ms: Arc::new(AtomicU64::new(mono_now_ms())),
+            active_streams: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    #[inline]
+    fn touch_rx(&self) {
+        self.last_rx_ms.store(mono_now_ms(), Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn load_score(&self) -> usize {
+        let active = self.active_streams.load(Ordering::Relaxed);
+        let queued = 1024usize.saturating_sub(self.tx.capacity());
+        active.saturating_mul(4).saturating_add(queued)
+    }
+
     fn open_stream(&self) -> Option<(u32, mpsc::Receiver<(u8, Vec<u8>)>)> {
         let mut map = self.streams.lock().unwrap();
         if map.len() >= MAX_STREAMS {
+            self.active_streams.store(map.len(), Ordering::Relaxed);
             return None;
         }
         let mut id = self.next_id.fetch_add(1, Ordering::Relaxed);
         while id == 0 || map.contains_key(&id) {
             id = self.next_id.fetch_add(1, Ordering::Relaxed);
         }
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::channel(STREAM_CHAN_CAP);
         map.insert(id, tx);
+        self.active_streams.store(map.len(), Ordering::Relaxed);
         Some((id, rx))
     }
 
     fn close_stream(&self, id: u32) {
-        self.streams.lock().unwrap().remove(&id);
+        let mut map = self.streams.lock().unwrap();
+        map.remove(&id);
+        self.active_streams.store(map.len(), Ordering::Relaxed);
     }
 }
 
 type SessionMap = Arc<Mutex<HashMap<String, Vec<SessionHandle>>>>;
 
-/// Most recent session for a binding whose writer is still alive.
+/// Selects the healthiest, least-loaded session for a binding.
 fn pick_session(sessions: &SessionMap, binding_id: &str) -> Option<SessionHandle> {
     static RR: AtomicUsize = AtomicUsize::new(0);
+    let now_ms = mono_now_ms();
     let guard = sessions.lock().unwrap();
     let list = guard.get(binding_id)?;
-    let alive: Vec<&SessionHandle> = list.iter().filter(|h| !h.tx.is_closed()).collect();
+    let alive: Vec<&SessionHandle> = list
+        .iter()
+        .filter(|h| !h.tx.is_closed() && h.active_streams.load(Ordering::Relaxed) < MAX_STREAMS)
+        .collect();
     if alive.is_empty() {
         return None;
     }
-    let idx = RR.fetch_add(1, Ordering::Relaxed) % alive.len();
-    Some(alive[idx].clone())
+    let has_fresh = alive.iter().any(|h| {
+        now_ms.saturating_sub(h.last_rx_ms.load(Ordering::Relaxed)) <= SESSION_FRESH_RX_MS
+    });
+    let start = RR.fetch_add(1, Ordering::Relaxed);
+    let n = alive.len();
+    let mut best: Option<&SessionHandle> = None;
+    let mut best_score = usize::MAX;
+    for offset in 0..n {
+        let h = alive[(start + offset) % n];
+        if has_fresh
+            && now_ms.saturating_sub(h.last_rx_ms.load(Ordering::Relaxed)) > SESSION_FRESH_RX_MS
+        {
+            continue;
+        }
+        let score = h.load_score();
+        if score < best_score {
+            best_score = score;
+            best = Some(h);
+            if score == 0 {
+                break;
+            }
+        }
+    }
+    best.or_else(|| alive.first().copied()).cloned()
 }
 
 /// Unregister a finished session and drop its stream senders so that every
@@ -2356,11 +2432,17 @@ fn pick_session(sessions: &SessionMap, binding_id: &str) -> Option<SessionHandle
 /// no live session left.
 fn remove_session(sessions: &SessionMap, binding_id: &str, handle: &SessionHandle) -> bool {
     handle.streams.lock().unwrap().clear();
+    handle.active_streams.store(0, Ordering::Relaxed);
     let mut map = sessions.lock().unwrap();
     let Some(list) = map.get_mut(binding_id) else {
         return true;
     };
-    list.retain(|h| !Arc::ptr_eq(&h.streams, &handle.streams) && !h.tx.is_closed());
+    let now_ms = mono_now_ms();
+    list.retain(|h| {
+        !Arc::ptr_eq(&h.streams, &handle.streams)
+            && !h.tx.is_closed()
+            && now_ms.saturating_sub(h.last_rx_ms.load(Ordering::Relaxed)) <= SESSION_STALE_RX_MS
+    });
     if list.is_empty() {
         map.remove(binding_id);
         true
@@ -2757,17 +2839,31 @@ async fn serve_established_session(
     let (tx, mut out_rx) = mpsc::channel::<(u8, u32, Vec<u8>)>(1024);
     let streams_map: Arc<Mutex<HashMap<u32, mpsc::Sender<(u8, Vec<u8>)>>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    let handle = SessionHandle {
-        tx: tx.clone(),
-        streams: streams_map.clone(),
-        next_id: Arc::new(AtomicU32::new(1)),
-    };
-    sessions
-        .lock()
-        .unwrap()
-        .entry(binding.id.clone())
-        .or_default()
-        .push(handle.clone());
+    let handle = SessionHandle::new(tx.clone(), streams_map.clone());
+    {
+        let now_ms = mono_now_ms();
+        let mut guard = sessions.lock().unwrap();
+        let list = guard.entry(binding.id.clone()).or_default();
+        list.retain(|h| {
+            !h.tx.is_closed()
+                && now_ms.saturating_sub(h.last_rx_ms.load(Ordering::Relaxed))
+                    <= SESSION_STALE_RX_MS
+        });
+        while list.len() >= MAX_BINDING_SESSIONS {
+            if let Some((oldest_idx, _)) = list
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, h)| h.last_rx_ms.load(Ordering::Relaxed))
+            {
+                let evicted = list.remove(oldest_idx);
+                evicted.streams.lock().unwrap().clear();
+                evicted.active_streams.store(0, Ordering::Relaxed);
+            } else {
+                break;
+            }
+        }
+        list.push(handle.clone());
+    }
     let (mut rd, mut wr) = split_tunnel_stream(stream);
     let (write_done_tx, mut write_done_rx) = watch::channel(false);
     let write_task = tokio::spawn(async move {
@@ -2793,6 +2889,9 @@ async fn serve_established_session(
             if !matches!(write_res, Ok(Ok(()))) {
                 break;
             }
+            if write_buf.capacity() > 256 * 1024 {
+                write_buf.shrink_to(65536);
+            }
         }
         let _ = write_done_tx.send(true);
         let _ = wr.shutdown().await;
@@ -2815,6 +2914,7 @@ async fn serve_established_session(
             _ = write_done_rx.changed() => break,
             frame = tokio::time::timeout(Duration::from_secs(45), read_frame(&mut rd)) => {
                 let Ok(Ok((kind, id, payload))) = frame else { break };
+                handle.touch_rx();
                 match kind {
                     FRAME_PING => {
                         if tx.try_send((FRAME_PONG, 0, Vec::new())).is_err() {
@@ -2827,21 +2927,37 @@ async fn serve_established_session(
                     FRAME_PONG => {}
                     FRAME_DATA | FRAME_HALF | FRAME_RESET => {
                         if kind == FRAME_RESET {
-                            if let Some(s) = streams_map.lock().unwrap().remove(&id) {
+                            let removed = {
+                                let mut map = streams_map.lock().unwrap();
+                                let r = map.remove(&id);
+                                handle.active_streams.store(map.len(), Ordering::Relaxed);
+                                r
+                            };
+                            if let Some(s) = removed {
                                 let _ = s.try_send((kind, payload));
                             }
                         } else {
                             let sender = streams_map.lock().unwrap().get(&id).cloned();
                             if let Some(s) = sender {
-                                if tokio::time::timeout(
-                                    Duration::from_secs(30),
-                                    s.send((kind, payload)),
-                                )
-                                .await
-                                .is_err()
-                                {
-                                    streams_map.lock().unwrap().remove(&id);
-                                    let _ = tx.try_send((FRAME_RESET, id, Vec::new()));
+                                match s.try_send((kind, payload)) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(item)) => {
+                                        if tokio::time::timeout(DEMUX_SEND_TIMEOUT, s.send(item))
+                                            .await
+                                            .is_err()
+                                        {
+                                            let mut map = streams_map.lock().unwrap();
+                                            map.remove(&id);
+                                            handle.active_streams.store(map.len(), Ordering::Relaxed);
+                                            drop(map);
+                                            let _ = tx.try_send((FRAME_RESET, id, Vec::new()));
+                                        }
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        let mut map = streams_map.lock().unwrap();
+                                        map.remove(&id);
+                                        handle.active_streams.store(map.len(), Ordering::Relaxed);
+                                    }
                                 }
                             }
                         }
@@ -3123,7 +3239,6 @@ fn start_instance(
                     let jh = handle.spawn(async move {
                         let rate_bps = bandwidth_bytes(&m.bandwidth_limit).unwrap_or(0) as u64;
                         let up_limiter = BandwidthLimiter::new(rate_bps);
-                        let down_limiter = BandwidthLimiter::with_burst_div(rate_bps, 10);
                         let mux_type = m.effective_mux_type().unwrap_or_default();
                         loop {
                             tokio::select! {
@@ -3137,7 +3252,6 @@ fn start_instance(
                                     let traffic_conn = traffic_clone.clone();
                                     let mux_t = mux_type.clone();
                                     let up_lim = up_limiter.clone();
-                                    let down_lim = down_limiter.clone();
                                     tokio::spawn(async move {
                                         let meta = if mux_t.is_empty() {
                                             m_clone.target_host.clone()
@@ -3155,25 +3269,50 @@ fn start_instance(
                                         let tx_up = sess.tx.clone();
                                         let t_up = traffic_conn.clone();
                                         let mid_up = m_clone.id.clone();
+                                        let last_active_ms = Arc::new(AtomicU64::new(mono_now_ms()));
+                                        let any_half_closed = Arc::new(AtomicBool::new(false));
+                                        let up_active = last_active_ms.clone();
+                                        let up_half = any_half_closed.clone();
                                         let mut up_task = tokio::spawn(async move {
                                             let read_cap = up_lim.read_size(OPTIMAL_DATA_CHUNK);
                                             let mut buf = vec![0u8; read_cap];
                                             loop {
-                                                match pr.read(&mut buf).await {
-                                                    Ok(0) => {
+                                                match tokio::time::timeout(
+                                                    Duration::from_secs(15),
+                                                    pr.read(&mut buf),
+                                                )
+                                                .await
+                                                {
+                                                    Ok(Ok(0)) => {
+                                                        up_half.store(true, Ordering::Relaxed);
                                                         let _ = tx_up.send((FRAME_HALF, stream_id, Vec::new())).await;
                                                         break;
                                                     }
-                                                    Ok(n) => {
+                                                    Ok(Ok(n)) => {
+                                                        up_active.store(mono_now_ms(), Ordering::Relaxed);
                                                         up_lim.wait(n).await;
                                                         t_up.add(&mid_up, n, 0);
                                                         if tx_up.send((FRAME_DATA, stream_id, buf[..n].to_vec())).await.is_err() {
                                                             break;
                                                         }
                                                     }
-                                                    Err(_) => {
+                                                    Ok(Err(_)) => {
                                                         let _ = tx_up.send((FRAME_RESET, stream_id, Vec::new())).await;
                                                         break;
+                                                    }
+                                                    Err(_) => {
+                                                        let idle_limit = if up_half.load(Ordering::Relaxed) {
+                                                            STREAM_HALF_CLOSE_IDLE_MS
+                                                        } else {
+                                                            STREAM_OPEN_IDLE_MS
+                                                        };
+                                                        if mono_now_ms().saturating_sub(
+                                                            up_active.load(Ordering::Relaxed),
+                                                        ) >= idle_limit
+                                                        {
+                                                            let _ = tx_up.send((FRAME_RESET, stream_id, Vec::new())).await;
+                                                            break;
+                                                        }
                                                     }
                                                 }
                                             }
@@ -3182,25 +3321,53 @@ fn start_instance(
                                         // tell it to release its side (half-close is treated as full close here).
                                         let mut remote_reset = false;
                                         let mut half_closed = false;
-                                        while let Some((kind, data)) = in_rx.recv().await {
-                                            match kind {
-                                                FRAME_DATA => {
-                                                    traffic_conn.add(&m_clone.id, 0, data.len());
-                                                    if pw.write_all(&data).await.is_err() {
+                                        loop {
+                                            match tokio::time::timeout(
+                                                Duration::from_secs(15),
+                                                in_rx.recv(),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Some((kind, data))) => match kind {
+                                                    FRAME_DATA => {
+                                                        last_active_ms.store(mono_now_ms(), Ordering::Relaxed);
+                                                        traffic_conn.add(&m_clone.id, 0, data.len());
+                                                        if tokio::time::timeout(
+                                                            STREAM_SOCKET_WRITE_TIMEOUT,
+                                                            pw.write_all(&data),
+                                                        )
+                                                        .await
+                                                        .map_or(true, |r| r.is_err())
+                                                        {
+                                                            break;
+                                                        }
+                                                    }
+                                                    FRAME_HALF => {
+                                                        half_closed = true;
+                                                        any_half_closed.store(true, Ordering::Relaxed);
+                                                        let _ = pw.shutdown().await;
                                                         break;
                                                     }
-                                                    down_lim.wait(data.len()).await;
+                                                    FRAME_RESET => {
+                                                        remote_reset = true;
+                                                        break;
+                                                    }
+                                                    _ => break,
+                                                },
+                                                Ok(None) => break,
+                                                Err(_) => {
+                                                    let idle_limit = if any_half_closed.load(Ordering::Relaxed) {
+                                                        STREAM_HALF_CLOSE_IDLE_MS
+                                                    } else {
+                                                        STREAM_OPEN_IDLE_MS
+                                                    };
+                                                    if mono_now_ms().saturating_sub(
+                                                        last_active_ms.load(Ordering::Relaxed),
+                                                    ) >= idle_limit
+                                                    {
+                                                        break;
+                                                    }
                                                 }
-                                                FRAME_HALF => {
-                                                    half_closed = true;
-                                                    let _ = pw.shutdown().await;
-                                                    break;
-                                                }
-                                                FRAME_RESET => {
-                                                    remote_reset = true;
-                                                    break;
-                                                }
-                                                _ => break,
                                             }
                                         }
                                         if half_closed && !remote_reset {
@@ -3244,7 +3411,6 @@ fn start_instance(
                     let jh = handle.spawn(async move {
                         let rate_bps = bandwidth_bytes(&m.bandwidth_limit).unwrap_or(0) as u64;
                         let up_limiter = BandwidthLimiter::new(rate_bps);
-                        let down_limiter = BandwidthLimiter::with_burst_div(rate_bps, 10);
                         let mut peer_streams: HashMap<SocketAddr, mpsc::Sender<Vec<u8>>> =
                             HashMap::new();
                         let mut buf = vec![0u8; 65535];
@@ -3261,7 +3427,7 @@ fn start_instance(
                                         }
                                         peer_streams.remove(&peer_addr);
                                     }
-                                    if peer_streams.len() >= 1024 {
+                                    if peer_streams.len() >= 64 {
                                         peer_streams.retain(|_, tx| !tx.is_closed());
                                         if peer_streams.len() >= 4096 {
                                             continue;
@@ -3277,7 +3443,6 @@ fn start_instance(
                                     let udp_reply = udp_sock.clone();
                                     let traffic_down = traffic_clone.clone();
                                     let up_lim = up_limiter.clone();
-                                    let down_lim = down_limiter.clone();
                                     tokio::spawn(async move {
                                         let meta = format!("{}\0udp\0", m_clone.target_host);
                                         let mut open_payload = Vec::with_capacity(2 + meta.len());
@@ -3303,7 +3468,6 @@ fn start_instance(
                                                     let raw_dg = decode_xudp(&data);
                                                     traffic_down.add(&m_clone.id, 0, raw_dg.len());
                                                     let _ = udp_reply.send_to(raw_dg, peer_addr).await;
-                                                    down_lim.wait(raw_dg.len()).await;
                                                 }
                                                 _ => break,
                                             }
@@ -3449,6 +3613,9 @@ fn start_instance(
                                         if !matches!(write_res, Ok(Ok(()))) {
                                             break;
                                         }
+                                        if write_buf.capacity() > 256 * 1024 {
+                                            write_buf.shrink_to(65536);
+                                        }
                                     }
                                     let _ = write_done_tx.send(true);
                                     let _ = wr.shutdown().await;
@@ -3503,15 +3670,23 @@ fn start_instance(
                                                     } else {
                                                         let sender = streams_map.lock().unwrap().get(&id).cloned();
                                                         if let Some(s) = sender {
-                                                            if tokio::time::timeout(
-                                                                Duration::from_secs(30),
-                                                                s.send((kind, payload)),
-                                                            )
-                                                            .await
-                                                            .is_err()
-                                                            {
-                                                                streams_map.lock().unwrap().remove(&id);
-                                                                let _ = tx.try_send((FRAME_RESET, id, Vec::new()));
+                                                            match s.try_send((kind, payload)) {
+                                                                Ok(()) => {}
+                                                                Err(mpsc::error::TrySendError::Full(item)) => {
+                                                                    if tokio::time::timeout(
+                                                                        DEMUX_SEND_TIMEOUT,
+                                                                        s.send(item),
+                                                                    )
+                                                                    .await
+                                                                    .is_err()
+                                                                    {
+                                                                        streams_map.lock().unwrap().remove(&id);
+                                                                        let _ = tx.try_send((FRAME_RESET, id, Vec::new()));
+                                                                    }
+                                                                }
+                                                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                                                    streams_map.lock().unwrap().remove(&id);
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -3579,6 +3754,10 @@ fn start_instance(
 }
 
 async fn resolve_socket_addrs(host: &str, port: i64) -> Result<Vec<SocketAddr>, String> {
+    static DNS_CACHE: OnceLock<
+        parking_lot::Mutex<HashMap<(String, i64), (Vec<SocketAddr>, std::time::Instant)>>,
+    > = OnceLock::new();
+
     let addr_str = if host.contains(':') && !host.starts_with('[') {
         format!("[{}]:{}", host, port)
     } else {
@@ -3587,6 +3766,18 @@ async fn resolve_socket_addrs(host: &str, port: i64) -> Result<Vec<SocketAddr>, 
     if let Ok(sa) = addr_str.parse::<SocketAddr>() {
         return Ok(vec![sa]);
     }
+
+    let cache = DNS_CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+    let key = (host.to_ascii_lowercase(), port);
+    {
+        let guard = cache.lock();
+        if let Some((cached, at)) = guard.get(&key) {
+            if at.elapsed() < DNS_CACHE_TTL && !cached.is_empty() {
+                return Ok(cached.clone());
+            }
+        }
+    }
+
     let addrs: Vec<SocketAddr> =
         match tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(&addr_str)).await
         {
@@ -3606,6 +3797,16 @@ async fn resolve_socket_addrs(host: &str, port: i64) -> Result<Vec<SocketAddr>, 
         };
     if addrs.is_empty() {
         return Err(format!("unable to resolve {}", addr_str));
+    }
+    {
+        let mut guard = cache.lock();
+        if guard.len() >= MAX_DNS_CACHE_ENTRIES {
+            guard.retain(|_, (_, at)| at.elapsed() < DNS_CACHE_TTL);
+            if guard.len() >= MAX_DNS_CACHE_ENTRIES {
+                guard.clear();
+            }
+        }
+        guard.insert(key, (addrs.clone(), std::time::Instant::now()));
     }
     Ok(addrs)
 }
@@ -3778,7 +3979,7 @@ fn handle_client_frame_open(
             BandwidthLimiter::new(rate_bps)
         });
 
-    let (stx, mut srx) = mpsc::channel::<(u8, Vec<u8>)>(64);
+    let (stx, mut srx) = mpsc::channel::<(u8, Vec<u8>)>(STREAM_CHAN_CAP);
     streams_map.lock().unwrap().insert(id, stx);
     let tx_back = tx.clone();
     let streams_done = streams_map.clone();
@@ -3821,7 +4022,9 @@ fn handle_client_frame_open(
                     }
                 }
             });
-            while let Some((k, data)) = srx.recv().await {
+            while let Ok(Some((k, data))) =
+                tokio::time::timeout(Duration::from_secs(60), srx.recv()).await
+            {
                 match k {
                     FRAME_DATA => {
                         let raw_dg = decode_xudp(&data);
@@ -3857,47 +4060,89 @@ fn handle_client_frame_open(
             let (mut tr, mut tw) = target_stream.into_split();
             let tx_read = tx_back.clone();
             let lim_read = limiter.clone();
+            let last_active_ms = Arc::new(AtomicU64::new(mono_now_ms()));
+            let any_half_closed = Arc::new(AtomicBool::new(false));
+            let rt_active = last_active_ms.clone();
+            let rt_half = any_half_closed.clone();
             let mut read_target = tokio::spawn(async move {
                 let read_cap = lim_read.read_size(OPTIMAL_DATA_CHUNK);
                 let mut buf = vec![0u8; read_cap];
                 loop {
-                    match tr.read(&mut buf).await {
-                        Ok(0) => {
+                    match tokio::time::timeout(Duration::from_secs(15), tr.read(&mut buf)).await {
+                        Ok(Ok(0)) => {
+                            rt_half.store(true, Ordering::Relaxed);
                             let _ = tx_read.send((FRAME_HALF, id, Vec::new())).await;
                             break;
                         }
-                        Ok(n) => {
+                        Ok(Ok(n)) => {
+                            rt_active.store(mono_now_ms(), Ordering::Relaxed);
                             lim_read.wait(n).await;
                             if tx_read.send((FRAME_DATA, id, buf[..n].to_vec())).await.is_err() {
                                 break;
                             }
                         }
-                        Err(_) => {
+                        Ok(Err(_)) => {
                             let _ = tx_read.send((FRAME_RESET, id, Vec::new())).await;
                             break;
+                        }
+                        Err(_) => {
+                            let idle_limit = if rt_half.load(Ordering::Relaxed) {
+                                STREAM_HALF_CLOSE_IDLE_MS
+                            } else {
+                                STREAM_OPEN_IDLE_MS
+                            };
+                            if mono_now_ms().saturating_sub(rt_active.load(Ordering::Relaxed))
+                                >= idle_limit
+                            {
+                                let _ = tx_read.send((FRAME_RESET, id, Vec::new())).await;
+                                break;
+                            }
                         }
                     }
                 }
             });
             let mut peer_reset = false;
             let mut half_closed = false;
-            while let Some((k, data)) = srx.recv().await {
-                match k {
-                    FRAME_DATA => {
-                        if tw.write_all(&data).await.is_err() {
+            loop {
+                match tokio::time::timeout(Duration::from_secs(15), srx.recv()).await {
+                    Ok(Some((k, data))) => match k {
+                        FRAME_DATA => {
+                            last_active_ms.store(mono_now_ms(), Ordering::Relaxed);
+                            if tokio::time::timeout(
+                                STREAM_SOCKET_WRITE_TIMEOUT,
+                                tw.write_all(&data),
+                            )
+                            .await
+                            .map_or(true, |r| r.is_err())
+                            {
+                                break;
+                            }
+                        }
+                        FRAME_HALF => {
+                            half_closed = true;
+                            any_half_closed.store(true, Ordering::Relaxed);
+                            let _ = tw.shutdown().await;
+                            break;
+                        }
+                        FRAME_RESET => {
+                            peer_reset = true;
+                            break;
+                        }
+                        _ => break,
+                    },
+                    Ok(None) => break,
+                    Err(_) => {
+                        let idle_limit = if any_half_closed.load(Ordering::Relaxed) {
+                            STREAM_HALF_CLOSE_IDLE_MS
+                        } else {
+                            STREAM_OPEN_IDLE_MS
+                        };
+                        if mono_now_ms().saturating_sub(last_active_ms.load(Ordering::Relaxed))
+                            >= idle_limit
+                        {
                             break;
                         }
                     }
-                    FRAME_HALF => {
-                        half_closed = true;
-                        let _ = tw.shutdown().await;
-                        break;
-                    }
-                    FRAME_RESET => {
-                        peer_reset = true;
-                        break;
-                    }
-                    _ => break,
                 }
             }
             if half_closed && !peer_reset {
@@ -4104,11 +4349,7 @@ mod tests {
 
     fn test_session() -> (SessionHandle, mpsc::Receiver<(u8, u32, Vec<u8>)>) {
         let (tx, rx) = mpsc::channel(4);
-        let h = SessionHandle {
-            tx,
-            streams: Arc::new(Mutex::new(HashMap::new())),
-            next_id: Arc::new(AtomicU32::new(1)),
-        };
+        let h = SessionHandle::new(tx, Arc::new(Mutex::new(HashMap::new())));
         (h, rx)
     }
 
@@ -4928,19 +5169,53 @@ mod tests {
     #[test]
     fn session_handle_open_stream_skips_zero_and_existing_ids_on_wraparound() {
         let (tx, _rx) = mpsc::channel(8);
-        let handle = SessionHandle {
-            tx,
-            streams: Arc::new(Mutex::new(HashMap::new())),
-            next_id: Arc::new(AtomicU32::new(1)),
-        };
+        let handle = SessionHandle::new(tx, Arc::new(Mutex::new(HashMap::new())));
         let (id1, _rx1) = handle.open_stream().unwrap();
         assert_eq!(id1, 1);
+        assert_eq!(handle.active_streams.load(Ordering::Relaxed), 1);
         // Simulate counter wrap-around back to u32::MAX -> 0 -> 1 (already active) -> 2
         handle.next_id.store(u32::MAX, Ordering::Relaxed);
         let (id_max, _rx_max) = handle.open_stream().unwrap();
         assert_eq!(id_max, u32::MAX);
         let (id_next, _rx_next) = handle.open_stream().unwrap();
         assert_eq!(id_next, 2);
+        assert_eq!(handle.active_streams.load(Ordering::Relaxed), 3);
         assert!(handle.streams.lock().unwrap().contains_key(&1));
+        handle.close_stream(id1);
+        assert_eq!(handle.active_streams.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn pick_session_prefers_fresh_and_least_loaded_session() {
+        let _ = mono_now_ms();
+        let (tx_stale, _rx_stale) = mpsc::channel(1024);
+        let stale = SessionHandle::new(tx_stale, Arc::new(Mutex::new(HashMap::new())));
+        // Simulate a zombie session whose last RX was 30s ago (> SESSION_FRESH_RX_MS)
+        let now = mono_now_ms();
+        stale.last_rx_ms.store(now.saturating_sub(30_000), Ordering::Relaxed);
+
+        let (tx_busy, _rx_busy) = mpsc::channel(1024);
+        let busy = SessionHandle::new(tx_busy, Arc::new(Mutex::new(HashMap::new())));
+        busy.touch_rx();
+        let (_sid1, _srx1) = busy.open_stream().unwrap();
+        let (_sid2, _srx2) = busy.open_stream().unwrap();
+
+        let (tx_idle, _rx_idle) = mpsc::channel(1024);
+        let idle = SessionHandle::new(tx_idle, Arc::new(Mutex::new(HashMap::new())));
+        idle.touch_rx();
+
+        let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
+        sessions.lock().unwrap().insert(
+            "b1".to_string(),
+            vec![stale.clone(), busy.clone(), idle.clone()],
+        );
+
+        for _ in 0..6 {
+            let picked = pick_session(&sessions, "b1").unwrap();
+            assert!(
+                Arc::ptr_eq(&picked.streams, &idle.streams),
+                "pick_session must skip stale session and prefer idle fresh session over busy session"
+            );
+        }
     }
 }
