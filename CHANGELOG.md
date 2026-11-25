@@ -8,6 +8,20 @@ Release。
 
 ## [Unreleased]
 
+## [0.4.23] - 2026-11-25
+
+### Bug Fixes & Stability
+
+- 全面加固隧道多路复用与会话稳定性（`tunnel/mod.rs`）：拆分控制帧与数据帧双优先级写入调度（`SessionSender` / `spawn_session_writer`），避免高负载下保活 `FRAME_PING/PONG` 与控制帧被大流量阻塞；优化多流解复用慢消费者隔离与 `FRAME_RESET` 清理、原子同步会话状态及可疑无响应会话摘除（`pick_session`）；修复突发 UDP 流量下客户端 NAT 源端口变更导致的流重建问题，并增加连接池建连重试与 DNS 缓存失效清理。
+- 修复 `VLESS + REALITY + Vision + VLESS Encryption` 全组合稳定性与协议一致性（`reality.rs` / `reality_hello.rs` / `vision.rs` / `vless_enc.rs`）：
+  - 将 `VLESS Encryption` 由独立中继任务重构为内联状态机 `VlessEncStream`，严格校验 X25519 低阶公钥、补齐分片双工刷新与半死连接写错误传播，并实现服务端重启后 `0-RTT` 票据自动失效回退至 `1-RTT` 恢复建连。
+  - 修复 `REALITY` TLS 1.3 ClientHello 填充位置（置于尾部 GREASE 之前）与默认 ALPN / 180s 时间窗配置；严格校验 ML-DSA-65 握手抄本签名；修正 `max_time_diff = 0` 语义（关闭时钟偏移限制同时保留重放防护）。
+  - 修复 `XTLS Vision` 首包伪装帧合并（`append_initial_camouflage` / `wrap_vision_stream_started`）、首帧 UUID 严格校验，以及 `poll_flush` / `poll_shutdown` 写错误状态清理。
+- 补全 `XHTTP` 与 `Hysteria2` 协议栈规范实现及连接稳定性（`xhttp.rs` / `hysteria2.rs`）：
+  - `XHTTP` 原生支持 HTTP/1.1、RFC 9113 HTTP/2（含 h2c）及 RFC 9114 HTTP/3（QUIC + RFC 9204 QPACK 静态表与 RFC 7541 Huffman 解码），完善 `PUT` 方法、`Host`/自定义请求头校验、CORS 与分片上行配置。
+  - `Hysteria2` 统一 QUIC 传输窗口与超时配置，修复流关闭清理及客户端无自定义 CA 时的证书校验加固。
+- 新增覆盖 REALITY、Vision、VLESS Encryption 0-RTT 恢复、XHTTP H2/H3/QPACK、Hysteria2、多路复用优先级与 UDP NAT 保活的自动化单元测试与集成测试。
+
 ## [0.4.22] - 2026-11-10
 
 ### Security & Protocol Camouflage

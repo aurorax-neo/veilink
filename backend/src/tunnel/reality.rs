@@ -688,8 +688,13 @@ where
                     transcript.update(&full_msg);
                 }
                 0x0b => {
-                    let ed_pub =
-                        verify_reality_certificate(msg_body, &auth_key, &cfg.mldsa65_verify)?;
+                    let ed_pub = verify_reality_certificate(
+                        msg_body,
+                        &auth_key,
+                        &cfg.mldsa65_verify,
+                        &hello.record[5..],
+                        &sh_body,
+                    )?;
                     verified_ed25519_pub = Some(ed_pub);
                     transcript.update(&full_msg);
                 }
@@ -865,6 +870,12 @@ pub async fn reality_accept(
     let srv_eph_secret = StaticSecret::from(srv_eph_bytes);
     let srv_eph_pub = PublicKey::from(&srv_eph_secret);
     let hs_shared = srv_eph_secret.diffie_hellman(&cli_pub);
+    if hs_shared.as_bytes().iter().all(|&b| b == 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "REALITY handshake X25519 low-order point",
+        ));
+    }
 
     let mut server_random = [0u8; 32];
     rand::rng().fill_bytes(&mut server_random);
@@ -905,12 +916,15 @@ pub async fn reality_accept(
     let mut mac = <HmacSha512 as Mac>::new_from_slice(&auth_key)
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "HMAC key"))?;
     mac.update(&ed_pub);
-    let hmac_bytes = mac.finalize().into_bytes();
+    let hmac_bytes = mac.clone().finalize().into_bytes();
     let mut hmac_sig = [0u8; 64];
     hmac_sig.copy_from_slice(&hmac_bytes);
 
     let mldsa_sig = if !cfg.mldsa65_seed.trim().is_empty() {
-        let sig = crate::model::sign_mldsa65(&cfg.mldsa65_seed, &ed_pub)
+        mac.update(&hs_msg);
+        mac.update(&sh_msg);
+        let transcript_mac = mac.finalize().into_bytes();
+        let sig = crate::model::sign_mldsa65(&cfg.mldsa65_seed, transcript_mac.as_slice())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         Some(sig)
     } else {
@@ -1019,13 +1033,11 @@ fn validate_reality_sid(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    let max_diff_sec = if max_time_diff_ms > 0 {
-        (max_time_diff_ms / 1000).max(1) as i64
-    } else {
-        120
-    };
-    if (now - ts).abs() > max_diff_sec {
-        return false;
+    if max_time_diff_ms > 0 {
+        let max_diff_sec = (max_time_diff_ms / 1000).max(1) as i64;
+        if (now - ts).abs() > max_diff_sec {
+            return false;
+        }
     }
     let sid_bytes = &sid_plain[8..16];
     if !short_ids.is_empty() {
@@ -1041,7 +1053,12 @@ fn validate_reality_sid(
             return false;
         }
     }
-    let ttl = Duration::from_secs((max_diff_sec as u64) * 2 + 30);
+    let window_sec = if max_time_diff_ms > 0 {
+        (max_time_diff_ms / 1000).max(1)
+    } else {
+        180
+    };
+    let ttl = Duration::from_secs(window_sec * 2 + 30);
     replay_cache.check_and_insert(*encrypted_sid, ttl)
 }
 
@@ -1487,6 +1504,8 @@ fn verify_reality_certificate(
     cert_msg_body: &[u8],
     auth_key: &[u8; 32],
     mldsa65_verify: &str,
+    client_hello_hs: &[u8],
+    server_hello_hs: &[u8],
 ) -> io::Result<[u8; 32]> {
     if cert_msg_body.len() < 4 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Cert msg short"));
@@ -1538,7 +1557,7 @@ fn verify_reality_certificate(
     let mut mac = <HmacSha512 as Mac>::new_from_slice(auth_key)
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "HMAC key"))?;
     mac.update(&ed_pub);
-    let expected_sig = mac.finalize().into_bytes();
+    let expected_sig = mac.clone().finalize().into_bytes();
 
     if cert_sig.ct_eq(expected_sig.as_slice()).unwrap_u8() != 1 {
         return Err(io::Error::new(
@@ -1554,7 +1573,10 @@ fn verify_reality_certificate(
                 "REALITY certificate missing ML-DSA-65 extension",
             )
         })?;
-        if !crate::model::verify_mldsa65(mldsa65_verify, &ed_pub, mldsa_sig) {
+        mac.update(client_hello_hs);
+        mac.update(server_hello_hs);
+        let transcript_mac = mac.finalize().into_bytes();
+        if !crate::model::verify_mldsa65(mldsa65_verify, transcript_mac.as_slice(), mldsa_sig) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "REALITY certificate ML-DSA-65 signature invalid",
@@ -1651,6 +1673,7 @@ pub struct RealityTlsStream<S> {
     write_cipher_buf: Vec<u8>,
     write_cipher_pos: usize,
     pending_write_len: usize,
+    sent_close_notify: bool,
     eof: bool,
 }
 
@@ -1667,6 +1690,7 @@ impl<S> RealityTlsStream<S> {
             write_cipher_buf: Vec::with_capacity(65536 + 128),
             write_cipher_pos: 0,
             pending_write_len: 0,
+            sent_close_notify: false,
             eof: false,
         }
     }
@@ -1918,8 +1942,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for RealityTlsStream<S> {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if let Poll::Pending = this.poll_flush_write_buf(cx) {
-            return Poll::Pending;
+        match this.poll_flush_write_buf(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => {
+                this.pending_write_len = 0;
+                return Poll::Ready(Err(e));
+            }
+            Poll::Pending => return Poll::Pending,
         }
         this.pending_write_len = 0;
         Pin::new(&mut this.inner).poll_flush(cx)
@@ -1927,14 +1956,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for RealityTlsStream<S> {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if this.write_cipher_buf.is_empty() {
+        if !this.sent_close_notify {
+            match this.poll_flush_write_buf(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => {
+                    this.pending_write_len = 0;
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+            this.pending_write_len = 0;
+            this.sent_close_notify = true;
             if let Ok(alert_rec) = this.write_cipher.seal_record(0x15, &[0x01, 0x00]) {
                 this.write_cipher_buf = alert_rec;
                 this.write_cipher_pos = 0;
             }
         }
-        if let Poll::Pending = this.poll_flush_write_buf(cx) {
-            return Poll::Pending;
+        match this.poll_flush_write_buf(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => {
+                this.pending_write_len = 0;
+                return Poll::Ready(Err(e));
+            }
+            Poll::Pending => return Poll::Pending,
         }
         this.pending_write_len = 0;
         Pin::new(&mut this.inner).poll_shutdown(cx)
@@ -1963,5 +2007,95 @@ mod tests {
         extra[0] = 0xfe;
         assert!(cache.check_and_insert(extra, Duration::from_secs(60)));
         assert!(cache.check_and_insert(first, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn validate_sid_zero_max_time_diff_disables_clock_skew_while_blocking_replay() {
+        let cache = RealityReplayCache::new();
+        let short_ids = vec![(vec![0x01, 0x02, 0x03, 0x04, 0, 0, 0, 0], 4usize)];
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32;
+        let skewed_ts = now.wrapping_sub(3600);
+        let mut sid_plain = [0u8; 16];
+        sid_plain[0] = 1;
+        sid_plain[4..8].copy_from_slice(&skewed_ts.to_be_bytes());
+        sid_plain[8..12].copy_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+
+        let enc_sid_1 = [0x11u8; 32];
+        // Rejected when max_time_diff_ms == 180_000 (180s < 3600s skew)
+        assert!(!validate_reality_sid(
+            &sid_plain,
+            &enc_sid_1,
+            &short_ids,
+            180_000,
+            &cache
+        ));
+        // Accepted when max_time_diff_ms == 0 (explicit disable), while replay is still rejected
+        assert!(validate_reality_sid(
+            &sid_plain,
+            &enc_sid_1,
+            &short_ids,
+            0,
+            &cache
+        ));
+        assert!(!validate_reality_sid(
+            &sid_plain,
+            &enc_sid_1,
+            &short_ids,
+            0,
+            &cache
+        ));
+    }
+
+    #[test]
+    fn chrome_client_hello_includes_alpn_and_places_padding_before_trailing_grease() {
+        let random = [0x42u8; 32];
+        let sid = [0x24u8; 32];
+        let x25519_pub = [0x33u8; 32];
+        let hello = build_client_hello(
+            FingerprintProfile::Chrome,
+            "www.cloudflare.com",
+            &random,
+            &sid,
+            &x25519_pub,
+            &["h2", "http/1.1"],
+        );
+        let parsed = parse_client_hello(&hello.record[5..]).expect("valid ClientHello");
+        assert_eq!(parsed.alpn, vec!["h2".to_string(), "http/1.1".to_string()]);
+
+        // Walk extensions in ClientHello body and verify 0x0015 precedes trailing GREASE
+        let hs = &hello.record[5..];
+        let mut pos = 6 + 32;
+        let sid_len = hs[pos] as usize;
+        pos += 1 + sid_len;
+        let cs_len = u16::from_be_bytes([hs[pos], hs[pos + 1]]) as usize;
+        pos += 2 + cs_len;
+        let comp_len = hs[pos] as usize;
+        pos += 1 + comp_len;
+        let ext_total = u16::from_be_bytes([hs[pos], hs[pos + 1]]) as usize;
+        pos += 2;
+        let end = pos + ext_total;
+        let mut ext_types = Vec::new();
+        while pos + 4 <= end {
+            let et = u16::from_be_bytes([hs[pos], hs[pos + 1]]);
+            let el = u16::from_be_bytes([hs[pos + 2], hs[pos + 3]]) as usize;
+            ext_types.push(et);
+            pos += 4 + el;
+        }
+        assert_eq!(pos, end);
+        assert!(ext_types.contains(&0x0010), "ALPN extension must be present");
+        if let Some(pad_idx) = ext_types.iter().position(|&t| t == 0x0015) {
+            assert_eq!(
+                pad_idx + 2,
+                ext_types.len(),
+                "Chrome padding extension (0x0015) must immediately precede trailing GREASE"
+            );
+            let last_ext = *ext_types.last().unwrap();
+            assert_eq!(last_ext & 0x0f0f, 0x0a0a, "final extension must be GREASE");
+        } else {
+            panic!("expected Chrome ClientHello < 512B body to include padding extension 0x0015");
+        }
     }
 }

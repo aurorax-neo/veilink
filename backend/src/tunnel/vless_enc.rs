@@ -13,10 +13,7 @@ use ctr::cipher::{KeyIvInit, StreamCipher};
 use ml_kem::kem::{Decapsulate, Encapsulate, Kem, KeyExport};
 use ml_kem::{DecapsulationKey, EncapsulationKey, MlKem768};
 use parking_lot::Mutex;
-use tokio::io::{
-    duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, ReadHalf,
-    WriteHalf,
-};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::task::AbortHandle;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -30,9 +27,8 @@ pub const MLKEM768_CT_LEN: usize = 1088;
 pub const TAG_LEN: usize = 16;
 
 const MAX_NONCE: [u8; 12] = [0xFF; 12];
-const RELAY_BUF: usize = 256 * 1024;
-const MAX_CHUNK: usize = 16384;
-const MAX_RECORD_BODY: usize = 16_640;
+const WRITE_CHUNK: usize = 16384 - 5 - TAG_LEN;
+const MAX_WRITE_BATCH: usize = 4 * WRITE_CHUNK;
 
 fn derive_key(ctx: &[u8], key_material: &[u8]) -> [u8; 32] {
     use blake3::hazmat::HasherExt;
@@ -261,7 +257,12 @@ impl CipherImpl {
         out
     }
 
-    fn open_trailing(&self, nonce: &[u8; 12], ad: &[u8], buf: &mut Vec<u8>) -> Result<(), ()> {
+    fn open_slice_trailing(
+        &self,
+        nonce: &[u8; 12],
+        ad: &[u8],
+        buf: &mut [u8],
+    ) -> Result<usize, ()> {
         if buf.len() < TAG_LEN {
             return Err(());
         }
@@ -275,6 +276,11 @@ impl CipherImpl {
         if res.is_err() {
             return Err(());
         }
+        Ok(split)
+    }
+
+    fn open_trailing(&self, nonce: &[u8; 12], ad: &[u8], buf: &mut Vec<u8>) -> Result<(), ()> {
+        let split = self.open_slice_trailing(nonce, ad, buf)?;
         buf.truncate(split);
         Ok(())
     }
@@ -352,10 +358,10 @@ impl Aead {
         self.decrypt(&nonce, ct, &[])
     }
 
-    fn open_ad_in_place(&mut self, ct: &mut Vec<u8>, ad: &[u8]) -> Result<(), ()> {
+    fn open_ad_slice(&mut self, ct: &mut [u8], ad: &[u8]) -> Result<usize, ()> {
         self.increment_nonce();
         let nonce = self.nonce;
-        self.cipher.open_trailing(&nonce, ad, ct)
+        self.cipher.open_slice_trailing(&nonce, ad, ct)
     }
 
     fn open_max(&self, ct: &[u8]) -> Result<Vec<u8>, ()> {
@@ -573,10 +579,11 @@ impl ServerInstance {
                     if peer[31] > 127 {
                         return Err("X25519 public key high bit set".to_string());
                     }
-                    nfs_key = sk
-                        .diffie_hellman(&PublicKey::from(peer))
-                        .to_bytes()
-                        .to_vec();
+                    let shared = sk.diffie_hellman(&PublicKey::from(peer));
+                    if shared.as_bytes().iter().all(|&b| b == 0) {
+                        return Err("X25519 low-order point".to_string());
+                    }
+                    nfs_key = shared.to_bytes().to_vec();
                 }
                 ServerKey::MlKem(dk, _) => {
                     nfs_key = dk
@@ -644,6 +651,9 @@ impl ServerInstance {
             .unwrap();
         let x_sk = StaticSecret::from(random_array::<32>());
         let x_shared = x_sk.diffie_hellman(&PublicKey::from(peer_x)).to_bytes();
+        if x_shared.iter().all(|&b| b == 0) {
+            return Err("PFS X25519 low-order point".to_string());
+        }
 
         let mut pfs_key = Vec::with_capacity(64);
         pfs_key.extend_from_slice(mlkem_shared.as_slice());
@@ -667,6 +677,15 @@ impl ServerInstance {
             let mut map = self.sessions.lock();
             let now = Instant::now();
             map.retain(|_, s| s.expire > now);
+            if map.len() >= 4096 {
+                if let Some(evict_key) = map
+                    .iter()
+                    .min_by_key(|(_, s)| s.expire)
+                    .map(|(k, _)| *k)
+                {
+                    map.remove(&evict_key);
+                }
+            }
             if map.len() < 4096 {
                 map.insert(
                     ticket,
@@ -782,12 +801,14 @@ impl ServerInstance {
             match map.get_mut(&ticket_arr) {
                 Some(sess) if sess.expire > now => {
                     if sess.seen_nfs.len() >= 8192 {
-                        return Err("0-RTT ticket replay window exhausted".to_string());
+                        map.remove(&ticket_arr);
+                        None
+                    } else {
+                        if !sess.seen_nfs.insert(nfs_arr) {
+                            return Err("0-RTT replay detected".to_string());
+                        }
+                        Some(sess.pfs_key.clone())
                     }
-                    if !sess.seen_nfs.insert(nfs_arr) {
-                        return Err("0-RTT replay detected".to_string());
-                    }
-                    Some(sess.pfs_key.clone())
                 }
                 _ => None,
             }
@@ -797,12 +818,15 @@ impl ServerInstance {
             let mut noise = vec![0u8; noise_len];
             loop {
                 rand::RngCore::fill_bytes(&mut rand::rng(), &mut noise);
-                let hdr: [u8; 5] = noise[..5].try_into().unwrap();
-                if decode_header(&hdr).is_err() {
+                let hdr0: [u8; 5] = noise[..5].try_into().unwrap();
+                let hdr16: [u8; 5] = noise[16..21].try_into().unwrap();
+                if decode_header(&hdr0).is_err() && decode_header(&hdr16).is_err() {
                     break;
                 }
             }
             let _ = stream.write_all(&noise).await;
+            let _ = stream.flush().await;
+            let _ = stream.shutdown().await;
             return Err("expired ticket".to_string());
         };
 
@@ -904,6 +928,18 @@ impl ClientInstance {
         })))
     }
 
+    pub fn has_cached_ticket(&self) -> bool {
+        if self.seconds == 0 {
+            return false;
+        }
+        let cache = self.cache.lock();
+        matches!(cache.expire, Some(exp) if Instant::now() < exp)
+    }
+
+    pub fn invalidate_ticket(&self) {
+        self.cache.lock().expire = None;
+    }
+
     pub async fn handshake(&self, mut stream: BoxStream) -> Result<BoxStream, String> {
         let use_aes = self.use_aes;
         let iv: [u8; 16] = random_array();
@@ -915,19 +951,23 @@ impl ClientInstance {
         for (j, key) in self.nfs_keys.iter().enumerate() {
             let index = match key {
                 NfsKey::X25519(server_pub) => {
-                    let mut my_pub = [0u8; 32];
                     let mut sk = StaticSecret::from(random_array::<32>());
+                    let mut my_pub = PublicKey::from(&sk).to_bytes();
                     for _ in 0..8 {
-                        let cand = StaticSecret::from(random_array::<32>());
-                        let pub_b = PublicKey::from(&cand).to_bytes();
-                        if pub_b[31] <= 127 {
-                            sk = cand;
-                            my_pub = pub_b;
+                        if my_pub[31] <= 127 {
                             break;
                         }
+                        let cand = StaticSecret::from(random_array::<32>());
+                        let pub_b = PublicKey::from(&cand).to_bytes();
+                        sk = cand;
+                        my_pub = pub_b;
                     }
                     relays[pos..pos + X25519_LEN].copy_from_slice(&my_pub);
-                    nfs_key = sk.diffie_hellman(server_pub).to_bytes().to_vec();
+                    let shared = sk.diffie_hellman(server_pub);
+                    if shared.as_bytes().iter().all(|&b| b == 0) {
+                        return Err("X25519 low-order point".to_string());
+                    }
+                    nfs_key = shared.to_bytes().to_vec();
                     X25519_LEN
                 }
                 NfsKey::MlKem(ek) => {
@@ -1055,6 +1095,9 @@ impl ClientInstance {
             .try_into()
             .unwrap();
         let x_shared = x_sk.diffie_hellman(&PublicKey::from(peer_x)).to_bytes();
+        if x_shared.iter().all(|&b| b == 0) {
+            return Err("PFS X25519 low-order point".to_string());
+        }
 
         let mut pfs_key = Vec::with_capacity(64);
         pfs_key.extend_from_slice(mlkem_shared.as_slice());
@@ -1134,7 +1177,7 @@ struct DataPhase {
 pub struct TaskedDuplex {
     inner: DuplexStream,
     read_abort: AbortHandle,
-    write_abort: AbortHandle,
+    _write_abort: AbortHandle,
 }
 
 impl TaskedDuplex {
@@ -1151,15 +1194,16 @@ impl TaskedDuplex {
         Self {
             inner,
             read_abort: r_abort,
-            write_abort: w_abort,
+            _write_abort: w_abort,
         }
     }
 }
 
 impl Drop for TaskedDuplex {
     fn drop(&mut self) {
+        // Only abort reader immediately; dropping `self.inner` yields EOF on `peer_rd`
+        // so `write_task` can flush trailing chunks / `0\r\n\r\n` cleanly before exiting.
         self.read_abort.abort();
-        self.write_abort.abort();
     }
 }
 
@@ -1192,10 +1236,6 @@ impl AsyncWrite for TaskedDuplex {
 }
 
 fn spawn_relay(stream: BoxStream, dp: DataPhase) -> BoxStream {
-    let (client, proxy) = duplex(RELAY_BUF);
-    let (rd, wr) = tokio::io::split(stream);
-    let (proxy_rd, proxy_wr) = tokio::io::split(proxy);
-
     let DataPhase {
         aead,
         peer_aead,
@@ -1208,181 +1248,618 @@ fn spawn_relay(stream: BoxStream, dp: DataPhase) -> BoxStream {
         xor,
         reset_cache,
     } = dp;
-
-    let read_key = united_key.clone();
-    let read_task = tokio::spawn(read_loop(
-        rd,
-        proxy_wr,
+    Box::new(VlessEncStream {
+        inner: stream,
+        aead,
         peer_aead,
+        united_key,
+        use_aes,
+        pre_write,
+        peer_padding_len,
+        write_ctr,
         read_ctr,
         xor,
-        peer_padding_len,
-        read_key,
-        use_aes,
         reset_cache,
-    ));
-    let write_task = tokio::spawn(write_loop(
-        wr, proxy_rd, aead, write_ctr, pre_write, united_key, use_aes,
-    ));
-
-    let read_abort = read_task.abort_handle();
-    let write_abort = write_task.abort_handle();
-    let write_abort_sup = write_abort.clone();
-    tokio::spawn(async move {
-        let clean_eof = matches!(read_task.await, Ok(true));
-        if !clean_eof {
-            write_abort_sup.abort();
-        }
-    });
-
-    Box::new(TaskedDuplex {
-        inner: client,
-        read_abort,
-        write_abort,
+        first_record_ok: false,
+        pending_rec_hdr: None,
+        read_raw_buf: Vec::with_capacity(65536),
+        read_raw_pos: 0,
+        read_plain_buf: Vec::with_capacity(32768),
+        read_plain_pos: 0,
+        write_buf: Vec::with_capacity(65536 + 128),
+        write_pos: 0,
+        pending_write_len: 0,
+        eof: false,
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn read_loop(
-    rd: ReadHalf<BoxStream>,
-    mut proxy_wr: WriteHalf<DuplexStream>,
+struct VlessEncStream {
+    inner: BoxStream,
+    aead: Aead,
     peer_aead: Option<Aead>,
-    mut read_ctr: Option<Aes256Ctr>,
-    xor: bool,
-    peer_padding_len: usize,
     united_key: Vec<u8>,
     use_aes: bool,
+    pre_write: Vec<u8>,
+    peer_padding_len: usize,
+    write_ctr: Option<Aes256Ctr>,
+    read_ctr: Option<Aes256Ctr>,
+    xor: bool,
     reset_cache: Option<Arc<Mutex<TicketCache>>>,
-) -> bool {
-    let mut rd = tokio::io::BufReader::with_capacity(64 * 1024, rd);
-    let mut first_record_ok = false;
-    let invalidate = |reset_cache: &Option<Arc<Mutex<TicketCache>>>| {
-        if let Some(cache) = reset_cache {
-            cache.lock().expire = None;
-        }
-    };
-
-    let mut peer_aead = match peer_aead {
-        Some(a) => a,
-        None => {
-            let mut sr = [0u8; 16];
-            if rd.read_exact(&mut sr).await.is_err() {
-                invalidate(&reset_cache);
-                let _ = proxy_wr.shutdown().await;
-                return false;
-            }
-            if xor {
-                read_ctr = Some(new_ctr(&united_key, &sr));
-            }
-            Aead::new(&sr, &united_key, use_aes)
-        }
-    };
-
-    if peer_padding_len > 0 {
-        let mut pad = vec![0u8; peer_padding_len];
-        if rd.read_exact(&mut pad).await.is_err() {
-            let _ = proxy_wr.shutdown().await;
-            return false;
-        }
-        if peer_aead.open(&pad).is_err() {
-            let _ = proxy_wr.shutdown().await;
-            return false;
-        }
-    }
-
-    let mut clean_eof = false;
-    let mut data = Vec::with_capacity(MAX_RECORD_BODY);
-    loop {
-        let mut hdr = [0u8; 5];
-        match rd.read(&mut hdr).await {
-            Ok(0) => {
-                clean_eof = true;
-                break;
-            }
-            Ok(n) => {
-                if rd.read_exact(&mut hdr[n..]).await.is_err() {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-        if let Some(ctr) = read_ctr.as_mut() {
-            ctr.apply_keystream(&mut hdr);
-        }
-        let Ok(l) = decode_header(&hdr) else {
-            if !first_record_ok {
-                invalidate(&reset_cache);
-            }
-            break;
-        };
-        data.resize(l, 0);
-        if rd.read_exact(&mut data).await.is_err() {
-            break;
-        }
-        let rekey = peer_aead.is_exhausted().then(|| {
-            let mut ctx = Vec::with_capacity(5 + data.len());
-            ctx.extend_from_slice(&hdr);
-            ctx.extend_from_slice(&data);
-            Aead::new(&ctx, &united_key, use_aes)
-        });
-        if peer_aead.open_ad_in_place(&mut data, &hdr).is_err() {
-            if !first_record_ok {
-                invalidate(&reset_cache);
-            }
-            break;
-        }
-        first_record_ok = true;
-        if let Some(next) = rekey {
-            peer_aead = next;
-        }
-        if proxy_wr.write_all(&data).await.is_err() {
-            break;
-        }
-    }
-    let _ = proxy_wr.shutdown().await;
-    clean_eof
+    first_record_ok: bool,
+    pending_rec_hdr: Option<([u8; 5], usize)>,
+    read_raw_buf: Vec<u8>,
+    read_raw_pos: usize,
+    read_plain_buf: Vec<u8>,
+    read_plain_pos: usize,
+    write_buf: Vec<u8>,
+    write_pos: usize,
+    pending_write_len: usize,
+    eof: bool,
 }
 
-async fn write_loop(
-    mut wr: WriteHalf<BoxStream>,
-    mut proxy_rd: ReadHalf<DuplexStream>,
-    mut aead: Aead,
-    mut write_ctr: Option<Aes256Ctr>,
-    pre_write: Vec<u8>,
-    united_key: Vec<u8>,
-    use_aes: bool,
-) {
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut out = Vec::with_capacity(pre_write.len() + 4 * (5 + MAX_CHUNK + TAG_LEN));
-    let mut first_record = true;
-    loop {
-        let n = match proxy_rd.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        out.clear();
-        if first_record {
-            out.extend_from_slice(&pre_write);
-            first_record = false;
-        }
-        for body in buf[..n].chunks(MAX_CHUNK) {
-            let header = encode_header(body.len() + TAG_LEN);
-            let exhausted = aead.is_exhausted();
-            let header_start = out.len();
-            out.extend_from_slice(&header);
-            aead.seal_ad_append(body, &header, &mut out);
-            if exhausted {
-                let mut ctx = Vec::with_capacity(out.len() - header_start);
-                ctx.extend_from_slice(&out[header_start..]);
-                aead = Aead::new(&ctx, &united_key, use_aes);
-            }
-            if let Some(ctr) = write_ctr.as_mut() {
-                ctr.apply_keystream(&mut out[header_start..header_start + 5]);
-            }
-        }
-        if wr.write_all(&out).await.is_err() || wr.flush().await.is_err() {
-            break;
+impl VlessEncStream {
+    fn invalidate_cache(&mut self) {
+        if let Some(ref cache) = self.reset_cache {
+            cache.lock().expire = None;
         }
     }
-    let _ = wr.shutdown().await;
+
+    fn poll_drain_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while self.write_pos < self.write_buf.len() {
+            match Pin::new(&mut self.inner).poll_write(cx, &self.write_buf[self.write_pos..]) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "vless-encryption: write zero",
+                    )))
+                }
+                Poll::Ready(Ok(n)) => {
+                    self.write_pos += n;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        self.write_buf.clear();
+        self.write_pos = 0;
+        if self.write_buf.capacity() > 256 * 1024 {
+            self.write_buf.shrink_to(65536 + 128);
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncRead for VlessEncStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let mut produced = false;
+        loop {
+            if this.read_plain_pos < this.read_plain_buf.len() {
+                let avail = &this.read_plain_buf[this.read_plain_pos..];
+                let to_copy = avail.len().min(buf.remaining());
+                buf.put_slice(&avail[..to_copy]);
+                this.read_plain_pos += to_copy;
+                if this.read_plain_pos >= this.read_plain_buf.len() {
+                    this.read_plain_buf.clear();
+                    this.read_plain_pos = 0;
+                }
+                produced = true;
+                if buf.remaining() == 0 {
+                    return Poll::Ready(Ok(()));
+                }
+            }
+            if this.eof {
+                return Poll::Ready(Ok(()));
+            }
+
+            if this.peer_aead.is_none() {
+                let raw_avail = this.read_raw_buf.len() - this.read_raw_pos;
+                if raw_avail >= 16 {
+                    let mut sr = [0u8; 16];
+                    sr.copy_from_slice(
+                        &this.read_raw_buf[this.read_raw_pos..this.read_raw_pos + 16],
+                    );
+                    this.read_raw_pos += 16;
+                    if this.xor {
+                        this.read_ctr = Some(new_ctr(&this.united_key, &sr));
+                    }
+                    this.peer_aead = Some(Aead::new(&sr, &this.united_key, this.use_aes));
+                    if this.read_raw_pos == this.read_raw_buf.len() {
+                        this.read_raw_buf.clear();
+                        this.read_raw_pos = 0;
+                    }
+                }
+            }
+
+            if this.peer_aead.is_some() && this.peer_padding_len > 0 {
+                let raw_avail = this.read_raw_buf.len() - this.read_raw_pos;
+                if raw_avail >= this.peer_padding_len {
+                    let plen = this.peer_padding_len;
+                    let start = this.read_raw_pos;
+                    this.read_raw_pos += plen;
+                    this.peer_padding_len = 0;
+                    if this
+                        .peer_aead
+                        .as_mut()
+                        .unwrap()
+                        .open_ad_slice(&mut this.read_raw_buf[start..start + plen], &[])
+                        .is_err()
+                    {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "vless-encryption: server padding open failed",
+                        )));
+                    }
+                    if this.read_raw_pos == this.read_raw_buf.len() {
+                        this.read_raw_buf.clear();
+                        this.read_raw_pos = 0;
+                    }
+                }
+            }
+
+            if this.peer_aead.is_some() && this.peer_padding_len == 0 {
+                if this.pending_rec_hdr.is_none() {
+                    let raw_avail = this.read_raw_buf.len() - this.read_raw_pos;
+                    if raw_avail >= 5 {
+                        let mut hdr = [0u8; 5];
+                        hdr.copy_from_slice(
+                            &this.read_raw_buf[this.read_raw_pos..this.read_raw_pos + 5],
+                        );
+                        this.read_raw_pos += 5;
+                        if let Some(ctr) = this.read_ctr.as_mut() {
+                            ctr.apply_keystream(&mut hdr);
+                        }
+                        match decode_header(&hdr) {
+                            Ok(l) => {
+                                this.pending_rec_hdr = Some((hdr, l));
+                            }
+                            Err(e) => {
+                                if !this.first_record_ok {
+                                    this.invalidate_cache();
+                                }
+                                return Poll::Ready(Err(e));
+                            }
+                        }
+                    }
+                }
+
+                if let Some((hdr, body_len)) = this.pending_rec_hdr {
+                    let raw_avail = this.read_raw_buf.len() - this.read_raw_pos;
+                    if raw_avail >= body_len {
+                        this.pending_rec_hdr = None;
+                        let rec_start = this.read_raw_pos;
+                        let rec_end = rec_start + body_len;
+                        this.read_raw_pos = rec_end;
+                        let rekey = this.peer_aead.as_ref().unwrap().is_exhausted().then(|| {
+                            let mut ctx = Vec::with_capacity(5 + body_len);
+                            ctx.extend_from_slice(&hdr);
+                            ctx.extend_from_slice(&this.read_raw_buf[rec_start..rec_end]);
+                            Aead::new(&ctx, &this.united_key, this.use_aes)
+                        });
+                        let Ok(plain_len) = this
+                            .peer_aead
+                            .as_mut()
+                            .unwrap()
+                            .open_ad_slice(&mut this.read_raw_buf[rec_start..rec_end], &hdr)
+                        else {
+                            if !this.first_record_ok {
+                                this.invalidate_cache();
+                            }
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "vless-encryption: record AEAD open failed",
+                            )));
+                        };
+                        this.first_record_ok = true;
+                        if let Some(next) = rekey {
+                            this.peer_aead = Some(next);
+                        }
+                        if plain_len > 0 {
+                            let plain_slice = &this.read_raw_buf[rec_start..rec_start + plain_len];
+                            let direct = plain_slice.len().min(buf.remaining());
+                            if direct > 0 {
+                                buf.put_slice(&plain_slice[..direct]);
+                                produced = true;
+                            }
+                            if direct < plain_slice.len() {
+                                this.read_plain_buf.clear();
+                                this.read_plain_buf
+                                    .extend_from_slice(&plain_slice[direct..]);
+                                this.read_plain_pos = 0;
+                            }
+                        }
+                        if this.read_raw_pos == this.read_raw_buf.len() {
+                            this.read_raw_buf.clear();
+                            this.read_raw_pos = 0;
+                            if this.read_raw_buf.capacity() > 256 * 1024 {
+                                this.read_raw_buf.shrink_to(65536);
+                            }
+                        }
+                        if buf.remaining() == 0 || this.read_plain_pos < this.read_plain_buf.len()
+                        {
+                            return Poll::Ready(Ok(()));
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            if produced {
+                return Poll::Ready(Ok(()));
+            }
+
+            if this.read_raw_pos > 0 {
+                this.read_raw_buf.copy_within(this.read_raw_pos.., 0);
+                let rem = this.read_raw_buf.len() - this.read_raw_pos;
+                this.read_raw_buf.truncate(rem);
+                this.read_raw_pos = 0;
+                if this.read_raw_buf.capacity() > 256 * 1024 && rem < 16384 {
+                    this.read_raw_buf.shrink_to(65536);
+                }
+            }
+
+            let mut tmp = [0u8; 32768];
+            let mut rbuf = ReadBuf::new(&mut tmp);
+            match Pin::new(&mut this.inner).poll_read(cx, &mut rbuf) {
+                Poll::Ready(Ok(())) => {
+                    let filled = rbuf.filled();
+                    if filled.is_empty() {
+                        this.eof = true;
+                        if !this.first_record_ok {
+                            this.invalidate_cache();
+                        }
+                        if this.peer_aead.is_none()
+                            || this.peer_padding_len > 0
+                            || this.pending_rec_hdr.is_some()
+                            || this.read_raw_pos < this.read_raw_buf.len()
+                        {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "vless-encryption: record truncated on EOF",
+                            )));
+                        }
+                        return Poll::Ready(Ok(()));
+                    }
+                    this.read_raw_buf.extend_from_slice(filled);
+                }
+                Poll::Ready(Err(e)) => {
+                    if !this.first_record_ok {
+                        this.invalidate_cache();
+                    }
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl AsyncWrite for VlessEncStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if this.write_pos < this.write_buf.len() {
+            match this.poll_drain_write(cx) {
+                Poll::Ready(Ok(())) => {
+                    if this.pending_write_len > 0 {
+                        let written = std::mem::replace(&mut this.pending_write_len, 0);
+                        return Poll::Ready(Ok(written));
+                    }
+                }
+                Poll::Ready(Err(e)) => {
+                    this.pending_write_len = 0;
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        let batch_len = buf.len().min(MAX_WRITE_BATCH);
+        this.write_buf.clear();
+        this.write_pos = 0;
+        this.pending_write_len = batch_len;
+        if !this.pre_write.is_empty() {
+            this.write_buf.extend_from_slice(&this.pre_write);
+            this.pre_write.clear();
+        }
+        for body in buf[..batch_len].chunks(WRITE_CHUNK) {
+            let header = encode_header(body.len() + TAG_LEN);
+            let exhausted = this.aead.is_exhausted();
+            let header_start = this.write_buf.len();
+            this.write_buf.extend_from_slice(&header);
+            this.aead.seal_ad_append(body, &header, &mut this.write_buf);
+            if exhausted {
+                let mut ctx = Vec::with_capacity(this.write_buf.len() - header_start);
+                ctx.extend_from_slice(&this.write_buf[header_start..]);
+                this.aead = Aead::new(&ctx, &this.united_key, this.use_aes);
+            }
+            if let Some(ctr) = this.write_ctr.as_mut() {
+                ctr.apply_keystream(&mut this.write_buf[header_start..header_start + 5]);
+            }
+        }
+
+        match this.poll_drain_write(cx) {
+            Poll::Ready(Ok(())) => {
+                let written = std::mem::replace(&mut this.pending_write_len, 0);
+                Poll::Ready(Ok(written))
+            }
+            Poll::Ready(Err(e)) => {
+                this.pending_write_len = 0;
+                Poll::Ready(Err(e))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match this.poll_drain_write(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => {
+                this.pending_write_len = 0;
+                return Poll::Ready(Err(e));
+            }
+            Poll::Pending => return Poll::Pending,
+        }
+        this.pending_write_len = 0;
+        Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match this.poll_drain_write(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => {
+                this.pending_write_len = 0;
+                return Poll::Ready(Err(e));
+            }
+            Poll::Pending => return Poll::Pending,
+        }
+        this.pending_write_len = 0;
+        Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct SlicedStream<S> {
+        inner: S,
+        max_read: usize,
+        max_write: usize,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for SlicedStream<S> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let cap = buf.remaining().min(self.max_read);
+            let mut tmp = vec![0u8; cap];
+            let mut rbuf = ReadBuf::new(&mut tmp);
+            match Pin::new(&mut self.inner).poll_read(cx, &mut rbuf) {
+                Poll::Ready(Ok(())) => {
+                    buf.put_slice(rbuf.filled());
+                    Poll::Ready(Ok(()))
+                }
+                other => other,
+            }
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for SlicedStream<S> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let cap = buf.len().min(self.max_write);
+            Pin::new(&mut self.inner).poll_write(cx, &buf[..cap])
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn vless_enc_stream_fragmented_duplex_flush_and_half_dead_write_error() {
+        let (x_dec, x_enc, pq_dec, pq_enc) = crate::tunnel::generate_vless_enc().unwrap();
+        let pairs = [
+            (x_dec, x_enc),
+            (
+                pq_dec.replacen(".native.", ".random.", 1),
+                pq_enc.replacen(".native.", ".random.", 1),
+            ),
+        ];
+        for (dec_raw, enc_raw) in pairs {
+            let srv = ServerInstance::from_raw(&dec_raw).unwrap().unwrap();
+            let cli = ClientInstance::from_raw(&enc_raw).unwrap().unwrap();
+
+            // 1. Prime-sliced concurrent full-duplex with backpressure & immediate drop after shutdown
+            let (c_raw, s_raw) = tokio::io::duplex(4096);
+            let c_sliced = SlicedStream {
+                inner: c_raw,
+                max_read: 137,
+                max_write: 211,
+            };
+            let s_sliced = SlicedStream {
+                inner: s_raw,
+                max_read: 149,
+                max_write: 193,
+            };
+            let payload_up: Vec<u8> = (0..90_000usize).map(|i| (i.wrapping_mul(31)) as u8).collect();
+            let payload_dn: Vec<u8> = (0..75_000usize).map(|i| (i.wrapping_mul(17)) as u8).collect();
+            let expected_up = payload_up.clone();
+            let expected_dn = payload_dn.clone();
+
+            let srv_c = srv.clone();
+            let srv_task = tokio::spawn(async move {
+                let s = srv_c.handshake(Box::new(s_sliced)).await.unwrap();
+                let (mut sr, mut sw) = tokio::io::split(s);
+                let w_task = tokio::spawn(async move {
+                    for chunk in payload_dn.chunks(313) {
+                        sw.write_all(chunk).await.unwrap();
+                    }
+                    sw.flush().await.unwrap();
+                    sw.shutdown().await.unwrap();
+                });
+                let mut got = vec![0u8; expected_up.len()];
+                sr.read_exact(&mut got).await.unwrap();
+                assert_eq!(got, expected_up);
+                w_task.await.unwrap();
+                // Dropping `sr`/`sw` right after `shutdown()` must never truncate the tail record
+            });
+
+            let c = cli.handshake(Box::new(c_sliced)).await.unwrap();
+            let (mut cr, mut cw) = tokio::io::split(c);
+            let cw_task = tokio::spawn(async move {
+                for chunk in payload_up.chunks(277) {
+                    cw.write_all(chunk).await.unwrap();
+                }
+                cw.flush().await.unwrap();
+            });
+            let mut got_dn = Vec::new();
+            cr.read_to_end(&mut got_dn).await.unwrap();
+            assert_eq!(got_dn, expected_dn);
+            cw_task.await.unwrap();
+            srv_task.await.unwrap();
+
+            // 2. Half-dead underlying socket: writes must fail immediately instead of buffering 256 KiB
+            cli.invalidate_ticket();
+            let (c_raw2, s_raw2) = tokio::io::duplex(4096);
+            let srv_c2 = srv.clone();
+            let srv_hs = tokio::spawn(async move { srv_c2.handshake(Box::new(s_raw2)).await.unwrap() });
+            let mut c2 = cli.handshake(Box::new(c_raw2)).await.unwrap();
+            let s2 = srv_hs.await.unwrap();
+            drop(s2);
+            let write_err = c2.write_all(&[0xabu8; 1024]).await;
+            assert!(
+                write_err.is_err(),
+                "VlessEncStream must surface broken peer immediately on write"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn vless_enc_0rtt_server_restart_invalidates_client_ticket_and_recovers() {
+        let (_, _, pq_dec, pq_enc) = crate::tunnel::generate_vless_enc().unwrap();
+        let dec_raw = pq_dec.replacen(".native.", ".xorpub.", 1);
+        let enc_raw = pq_enc.replacen(".native.", ".xorpub.", 1);
+
+        let srv1 = ServerInstance::from_raw(&dec_raw).unwrap().unwrap();
+        let cli = ClientInstance::from_raw(&enc_raw).unwrap().unwrap();
+        assert!(!cli.has_cached_ticket());
+
+        // Session 1: 1-RTT caches ticket
+        {
+            let (cr, sr) = tokio::io::duplex(65536);
+            let s_fut = {
+                let srv = srv1.clone();
+                tokio::spawn(async move {
+                    let mut s = srv.handshake(Box::new(sr)).await.unwrap();
+                    let mut b = [0u8; 4];
+                    s.read_exact(&mut b).await.unwrap();
+                    assert_eq!(&b, b"ping");
+                    s.write_all(b"pong").await.unwrap();
+                    s.flush().await.unwrap();
+                })
+            };
+            let mut c = cli.handshake(Box::new(cr)).await.unwrap();
+            assert!(cli.has_cached_ticket());
+            c.write_all(b"ping").await.unwrap();
+            c.flush().await.unwrap();
+            let mut resp = [0u8; 4];
+            c.read_exact(&mut resp).await.unwrap();
+            assert_eq!(&resp, b"pong");
+            s_fut.await.unwrap();
+        }
+
+        // Session 2: valid 0-RTT succeeds against srv1
+        {
+            let (cr, sr) = tokio::io::duplex(65536);
+            let s_fut = {
+                let srv = srv1.clone();
+                tokio::spawn(async move {
+                    let mut s = srv.handshake(Box::new(sr)).await.unwrap();
+                    let mut b = [0u8; 5];
+                    s.read_exact(&mut b).await.unwrap();
+                    assert_eq!(&b, b"0rtt!");
+                    s.write_all(b"ok200").await.unwrap();
+                    s.flush().await.unwrap();
+                })
+            };
+            let mut c = cli.handshake(Box::new(cr)).await.unwrap();
+            c.write_all(b"0rtt!").await.unwrap();
+            c.flush().await.unwrap();
+            let mut resp = [0u8; 5];
+            c.read_exact(&mut resp).await.unwrap();
+            assert_eq!(&resp, b"ok200");
+            s_fut.await.unwrap();
+        }
+
+        // Simulate server restart: srv2 has identical keys, empty 0-RTT session map
+        let srv2 = ServerInstance::from_raw(&dec_raw).unwrap().unwrap();
+        {
+            let (cr, sr) = tokio::io::duplex(65536);
+            let s_fut = {
+                let srv = srv2.clone();
+                tokio::spawn(async move { srv.handshake(Box::new(sr)).await })
+            };
+            let mut c = cli.handshake(Box::new(cr)).await.unwrap();
+            c.write_all(b"stale").await.unwrap();
+            c.flush().await.unwrap();
+            let mut resp = [0u8; 2];
+            assert!(
+                c.read_exact(&mut resp).await.is_err(),
+                "client must detect 0-RTT rejection noise immediately"
+            );
+            assert!(
+                !cli.has_cached_ticket(),
+                "client must invalidate stale 0-RTT ticket upon rejection"
+            );
+            assert_eq!(s_fut.await.unwrap().err().as_deref(), Some("expired ticket"));
+        }
+
+        // Next dial automatically performs 1-RTT against srv2 and caches a fresh ticket
+        {
+            let (cr, sr) = tokio::io::duplex(65536);
+            let s_fut = {
+                let srv = srv2.clone();
+                tokio::spawn(async move {
+                    let mut s = srv.handshake(Box::new(sr)).await.unwrap();
+                    let mut b = [0u8; 5];
+                    s.read_exact(&mut b).await.unwrap();
+                    assert_eq!(&b, b"fresh");
+                    s.write_all(b"ready").await.unwrap();
+                    s.flush().await.unwrap();
+                })
+            };
+            let mut c = cli.handshake(Box::new(cr)).await.unwrap();
+            assert!(cli.has_cached_ticket());
+            c.write_all(b"fresh").await.unwrap();
+            c.flush().await.unwrap();
+            let mut resp = [0u8; 5];
+            c.read_exact(&mut resp).await.unwrap();
+            assert_eq!(&resp, b"ready");
+            s_fut.await.unwrap();
+        }
+    }
 }

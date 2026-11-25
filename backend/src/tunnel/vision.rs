@@ -208,6 +208,15 @@ impl AsyncRead for VisionStream {
             let need_hdr = (if this.read_uuid { 0 } else { 16 }) + 5;
             let raw_avail = this.read_raw_buf.len() - this.read_raw_pos;
             if raw_avail >= need_hdr {
+                if !this.read_uuid
+                    && this.read_raw_buf[this.read_raw_pos..this.read_raw_pos + 16]
+                        != this.user_uuid
+                {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "vision user uuid mismatch",
+                    )));
+                }
                 let hdr_off = this.read_raw_pos + if this.read_uuid { 0 } else { 16 };
                 let cmd = this.read_raw_buf[hdr_off];
                 if cmd != VISION_CMD_CONTINUE
@@ -366,8 +375,13 @@ impl AsyncWrite for VisionStream {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if let Poll::Pending = this.poll_drain_write(cx) {
-            return Poll::Pending;
+        match this.poll_drain_write(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => {
+                this.pending_write_len = 0;
+                return Poll::Ready(Err(e));
+            }
+            Poll::Pending => return Poll::Pending,
         }
         this.pending_write_len = 0;
         Pin::new(&mut this.inner).poll_flush(cx)
@@ -375,12 +389,50 @@ impl AsyncWrite for VisionStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if let Poll::Pending = this.poll_drain_write(cx) {
-            return Poll::Pending;
+        match this.poll_drain_write(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => {
+                this.pending_write_len = 0;
+                return Poll::Ready(Err(e));
+            }
+            Poll::Pending => return Poll::Pending,
         }
         this.pending_write_len = 0;
         Pin::new(&mut this.inner).poll_shutdown(cx)
     }
+}
+
+pub fn append_initial_camouflage(buf: &mut Vec<u8>, user_uuid: &[u8; 16]) {
+    let mut wrote_uuid = false;
+    let pad_len = calc_vision_padding(0, true);
+    build_vision_frame_into(
+        buf,
+        user_uuid,
+        &mut wrote_uuid,
+        &[],
+        VISION_CMD_CONTINUE,
+        pad_len,
+    );
+}
+
+pub fn wrap_vision_stream_started(inner: BoxStream, user_uuid: [u8; 16]) -> BoxStream {
+    Box::new(VisionStream {
+        inner,
+        user_uuid,
+        wrote_uuid: true,
+        padded_chunks: 1,
+        write_direct: false,
+        write_buf: Vec::with_capacity(VISION_MAX_CONTENT + 512),
+        write_pos: 0,
+        pending_write_len: 0,
+        read_uuid: false,
+        read_direct: false,
+        read_raw_buf: Vec::with_capacity(65536),
+        read_raw_pos: 0,
+        read_plain_buf: Vec::with_capacity(32768),
+        read_plain_pos: 0,
+        eof: false,
+    })
 }
 
 pub fn wrap_vision_stream(

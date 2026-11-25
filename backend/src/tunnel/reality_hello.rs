@@ -107,9 +107,17 @@ pub fn build_client_hello(
         let exts_len_pos = body.len() - exts.len() - 2;
         let needed = 512usize.saturating_sub(total_with_hs_header);
         let pad_payload_len = needed.saturating_sub(4);
+        let trailing_grease = if body.len() >= exts_len_pos + 2 + 5 {
+            Some(body.split_off(body.len() - 5))
+        } else {
+            None
+        };
         put_u16(&mut body, 0x0015);
         put_u16(&mut body, pad_payload_len as u16);
         body.resize(body.len() + pad_payload_len, 0);
+        if let Some(tg) = trailing_grease {
+            body.extend_from_slice(&tg);
+        }
         let new_exts_len = (body.len() - exts_len_pos - 2) as u16;
         body[exts_len_pos..exts_len_pos + 2].copy_from_slice(&new_exts_len.to_be_bytes());
     }

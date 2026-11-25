@@ -64,13 +64,22 @@ pub const FRAME_PONG: u8 = 6;
 pub const MAX_PAYLOAD: usize = 32 << 10;
 pub const MAX_STREAMS: usize = 512;
 const STREAM_CHAN_CAP: usize = 256;
+const SESSION_DATA_CHAN_CAP: usize = 256;
+const SESSION_CTRL_CHAN_CAP: usize = 2048;
 const MAX_BINDING_SESSIONS: usize = 64;
-const SESSION_FRESH_RX_MS: u64 = 25_000;
-const SESSION_STALE_RX_MS: u64 = 40_000;
+const PING_INTERVAL: Duration = Duration::from_secs(8);
+const PING_SUSPECT_MS: u64 = 1_500;
+const OPPORTUNISTIC_PING_IDLE_MS: u64 = 1_000;
+const SESSION_FRESH_RX_MS: u64 = 18_000;
+const SESSION_READ_TIMEOUT: Duration = Duration::from_secs(25);
+const SESSION_READ_TIMEOUT_MS: u64 = 25_000;
+const SESSION_STALE_RX_MS: u64 = 28_000;
+const SESSION_WRITE_SLICE: Duration = Duration::from_secs(10);
 const STREAM_OPEN_IDLE_MS: u64 = 300_000;
 const STREAM_HALF_CLOSE_IDLE_MS: u64 = 60_000;
 const STREAM_SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
-const DEMUX_SEND_TIMEOUT: Duration = Duration::from_secs(3);
+const DEMUX_SINGLE_SEND_TIMEOUT: Duration = Duration::from_secs(3);
+const DEMUX_MULTI_SEND_TIMEOUT: Duration = Duration::from_millis(500);
 const DNS_CACHE_TTL: Duration = Duration::from_secs(60);
 const MAX_DNS_CACHE_ENTRIES: usize = 1024;
 const FRAME_HDR_LEN: usize = 7;
@@ -1375,7 +1384,7 @@ fn check_dest(dest: &str) -> Result<(), String> {
 fn parse_go_duration_non_negative(s: &str) -> Result<Duration, String> {
     let s = s.trim();
     if s.is_empty() {
-        return Ok(Duration::from_secs(60));
+        return Ok(Duration::from_secs(180));
     }
     if s.starts_with('-') {
         return Err("REALITY max_time_diff must be a non-negative duration".to_string());
@@ -1865,7 +1874,9 @@ pub fn validate(s: &Snapshot, local: &LocalTLS) -> Result<(), String> {
             {
                 return bad("server TLS certificate and key required");
             }
-            let network = if local.hysteria2.enabled() {
+            let network = if local.hysteria2.enabled()
+                || (local.xhttp.enabled() && local.xhttp.http_version == "3")
+            {
                 "udp"
             } else {
                 "tcp"
@@ -2158,8 +2169,8 @@ pub async fn write_vless<W: AsyncWrite + Unpin>(
     write_vless_with_flow(w, id, host, port, "").await
 }
 
-pub async fn write_vless_with_flow<W: AsyncWrite + Unpin>(
-    w: &mut W,
+fn encode_vless_request_into(
+    buf: &mut Vec<u8>,
     id: [u8; 16],
     host: &str,
     port: u16,
@@ -2169,7 +2180,7 @@ pub async fn write_vless_with_flow<W: AsyncWrite + Unpin>(
     if addons.len() > 255 {
         return Err("vless addons too large".to_string());
     }
-    let mut buf = Vec::with_capacity(32 + addons.len() + host.len());
+    buf.reserve(32 + addons.len() + host.len());
     buf.push(0); // version 0
     buf.extend_from_slice(&id);
     buf.push(addons.len() as u8);
@@ -2195,6 +2206,18 @@ pub async fn write_vless_with_flow<W: AsyncWrite + Unpin>(
         buf.push(host.len() as u8);
         buf.extend_from_slice(host.as_bytes());
     }
+    Ok(())
+}
+
+pub async fn write_vless_with_flow<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    id: [u8; 16],
+    host: &str,
+    port: u16,
+    flow: &str,
+) -> Result<(), String> {
+    let mut buf = Vec::with_capacity(64 + host.len());
+    encode_vless_request_into(&mut buf, id, host, port, flow)?;
     w.write_all(&buf).await.map_err(|e| e.to_string())
 }
 
@@ -2329,41 +2352,155 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<(u8, u32, Vec
 
 
 #[derive(Clone)]
+struct SessionSender {
+    ctrl_tx: mpsc::Sender<(u8, u32, Vec<u8>)>,
+    data_tx: mpsc::Sender<(u8, u32, Vec<u8>)>,
+}
+
+impl SessionSender {
+    fn new(
+        ctrl_tx: mpsc::Sender<(u8, u32, Vec<u8>)>,
+        data_tx: mpsc::Sender<(u8, u32, Vec<u8>)>,
+    ) -> Self {
+        Self { ctrl_tx, data_tx }
+    }
+
+    #[inline]
+    fn is_closed(&self) -> bool {
+        self.ctrl_tx.is_closed() || self.data_tx.is_closed()
+    }
+
+    #[inline]
+    async fn send_ctrl(&self, kind: u8, id: u32, payload: Vec<u8>) -> Result<(), ()> {
+        self.ctrl_tx.send((kind, id, payload)).await.map_err(|_| ())
+    }
+
+    #[inline]
+    fn send_ctrl_bg(&self, kind: u8, id: u32, payload: Vec<u8>) {
+        if let Err(mpsc::error::TrySendError::Full(item)) =
+            self.ctrl_tx.try_send((kind, id, payload))
+        {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                let tx = self.ctrl_tx.clone();
+                rt.spawn(async move {
+                    let _ = tx.send(item).await;
+                });
+            }
+        }
+    }
+
+    #[inline]
+    async fn send_data(&self, kind: u8, id: u32, payload: Vec<u8>) -> Result<(), ()> {
+        self.data_tx.send((kind, id, payload)).await.map_err(|_| ())
+    }
+}
+
+#[derive(Clone)]
 struct SessionHandle {
-    tx: mpsc::Sender<(u8, u32, Vec<u8>)>,
+    sender: SessionSender,
+    data_max_cap: usize,
     streams: Arc<Mutex<HashMap<u32, mpsc::Sender<(u8, Vec<u8>)>>>>,
     next_id: Arc<AtomicU32>,
     last_rx_ms: Arc<AtomicU64>,
+    unanswered_pings: Arc<AtomicU32>,
+    ping_sent_ms: Arc<AtomicU64>,
     active_streams: Arc<AtomicUsize>,
+    killed: Arc<AtomicBool>,
+    kill_tx: watch::Sender<bool>,
 }
 
 impl SessionHandle {
     fn new(
-        tx: mpsc::Sender<(u8, u32, Vec<u8>)>,
+        ctrl_tx: mpsc::Sender<(u8, u32, Vec<u8>)>,
+        data_tx: mpsc::Sender<(u8, u32, Vec<u8>)>,
         streams: Arc<Mutex<HashMap<u32, mpsc::Sender<(u8, Vec<u8>)>>>>,
-    ) -> Self {
-        Self {
-            tx,
-            streams,
-            next_id: Arc::new(AtomicU32::new(1)),
-            last_rx_ms: Arc::new(AtomicU64::new(mono_now_ms())),
-            active_streams: Arc::new(AtomicUsize::new(0)),
-        }
+    ) -> (Self, watch::Receiver<bool>) {
+        let data_max_cap = data_tx.max_capacity();
+        let (kill_tx, kill_rx) = watch::channel(false);
+        (
+            Self {
+                sender: SessionSender::new(ctrl_tx, data_tx),
+                data_max_cap,
+                streams,
+                next_id: Arc::new(AtomicU32::new(1)),
+                last_rx_ms: Arc::new(AtomicU64::new(mono_now_ms())),
+                unanswered_pings: Arc::new(AtomicU32::new(0)),
+                ping_sent_ms: Arc::new(AtomicU64::new(0)),
+                active_streams: Arc::new(AtomicUsize::new(0)),
+                killed: Arc::new(AtomicBool::new(false)),
+                kill_tx,
+            },
+            kill_rx,
+        )
+    }
+
+    #[inline]
+    fn is_closed(&self) -> bool {
+        self.killed.load(Ordering::Relaxed) || self.sender.is_closed()
+    }
+
+    fn evict(&self) {
+        self.killed.store(true, Ordering::Relaxed);
+        let _ = self.kill_tx.send(true);
+        self.streams.lock().unwrap().clear();
+        self.active_streams.store(0, Ordering::Relaxed);
     }
 
     #[inline]
     fn touch_rx(&self) {
         self.last_rx_ms.store(mono_now_ms(), Ordering::Relaxed);
+        self.unanswered_pings.store(0, Ordering::Relaxed);
+        self.ping_sent_ms.store(0, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn note_ping_sent(&self) {
+        let prev = self.unanswered_pings.fetch_add(1, Ordering::Relaxed);
+        if prev == 0 {
+            self.ping_sent_ms.store(mono_now_ms(), Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn maybe_probe_on_open(&self) {
+        let now = mono_now_ms();
+        if now.saturating_sub(self.last_rx_ms.load(Ordering::Relaxed)) >= OPPORTUNISTIC_PING_IDLE_MS
+            && self
+                .unanswered_pings
+                .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.ping_sent_ms.store(now, Ordering::Relaxed);
+            self.sender.send_ctrl_bg(FRAME_PING, 0, Vec::new());
+        }
+    }
+
+    #[inline]
+    fn is_suspect(&self, now_ms: u64) -> bool {
+        let unans = self.unanswered_pings.load(Ordering::Relaxed);
+        if unans >= 2 {
+            return true;
+        }
+        if unans == 1 {
+            let sent = self.ping_sent_ms.load(Ordering::Relaxed);
+            if sent > 0 && now_ms.saturating_sub(sent) > PING_SUSPECT_MS {
+                return true;
+            }
+        }
+        false
     }
 
     #[inline]
     fn load_score(&self) -> usize {
         let active = self.active_streams.load(Ordering::Relaxed);
-        let queued = 1024usize.saturating_sub(self.tx.capacity());
+        let queued = self.data_max_cap.saturating_sub(self.sender.data_tx.capacity());
         active.saturating_mul(4).saturating_add(queued)
     }
 
     fn open_stream(&self) -> Option<(u32, mpsc::Receiver<(u8, Vec<u8>)>)> {
+        if self.is_closed() {
+            return None;
+        }
         let mut map = self.streams.lock().unwrap();
         if map.len() >= MAX_STREAMS {
             self.active_streams.store(map.len(), Ordering::Relaxed);
@@ -2396,12 +2533,16 @@ fn pick_session(sessions: &SessionMap, binding_id: &str) -> Option<SessionHandle
     let list = guard.get(binding_id)?;
     let alive: Vec<&SessionHandle> = list
         .iter()
-        .filter(|h| !h.tx.is_closed() && h.active_streams.load(Ordering::Relaxed) < MAX_STREAMS)
+        .filter(|h| !h.is_closed() && h.active_streams.load(Ordering::Relaxed) < MAX_STREAMS)
         .collect();
     if alive.is_empty() {
         return None;
     }
-    let has_fresh = alive.iter().any(|h| {
+    let has_healthy_fresh = alive.iter().any(|h| {
+        now_ms.saturating_sub(h.last_rx_ms.load(Ordering::Relaxed)) <= SESSION_FRESH_RX_MS
+            && !h.is_suspect(now_ms)
+    });
+    let has_any_fresh = alive.iter().any(|h| {
         now_ms.saturating_sub(h.last_rx_ms.load(Ordering::Relaxed)) <= SESSION_FRESH_RX_MS
     });
     let start = RR.fetch_add(1, Ordering::Relaxed);
@@ -2410,12 +2551,21 @@ fn pick_session(sessions: &SessionMap, binding_id: &str) -> Option<SessionHandle
     let mut best_score = usize::MAX;
     for offset in 0..n {
         let h = alive[(start + offset) % n];
-        if has_fresh
-            && now_ms.saturating_sub(h.last_rx_ms.load(Ordering::Relaxed)) > SESSION_FRESH_RX_MS
-        {
+        let is_fresh =
+            now_ms.saturating_sub(h.last_rx_ms.load(Ordering::Relaxed)) <= SESSION_FRESH_RX_MS;
+        let suspect = h.is_suspect(now_ms);
+        if has_healthy_fresh && (!is_fresh || suspect) {
             continue;
         }
-        let score = h.load_score();
+        if !has_healthy_fresh && has_any_fresh && !is_fresh {
+            continue;
+        }
+        let ping_penalty = if suspect {
+            (h.unanswered_pings.load(Ordering::Relaxed) as usize).saturating_mul(256)
+        } else {
+            0
+        };
+        let score = h.load_score().saturating_add(ping_penalty);
         if score < best_score {
             best_score = score;
             best = Some(h);
@@ -2430,24 +2580,223 @@ fn pick_session(sessions: &SessionMap, binding_id: &str) -> Option<SessionHandle
 /// Unregister a finished session and drop its stream senders so that every
 /// mapping task bound to it observes EOF. Returns true when the binding has
 /// no live session left.
+#[cfg(test)]
 fn remove_session(sessions: &SessionMap, binding_id: &str, handle: &SessionHandle) -> bool {
-    handle.streams.lock().unwrap().clear();
-    handle.active_streams.store(0, Ordering::Relaxed);
-    let mut map = sessions.lock().unwrap();
-    let Some(list) = map.get_mut(binding_id) else {
-        return true;
+    remove_session_sync_linked(sessions, None, binding_id, handle).0
+}
+
+fn remove_session_sync_linked(
+    sessions: &SessionMap,
+    linked: Option<&Mutex<HashSet<String>>>,
+    binding_id: &str,
+    handle: &SessionHandle,
+) -> (bool, bool) {
+    handle.evict();
+    let mut stale_evicted = Vec::new();
+    let (empty, unlinked) = {
+        let mut map = sessions.lock().unwrap();
+        let now_ms = mono_now_ms();
+        let is_empty = if let Some(list) = map.get_mut(binding_id) {
+            let mut kept = Vec::with_capacity(list.len());
+            for h in list.drain(..) {
+                if Arc::ptr_eq(&h.streams, &handle.streams) {
+                    continue;
+                }
+                if h.is_closed()
+                    || now_ms.saturating_sub(h.last_rx_ms.load(Ordering::Relaxed))
+                        > SESSION_STALE_RX_MS
+                {
+                    stale_evicted.push(h);
+                } else {
+                    kept.push(h);
+                }
+            }
+            *list = kept;
+            if list.is_empty() {
+                map.remove(binding_id);
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        };
+        let unl = if is_empty {
+            linked
+                .map(|lk| lk.lock().unwrap().remove(binding_id))
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        (is_empty, unl)
     };
-    let now_ms = mono_now_ms();
-    list.retain(|h| {
-        !Arc::ptr_eq(&h.streams, &handle.streams)
-            && !h.tx.is_closed()
-            && now_ms.saturating_sub(h.last_rx_ms.load(Ordering::Relaxed)) <= SESSION_STALE_RX_MS
-    });
-    if list.is_empty() {
-        map.remove(binding_id);
-        true
-    } else {
-        false
+    for h in stale_evicted {
+        h.evict();
+    }
+    (empty, unlinked)
+}
+
+fn spawn_session_writer(
+    mut wr: BoxWrite,
+    mut ctrl_rx: mpsc::Receiver<(u8, u32, Vec<u8>)>,
+    mut data_rx: mpsc::Receiver<(u8, u32, Vec<u8>)>,
+    last_rx_ms: Arc<AtomicU64>,
+    mut conn_stop: watch::Receiver<bool>,
+    mut kill_rx: Option<watch::Receiver<bool>>,
+    write_done_tx: watch::Sender<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut write_buf = Vec::with_capacity(65536);
+        let mut pending_data: Option<(u8, u32, Vec<u8>)> = None;
+        loop {
+            write_buf.clear();
+            let first = if let Ok(item) = ctrl_rx.try_recv() {
+                Some(item)
+            } else if let Some(item) = pending_data.take() {
+                Some(item)
+            } else {
+                tokio::select! {
+                    biased;
+                    msg = ctrl_rx.recv() => match msg {
+                        Some(m) => Some(m),
+                        None => data_rx.recv().await,
+                    },
+                    msg = data_rx.recv() => msg,
+                }
+            };
+            let Some((kind, id, payload)) = first else {
+                break;
+            };
+            if append_frame(&mut write_buf, kind, id, &payload).is_err() {
+                continue;
+            }
+            while let Ok((k, i, p)) = ctrl_rx.try_recv() {
+                let _ = append_frame(&mut write_buf, k, i, &p);
+                if write_buf.len() >= 65536 {
+                    break;
+                }
+            }
+            while write_buf.len() < 65536 {
+                if let Ok((k, i, p)) = ctrl_rx.try_recv() {
+                    let _ = append_frame(&mut write_buf, k, i, &p);
+                    continue;
+                }
+                let next_data = pending_data.take().or_else(|| data_rx.try_recv().ok());
+                let Some((k, i, p)) = next_data else {
+                    break;
+                };
+                if p.len() > MAX_PAYLOAD {
+                    continue;
+                }
+                if !write_buf.is_empty() && write_buf.len() + FRAME_HDR_LEN + p.len() > 65536 {
+                    pending_data = Some((k, i, p));
+                    break;
+                }
+                let _ = append_frame(&mut write_buf, k, i, &p);
+            }
+            if write_buf.is_empty() {
+                continue;
+            }
+            let mut write_fut = std::pin::pin!(async {
+                wr.write_all(&write_buf).await?;
+                wr.flush().await
+            });
+            let mut write_ok = false;
+            loop {
+                tokio::select! {
+                    res = &mut write_fut => {
+                        write_ok = res.is_ok();
+                        break;
+                    }
+                    _ = conn_stop.changed() => {
+                        break;
+                    }
+                    _ = async {
+                        match kill_rx.as_mut() {
+                            Some(krx) => {
+                                let _ = krx.changed().await;
+                            }
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {
+                        break;
+                    }
+                    _ = tokio::time::sleep(SESSION_WRITE_SLICE) => {
+                        if mono_now_ms().saturating_sub(last_rx_ms.load(Ordering::Relaxed))
+                            > SESSION_READ_TIMEOUT_MS
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            if !write_ok {
+                break;
+            }
+            if write_buf.capacity() > 256 * 1024 {
+                write_buf.shrink_to(65536);
+            }
+        }
+        let _ = write_done_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), wr.shutdown()).await;
+    })
+}
+
+async fn demux_stream_frame(
+    kind: u8,
+    id: u32,
+    payload: Vec<u8>,
+    streams_map: &Mutex<HashMap<u32, mpsc::Sender<(u8, Vec<u8>)>>>,
+    active_streams: Option<&AtomicUsize>,
+    sender: &SessionSender,
+) {
+    if kind == FRAME_RESET {
+        let removed = {
+            let mut map = streams_map.lock().unwrap();
+            let r = map.remove(&id);
+            if let Some(cnt) = active_streams {
+                cnt.store(map.len(), Ordering::Relaxed);
+            }
+            r
+        };
+        if let Some(s) = removed {
+            let _ = s.try_send((kind, payload));
+        }
+        return;
+    }
+    let (stream_tx, stream_count) = {
+        let map = streams_map.lock().unwrap();
+        (map.get(&id).cloned(), map.len())
+    };
+    let Some(s) = stream_tx else {
+        return;
+    };
+    match s.try_send((kind, payload)) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(item)) => {
+            let wait_dur = if stream_count <= 1 {
+                DEMUX_SINGLE_SEND_TIMEOUT
+            } else {
+                DEMUX_MULTI_SEND_TIMEOUT
+            };
+            if tokio::time::timeout(wait_dur, s.send(item)).await.is_err() {
+                {
+                    let mut map = streams_map.lock().unwrap();
+                    map.remove(&id);
+                    if let Some(cnt) = active_streams {
+                        cnt.store(map.len(), Ordering::Relaxed);
+                    }
+                }
+                sender.send_ctrl_bg(FRAME_RESET, id, Vec::new());
+            }
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            let mut map = streams_map.lock().unwrap();
+            map.remove(&id);
+            if let Some(cnt) = active_streams {
+                cnt.store(map.len(), Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -2544,13 +2893,29 @@ pub(crate) fn fast_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
 fn build_tls_acceptor(local: &LocalTLS) -> Result<tokio_rustls::TlsAcceptor, String> {
     let (certs, key) = hysteria2::load_cert_and_key(&local.cert_pem, &local.key_pem)?;
     let provider = fast_crypto_provider();
-    let mut cfg = rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| e.to_string())?
+    let is_vision = normalize_flow(&local.flow).unwrap_or_default() == FLOW_VISION;
+    let builder = if is_vision {
+        rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|e| e.to_string())?
+    } else {
+        rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| e.to_string())?
+    };
+    let mut cfg = builder
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| e.to_string())?;
-    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    cfg.alpn_protocols = if local.xhttp.enabled() {
+        match xhttp::xhttp_effective_http_version(&local.xhttp, false) {
+            "1.1" => vec![b"http/1.1".to_vec()],
+            "2" => vec![b"h2".to_vec()],
+            _ => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        }
+    } else {
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    };
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(cfg)))
 }
 
@@ -2563,9 +2928,16 @@ fn build_tls_connector_with_sni(
     enable_sni: bool,
 ) -> Result<tokio_rustls::TlsConnector, String> {
     let provider = fast_crypto_provider();
-    let builder = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| e.to_string())?;
+    let is_vision = normalize_flow(&local.flow).unwrap_or_default() == FLOW_VISION;
+    let builder = if is_vision {
+        rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|e| e.to_string())?
+    } else {
+        rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| e.to_string())?
+    };
     let roots: Arc<rustls::RootCertStore> = if !local.ca_pem.trim().is_empty() {
         let mut custom = rustls::RootCertStore::empty();
         let mut reader = BufReader::new(local.ca_pem.as_bytes());
@@ -2588,7 +2960,15 @@ fn build_tls_connector_with_sni(
             .clone()
     };
     let mut cfg = builder.with_root_certificates(roots).with_no_client_auth();
-    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    cfg.alpn_protocols = if local.xhttp.enabled() {
+        match xhttp::xhttp_effective_http_version(&local.xhttp, false) {
+            "1.1" => vec![b"http/1.1".to_vec()],
+            "2" => vec![b"h2".to_vec()],
+            _ => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        }
+    } else {
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    };
     cfg.enable_sni = enable_sni;
     Ok(tokio_rustls::TlsConnector::from(Arc::new(cfg)))
 }
@@ -2614,7 +2994,7 @@ fn build_reality_server_cfg(local: &LocalTLS) -> Result<reality::RealityServerCo
     }
     let server_names = reality_names(&local.reality, "").unwrap_or_default();
     let max_time_diff_ms = parse_go_duration_non_negative(&local.reality.max_time_diff)
-        .unwrap_or(Duration::from_secs(60))
+        .unwrap_or(Duration::from_secs(180))
         .as_millis() as u64;
     Ok(reality::RealityServerConfig {
         private_key,
@@ -2640,9 +3020,13 @@ fn build_reality_client_cfg(
         .cloned()
         .unwrap_or_else(|| domain.trim().to_string());
     let alpn = if local.xhttp.enabled() {
-        vec!["h2".to_string(), "http/1.1".to_string()]
+        match xhttp::xhttp_effective_http_version(&local.xhttp, true) {
+            "1.1" => vec!["http/1.1".to_string()],
+            "2" => vec!["h2".to_string()],
+            _ => vec!["h2".to_string(), "http/1.1".to_string()],
+        }
     } else {
-        Vec::new()
+        vec!["h2".to_string(), "http/1.1".to_string()]
     };
     Ok(reality::RealityClientConfig {
         server_name,
@@ -2691,6 +3075,14 @@ async fn connect_outer_stream(
     binding: Binding,
     gw_addr: String,
 ) -> Result<BoxStream, String> {
+    let cert_verify_name = if !gw_addr.trim().is_empty() {
+        gw_addr.trim().to_string()
+    } else if !binding.domain.trim().is_empty() {
+        binding.domain.trim().to_string()
+    } else {
+        "localhost".to_string()
+    };
+
     let tcp = tokio::time::timeout(Duration::from_secs(8), TcpStream::connect(remote_addr))
         .await
         .map_err(|_| "tcp connect timeout".to_string())?
@@ -2706,16 +3098,7 @@ async fn connect_outer_stream(
         Ok(s)
     } else if local.transport_security == "tls" || (local.xhttp.enabled() && local.xhttp.tls) {
         let connector = build_tls_connector(&local)?;
-        let sni_str = if !local.xhttp.host.trim().is_empty() {
-            local.xhttp.host.trim().to_string()
-        } else if !gw_addr.trim().is_empty() {
-            gw_addr.trim().to_string()
-        } else if !binding.domain.trim().is_empty() {
-            binding.domain.trim().to_string()
-        } else {
-            "localhost".to_string()
-        };
-        let server_name = ServerName::try_from(sni_str)
+        let server_name = ServerName::try_from(cert_verify_name)
             .unwrap_or_else(|_| ServerName::try_from("localhost".to_string()).unwrap());
         let first_try = tokio::time::timeout(
             Duration::from_secs(8),
@@ -2767,7 +3150,23 @@ async fn serve_vless_session(
             res = tokio::time::timeout(Duration::from_secs(8), dec.handshake(stream)) => {
                 match res {
                     Ok(Ok(s)) => stream = s,
-                    _ => return,
+                    Ok(Err(e)) => {
+                        let lvl = if e == "expired ticket" { "INFO" } else { "WARN" };
+                        log_tunnel(
+                            &logger,
+                            lvl,
+                            format!("server vless decryption handshake rejected role=server err={}", e),
+                        );
+                        return;
+                    }
+                    Err(_) => {
+                        log_tunnel(
+                            &logger,
+                            "WARN",
+                            "server vless decryption handshake timeout role=server".to_string(),
+                        );
+                        return;
+                    }
                 }
             }
         }
@@ -2777,12 +3176,35 @@ async fn serve_vless_session(
         res = tokio::time::timeout(Duration::from_secs(8), read_vless_with_flow(&mut stream)) => {
             match res {
                 Ok(Ok(v)) => v,
-                _ => return,
+                Ok(Err(e)) => {
+                    log_tunnel(
+                        &logger,
+                        "WARN",
+                        format!("server vless request header failed role=server err={}", e),
+                    );
+                    return;
+                }
+                Err(_) => {
+                    log_tunnel(
+                        &logger,
+                        "WARN",
+                        "server vless request header timeout role=server".to_string(),
+                    );
+                    return;
+                }
             }
         }
     };
     let expected_flow = normalize_flow(&local.flow).unwrap_or_default();
     if !expected_flow.is_empty() && client_flow != expected_flow {
+        log_tunnel(
+            &logger,
+            "WARN",
+            format!(
+                "server vless flow mismatch role=server expected={} got={}",
+                expected_flow, client_flow
+            ),
+        );
         return;
     }
     let Some(binding) = bindings
@@ -2793,13 +3215,26 @@ async fn serve_vless_session(
         })
         .cloned()
     else {
+        log_tunnel(
+            &logger,
+            "WARN",
+            format!(
+                "server vless binding not matched role=server domain={}",
+                domain
+            ),
+        );
         return;
     };
-    if stream.write_all(&[0, 0]).await.is_err() || stream.flush().await.is_err() {
-        return;
-    }
     if expected_flow == FLOW_VISION {
-        stream = vision::wrap_vision_stream(stream, uuid_bytes, false);
+        let mut resp_flight = Vec::with_capacity(1500);
+        resp_flight.extend_from_slice(&[0, 0]);
+        vision::append_initial_camouflage(&mut resp_flight, &uuid_bytes);
+        if stream.write_all(&resp_flight).await.is_err() || stream.flush().await.is_err() {
+            return;
+        }
+        stream = vision::wrap_vision_stream_started(stream, uuid_bytes);
+    } else if stream.write_all(&[0, 0]).await.is_err() || stream.flush().await.is_err() {
+        return;
     }
     serve_established_session(
         stream,
@@ -2825,7 +3260,46 @@ async fn serve_established_session(
     if *conn_stop.borrow() {
         return;
     }
-    if linked.lock().unwrap().insert(binding.id.clone()) {
+    let (ctrl_tx, ctrl_rx) = mpsc::channel::<(u8, u32, Vec<u8>)>(SESSION_CTRL_CHAN_CAP);
+    let (data_tx, data_rx) = mpsc::channel::<(u8, u32, Vec<u8>)>(SESSION_DATA_CHAN_CAP);
+    let streams_map: Arc<Mutex<HashMap<u32, mpsc::Sender<(u8, Vec<u8>)>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let (handle, mut kill_rx) = SessionHandle::new(ctrl_tx, data_tx, streams_map.clone());
+    let mut to_evict = Vec::new();
+    let newly_linked = {
+        let now_ms = mono_now_ms();
+        let mut guard = sessions.lock().unwrap();
+        let list = guard.entry(binding.id.clone()).or_default();
+        let mut kept = Vec::with_capacity(list.len() + 1);
+        for h in list.drain(..) {
+            if h.is_closed()
+                || now_ms.saturating_sub(h.last_rx_ms.load(Ordering::Relaxed))
+                    > SESSION_STALE_RX_MS
+            {
+                to_evict.push(h);
+            } else {
+                kept.push(h);
+            }
+        }
+        while kept.len() >= MAX_BINDING_SESSIONS {
+            if let Some((oldest_idx, _)) = kept
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, h)| h.last_rx_ms.load(Ordering::Relaxed))
+            {
+                to_evict.push(kept.remove(oldest_idx));
+            } else {
+                break;
+            }
+        }
+        kept.push(handle.clone());
+        *list = kept;
+        linked.lock().unwrap().insert(binding.id.clone())
+    };
+    for h in to_evict {
+        h.evict();
+    }
+    if newly_linked {
         log_tunnel(
             &logger,
             "INFO",
@@ -2836,131 +3310,58 @@ async fn serve_established_session(
         );
         state_notify.notify_waiters();
     }
-    let (tx, mut out_rx) = mpsc::channel::<(u8, u32, Vec<u8>)>(1024);
-    let streams_map: Arc<Mutex<HashMap<u32, mpsc::Sender<(u8, Vec<u8>)>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    let handle = SessionHandle::new(tx.clone(), streams_map.clone());
-    {
-        let now_ms = mono_now_ms();
-        let mut guard = sessions.lock().unwrap();
-        let list = guard.entry(binding.id.clone()).or_default();
-        list.retain(|h| {
-            !h.tx.is_closed()
-                && now_ms.saturating_sub(h.last_rx_ms.load(Ordering::Relaxed))
-                    <= SESSION_STALE_RX_MS
-        });
-        while list.len() >= MAX_BINDING_SESSIONS {
-            if let Some((oldest_idx, _)) = list
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, h)| h.last_rx_ms.load(Ordering::Relaxed))
-            {
-                let evicted = list.remove(oldest_idx);
-                evicted.streams.lock().unwrap().clear();
-                evicted.active_streams.store(0, Ordering::Relaxed);
-            } else {
-                break;
-            }
-        }
-        list.push(handle.clone());
-    }
-    let (mut rd, mut wr) = split_tunnel_stream(stream);
+    let (mut rd, wr) = split_tunnel_stream(stream);
     let (write_done_tx, mut write_done_rx) = watch::channel(false);
-    let write_task = tokio::spawn(async move {
-        let mut write_buf = Vec::with_capacity(65536);
-        while let Some((kind, id, payload)) = out_rx.recv().await {
-            write_buf.clear();
-            if append_frame(&mut write_buf, kind, id, &payload).is_err() {
-                break;
-            }
-            while write_buf.len() < 65536 {
-                let Ok((k, i, p)) = out_rx.try_recv() else { break };
-                if append_frame(&mut write_buf, k, i, &p).is_err() {
-                    let _ = write_done_tx.send(true);
-                    let _ = wr.shutdown().await;
-                    return;
-                }
-            }
-            let write_res = tokio::time::timeout(Duration::from_secs(30), async {
-                wr.write_all(&write_buf).await?;
-                wr.flush().await
-            })
-            .await;
-            if !matches!(write_res, Ok(Ok(()))) {
-                break;
-            }
-            if write_buf.capacity() > 256 * 1024 {
-                write_buf.shrink_to(65536);
-            }
-        }
-        let _ = write_done_tx.send(true);
-        let _ = wr.shutdown().await;
-    });
-    let tx_ping = tx.clone();
+    let write_task = spawn_session_writer(
+        wr,
+        ctrl_rx,
+        data_rx,
+        handle.last_rx_ms.clone(),
+        conn_stop.clone(),
+        Some(kill_rx.clone()),
+        write_done_tx,
+    );
+    let handle_ping = handle.clone();
     let ping_task = tokio::spawn(async move {
-        let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
+        let mut ping_interval = tokio::time::interval(PING_INTERVAL);
         ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ping_interval.tick().await;
         loop {
             ping_interval.tick().await;
-            if tx_ping.try_send((FRAME_PING, 0, Vec::new())).is_err() {
-                let _ = tx_ping.send((FRAME_PING, 0, Vec::new())).await;
+            handle_ping.note_ping_sent();
+            if handle_ping
+                .sender
+                .send_ctrl(FRAME_PING, 0, Vec::new())
+                .await
+                .is_err()
+            {
+                break;
             }
         }
     });
     loop {
         tokio::select! {
             _ = conn_stop.changed() => break,
+            _ = kill_rx.changed() => break,
             _ = write_done_rx.changed() => break,
-            frame = tokio::time::timeout(Duration::from_secs(45), read_frame(&mut rd)) => {
+            frame = tokio::time::timeout(SESSION_READ_TIMEOUT, read_frame(&mut rd)) => {
                 let Ok(Ok((kind, id, payload))) = frame else { break };
                 handle.touch_rx();
                 match kind {
                     FRAME_PING => {
-                        if tx.try_send((FRAME_PONG, 0, Vec::new())).is_err() {
-                            let tx_pong = tx.clone();
-                            tokio::spawn(async move {
-                                let _ = tx_pong.send((FRAME_PONG, 0, Vec::new())).await;
-                            });
-                        }
+                        handle.sender.send_ctrl_bg(FRAME_PONG, 0, Vec::new());
                     }
                     FRAME_PONG => {}
                     FRAME_DATA | FRAME_HALF | FRAME_RESET => {
-                        if kind == FRAME_RESET {
-                            let removed = {
-                                let mut map = streams_map.lock().unwrap();
-                                let r = map.remove(&id);
-                                handle.active_streams.store(map.len(), Ordering::Relaxed);
-                                r
-                            };
-                            if let Some(s) = removed {
-                                let _ = s.try_send((kind, payload));
-                            }
-                        } else {
-                            let sender = streams_map.lock().unwrap().get(&id).cloned();
-                            if let Some(s) = sender {
-                                match s.try_send((kind, payload)) {
-                                    Ok(()) => {}
-                                    Err(mpsc::error::TrySendError::Full(item)) => {
-                                        if tokio::time::timeout(DEMUX_SEND_TIMEOUT, s.send(item))
-                                            .await
-                                            .is_err()
-                                        {
-                                            let mut map = streams_map.lock().unwrap();
-                                            map.remove(&id);
-                                            handle.active_streams.store(map.len(), Ordering::Relaxed);
-                                            drop(map);
-                                            let _ = tx.try_send((FRAME_RESET, id, Vec::new()));
-                                        }
-                                    }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                                        let mut map = streams_map.lock().unwrap();
-                                        map.remove(&id);
-                                        handle.active_streams.store(map.len(), Ordering::Relaxed);
-                                    }
-                                }
-                            }
-                        }
+                        demux_stream_frame(
+                            kind,
+                            id,
+                            payload,
+                            &streams_map,
+                            Some(&handle.active_streams),
+                            &handle.sender,
+                        )
+                        .await;
                     }
                     _ => break,
                 }
@@ -2969,11 +3370,12 @@ async fn serve_established_session(
     }
     ping_task.abort();
     write_task.abort();
-    drop(tx);
-    if remove_session(&sessions, &binding.id, &handle) {
-        if linked.lock().unwrap().remove(&binding.id) {
-            state_notify.notify_waiters();
-        }
+    let (was_last, unlinked) =
+        remove_session_sync_linked(&sessions, Some(&linked), &binding.id, &handle);
+    if unlinked {
+        state_notify.notify_waiters();
+    }
+    if was_last {
         log_tunnel(
             &logger,
             "INFO",
@@ -3065,6 +3467,11 @@ fn start_instance(
         }
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let shared_xhttp_state = if local.xhttp.enabled() {
+                Some(xhttp::XhttpServerState::new())
+            } else {
+                None
+            };
             if local.hysteria2.enabled() {
                 if let Some(std_udp) = transport_udp {
                     let server_cfg = hysteria2::build_quic_server_config(local)?;
@@ -3100,7 +3507,12 @@ fn start_instance(
                                             let log_c = logger_clone.clone();
                                             let conn_stop = rx.clone();
                                             tokio::spawn(async move {
-                                                let Ok(conn) = incoming.await else { return };
+                                                let Ok(Ok(conn)) = tokio::time::timeout(
+                                                    Duration::from_secs(10),
+                                                    incoming,
+                                                ).await else {
+                                                    return;
+                                                };
                                                 let Ok((stream, binding)) =
                                                     hysteria2::hy2_accept_connection(conn, &local_c, &bindings).await
                                                 else {
@@ -3114,6 +3526,126 @@ fn start_instance(
                             });
                             tasks.push(jh.abort_handle());
                         }
+                    }
+                }
+            } else if local.xhttp.enabled() && local.xhttp.http_version == "3" {
+                if let (Some(std_udp), Some(xs_root)) = (transport_udp, shared_xhttp_state.clone()) {
+                    let server_cfg = hysteria2::build_quic_server_config(local)?;
+                    let vless_dec_h3 = vless_enc::ServerInstance::from_raw(&local.decryption)?;
+                    if let Ok(quic_ep) = quinn::Endpoint::new(
+                        quinn::EndpointConfig::default(),
+                        Some(server_cfg),
+                        std_udp,
+                        Arc::new(quinn::TokioRuntime),
+                    ) {
+                        quic_endpoints.push(quic_ep.clone());
+                        let bindings = s.bindings.clone();
+                        let local_clone = local.clone();
+                        let sessions_clone = sessions.clone();
+                        let linked_clone = linked.clone();
+                        let notify_clone = state_notify.clone();
+                        let logger_clone = logger.clone();
+                        let mut rx = stop_rx.clone();
+                        let jh = handle.spawn(async move {
+                            loop {
+                                tokio::select! {
+                                    _ = rx.changed() => {
+                                        quic_ep.close(0u32.into(), b"shutdown");
+                                        break;
+                                    }
+                                    inc = quic_ep.accept() => {
+                                        let Some(incoming) = inc else { break };
+                                        let bindings = bindings.clone();
+                                        let local_c = local_clone.clone();
+                                        let sessions = sessions_clone.clone();
+                                        let linked = linked_clone.clone();
+                                        let notify_c = notify_clone.clone();
+                                        let log_c = logger_clone.clone();
+                                        let v_dec = vless_dec_h3.clone();
+                                        let xs_conn = xs_root.clone();
+                                        let mut conn_stop = rx.clone();
+                                        tokio::spawn(async move {
+                                            let Ok(Ok(conn)) = tokio::time::timeout(
+                                                Duration::from_secs(10),
+                                                incoming,
+                                            ).await else {
+                                                return;
+                                            };
+                                            let Ok(Ok(uni_abort)) = tokio::time::timeout(
+                                                Duration::from_secs(5),
+                                                hysteria2::init_h3_connection(&conn),
+                                            )
+                                            .await
+                                            else {
+                                                conn.close(0u32.into(), b"h3 control err");
+                                                return;
+                                            };
+                                            loop {
+                                                tokio::select! {
+                                                    _ = conn_stop.changed() => {
+                                                        conn.close(0u32.into(), b"shutdown");
+                                                        break;
+                                                    }
+                                                    bi = conn.accept_bi() => {
+                                                        let Ok((send, recv)) = bi else { break };
+                                                        let conn_st = conn.clone();
+                                                        let local_st = local_c.clone();
+                                                        let local_in = local_c.clone();
+                                                        let xs_st = xs_conn.clone();
+                                                        let b_st = bindings.clone();
+                                                        let s_st = sessions.clone();
+                                                        let l_st = linked.clone();
+                                                        let n_st = notify_c.clone();
+                                                        let lg_st = log_c.clone();
+                                                        let vd_st = v_dec.clone();
+                                                        let cs_st = conn_stop.clone();
+                                                        let mut stop_st = conn_stop.clone();
+                                                        tokio::spawn(async move {
+                                                            tokio::select! {
+                                                                _ = stop_st.changed() => {}
+                                                                _ = xhttp::handle_xhttp_h3_stream(
+                                                                    send,
+                                                                    recv,
+                                                                    conn_st,
+                                                                    local_st,
+                                                                    xs_st,
+                                                                    move |tunnel_stream| {
+                                                                        let b = b_st.clone();
+                                                                        let s = s_st.clone();
+                                                                        let l = l_st.clone();
+                                                                        let n = n_st.clone();
+                                                                        let cs = cs_st.clone();
+                                                                        let vd = vd_st.clone();
+                                                                        let lc = local_in.clone();
+                                                                        let lg = lg_st.clone();
+                                                                        tokio::spawn(async move {
+                                                                            serve_vless_session(
+                                                                                tunnel_stream,
+                                                                                lc,
+                                                                                vd,
+                                                                                b,
+                                                                                s,
+                                                                                l,
+                                                                                n,
+                                                                                lg,
+                                                                                cs,
+                                                                            )
+                                                                            .await;
+                                                                        });
+                                                                    },
+                                                                ) => {}
+                                                            }
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                            uni_abort.abort();
+                                        });
+                                    }
+                                }
+                            }
+                        });
+                        tasks.push(jh.abort_handle());
                     }
                 }
             }
@@ -3141,11 +3673,7 @@ fn start_instance(
                         None
                     };
                     let vless_dec = vless_enc::ServerInstance::from_raw(&local.decryption)?;
-                    let xhttp_state = if local.xhttp.enabled() {
-                        Some(xhttp::XhttpServerState::new())
-                    } else {
-                        None
-                    };
+                    let xhttp_state = shared_xhttp_state;
                     let logger_clone = logger.clone();
                     let mut rx = stop_rx.clone();
                     let conn_sem = Arc::new(tokio::sync::Semaphore::new(4096));
@@ -3235,6 +3763,7 @@ fn start_instance(
                 if let Ok(tokio_ln) = TcpListener::from_std(std_ln) {
                     let sessions_clone = sessions.clone();
                     let traffic_clone = traffic.clone();
+                    let notify_map = state_notify.clone();
                     let mut rx = stop_rx.clone();
                     let jh = handle.spawn(async move {
                         let rate_bps = bandwidth_bytes(&m.bandwidth_limit).unwrap_or(0) as u64;
@@ -3246,13 +3775,32 @@ fn start_instance(
                                 accepted = tokio_ln.accept() => {
                                     let Ok((pub_stream, _)) = accepted else { break };
                                     configure_tcp_stream(&pub_stream);
-                                    let Some(sess) = pick_session(&sessions_clone, &m.binding_id) else { continue };
-                                    let Some((stream_id, mut in_rx)) = sess.open_stream() else { continue };
+                                    let sessions_req = sessions_clone.clone();
+                                    let notify_req = notify_map.clone();
+                                    let mut stop_req = rx.clone();
                                     let m_clone = m.clone();
                                     let traffic_conn = traffic_clone.clone();
                                     let mux_t = mux_type.clone();
                                     let up_lim = up_limiter.clone();
                                     tokio::spawn(async move {
+                                        let mut sess_opt = pick_session(&sessions_req, &m_clone.binding_id);
+                                        if sess_opt.is_none() {
+                                            let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+                                            while tokio::time::Instant::now() < deadline {
+                                                let notified = notify_req.notified();
+                                                tokio::select! {
+                                                    _ = stop_req.changed() => return,
+                                                    _ = notified => {}
+                                                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                                                }
+                                                sess_opt = pick_session(&sessions_req, &m_clone.binding_id);
+                                                if sess_opt.is_some() {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        let Some(sess) = sess_opt else { return };
+                                        let Some((stream_id, mut in_rx)) = sess.open_stream() else { return };
                                         let meta = if mux_t.is_empty() {
                                             m_clone.target_host.clone()
                                         } else {
@@ -3261,12 +3809,18 @@ fn start_instance(
                                         let mut open_payload = Vec::with_capacity(2 + meta.len());
                                         open_payload.extend_from_slice(&(m_clone.target_port as u16).to_be_bytes());
                                         open_payload.extend_from_slice(meta.as_bytes());
-                                        if sess.tx.send((FRAME_OPEN, stream_id, open_payload)).await.is_err() {
+                                        sess.maybe_probe_on_open();
+                                        if sess
+                                            .sender
+                                            .send_ctrl(FRAME_OPEN, stream_id, open_payload)
+                                            .await
+                                            .is_err()
+                                        {
                                             sess.close_stream(stream_id);
                                             return;
                                         }
                                         let (mut pr, mut pw) = pub_stream.into_split();
-                                        let tx_up = sess.tx.clone();
+                                        let sender_up = sess.sender.clone();
                                         let t_up = traffic_conn.clone();
                                         let mid_up = m_clone.id.clone();
                                         let last_active_ms = Arc::new(AtomicU64::new(mono_now_ms()));
@@ -3285,19 +3839,29 @@ fn start_instance(
                                                 {
                                                     Ok(Ok(0)) => {
                                                         up_half.store(true, Ordering::Relaxed);
-                                                        let _ = tx_up.send((FRAME_HALF, stream_id, Vec::new())).await;
+                                                        let _ = sender_up
+                                                            .send_data(FRAME_HALF, stream_id, Vec::new())
+                                                            .await;
                                                         break;
                                                     }
                                                     Ok(Ok(n)) => {
                                                         up_active.store(mono_now_ms(), Ordering::Relaxed);
                                                         up_lim.wait(n).await;
                                                         t_up.add(&mid_up, n, 0);
-                                                        if tx_up.send((FRAME_DATA, stream_id, buf[..n].to_vec())).await.is_err() {
+                                                        if sender_up
+                                                            .send_data(FRAME_DATA, stream_id, buf[..n].to_vec())
+                                                            .await
+                                                            .is_err()
+                                                        {
                                                             break;
                                                         }
                                                     }
                                                     Ok(Err(_)) => {
-                                                        let _ = tx_up.send((FRAME_RESET, stream_id, Vec::new())).await;
+                                                        sender_up.send_ctrl_bg(
+                                                            FRAME_RESET,
+                                                            stream_id,
+                                                            Vec::new(),
+                                                        );
                                                         break;
                                                     }
                                                     Err(_) => {
@@ -3310,7 +3874,11 @@ fn start_instance(
                                                             up_active.load(Ordering::Relaxed),
                                                         ) >= idle_limit
                                                         {
-                                                            let _ = tx_up.send((FRAME_RESET, stream_id, Vec::new())).await;
+                                                            sender_up.send_ctrl_bg(
+                                                                FRAME_RESET,
+                                                                stream_id,
+                                                                Vec::new(),
+                                                            );
                                                             break;
                                                         }
                                                     }
@@ -3390,7 +3958,7 @@ fn start_instance(
                                         drop(in_rx);
                                         sess.close_stream(stream_id);
                                         if !remote_reset && !half_closed {
-                                            let _ = sess.tx.send((FRAME_RESET, stream_id, Vec::new())).await;
+                                            sess.sender.send_ctrl_bg(FRAME_RESET, stream_id, Vec::new());
                                         }
                                     });
                                 }
@@ -3419,13 +3987,24 @@ fn start_instance(
                                 _ = rx.changed() => break,
                                 recv_res = udp_sock.recv_from(&mut buf) => {
                                     let Ok((n, peer_addr)) = recv_res else { break };
+                                    if n + 8 > MAX_PAYLOAD {
+                                        continue;
+                                    }
                                     let pkt = buf[..n].to_vec();
                                     if let Some(tx) = peer_streams.get(&peer_addr) {
-                                        if tx.try_send(pkt.clone()).is_ok() {
-                                            traffic_clone.add(&m.id, n, 0);
-                                            continue;
+                                        match tx.try_send(pkt.clone()) {
+                                            Ok(()) => {
+                                                traffic_clone.add(&m.id, n, 0);
+                                                continue;
+                                            }
+                                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                                // Tail-drop burst packet while preserving peer NAT mapping
+                                                continue;
+                                            }
+                                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                                peer_streams.remove(&peer_addr);
+                                            }
                                         }
-                                        peer_streams.remove(&peer_addr);
                                     }
                                     if peer_streams.len() >= 64 {
                                         peer_streams.retain(|_, tx| !tx.is_closed());
@@ -3435,7 +4014,7 @@ fn start_instance(
                                     }
                                     let Some(sess) = pick_session(&sessions_clone, &m.binding_id) else { continue };
                                     let Some((stream_id, mut in_rx)) = sess.open_stream() else { continue };
-                                    let (pkt_tx, mut pkt_rx) = mpsc::channel::<Vec<u8>>(64);
+                                    let (pkt_tx, mut pkt_rx) = mpsc::channel::<Vec<u8>>(256);
                                     let _ = pkt_tx.try_send(pkt);
                                     traffic_clone.add(&m.id, n, 0);
                                     peer_streams.insert(peer_addr, pkt_tx);
@@ -3448,16 +4027,29 @@ fn start_instance(
                                         let mut open_payload = Vec::with_capacity(2 + meta.len());
                                         open_payload.extend_from_slice(&(m_clone.target_port as u16).to_be_bytes());
                                         open_payload.extend_from_slice(meta.as_bytes());
-                                        if sess.tx.send((FRAME_OPEN, stream_id, open_payload)).await.is_err() {
+                                        sess.maybe_probe_on_open();
+                                        if sess
+                                            .sender
+                                            .send_ctrl(FRAME_OPEN, stream_id, open_payload)
+                                            .await
+                                            .is_err()
+                                        {
                                             sess.close_stream(stream_id);
                                             return;
                                         }
-                                        let tx_up = sess.tx.clone();
+                                        let sender_up = sess.sender.clone();
                                         let up_task = tokio::spawn(async move {
                                             while let Some(dg) = pkt_rx.recv().await {
                                                 up_lim.wait(dg.len()).await;
                                                 let xudp = encode_xudp(&dg);
-                                                if tx_up.send((FRAME_DATA, stream_id, xudp)).await.is_err() {
+                                                if xudp.len() > MAX_PAYLOAD {
+                                                    continue;
+                                                }
+                                                if sender_up
+                                                    .send_data(FRAME_DATA, stream_id, xudp)
+                                                    .await
+                                                    .is_err()
+                                                {
                                                     break;
                                                 }
                                             }
@@ -3474,7 +4066,7 @@ fn start_instance(
                                         }
                                         up_task.abort();
                                         sess.close_stream(stream_id);
-                                        let _ = sess.tx.send((FRAME_RESET, stream_id, Vec::new())).await;
+                                        sess.sender.send_ctrl_bg(FRAME_RESET, stream_id, Vec::new());
                                     });
                                 }
                             }
@@ -3558,9 +4150,12 @@ fn start_instance(
                                 Ok(stream) => {
                                     let prev_fails = fail_streak;
                                     fail_streak = 0;
-                                    let prev_workers = workers_ref.fetch_add(1, Ordering::SeqCst);
-                                    let newly_linked =
-                                        linked_clone.lock().unwrap().insert(b_clone.id.clone());
+                                    let (prev_workers, newly_linked) = {
+                                        let mut lg = linked_clone.lock().unwrap();
+                                        let prev = workers_ref.fetch_add(1, Ordering::SeqCst);
+                                        let ins = lg.insert(b_clone.id.clone());
+                                        (prev, ins)
+                                    };
                                     if (worker_idx == 0 && !ever_connected)
                                         || (prev_workers == 0 && prev_fails > 0)
                                     {
@@ -3581,129 +4176,111 @@ fn start_instance(
                                     if newly_linked {
                                         notify_clone.notify_waiters();
                                     }
-                                let (tx, mut out_rx) = mpsc::channel::<(u8, u32, Vec<u8>)>(1024);
-                                let streams_map: Arc<
-                                    Mutex<HashMap<u32, mpsc::Sender<(u8, Vec<u8>)>>>,
-                                > = Arc::new(Mutex::new(HashMap::new()));
-                                let (mut rd, mut wr) = split_tunnel_stream(stream);
-                                let (write_done_tx, mut write_done_rx) = watch::channel(false);
-                                let write_task = tokio::spawn(async move {
-                                    let mut write_buf = Vec::with_capacity(65536);
-                                    while let Some((kind, id, payload)) = out_rx.recv().await {
-                                        write_buf.clear();
-                                        if append_frame(&mut write_buf, kind, id, &payload).is_err() {
-                                            break;
-                                        }
-                                        while write_buf.len() < 65536 {
-                                            let Ok((k, i, p)) = out_rx.try_recv() else { break };
-                                            if append_frame(&mut write_buf, k, i, &p).is_err() {
-                                                let _ = write_done_tx.send(true);
-                                                let _ = wr.shutdown().await;
-                                                return;
-                                            }
-                                        }
-                                        let write_res = tokio::time::timeout(
-                                            Duration::from_secs(30),
-                                            async {
-                                                wr.write_all(&write_buf).await?;
-                                                wr.flush().await
-                                            },
-                                        )
-                                        .await;
-                                        if !matches!(write_res, Ok(Ok(()))) {
-                                            break;
-                                        }
-                                        if write_buf.capacity() > 256 * 1024 {
-                                            write_buf.shrink_to(65536);
-                                        }
-                                    }
-                                    let _ = write_done_tx.send(true);
-                                    let _ = wr.shutdown().await;
-                                });
-                                let tx_ping = tx.clone();
-                                let ping_task = tokio::spawn(async move {
-                                    let mut ping_interval =
-                                        tokio::time::interval(Duration::from_secs(15));
-                                    ping_interval.set_missed_tick_behavior(
-                                        tokio::time::MissedTickBehavior::Delay,
+                                    let (ctrl_tx, ctrl_rx) =
+                                        mpsc::channel::<(u8, u32, Vec<u8>)>(SESSION_CTRL_CHAN_CAP);
+                                    let (data_tx, data_rx) =
+                                        mpsc::channel::<(u8, u32, Vec<u8>)>(SESSION_DATA_CHAN_CAP);
+                                    let sender = SessionSender::new(ctrl_tx, data_tx);
+                                    let last_rx_ms = Arc::new(AtomicU64::new(mono_now_ms()));
+                                    let streams_map: Arc<
+                                        Mutex<HashMap<u32, mpsc::Sender<(u8, Vec<u8>)>>>,
+                                    > = Arc::new(Mutex::new(HashMap::new()));
+                                    let (mut rd, wr) = split_tunnel_stream(stream);
+                                    let (write_done_tx, mut write_done_rx) = watch::channel(false);
+                                    let write_task = spawn_session_writer(
+                                        wr,
+                                        ctrl_rx,
+                                        data_rx,
+                                        last_rx_ms.clone(),
+                                        rx.clone(),
+                                        None,
+                                        write_done_tx,
                                     );
-                                    ping_interval.tick().await;
-                                    loop {
+                                    let sender_ping = sender.clone();
+                                    let ping_task = tokio::spawn(async move {
+                                        let mut ping_interval = tokio::time::interval(PING_INTERVAL);
+                                        ping_interval.set_missed_tick_behavior(
+                                            tokio::time::MissedTickBehavior::Delay,
+                                        );
                                         ping_interval.tick().await;
-                                        if tx_ping.try_send((FRAME_PING, 0, Vec::new())).is_err() {
-                                            let _ = tx_ping.send((FRAME_PING, 0, Vec::new())).await;
+                                        loop {
+                                            ping_interval.tick().await;
+                                            if sender_ping
+                                                .send_ctrl(FRAME_PING, 0, Vec::new())
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
                                         }
-                                    }
-                                });
-                                loop {
-                                    tokio::select! {
-                                        _ = rx.changed() => break,
-                                        _ = write_done_rx.changed() => break,
-                                        frame = tokio::time::timeout(Duration::from_secs(45), read_frame(&mut rd)) => {
-                                            let Ok(Ok((kind, id, payload))) = frame else { break };
-                                            match kind {
-                                                FRAME_PING => {
-                                                    if tx.try_send((FRAME_PONG, 0, Vec::new())).is_err() {
-                                                        let tx_pong = tx.clone();
-                                                        tokio::spawn(async move {
-                                                            let _ = tx_pong.send((FRAME_PONG, 0, Vec::new())).await;
-                                                        });
+                                    });
+                                    loop {
+                                        tokio::select! {
+                                            _ = rx.changed() => break,
+                                            _ = write_done_rx.changed() => break,
+                                            frame = tokio::time::timeout(SESSION_READ_TIMEOUT, read_frame(&mut rd)) => {
+                                                let Ok(Ok((kind, id, payload))) = frame else { break };
+                                                last_rx_ms.store(mono_now_ms(), Ordering::Relaxed);
+                                                match kind {
+                                                    FRAME_PING => {
+                                                        sender.send_ctrl_bg(FRAME_PONG, 0, Vec::new());
                                                     }
-                                                }
-                                                FRAME_PONG => {}
-                                                FRAME_OPEN => {
-                                                    handle_client_frame_open(
-                                                        id,
-                                                        payload,
-                                                        &b_clone,
-                                                        &mappings,
-                                                        &limiters_clone,
-                                                        &tx,
-                                                        &streams_map,
-                                                    );
-                                                }
-                                                FRAME_DATA | FRAME_HALF | FRAME_RESET => {
-                                                    if kind == FRAME_RESET {
-                                                        if let Some(s) = streams_map.lock().unwrap().remove(&id) {
-                                                            let _ = s.try_send((kind, payload));
-                                                        }
-                                                    } else {
-                                                        let sender = streams_map.lock().unwrap().get(&id).cloned();
-                                                        if let Some(s) = sender {
-                                                            match s.try_send((kind, payload)) {
-                                                                Ok(()) => {}
-                                                                Err(mpsc::error::TrySendError::Full(item)) => {
-                                                                    if tokio::time::timeout(
-                                                                        DEMUX_SEND_TIMEOUT,
-                                                                        s.send(item),
-                                                                    )
-                                                                    .await
-                                                                    .is_err()
-                                                                    {
-                                                                        streams_map.lock().unwrap().remove(&id);
-                                                                        let _ = tx.try_send((FRAME_RESET, id, Vec::new()));
-                                                                    }
-                                                                }
-                                                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                                                    streams_map.lock().unwrap().remove(&id);
-                                                                }
-                                                            }
-                                                        }
+                                                    FRAME_PONG => {}
+                                                    FRAME_OPEN => {
+                                                        handle_client_frame_open(
+                                                            id,
+                                                            payload,
+                                                            &b_clone,
+                                                            &mappings,
+                                                            &limiters_clone,
+                                                            &sender,
+                                                            &streams_map,
+                                                        );
                                                     }
+                                                    FRAME_DATA | FRAME_HALF | FRAME_RESET => {
+                                                        demux_stream_frame(
+                                                            kind,
+                                                            id,
+                                                            payload,
+                                                            &streams_map,
+                                                            None,
+                                                            &sender,
+                                                        )
+                                                        .await;
+                                                    }
+                                                    _ => break,
                                                 }
-                                                _ => break,
                                             }
                                         }
                                     }
-                                }
-                                ping_task.abort();
-                                write_task.abort();
-                                streams_map.lock().unwrap().clear();
-                                if workers_ref.fetch_sub(1, Ordering::SeqCst) == 1 {
-                                    if linked_clone.lock().unwrap().remove(&b_clone.id) {
+                                    ping_task.abort();
+                                    write_task.abort();
+                                    drop(sender);
+                                    streams_map.lock().unwrap().clear();
+                                    let (rem_workers, unlinked) = {
+                                        let mut lg = linked_clone.lock().unwrap();
+                                        let prev = workers_ref.fetch_sub(1, Ordering::SeqCst);
+                                        let rem = prev.saturating_sub(1);
+                                        let unl = if rem == 0 {
+                                            lg.remove(&b_clone.id)
+                                        } else {
+                                            false
+                                        };
+                                        (rem, unl)
+                                    };
+                                    if unlinked {
                                         notify_clone.notify_waiters();
                                     }
-                                }
+                                    if rem_workers == 0 && !*rx.borrow() {
+                                        log_tunnel(
+                                            &log_c,
+                                            "INFO",
+                                            format!(
+                                                "client tunnel session closed; reconnecting role=client id={} node_id={}",
+                                                b_clone.id, b_clone.server_id
+                                            ),
+                                        );
+                                    }
                                 }
                                 Err(err) => {
                                     fail_streak = fail_streak.saturating_add(1);
@@ -3753,11 +4330,21 @@ fn start_instance(
     })
 }
 
-async fn resolve_socket_addrs(host: &str, port: i64) -> Result<Vec<SocketAddr>, String> {
+fn dns_cache_map(
+) -> &'static parking_lot::Mutex<HashMap<(String, i64), (Vec<SocketAddr>, std::time::Instant)>> {
     static DNS_CACHE: OnceLock<
         parking_lot::Mutex<HashMap<(String, i64), (Vec<SocketAddr>, std::time::Instant)>>,
     > = OnceLock::new();
+    DNS_CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+}
 
+fn invalidate_dns_cache(host: &str, port: i64) {
+    dns_cache_map()
+        .lock()
+        .remove(&(host.to_ascii_lowercase(), port));
+}
+
+async fn resolve_socket_addrs(host: &str, port: i64) -> Result<Vec<SocketAddr>, String> {
     let addr_str = if host.contains(':') && !host.starts_with('[') {
         format!("[{}]:{}", host, port)
     } else {
@@ -3767,7 +4354,7 @@ async fn resolve_socket_addrs(host: &str, port: i64) -> Result<Vec<SocketAddr>, 
         return Ok(vec![sa]);
     }
 
-    let cache = DNS_CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+    let cache = dns_cache_map();
     let key = (host.to_ascii_lowercase(), port);
     {
         let guard = cache.lock();
@@ -3843,10 +4430,54 @@ async fn dial_client_session(
             Err(e) => last_err = e,
         }
     }
+    invalidate_dns_cache(&dial_ep.host, dial_ep.port);
     Err(last_err)
 }
 
 async fn dial_client_session_addr(
+    remote_addr: SocketAddr,
+    all_eps: &[ConnectEndpoint],
+    client_cfg: &LocalTLS,
+    binding: &Binding,
+    uuid_bytes: [u8; 16],
+    gw_addr: &str,
+    vless_enc_cli: Option<Arc<vless_enc::ClientInstance>>,
+) -> Result<BoxStream, String> {
+    let had_cached_0rtt = vless_enc_cli
+        .as_ref()
+        .is_some_and(|c| c.has_cached_ticket());
+    match dial_client_session_once(
+        remote_addr,
+        all_eps,
+        client_cfg,
+        binding,
+        uuid_bytes,
+        gw_addr,
+        vless_enc_cli.clone(),
+    )
+    .await
+    {
+        Ok(s) => Ok(s),
+        Err(_first_err) if had_cached_0rtt => {
+            if let Some(ref enc) = vless_enc_cli {
+                enc.invalidate_ticket();
+            }
+            dial_client_session_once(
+                remote_addr,
+                all_eps,
+                client_cfg,
+                binding,
+                uuid_bytes,
+                gw_addr,
+                vless_enc_cli,
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn dial_client_session_once(
     remote_addr: SocketAddr,
     all_eps: &[ConnectEndpoint],
     client_cfg: &LocalTLS,
@@ -3876,17 +4507,22 @@ async fn dial_client_session_addr(
             None
         };
         let gw_owned = gw_addr.to_string();
-        xhttp::xhttp_client_connect(
-            remote_addr,
-            client_cfg,
-            dn_target,
-            binding,
-            move |sa, lcfg, b| {
-                let g = gw_owned.clone();
-                async move { connect_outer_stream(sa, lcfg, b, g).await }
-            },
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            xhttp::xhttp_client_connect(
+                remote_addr,
+                client_cfg,
+                dn_target,
+                binding,
+                gw_addr,
+                move |sa, lcfg, b| {
+                    let g = gw_owned.clone();
+                    async move { connect_outer_stream(sa, lcfg, b, g).await }
+                },
+            ),
         )
-        .await?
+        .await
+        .map_err(|_| "xhttp connect timeout".to_string())??
     } else {
         connect_outer_stream(remote_addr, client_cfg.clone(), binding.clone(), gw_addr.to_string())
             .await?
@@ -3900,7 +4536,17 @@ async fn dial_client_session_addr(
     }
 
     let flow = normalize_flow(&client_cfg.flow).unwrap_or_default();
-    write_vless_with_flow(&mut stream, uuid_bytes, &binding.domain, 0, &flow).await?;
+    if flow == FLOW_VISION {
+        let mut init_flight = Vec::with_capacity(1500);
+        encode_vless_request_into(&mut init_flight, uuid_bytes, &binding.domain, 0, &flow)?;
+        vision::append_initial_camouflage(&mut init_flight, &uuid_bytes);
+        stream
+            .write_all(&init_flight)
+            .await
+            .map_err(|e| e.to_string())?;
+    } else {
+        write_vless_with_flow(&mut stream, uuid_bytes, &binding.domain, 0, &flow).await?;
+    }
     stream.flush().await.map_err(|e| e.to_string())?;
 
     let mut resp = [0u8; 2];
@@ -3913,7 +4559,7 @@ async fn dial_client_session_addr(
     }
 
     if flow == FLOW_VISION {
-        stream = vision::wrap_vision_stream(stream, uuid_bytes, true);
+        stream = vision::wrap_vision_stream_started(stream, uuid_bytes);
     }
     Ok(stream)
 }
@@ -3924,22 +4570,16 @@ fn handle_client_frame_open(
     binding: &Binding,
     mappings: &[Mapping],
     mapping_limiters: &Arc<HashMap<String, Arc<BandwidthLimiter>>>,
-    tx: &mpsc::Sender<(u8, u32, Vec<u8>)>,
+    sender: &SessionSender,
     streams_map: &Arc<Mutex<HashMap<u32, mpsc::Sender<(u8, Vec<u8>)>>>>,
 ) {
     if payload.len() < 3 {
-        let tx_c = tx.clone();
-        tokio::spawn(async move {
-            let _ = tx_c.send((FRAME_RESET, id, Vec::new())).await;
-        });
+        sender.send_ctrl_bg(FRAME_RESET, id, Vec::new());
         return;
     }
     let port = u16::from_be_bytes([payload[0], payload[1]]) as i64;
     let Ok(raw_meta) = String::from_utf8(payload[2..].to_vec()) else {
-        let tx_c = tx.clone();
-        tokio::spawn(async move {
-            let _ = tx_c.send((FRAME_RESET, id, Vec::new())).await;
-        });
+        sender.send_ctrl_bg(FRAME_RESET, id, Vec::new());
         return;
     };
     let mut parts = raw_meta.split('\0');
@@ -3965,10 +4605,7 @@ fn handle_client_frame_open(
         }
     });
     let Some(matched_m) = matched_mapping else {
-        let tx_c = tx.clone();
-        tokio::spawn(async move {
-            let _ = tx_c.send((FRAME_RESET, id, Vec::new())).await;
-        });
+        sender.send_ctrl_bg(FRAME_RESET, id, Vec::new());
         return;
     };
     let limiter = mapping_limiters
@@ -3981,14 +4618,14 @@ fn handle_client_frame_open(
 
     let (stx, mut srx) = mpsc::channel::<(u8, Vec<u8>)>(STREAM_CHAN_CAP);
     streams_map.lock().unwrap().insert(id, stx);
-    let tx_back = tx.clone();
+    let sender_back = sender.clone();
     let streams_done = streams_map.clone();
 
     if req_net == "udp" {
         tokio::spawn(async move {
             let Ok(target_sa) = resolve_socket_addr(&host, port).await else {
                 streams_done.lock().unwrap().remove(&id);
-                let _ = tx_back.send((FRAME_RESET, id, Vec::new())).await;
+                sender_back.send_ctrl_bg(FRAME_RESET, id, Vec::new());
                 return;
             };
             let bind_sa: SocketAddr = if target_sa.is_ipv6() {
@@ -3998,17 +4635,17 @@ fn handle_client_frame_open(
             };
             let Ok(udp_sock) = tokio::net::UdpSocket::bind(bind_sa).await else {
                 streams_done.lock().unwrap().remove(&id);
-                let _ = tx_back.send((FRAME_RESET, id, Vec::new())).await;
+                sender_back.send_ctrl_bg(FRAME_RESET, id, Vec::new());
                 return;
             };
             if udp_sock.connect(target_sa).await.is_err() {
                 streams_done.lock().unwrap().remove(&id);
-                let _ = tx_back.send((FRAME_RESET, id, Vec::new())).await;
+                sender_back.send_ctrl_bg(FRAME_RESET, id, Vec::new());
                 return;
             };
             let udp_arc = Arc::new(udp_sock);
             let udp_recv = udp_arc.clone();
-            let tx_read = tx_back.clone();
+            let sender_read = sender_back.clone();
             let lim_read = limiter.clone();
             let read_target = tokio::spawn(async move {
                 let mut buf = vec![0u8; 65535];
@@ -4017,7 +4654,10 @@ fn handle_client_frame_open(
                 {
                     lim_read.wait(n).await;
                     let xudp = encode_xudp(&buf[..n]);
-                    if tx_read.send((FRAME_DATA, id, xudp)).await.is_err() {
+                    if xudp.len() > MAX_PAYLOAD {
+                        continue;
+                    }
+                    if sender_read.send_data(FRAME_DATA, id, xudp).await.is_err() {
                         break;
                     }
                 }
@@ -4037,12 +4677,13 @@ fn handle_client_frame_open(
             }
             read_target.abort();
             streams_done.lock().unwrap().remove(&id);
+            sender_back.send_ctrl_bg(FRAME_RESET, id, Vec::new());
         });
     } else {
         tokio::spawn(async move {
             let Ok(target_addrs) = resolve_socket_addrs(&host, port).await else {
                 streams_done.lock().unwrap().remove(&id);
-                let _ = tx_back.send((FRAME_RESET, id, Vec::new())).await;
+                sender_back.send_ctrl_bg(FRAME_RESET, id, Vec::new());
                 return;
             };
             let Ok(Ok(target_stream)) =
@@ -4053,12 +4694,12 @@ fn handle_client_frame_open(
                 .await
             else {
                 streams_done.lock().unwrap().remove(&id);
-                let _ = tx_back.send((FRAME_RESET, id, Vec::new())).await;
+                sender_back.send_ctrl_bg(FRAME_RESET, id, Vec::new());
                 return;
             };
             configure_tcp_stream(&target_stream);
             let (mut tr, mut tw) = target_stream.into_split();
-            let tx_read = tx_back.clone();
+            let sender_read = sender_back.clone();
             let lim_read = limiter.clone();
             let last_active_ms = Arc::new(AtomicU64::new(mono_now_ms()));
             let any_half_closed = Arc::new(AtomicBool::new(false));
@@ -4071,18 +4712,22 @@ fn handle_client_frame_open(
                     match tokio::time::timeout(Duration::from_secs(15), tr.read(&mut buf)).await {
                         Ok(Ok(0)) => {
                             rt_half.store(true, Ordering::Relaxed);
-                            let _ = tx_read.send((FRAME_HALF, id, Vec::new())).await;
+                            let _ = sender_read.send_data(FRAME_HALF, id, Vec::new()).await;
                             break;
                         }
                         Ok(Ok(n)) => {
                             rt_active.store(mono_now_ms(), Ordering::Relaxed);
                             lim_read.wait(n).await;
-                            if tx_read.send((FRAME_DATA, id, buf[..n].to_vec())).await.is_err() {
+                            if sender_read
+                                .send_data(FRAME_DATA, id, buf[..n].to_vec())
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
                         Ok(Err(_)) => {
-                            let _ = tx_read.send((FRAME_RESET, id, Vec::new())).await;
+                            sender_read.send_ctrl_bg(FRAME_RESET, id, Vec::new());
                             break;
                         }
                         Err(_) => {
@@ -4094,7 +4739,7 @@ fn handle_client_frame_open(
                             if mono_now_ms().saturating_sub(rt_active.load(Ordering::Relaxed))
                                 >= idle_limit
                             {
-                                let _ = tx_read.send((FRAME_RESET, id, Vec::new())).await;
+                                sender_read.send_ctrl_bg(FRAME_RESET, id, Vec::new());
                                 break;
                             }
                         }
@@ -4165,7 +4810,7 @@ fn handle_client_frame_open(
             drop(srx);
             streams_done.lock().unwrap().remove(&id);
             if !peer_reset && !half_closed {
-                let _ = tx_back.send((FRAME_RESET, id, Vec::new())).await;
+                sender_back.send_ctrl_bg(FRAME_RESET, id, Vec::new());
             }
         });
     }
@@ -4347,10 +4992,18 @@ mod tests {
     use super::*;
     use crate::model::{Reality, XHTTP};
 
-    fn test_session() -> (SessionHandle, mpsc::Receiver<(u8, u32, Vec<u8>)>) {
-        let (tx, rx) = mpsc::channel(4);
-        let h = SessionHandle::new(tx, Arc::new(Mutex::new(HashMap::new())));
-        (h, rx)
+    fn test_session() -> (
+        SessionHandle,
+        (
+            mpsc::Receiver<(u8, u32, Vec<u8>)>,
+            mpsc::Receiver<(u8, u32, Vec<u8>)>,
+        ),
+    ) {
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(4);
+        let (data_tx, data_rx) = mpsc::channel(4);
+        let (h, _kill_rx) =
+            SessionHandle::new(ctrl_tx, data_tx, Arc::new(Mutex::new(HashMap::new())));
+        (h, (ctrl_rx, data_rx))
     }
 
     #[test]
@@ -4508,7 +5161,9 @@ mod tests {
         mspec: &MatrixMappingSpec,
     ) {
         let domain = "edge.matrix.example.com";
-        let transport_port = if server_local.hysteria2.enabled() {
+        let transport_port = if server_local.hysteria2.enabled()
+            || (server_local.xhttp.enabled() && server_local.xhttp.http_version.trim() == "3")
+        {
             reserve_free_udp_port()
         } else {
             reserve_free_tcp_port()
@@ -5028,7 +5683,7 @@ mod tests {
                 LocalTLS {
                     protocol: "vless".to_string(),
                     transport_security: "tls".to_string(),
-                    reality: reality_base,
+                    reality: reality_base.clone(),
                     xhttp: XHTTP {
                         path: "/veilink/".to_string(),
                         mode: "auto".to_string(),
@@ -5061,6 +5716,124 @@ mod tests {
                 LocalTLS {
                     protocol: "vless".to_string(),
                     transport_security: "tls".to_string(),
+                    reality: reality_mldsa.clone(),
+                    ..Default::default()
+                },
+            ),
+            // === Explicit HTTP/2 (h2 + h2c prior-knowledge), RFC 9114 HTTP/3 (QUIC), & full PQ+MLDSA+Vision ===
+            (
+                "xhttp-h2c-prior-knowledge/enc=true/packet-up",
+                LocalTLS {
+                    protocol: "vless".to_string(),
+                    transport_security: "plain".to_string(),
+                    decryption: pq_dec.clone(),
+                    xhttp: XHTTP {
+                        path: "/veilink/".to_string(),
+                        mode: "packet-up".to_string(),
+                        tls: false,
+                        http_version: "2".to_string(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "xhttp-https-h2/enc=false/packet-up",
+                LocalTLS {
+                    protocol: "vless".to_string(),
+                    transport_security: "tls".to_string(),
+                    cert_pem: cert_pem.clone(),
+                    key_pem: key_pem.clone(),
+                    ca_pem: ca_pem.clone(),
+                    xhttp: XHTTP {
+                        path: "/veilink/".to_string(),
+                        mode: "packet-up".to_string(),
+                        tls: true,
+                        http_version: "2".to_string(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "xhttp-reality-h2/enc=true/packet-up",
+                LocalTLS {
+                    protocol: "vless".to_string(),
+                    transport_security: "tls".to_string(),
+                    decryption: pq_dec.clone(),
+                    reality: reality_base.clone(),
+                    xhttp: XHTTP {
+                        path: "/veilink/".to_string(),
+                        mode: "packet-up".to_string(),
+                        tls: false,
+                        http_version: "2".to_string(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "xhttp-h3-quic/enc=false/packet-up",
+                LocalTLS {
+                    protocol: "vless".to_string(),
+                    transport_security: "tls".to_string(),
+                    cert_pem: cert_pem.clone(),
+                    key_pem: key_pem.clone(),
+                    ca_pem: ca_pem.clone(),
+                    xhttp: XHTTP {
+                        path: "/veilink/".to_string(),
+                        mode: "packet-up".to_string(),
+                        tls: true,
+                        http_version: "3".to_string(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "xhttp-h3-quic/enc=false/stream-one",
+                LocalTLS {
+                    protocol: "vless".to_string(),
+                    transport_security: "tls".to_string(),
+                    cert_pem: cert_pem.clone(),
+                    key_pem: key_pem.clone(),
+                    ca_pem: ca_pem.clone(),
+                    xhttp: XHTTP {
+                        path: "/veilink/".to_string(),
+                        mode: "stream-one".to_string(),
+                        tls: true,
+                        http_version: "3".to_string(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "xhttp-h3-quic/enc=true/stream-up",
+                LocalTLS {
+                    protocol: "vless".to_string(),
+                    transport_security: "tls".to_string(),
+                    cert_pem: cert_pem.clone(),
+                    key_pem: key_pem.clone(),
+                    ca_pem: ca_pem.clone(),
+                    decryption: pq_dec.clone(),
+                    xhttp: XHTTP {
+                        path: "/veilink/".to_string(),
+                        mode: "stream-up".to_string(),
+                        tls: true,
+                        http_version: "3".to_string(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "vless-reality-mldsa65/enc=true/vision=true",
+                LocalTLS {
+                    protocol: "vless".to_string(),
+                    transport_security: "tls".to_string(),
+                    decryption: pq_dec.clone(),
+                    flow: FLOW_VISION.to_string(),
                     reality: reality_mldsa,
                     ..Default::default()
                 },
@@ -5168,8 +5941,10 @@ mod tests {
 
     #[test]
     fn session_handle_open_stream_skips_zero_and_existing_ids_on_wraparound() {
-        let (tx, _rx) = mpsc::channel(8);
-        let handle = SessionHandle::new(tx, Arc::new(Mutex::new(HashMap::new())));
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel(8);
+        let (data_tx, _data_rx) = mpsc::channel(8);
+        let (handle, _kill_rx) =
+            SessionHandle::new(ctrl_tx, data_tx, Arc::new(Mutex::new(HashMap::new())));
         let (id1, _rx1) = handle.open_stream().unwrap();
         assert_eq!(id1, 1);
         assert_eq!(handle.active_streams.load(Ordering::Relaxed), 1);
@@ -5188,20 +5963,28 @@ mod tests {
     #[test]
     fn pick_session_prefers_fresh_and_least_loaded_session() {
         let _ = mono_now_ms();
-        let (tx_stale, _rx_stale) = mpsc::channel(1024);
-        let stale = SessionHandle::new(tx_stale, Arc::new(Mutex::new(HashMap::new())));
+        let (c_stale, _crx_stale) = mpsc::channel(SESSION_CTRL_CHAN_CAP);
+        let (d_stale, _drx_stale) = mpsc::channel(SESSION_DATA_CHAN_CAP);
+        let (stale, _k_stale) =
+            SessionHandle::new(c_stale, d_stale, Arc::new(Mutex::new(HashMap::new())));
         // Simulate a zombie session whose last RX was 30s ago (> SESSION_FRESH_RX_MS)
         let now = mono_now_ms();
-        stale.last_rx_ms.store(now.saturating_sub(30_000), Ordering::Relaxed);
+        stale
+            .last_rx_ms
+            .store(now.saturating_sub(30_000), Ordering::Relaxed);
 
-        let (tx_busy, _rx_busy) = mpsc::channel(1024);
-        let busy = SessionHandle::new(tx_busy, Arc::new(Mutex::new(HashMap::new())));
+        let (c_busy, _crx_busy) = mpsc::channel(SESSION_CTRL_CHAN_CAP);
+        let (d_busy, _drx_busy) = mpsc::channel(SESSION_DATA_CHAN_CAP);
+        let (busy, _k_busy) =
+            SessionHandle::new(c_busy, d_busy, Arc::new(Mutex::new(HashMap::new())));
         busy.touch_rx();
         let (_sid1, _srx1) = busy.open_stream().unwrap();
         let (_sid2, _srx2) = busy.open_stream().unwrap();
 
-        let (tx_idle, _rx_idle) = mpsc::channel(1024);
-        let idle = SessionHandle::new(tx_idle, Arc::new(Mutex::new(HashMap::new())));
+        let (c_idle, _crx_idle) = mpsc::channel(SESSION_CTRL_CHAN_CAP);
+        let (d_idle, _drx_idle) = mpsc::channel(SESSION_DATA_CHAN_CAP);
+        let (idle, _k_idle) =
+            SessionHandle::new(c_idle, d_idle, Arc::new(Mutex::new(HashMap::new())));
         idle.touch_rx();
 
         let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
@@ -5217,5 +6000,844 @@ mod tests {
                 "pick_session must skip stale session and prefer idle fresh session over busy session"
             );
         }
+    }
+
+    #[test]
+    fn reality_client_cfg_always_advertises_alpn_and_180s_default_window() {
+        let (priv_k, pub_k) = generate_x25519().unwrap();
+        let local = LocalTLS {
+            protocol: "vless".to_string(),
+            reality: Reality {
+                dest: "www.cloudflare.com:443".to_string(),
+                private_key: priv_k,
+                public_key: pub_k,
+                short_id: "01020304".to_string(),
+                server_names: "www.cloudflare.com".to_string(),
+                max_time_diff: String::new(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cli_cfg = build_reality_client_cfg(&local, "www.cloudflare.com", "tun.local").unwrap();
+        assert_eq!(
+            cli_cfg.alpn,
+            vec!["h2".to_string(), "http/1.1".to_string()],
+            "non-XHTTP REALITY ClientHello must advertise browser ALPN"
+        );
+        let srv_cfg = build_reality_server_cfg(&local).unwrap();
+        assert_eq!(srv_cfg.max_time_diff_ms, 180_000);
+
+        let mut local_zero = local.clone();
+        local_zero.reality.max_time_diff = "0".to_string();
+        let srv_zero = build_reality_server_cfg(&local_zero).unwrap();
+        assert_eq!(srv_zero.max_time_diff_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn session_writer_prioritizes_control_ahead_of_data_and_skips_oversized() {
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(SESSION_CTRL_CHAN_CAP);
+        let (data_tx, data_rx) = mpsc::channel(SESSION_DATA_CHAN_CAP);
+        let (client_io, mut server_io) = tokio::io::duplex(512 * 1024);
+        let last_rx_ms = Arc::new(AtomicU64::new(mono_now_ms()));
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let (done_tx, _done_rx) = watch::channel(false);
+
+        // Pre-fill data_tx with multiple data frames, an oversized data frame, and a trailing FRAME_HALF
+        for idx in 0..8u32 {
+            data_tx
+                .try_send((FRAME_DATA, 1, vec![idx as u8; 8192]))
+                .unwrap();
+        }
+        data_tx
+            .try_send((FRAME_DATA, 99, vec![0xffu8; MAX_PAYLOAD + 100]))
+            .unwrap();
+        data_tx
+            .try_send((FRAME_HALF, 1, Vec::new()))
+            .unwrap();
+
+        // Enqueue control frames while data_tx already has 8 frames waiting
+        ctrl_tx.try_send((FRAME_PONG, 0, Vec::new())).unwrap();
+        ctrl_tx.try_send((FRAME_OPEN, 2, b"\x00\x50127.0.0.1".to_vec())).unwrap();
+
+        let writer = spawn_session_writer(
+            Box::new(client_io),
+            ctrl_rx,
+            data_rx,
+            last_rx_ms,
+            stop_rx,
+            None,
+            done_tx,
+        );
+        drop(ctrl_tx);
+        drop(data_tx);
+
+        let mut kinds = Vec::new();
+        while let Ok(f) = read_frame(&mut server_io).await {
+            kinds.push((f.0, f.1));
+        }
+        writer.await.unwrap();
+
+        // Control frames must come out ahead of all queued data frames
+        assert_eq!(kinds[0], (FRAME_PONG, 0));
+        assert_eq!(kinds[1], (FRAME_OPEN, 2));
+        // Oversized stream 99 frame must be skipped without killing the session, and FRAME_HALF must be last
+        assert!(!kinds.iter().any(|&(_, id)| id == 99));
+        assert_eq!(kinds.len(), 2 + 8 + 1);
+        assert_eq!(*kinds.last().unwrap(), (FRAME_HALF, 1));
+    }
+
+    #[tokio::test]
+    async fn demux_multi_stream_isolates_stalled_consumer_and_emits_reset() {
+        let (ctrl_tx, mut ctrl_rx) = mpsc::channel(SESSION_CTRL_CHAN_CAP);
+        let (data_tx, _data_rx) = mpsc::channel(SESSION_DATA_CHAN_CAP);
+        let sender = SessionSender::new(ctrl_tx, data_tx);
+        let streams_map: Mutex<HashMap<u32, mpsc::Sender<(u8, Vec<u8>)>>> =
+            Mutex::new(HashMap::new());
+        let active = AtomicUsize::new(2);
+
+        let (stalled_tx, _stalled_rx) = mpsc::channel(1);
+        stalled_tx.try_send((FRAME_DATA, vec![1u8; 16])).unwrap(); // now full!
+        let (healthy_tx, mut healthy_rx) = mpsc::channel(8);
+        {
+            let mut m = streams_map.lock().unwrap();
+            m.insert(10, stalled_tx);
+            m.insert(20, healthy_tx);
+        }
+
+        let t0 = std::time::Instant::now();
+        demux_stream_frame(
+            FRAME_DATA,
+            10,
+            vec![2u8; 16],
+            &streams_map,
+            Some(&active),
+            &sender,
+        )
+        .await;
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(1200),
+            "multi-stream demux should cap stalled stream wait around 500ms, got {:?}",
+            elapsed
+        );
+        assert!(!streams_map.lock().unwrap().contains_key(&10));
+        assert_eq!(active.load(Ordering::Relaxed), 1);
+
+        let reset_msg = ctrl_rx.try_recv().expect("FRAME_RESET must be queued on ctrl_tx");
+        assert_eq!(reset_msg.0, FRAME_RESET);
+        assert_eq!(reset_msg.1, 10);
+
+        demux_stream_frame(
+            FRAME_DATA,
+            20,
+            b"ok".to_vec(),
+            &streams_map,
+            Some(&active),
+            &sender,
+        )
+        .await;
+        assert_eq!(healthy_rx.recv().await.unwrap(), (FRAME_DATA, b"ok".to_vec()));
+    }
+
+    #[test]
+    fn pick_session_skips_suspect_unanswered_ping_and_syncs_linked_atomically() {
+        let _ = mono_now_ms();
+        let (c1, _cr1) = mpsc::channel(SESSION_CTRL_CHAN_CAP);
+        let (d1, _dr1) = mpsc::channel(SESSION_DATA_CHAN_CAP);
+        let (zombie, _k1) = SessionHandle::new(c1, d1, Arc::new(Mutex::new(HashMap::new())));
+        zombie.touch_rx();
+        // Simulate session with recent last_rx_ms (< 18s) but an unanswered ping sent 2s ago (> 1.5s)
+        zombie.unanswered_pings.store(1, Ordering::Relaxed);
+        zombie
+            .ping_sent_ms
+            .store(mono_now_ms().saturating_sub(2_000), Ordering::Relaxed);
+
+        let (c2, _cr2) = mpsc::channel(SESSION_CTRL_CHAN_CAP);
+        let (d2, _dr2) = mpsc::channel(SESSION_DATA_CHAN_CAP);
+        let (healthy, _k2) = SessionHandle::new(c2, d2, Arc::new(Mutex::new(HashMap::new())));
+        healthy.touch_rx();
+
+        let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
+        let linked = Mutex::new(HashSet::from(["b-sync".to_string()]));
+        sessions
+            .lock()
+            .unwrap()
+            .insert("b-sync".to_string(), vec![zombie.clone(), healthy.clone()]);
+
+        for _ in 0..8 {
+            let picked = pick_session(&sessions, "b-sync").unwrap();
+            assert!(
+                Arc::ptr_eq(&picked.streams, &healthy.streams),
+                "pick_session must bypass session with overdue unanswered ping"
+            );
+        }
+
+        // Removing `zombie` while `healthy` remains must keep `linked` intact
+        let (was_last, unlinked) =
+            remove_session_sync_linked(&sessions, Some(&linked), "b-sync", &zombie);
+        assert!(!was_last);
+        assert!(!unlinked);
+        assert!(linked.lock().unwrap().contains("b-sync"));
+
+        // Removing `healthy` removes the last session and atomically clears `linked`
+        let (was_last2, unlinked2) =
+            remove_session_sync_linked(&sessions, Some(&linked), "b-sync", &healthy);
+        assert!(was_last2);
+        assert!(unlinked2);
+        assert!(!linked.lock().unwrap().contains("b-sync"));
+    }
+
+    #[tokio::test]
+    async fn vless_reality_vision_encryption_0rtt_auto_recovers_after_server_restart() {
+        let (priv_k, pub_k) = generate_x25519().unwrap();
+        let (_, _, dec_raw, enc_raw) = generate_vless_enc().unwrap();
+
+        let uuid_str = "550e8400-e29b-41d4-a716-446655440099".to_string();
+        let uuid_bytes = parse_uuid(&uuid_str).unwrap();
+        let binding = Binding {
+            id: "bind-0rtt".to_string(),
+            server_id: "srv-1".to_string(),
+            client_id: "cli-1".to_string(),
+            uuid: uuid_str,
+            domain: "tun.internal".to_string(),
+            ..Default::default()
+        };
+        let srv_local = LocalTLS {
+            protocol: "vless".to_string(),
+            flow: FLOW_VISION.to_string(),
+            decryption: dec_raw.clone(),
+            reality: Reality {
+                dest: "127.0.0.1:9".to_string(),
+                private_key: priv_k,
+                short_id: "0102030405060708".to_string(),
+                server_names: "www.cloudflare.com".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cli_local = LocalTLS {
+            protocol: "vless".to_string(),
+            flow: FLOW_VISION.to_string(),
+            encryption: enc_raw,
+            reality: Reality {
+                public_key: pub_k,
+                short_id: "0102030405060708".to_string(),
+                server_names: "www.cloudflare.com".to_string(),
+                fingerprint: "chrome".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = ln.local_addr().unwrap();
+        let active_dec: Arc<Mutex<Arc<vless_enc::ServerInstance>>> = Arc::new(Mutex::new(
+            vless_enc::ServerInstance::from_raw(&dec_raw).unwrap().unwrap(),
+        ));
+        let active_dec_srv = active_dec.clone();
+        let rcfg = build_reality_server_cfg(&srv_local).unwrap();
+        let srv_local_c = srv_local.clone();
+        let binding_srv = binding.clone();
+
+        let accept_loop = tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = ln.accept().await else { break };
+                let rcfg_c = rcfg.clone();
+                let dec_c = active_dec_srv.lock().unwrap().clone();
+                let local_c = srv_local_c.clone();
+                let b_c = binding_srv.clone();
+                tokio::spawn(async move {
+                    let Some(mut s) =
+                        accept_outer_stream(tcp, &local_c, None, Some(rcfg_c)).await
+                    else {
+                        return;
+                    };
+                    s = match dec_c.handshake(s).await {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                    let Ok((u, dom, _, fl)) = read_vless_with_flow(&mut s).await else {
+                        return;
+                    };
+                    if u != parse_uuid(&b_c.uuid).unwrap()
+                        || !dom.eq_ignore_ascii_case(&b_c.domain)
+                        || fl != FLOW_VISION
+                    {
+                        return;
+                    }
+                    if s.write_all(&[0, 0]).await.is_err() || s.flush().await.is_err() {
+                        return;
+                    }
+                    let mut vs = vision::wrap_vision_stream(s, u, false);
+                    let Ok((kind, id, payload)) = read_frame(&mut vs).await else {
+                        return;
+                    };
+                    let _ = write_frame(&mut vs, kind, id, &payload).await;
+                    let _ = vs.flush().await;
+                    let _ = vs.shutdown().await;
+                });
+            }
+        });
+
+        let enc_cli = vless_enc::ClientInstance::from_raw(&cli_local.encryption)
+            .unwrap()
+            .unwrap();
+        let eps = vec![ConnectEndpoint {
+            id: "ep1".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: listen_addr.port() as i64,
+            enabled: true,
+            ..Default::default()
+        }];
+
+        // 1. Initial 1-RTT connection populates client 0-RTT ticket
+        {
+            let mut cs = dial_client_session_addr(
+                listen_addr,
+                &eps,
+                &cli_local,
+                &binding,
+                uuid_bytes,
+                "www.cloudflare.com",
+                Some(enc_cli.clone()),
+            )
+            .await
+            .expect("1-RTT dial should succeed");
+            assert!(enc_cli.has_cached_ticket());
+            write_frame(&mut cs, FRAME_DATA, 7, b"hello-1rtt")
+                .await
+                .unwrap();
+            cs.flush().await.unwrap();
+            let (k, id, data) = read_frame(&mut cs).await.unwrap();
+            assert_eq!((k, id, data.as_slice()), (FRAME_DATA, 7, b"hello-1rtt".as_slice()));
+        }
+
+        // 2. Subsequent connection uses cached 0-RTT ticket
+        {
+            let mut cs = dial_client_session_addr(
+                listen_addr,
+                &eps,
+                &cli_local,
+                &binding,
+                uuid_bytes,
+                "www.cloudflare.com",
+                Some(enc_cli.clone()),
+            )
+            .await
+            .expect("0-RTT dial should succeed");
+            write_frame(&mut cs, FRAME_DATA, 8, b"hello-0rtt")
+                .await
+                .unwrap();
+            cs.flush().await.unwrap();
+            let (k, id, data) = read_frame(&mut cs).await.unwrap();
+            assert_eq!((k, id, data.as_slice()), (FRAME_DATA, 8, b"hello-0rtt".as_slice()));
+        }
+
+        // 3. Simulate server restart wiping server-side 0-RTT tickets; single dial must auto-fallback to 1-RTT
+        *active_dec.lock().unwrap() = vless_enc::ServerInstance::from_raw(&dec_raw).unwrap().unwrap();
+        assert!(enc_cli.has_cached_ticket());
+        {
+            let mut cs = dial_client_session_addr(
+                listen_addr,
+                &eps,
+                &cli_local,
+                &binding,
+                uuid_bytes,
+                "www.cloudflare.com",
+                Some(enc_cli.clone()),
+            )
+            .await
+            .expect("dial after server restart must transparently fallback from 0-RTT to 1-RTT");
+            assert!(
+                enc_cli.has_cached_ticket(),
+                "1-RTT fallback must refresh cached 0-RTT ticket"
+            );
+            write_frame(&mut cs, FRAME_DATA, 9, b"recovered!")
+                .await
+                .unwrap();
+            cs.flush().await.unwrap();
+            let (k, id, data) = read_frame(&mut cs).await.unwrap();
+            assert_eq!((k, id, data.as_slice()), (FRAME_DATA, 9, b"recovered!".as_slice()));
+        }
+
+        accept_loop.abort();
+    }
+
+    #[tokio::test]
+    async fn vision_coalesces_initial_camouflage_flights_and_rejects_mismatched_uuid() {
+        let uuid_ok = parse_uuid("550e8400-e29b-41d4-a716-4466554400aa").unwrap();
+        let uuid_bad = parse_uuid("550e8400-e29b-41d4-a716-4466554400bb").unwrap();
+
+        // 1. Client initial flight must coalesce VLESS header + Vision long padding (> 900B)
+        let mut cli_flight = Vec::new();
+        encode_vless_request_into(&mut cli_flight, uuid_ok, "tun.example.com", 0, FLOW_VISION)
+            .unwrap();
+        let bare_hdr_len = cli_flight.len();
+        assert!(bare_hdr_len < 100);
+        vision::append_initial_camouflage(&mut cli_flight, &uuid_ok);
+        assert!(
+            cli_flight.len() >= bare_hdr_len + 21 + 900,
+            "Vision client flight must coalesce VLESS header with >=900B initial padding, got {}",
+            cli_flight.len()
+        );
+
+        // 2. Server initial flight must coalesce [0, 0] + Vision long padding (> 900B)
+        let mut srv_flight = vec![0x00, 0x00];
+        vision::append_initial_camouflage(&mut srv_flight, &uuid_ok);
+        assert!(
+            srv_flight.len() >= 2 + 21 + 900,
+            "Vision server flight must coalesce [0, 0] with >=900B initial padding, got {}",
+            srv_flight.len()
+        );
+
+        // 3. VisionStream started after coalesced flight exchanges payload cleanly, and rejects wrong UUID
+        let (c_raw, mut s_raw) = tokio::io::duplex(64 * 1024);
+        let mut c_box: BoxStream = Box::new(c_raw);
+        c_box.write_all(&cli_flight).await.unwrap();
+        c_box.flush().await.unwrap();
+
+        let (got_u, got_dom, _, got_fl) = read_vless_with_flow(&mut s_raw).await.unwrap();
+        assert_eq!(got_u, uuid_ok);
+        assert_eq!(got_dom, "tun.example.com");
+        assert_eq!(got_fl, FLOW_VISION);
+
+        let mut s_box: BoxStream = Box::new(s_raw);
+        s_box.write_all(&srv_flight).await.unwrap();
+        s_box.flush().await.unwrap();
+        let mut srv_vs_bad = vision::wrap_vision_stream_started(s_box, uuid_bad);
+
+        let mut resp2 = [0u8; 2];
+        c_box.read_exact(&mut resp2).await.unwrap();
+        assert_eq!(resp2, [0, 0]);
+        let mut cli_vs = vision::wrap_vision_stream_started(c_box, uuid_ok);
+
+        cli_vs.write_all(b"ping").await.unwrap();
+        cli_vs.flush().await.unwrap();
+
+        // First Vision frame arrived in cli_flight with uuid_ok while srv_vs_bad expects uuid_bad -> InvalidData
+        let mut buf = [0u8; 16];
+        let err = srv_vs_bad
+            .read(&mut buf)
+            .await
+            .expect_err("VisionStream must reject frame carrying mismatched user UUID");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn reality_mldsa65_transcript_signature_rejects_mismatched_verify_key() {
+        let (x_priv, x_pub) = generate_x25519().unwrap();
+        let (seed_a, verify_a) = generate_mldsa65().unwrap();
+        let (_seed_b, verify_b) = generate_mldsa65().unwrap();
+
+        let srv_local = LocalTLS {
+            protocol: "vless".to_string(),
+            reality: Reality {
+                dest: "127.0.0.1:9".to_string(),
+                private_key: x_priv,
+                short_id: "01020304".to_string(),
+                server_names: "www.cloudflare.com".to_string(),
+                mldsa65_seed: seed_a,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let srv_cfg = build_reality_server_cfg(&srv_local).unwrap();
+        let ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = ln.local_addr().unwrap();
+        let srv_task = tokio::spawn(async move {
+            while let Ok((tcp, _)) = ln.accept().await {
+                let c = srv_cfg.clone();
+                tokio::spawn(async move {
+                    if let Ok(Some(mut s)) = reality::reality_accept(tcp, &c).await {
+                        let _ = s.write_all(b"ok").await;
+                        let _ = s.flush().await;
+                    }
+                });
+            }
+        });
+
+        // Matching mldsa65_verify succeeds
+        let mut cli_ok = LocalTLS {
+            protocol: "vless".to_string(),
+            reality: Reality {
+                public_key: x_pub.clone(),
+                short_id: "01020304".to_string(),
+                server_names: "www.cloudflare.com".to_string(),
+                mldsa65_verify: verify_a,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cfg_ok = build_reality_client_cfg(&cli_ok, "www.cloudflare.com", "tun.local").unwrap();
+        let tcp1 = TcpStream::connect(addr).await.unwrap();
+        let mut s1 = reality::reality_connect(tcp1, &cfg_ok)
+            .await
+            .expect("matching ML-DSA-65 transcript signature must succeed");
+        let mut two = [0u8; 2];
+        s1.read_exact(&mut two).await.unwrap();
+        assert_eq!(&two, b"ok");
+
+        // Mismatched mldsa65_verify must fail verification
+        cli_ok.reality.mldsa65_verify = verify_b;
+        let cfg_bad = build_reality_client_cfg(&cli_ok, "www.cloudflare.com", "tun.local").unwrap();
+        let tcp2 = TcpStream::connect(addr).await.unwrap();
+        assert!(
+            reality::reality_connect(tcp2, &cfg_bad).await.is_err(),
+            "mismatched ML-DSA-65 verify key must fail REALITY Certificate verification"
+        );
+
+        srv_task.abort();
+    }
+
+    #[tokio::test]
+    async fn xhttp_put_method_host_headers_cors_and_post_slicing_round_trip() {
+        let gw_domain = "edge.matrix.example.com";
+        let custom_host = "cdn.front.example.net";
+        let (ca_pem, cert_pem, key_pem) = generate_test_cert(gw_domain);
+        let hdrs = model::XHTTPHeaders::parse_raw(br#"{"X-Custom-Route":"alpha-9"}"#).unwrap();
+
+        let mut srv_local = LocalTLS {
+            protocol: "vless".to_string(),
+            transport_security: "tls".to_string(),
+            cert_pem,
+            key_pem,
+            ca_pem: ca_pem.clone(),
+            xhttp: XHTTP {
+                path: "/veilink/".to_string(),
+                mode: "packet-up".to_string(),
+                tls: true,
+                http_version: "1.1".to_string(),
+                host: custom_host.to_string(),
+                headers: hdrs,
+                uplink_http_method: "PUT".to_string(),
+                max_each_post_bytes: 2048,
+                post_bytes_max: 4096,
+                min_posts_interval_ms: 1,
+                max_posts_interval_ms: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Run full end-to-end TCP round-trip while TLS cert SAN is gw_domain != xhttp.host
+        let mspec = MatrixMappingSpec {
+            name: "smux",
+            network: "tcp",
+            mux: true,
+            mux_type: "smux",
+        };
+        let transport_port = reserve_free_tcp_port();
+        srv_local.listen_host = "127.0.0.1".to_string();
+        srv_local.listen_port = transport_port;
+
+        // Also spin up a standalone XHTTP server listener to probe Host/Header 404 & OPTIONS CORS preflight
+        let probe_ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let probe_addr = probe_ln.local_addr().unwrap();
+        let probe_local = srv_local.clone();
+        let probe_tls = build_tls_acceptor(&probe_local).unwrap();
+        let probe_state = xhttp::XhttpServerState::new();
+        let probe_task = tokio::spawn(async move {
+            while let Ok((tcp, _)) = probe_ln.accept().await {
+                let acc = probe_tls.clone();
+                let lc = probe_local.clone();
+                let st = probe_state.clone();
+                tokio::spawn(async move {
+                    if let Ok(tls_s) = acc.accept(tcp).await {
+                        xhttp::handle_xhttp_server_conn(Box::new(tls_s), lc, st, |_| {}).await;
+                    }
+                });
+            }
+        });
+
+        let cli_tls = build_tls_connector(&LocalTLS {
+            ca_pem,
+            xhttp: XHTTP {
+                path: "/veilink/".to_string(),
+                mode: "packet-up".to_string(),
+                tls: true,
+                http_version: "1.1".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+
+        // 1. Mismatched Host header -> 404
+        {
+            let tcp = TcpStream::connect(probe_addr).await.unwrap();
+            let sni = ServerName::try_from(gw_domain.to_string()).unwrap();
+            let mut tls = cli_tls.connect(sni, tcp).await.unwrap();
+            tls.write_all(
+                b"PUT /veilink/sid1/0 HTTP/1.1\r\nHost: wrong.example.net\r\nX-Custom-Route: alpha-9\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let mut rbuf = [0u8; 256];
+            let n = tls.read(&mut rbuf).await.unwrap();
+            let head = String::from_utf8_lossy(&rbuf[..n]);
+            assert!(head.starts_with("HTTP/1.1 404"), "got: {}", head);
+        }
+
+        // 2. Valid Host + custom header + OPTIONS CORS preflight -> 200 with Access-Control-Allow-Methods: PUT
+        {
+            let tcp = TcpStream::connect(probe_addr).await.unwrap();
+            let sni = ServerName::try_from(gw_domain.to_string()).unwrap();
+            let mut tls = cli_tls.connect(sni, tcp).await.unwrap();
+            let req = format!(
+                "OPTIONS /veilink/ HTTP/1.1\r\nHost: {}\r\nX-Custom-Route: alpha-9\r\nOrigin: https://app.example.com\r\nAccess-Control-Request-Method: PUT\r\n\r\n",
+                custom_host
+            );
+            tls.write_all(req.as_bytes()).await.unwrap();
+            let mut rbuf = [0u8; 512];
+            let n = tls.read(&mut rbuf).await.unwrap();
+            let head = String::from_utf8_lossy(&rbuf[..n]);
+            assert!(head.starts_with("HTTP/1.1 200"), "got: {}", head);
+            assert!(
+                head.to_ascii_lowercase()
+                    .contains("access-control-allow-methods: put"),
+                "got: {}",
+                head
+            );
+        }
+        probe_task.abort();
+
+        // 3. Full Runtime round-trip with gw_addr = gw_domain (TLS SAN) while xhttp.host = custom_host
+        let echo_ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = echo_ln.local_addr().unwrap().port() as i64;
+        let echo_guard = tokio::spawn(async move {
+            while let Ok((mut s, _)) = echo_ln.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                    let _ = w.shutdown().await;
+                });
+            }
+        });
+        let listen_port = reserve_free_tcp_port();
+        let srv_node = Node {
+            id: "srv-put".to_string(),
+            name: "srv-put".to_string(),
+            role: "server".to_string(),
+            address: gw_domain.to_string(),
+            port: transport_port,
+            connect_endpoints: vec![ConnectEndpoint {
+                id: "ep-1".to_string(),
+                name: "primary".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: transport_port,
+                enabled: true,
+            }],
+            tunnel: srv_local.clone(),
+            ..Default::default()
+        };
+        let mut srv_for_cli = srv_node.clone();
+        srv_for_cli.tunnel =
+            derive_client_tunnel(&LocalTLS::default(), &srv_local, &srv_node).unwrap();
+        let binding = Binding {
+            id: "bind-put".to_string(),
+            server_id: "srv-put".to_string(),
+            client_id: "cli-put".to_string(),
+            uuid: "550e8400-e29b-41d4-a716-4466554400cc".to_string(),
+            domain: gw_domain.to_string(),
+            ..Default::default()
+        };
+        let mapping = Mapping {
+            id: "map-put".to_string(),
+            name: "put-smux".to_string(),
+            binding_id: "bind-put".to_string(),
+            server_id: "srv-put".to_string(),
+            client_id: "cli-put".to_string(),
+            listen_host: "127.0.0.1".to_string(),
+            listen_port,
+            target_host: "127.0.0.1".to_string(),
+            target_port,
+            network: mspec.network.to_string(),
+            pool: 1,
+            mux: mspec.mux,
+            mux_type: mspec.mux_type.to_string(),
+            enabled: true,
+            ..Default::default()
+        };
+
+        let srv_rt = Runtime::new(srv_local);
+        srv_rt
+            .apply(Snapshot {
+                revision: 1,
+                node: srv_node,
+                nodes: vec![],
+                bindings: vec![binding.clone()],
+                mappings: vec![mapping.clone()],
+            })
+            .unwrap();
+        let cli_rt = Runtime::new(LocalTLS::default());
+        cli_rt
+            .apply(Snapshot {
+                revision: 1,
+                node: Node {
+                    id: "cli-put".to_string(),
+                    role: "client".to_string(),
+                    ..Default::default()
+                },
+                nodes: vec![srv_for_cli],
+                bindings: vec![binding],
+                mappings: vec![mapping],
+            })
+            .unwrap();
+
+        for _ in 0..80 {
+            if srv_rt.linked_bindings().contains(&"bind-put".to_string())
+                && cli_rt.linked_bindings().contains(&"bind-put".to_string())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let mut conn = TcpStream::connect(format!("127.0.0.1:{}", listen_port))
+            .await
+            .unwrap();
+        let payload = vec![0x5au8; 24 * 1024]; // spans multiple 2048..4096B PUT slices
+        conn.write_all(&payload).await.unwrap();
+        conn.shutdown().await.unwrap();
+        let mut echoed = Vec::new();
+        conn.read_to_end(&mut echoed).await.unwrap();
+        assert_eq!(echoed, payload);
+
+        let _ = cli_rt.close();
+        let _ = srv_rt.close();
+        echo_guard.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_burst_preserves_client_nat_port_without_recreating_stream() {
+        let domain = "edge.matrix.example.com";
+        let (ca_pem, cert_pem, key_pem) = generate_test_cert(domain);
+        let transport_port = reserve_free_tcp_port();
+        let listen_port = reserve_free_udp_port();
+
+        let target_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target_sock.local_addr().unwrap().port() as i64;
+        let seen_ports: Arc<Mutex<HashSet<u16>>> = Arc::new(Mutex::new(HashSet::new()));
+        let seen_c = seen_ports.clone();
+        let echo_task = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, peer)) = target_sock.recv_from(&mut buf).await {
+                seen_c.lock().unwrap().insert(peer.port());
+                let _ = target_sock.send_to(&buf[..n], peer).await;
+            }
+        });
+
+        let srv_local = LocalTLS {
+            protocol: "vless".to_string(),
+            transport_security: "tls".to_string(),
+            listen_host: "127.0.0.1".to_string(),
+            listen_port: transport_port,
+            cert_pem,
+            key_pem,
+            ca_pem,
+            ..Default::default()
+        };
+        let srv_node = Node {
+            id: "srv-udp".to_string(),
+            role: "server".to_string(),
+            address: "127.0.0.1".to_string(),
+            port: transport_port,
+            connect_endpoints: vec![ConnectEndpoint {
+                id: "ep-1".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: transport_port,
+                enabled: true,
+                ..Default::default()
+            }],
+            tunnel: srv_local.clone(),
+            ..Default::default()
+        };
+        let mut srv_for_cli = srv_node.clone();
+        srv_for_cli.tunnel =
+            derive_client_tunnel(&LocalTLS::default(), &srv_local, &srv_node).unwrap();
+        let binding = Binding {
+            id: "bind-udp".to_string(),
+            server_id: "srv-udp".to_string(),
+            client_id: "cli-udp".to_string(),
+            uuid: "550e8400-e29b-41d4-a716-4466554400dd".to_string(),
+            domain: domain.to_string(),
+            ..Default::default()
+        };
+        let mapping = Mapping {
+            id: "map-udp".to_string(),
+            name: "udp-burst".to_string(),
+            binding_id: "bind-udp".to_string(),
+            server_id: "srv-udp".to_string(),
+            client_id: "cli-udp".to_string(),
+            listen_host: "127.0.0.1".to_string(),
+            listen_port,
+            target_host: "127.0.0.1".to_string(),
+            target_port,
+            network: "udp".to_string(),
+            pool: 1,
+            enabled: true,
+            ..Default::default()
+        };
+
+        let srv_rt = Runtime::new(srv_local);
+        srv_rt
+            .apply(Snapshot {
+                revision: 1,
+                node: srv_node,
+                nodes: vec![],
+                bindings: vec![binding.clone()],
+                mappings: vec![mapping.clone()],
+            })
+            .unwrap();
+        let cli_rt = Runtime::new(LocalTLS::default());
+        cli_rt
+            .apply(Snapshot {
+                revision: 1,
+                node: Node {
+                    id: "cli-udp".to_string(),
+                    role: "client".to_string(),
+                    ..Default::default()
+                },
+                nodes: vec![srv_for_cli],
+                bindings: vec![binding],
+                mappings: vec![mapping],
+            })
+            .unwrap();
+
+        for _ in 0..80 {
+            if srv_rt.linked_bindings().contains(&"bind-udp".to_string())
+                && cli_rt.linked_bindings().contains(&"bind-udp".to_string())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let cli_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        cli_sock
+            .connect(format!("127.0.0.1:{}", listen_port))
+            .await
+            .unwrap();
+
+        // Fire 320 UDP datagrams back-to-back (> 256 channel depth) from the same UDP peer
+        for seq in 0..320u32 {
+            let _ = cli_sock.send(&seq.to_be_bytes()).await;
+        }
+        let mut rbuf = [0u8; 64];
+        let mut got_any = 0usize;
+        while let Ok(Ok(_)) =
+            tokio::time::timeout(Duration::from_millis(300), cli_sock.recv(&mut rbuf)).await
+        {
+            got_any += 1;
+        }
+        assert!(got_any > 0, "expected UDP burst responses");
+        assert_eq!(
+            seen_ports.lock().unwrap().len(),
+            1,
+            "UDP burst from one peer must preserve a single client NAT source port"
+        );
+
+        let _ = cli_rt.close();
+        let _ = srv_rt.close();
+        echo_task.abort();
     }
 }
