@@ -125,11 +125,11 @@ export function NotificationCenter() {
         key: 'sse:reconnecting',
         severity: 'info',
         category: 'system',
-        title: '实时事件流正在重连',
-        subtitle: 'SSE 通道中断，系统正在自动退避重连，数据仍可手动刷新。',
-        reasons: ['SSE 重连'],
+        title: '事件流重连中',
+        subtitle: '',
+        reasons: [],
         targetPage: 'logs',
-        actionLabel: '查看日志',
+        actionLabel: '日志',
       })
     }
 
@@ -296,7 +296,7 @@ export function NotificationCenter() {
                     <ShieldCheck size={20} />
                   </span>
                   <strong>{dict.dashboard.noAttention}</strong>
-                  <span>{hiddenCount > 0 ? `已静音 ${hiddenCount} 条当前会话提醒` : '节点心跳、配置修订与控制面状态均正常。'}</span>
+                  {hiddenCount > 0 && <span>已忽略 {hiddenCount} 条</span>}
                 </div>
               ) : (
                 visibleNotices.map((item) => {

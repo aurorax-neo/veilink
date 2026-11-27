@@ -14,6 +14,7 @@ export function Modal({
   kicker,
   size = 'md',
   isForm = false,
+  danger = false,
   saveLabel = '保存',
   cancelLabel = '取消',
   hideFooter = false,
@@ -28,6 +29,7 @@ export function Modal({
   kicker?: string
   size?: 'sm' | 'md' | 'lg'
   isForm?: boolean
+  danger?: boolean
   saveLabel?: string
   cancelLabel?: string
   hideFooter?: boolean
@@ -90,7 +92,7 @@ export function Modal({
       className="overlay-backdrop"
       onMouseDown={(e) => {
         // Spec 2.5: Form modals NEVER close on backdrop click
-        if (e.target === e.currentTarget && !isForm && hideSave && !busy) onClose()
+        if (e.target === e.currentTarget && !isForm && !busy) onClose()
       }}
     >
       <div
@@ -139,10 +141,10 @@ export function Modal({
               {!hideSave && (
                 <button
                   type="submit"
-                  className="btn btn-primary primary-action"
+                  className={`btn ${danger ? 'btn-danger-solid' : 'btn-primary'} primary-action`}
                   disabled={busy || disabled}
                 >
-                  {busy ? '正在提交…' : saveLabel}
+                  {busy ? '处理中…' : saveLabel}
                 </button>
               )}
             </footer>

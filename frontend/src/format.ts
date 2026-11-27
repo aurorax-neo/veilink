@@ -406,9 +406,55 @@ export function validateMapping(
   return null
 }
 
+function legacyExecCopy(value: string): boolean {
+  if (typeof document === 'undefined' || !document.body) return false
+  const prevFocus = (document.activeElement as HTMLElement | null) ?? null
+  const host = (prevFocus?.closest?.('[role="dialog"]') as HTMLElement | null) || document.body
+  const ta = document.createElement('textarea')
+  ta.value = value
+  ta.setAttribute('readonly', '')
+  ta.setAttribute('aria-hidden', 'true')
+  ta.tabIndex = -1
+  // Keep visible to WebKit layout (not display:none) with font-size 16px to prevent iOS zoom.
+  ta.style.cssText =
+    'position:fixed;top:0;left:0;width:2em;height:2em;padding:0;border:0;outline:none;box-shadow:none;background:transparent;color:transparent;opacity:0;font-size:16px;pointer-events:none;z-index:-1;'
+  host.appendChild(ta)
+  let ok = false
+  try {
+    ta.focus({ preventScroll: true })
+    ta.select()
+    ta.setSelectionRange(0, value.length)
+    ok = typeof document.execCommand === 'function' && document.execCommand('copy')
+  } catch {
+    ok = false
+  } finally {
+    ta.remove()
+    try {
+      globalThis.getSelection?.()?.removeAllRanges?.()
+    } catch { /* ignore */ }
+    try {
+      prevFocus?.focus?.({ preventScroll: true })
+    } catch { /* ignore */ }
+  }
+  return ok
+}
+
 export async function copyText(value: string): Promise<void> {
-  if (!navigator.clipboard?.writeText) throw new Error('无法写入剪贴板，请手动选择文本。')
-  await navigator.clipboard.writeText(value)
+  // Execute synchronous copy immediately inside the raw touch/click gesture before any
+  // Promise boundary can expire transient user activation in iOS WKWebView / Brave / HTTP.
+  const syncOk = legacyExecCopy(value)
+
+  if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value)
+      return
+    } catch {
+      if (syncOk) return
+    }
+  }
+
+  if (syncOk) return
+  throw new Error('无法写入剪贴板，请长按文本手动复制。')
 }
 
 export function logLevelTone(level: string): Tone {

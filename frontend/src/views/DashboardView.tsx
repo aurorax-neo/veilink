@@ -52,7 +52,7 @@ export function DashboardView() {
   if (!loaded && loading) {
     return (
       <div className="panel">
-        <EmptyState title="正在加载控制平面状态…" description="正在同步节点拓扑、端口映射与实时流量统计。" />
+        <EmptyState title="加载中…" />
       </div>
     )
   }
@@ -70,17 +70,16 @@ export function DashboardView() {
   const mappingRatio = mappings.length ? Math.round((linkedMappings / mappings.length) * 100) : 0
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-      {/* 5-Card Telemetry KPI Strip */}
-      <section className="kpi-grid" aria-label="关键指标概览">
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+      <section className="kpi-grid" aria-label="关键指标">
         <button type="button" className="kpi-card" onClick={() => navigate('servers')}>
           <div className="kpi-top">
             <span>{dict.dashboard.onlineServers}</span>
-            <Server size={15} />
+            <Server size={14} />
           </div>
           <div className="kpi-value tabular">
             {onlineServers}
-            <span style={{ fontSize: 15, color: 'var(--text-muted)', fontWeight: 'var(--fw-regular)' }}> / {servers.length}</span>
+            <span style={{ fontSize: 14, color: 'var(--text-muted)', fontWeight: 'var(--fw-regular)' }}> / {servers.length}</span>
           </div>
           <div className="kpi-bar">
             <div className="kpi-bar-fill" style={{ width: `${serverRatio}%` }} />
@@ -90,11 +89,11 @@ export function DashboardView() {
         <button type="button" className="kpi-card" onClick={() => navigate('clients')}>
           <div className="kpi-top">
             <span>{dict.dashboard.onlineClients}</span>
-            <Laptop size={15} />
+            <Laptop size={14} />
           </div>
           <div className="kpi-value tabular">
             {onlineClients}
-            <span style={{ fontSize: 15, color: 'var(--text-muted)', fontWeight: 'var(--fw-regular)' }}> / {clients.length}</span>
+            <span style={{ fontSize: 14, color: 'var(--text-muted)', fontWeight: 'var(--fw-regular)' }}> / {clients.length}</span>
           </div>
           <div className="kpi-bar">
             <div className="kpi-bar-fill" style={{ width: `${clientRatio}%`, background: 'var(--good)' }} />
@@ -104,13 +103,12 @@ export function DashboardView() {
         <button type="button" className="kpi-card" onClick={() => navigate('proxies')}>
           <div className="kpi-top">
             <span>{dict.dashboard.activeMappings}</span>
-            <ArrowLeftRight size={15} />
+            <ArrowLeftRight size={14} />
           </div>
           <div className="kpi-value tabular">
             {enabledMappings}
-            <span style={{ fontSize: 15, color: 'var(--text-muted)', fontWeight: 'var(--fw-regular)' }}> / {mappings.length}</span>
+            <span style={{ fontSize: 14, color: 'var(--text-muted)', fontWeight: 'var(--fw-regular)' }}> / {mappings.length}</span>
           </div>
-          <div className="kpi-sub tabular">已建立隧道链路 {linkedMappings} 条</div>
           <div className="kpi-bar">
             <div className="kpi-bar-fill" style={{ width: `${mappingRatio}%`, background: 'var(--purple)' }} />
           </div>
@@ -119,9 +117,9 @@ export function DashboardView() {
         <button type="button" className="kpi-card" onClick={() => navigate('proxies')}>
           <div className="kpi-top">
             <span>{dict.dashboard.totalTraffic}</span>
-            <Activity size={15} />
+            <Activity size={14} />
           </div>
-          <div className="kpi-value tabular ltr-force" style={{ fontSize: 22 }}>
+          <div className="kpi-value tabular ltr-force" style={{ fontSize: 20 }}>
             {formatBytes(totalTraffic.total)}
           </div>
           <div className="kpi-sub tabular ltr-force">
@@ -139,27 +137,25 @@ export function DashboardView() {
         >
           <div className="kpi-top">
             <span>{dict.dashboard.attentionNodes}</span>
-            {attention.length > 0 ? <AlertTriangle size={15} style={{ color: 'var(--warn)' }} /> : <ShieldCheck size={15} style={{ color: 'var(--good)' }} />}
+            {attention.length > 0 ? <AlertTriangle size={14} style={{ color: 'var(--warn)' }} /> : <ShieldCheck size={14} style={{ color: 'var(--good)' }} />}
           </div>
           <div className="kpi-value tabular" style={{ color: attention.length > 0 ? 'var(--warn)' : 'var(--good)' }}>
             {attention.length}
           </div>
-          <div className="kpi-sub">{attention.length > 0 ? '点击展开通知中心排查' : dict.dashboard.noAttention}</div>
         </button>
       </section>
 
-      {/* Interactive Live Reverse-Tunnel Topology */}
       <section className="panel">
-        <header className="panel-head">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <Network size={16} style={{ color: 'var(--accent-strong)' }} />
+        <header className="panel-head" style={{ padding: '10px 16px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+            <Network size={15} style={{ color: 'var(--accent-strong)' }} />
             <h2>{dict.dashboard.topologyTitle}</h2>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <Badge text="已连通" tone="good" dot />
             <Badge text="待建连" tone="warn" dot />
-            <button type="button" className="btn btn-sm btn-ghost" onClick={() => navigate('proxies')}>
-              <span>管理映射</span>
+            <button type="button" className="btn btn-sm btn-ghost" style={{ minHeight: 28 }} onClick={() => navigate('proxies')}>
+              <span>{dict.pages.proxies.title}</span>
               <ArrowRight size={13} className="rtl-flip" />
             </button>
           </div>
@@ -168,30 +164,28 @@ export function DashboardView() {
           <TopologyCanvas nodes={nodes} mappings={mappings} statuses={mappingStatuses} onNavigate={navigate} />
         ) : (
           <EmptyState
-            icon={<Network size={20} />}
-            title="尚未构建网络拓扑"
-            description={dict.dashboard.topologyEmpty}
+            icon={<Network size={18} />}
+            title="暂无拓扑"
             action={
               <button type="button" className="btn btn-sm btn-primary" onClick={() => navigate('servers')}>
-                前往创建公网网关
+                {dict.nodes.newServer}
               </button>
             }
           />
         )}
       </section>
 
-      {/* 2-Column Fleet Bento */}
       <div className="bento-2">
         <section className="panel">
-          <header className="panel-head">
+          <header className="panel-head" style={{ padding: '10px 16px' }}>
             <h2>{dict.dashboard.gatewaysTitle}</h2>
-            <button type="button" className="btn btn-sm btn-ghost" onClick={() => navigate('servers')}>
+            <button type="button" className="btn btn-sm btn-ghost" style={{ minHeight: 28 }} onClick={() => navigate('servers')}>
               <span>{dict.dashboard.manageAll}</span>
               <ArrowRight size={13} className="rtl-flip" />
             </button>
           </header>
           {servers.length === 0 ? (
-            <EmptyState icon={<Server size={18} />} title="暂无公网网关" />
+            <EmptyState icon={<Server size={18} />} title="暂无网关" />
           ) : (
             <div className="table-scroll">
               <table className="data-table">
@@ -234,15 +228,15 @@ export function DashboardView() {
         </section>
 
         <section className="panel">
-          <header className="panel-head">
+          <header className="panel-head" style={{ padding: '10px 16px' }}>
             <h2>{dict.dashboard.clientsTitle}</h2>
-            <button type="button" className="btn btn-sm btn-ghost" onClick={() => navigate('clients')}>
+            <button type="button" className="btn btn-sm btn-ghost" style={{ minHeight: 28 }} onClick={() => navigate('clients')}>
               <span>{dict.dashboard.manageAll}</span>
               <ArrowRight size={13} className="rtl-flip" />
             </button>
           </header>
           {clients.length === 0 ? (
-            <EmptyState icon={<Laptop size={18} />} title="暂无内网节点" />
+            <EmptyState icon={<Laptop size={18} />} title="暂无节点" />
           ) : (
             <div className="table-scroll">
               <table className="data-table">
@@ -250,7 +244,7 @@ export function DashboardView() {
                   <tr>
                     <th>节点</th>
                     <th>状态</th>
-                    <th>关联映射</th>
+                    <th>映射</th>
                     <th>配置</th>
                   </tr>
                 </thead>
@@ -262,7 +256,7 @@ export function DashboardView() {
                       <tr key={node.id} style={{ cursor: 'pointer' }} onClick={() => navigate('clients')}>
                         <td>
                           <div style={{ fontWeight: 'var(--fw-medium)' }}>{node.name}</div>
-                          <div className="cell-sub tabular ltr-force">{node.software_version || '等待上报'}</div>
+                          <div className="cell-sub tabular ltr-force">{node.software_version || '—'}</div>
                         </td>
                         <td><Badge text={st.text} tone={st.tone} dot pulse={st.tone === 'good'} /></td>
                         <td className="tabular">{mappings.filter((m) => m.client_id === node.id).length}</td>
@@ -277,17 +271,16 @@ export function DashboardView() {
         </section>
       </div>
 
-      {/* Recent Audit Activity */}
       <section className="panel">
-        <header className="panel-head">
+        <header className="panel-head" style={{ padding: '10px 16px' }}>
           <h2>{dict.dashboard.recentAuditTitle}</h2>
-          <button type="button" className="btn btn-sm btn-ghost" onClick={() => navigate('audit')}>
-            <span>完整审计轨迹</span>
+          <button type="button" className="btn btn-sm btn-ghost" style={{ minHeight: 28 }} onClick={() => navigate('audit')}>
+            <span>{dict.dashboard.manageAll}</span>
             <ArrowRight size={13} className="rtl-flip" />
           </button>
         </header>
         {audit.length === 0 ? (
-          <EmptyState title="暂无审计记录" description="节点与映射的创建、修改与令牌操作会自动记录。" />
+          <EmptyState title="暂无记录" />
         ) : (
           <ul className="audit-list">
             {audit.slice(0, 5).map((item, idx) => (

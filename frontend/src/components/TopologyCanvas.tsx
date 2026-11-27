@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react'
-import { byNameAndId, endpoint, heartbeatOnline, tunnelSummaryText } from '../format'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { byNameAndId, endpoint, heartbeatOnline } from '../format'
 import type { Mapping, MappingStatus, Node, PageId } from '../types'
 
 interface Props {
@@ -10,7 +10,23 @@ interface Props {
 }
 
 export function TopologyCanvas({ nodes, mappings, statuses, onNavigate }: Props) {
+  const wrapRef = useRef<HTMLDivElement>(null)
   const [hoverId, setHoverId] = useState<string>('')
+  const [canvasWidth, setCanvasWidth] = useState<number>(820)
+
+  useEffect(() => {
+    const el = wrapRef.current
+    if (!el) return
+    const sync = () => {
+      const w = el.clientWidth - 28
+      if (w > 0) setCanvasWidth(Math.max(480, Math.min(1360, Math.round(w))))
+    }
+    sync()
+    if (typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(sync)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
 
   const servers = useMemo(() => nodes.filter((n) => n.role === 'server' && !n.revoked).sort(byNameAndId), [nodes])
   const clients = useMemo(() => nodes.filter((n) => n.role === 'client' && !n.revoked).sort(byNameAndId), [nodes])
@@ -31,26 +47,42 @@ export function TopologyCanvas({ nodes, mappings, statuses, onNavigate }: Props)
     return [...map.values()]
   }, [mappings, statuses])
 
+  // True 1:1 pixel geometry — never magnifies nodes or fonts on wide screens
+  const nodeW = Math.min(188, Math.max(146, Math.round(canvasWidth * 0.23)))
+  const nodeH = 38
+  const rowGap = 46
+  const padY = 10
+  const padX = 8
   const rows = Math.max(servers.length, clients.length, 1)
-  const rowHeight = 76
-  const height = Math.max(200, rows * rowHeight + 56)
-  const width = 880
+  const height = rows * rowGap + padY * 2
+  const width = canvasWidth
 
-  const serverY = (idx: number) => {
-    const step = (height - 48) / Math.max(servers.length, 1)
-    return 24 + step * idx + step / 2
-  }
-  const clientY = (idx: number) => {
-    const step = (height - 48) / Math.max(clients.length, 1)
-    return 24 + step * idx + step / 2
+  const leftX = padX
+  const rightX = width - padX - nodeW
+  const serverPortX = leftX + nodeW
+  const clientPortX = rightX
+
+  const calcY = (idx: number, total: number) => {
+    const span = height - padY * 2
+    const step = span / Math.max(total, 1)
+    return Math.round(padY + step * idx + step / 2)
   }
 
-  const serverCoords = new Map(servers.map((s, i) => [s.id, { x: 250, y: serverY(i) }]))
-  const clientCoords = new Map(clients.map((c, i) => [c.id, { x: 630, y: clientY(i) }]))
+  const serverCoords = new Map(servers.map((s, i) => [s.id, { x: serverPortX, y: calcY(i, servers.length) }]))
+  const clientCoords = new Map(clients.map((c, i) => [c.id, { x: clientPortX, y: calcY(i, clients.length) }]))
+  const spanX = Math.max(80, clientPortX - serverPortX)
+  const ctrlOffset = Math.round(Math.min(140, spanX * 0.38))
 
   return (
-    <div className="topology-canvas-wrap">
-      <svg className="topology-svg" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="反向隧道实时拓扑图">
+    <div ref={wrapRef} className="topology-canvas-wrap">
+      <svg
+        className="topology-svg"
+        width={width}
+        height={height}
+        viewBox={`0 0 ${width} ${height}`}
+        role="img"
+        aria-label="反向隧道拓扑"
+      >
         <defs>
           <linearGradient id="edgeLinked" x1="0%" y1="0%" x2="100%" y2="0%">
             <stop offset="0%" stopColor="#14b8a6" />
@@ -62,81 +94,70 @@ export function TopologyCanvas({ nodes, mappings, statuses, onNavigate }: Props)
           </linearGradient>
         </defs>
 
-        {/* Column Headers */}
-        <text x="24" y="18" fill="var(--text-muted)" fontSize="11" fontWeight="500">
-          PUBLIC GATEWAYS (SERVER)
-        </text>
-        <text x="440" y="18" textAnchor="middle" fill="var(--text-muted)" fontSize="11" fontWeight="500">
-          ENCRYPTED REVERSE TUNNELS
-        </text>
-        <text x="856" y="18" textAnchor="end" fill="var(--text-muted)" fontSize="11" fontWeight="500">
-          INTRANET AGENTS (CLIENT)
-        </text>
-
-        {/* Curved Tunnel Links */}
         {pairMap.map((edge) => {
           const from = serverCoords.get(edge.serverId)
           const to = clientCoords.get(edge.clientId)
           if (!from || !to) return null
           const activeLink = edge.linked > 0
           const muted = hoverId && hoverId !== edge.serverId && hoverId !== edge.clientId
-          const midX = (from.x + to.x) / 2
-          const midY = (from.y + to.y) / 2
-          const d = `M ${from.x} ${from.y} C ${from.x + 130} ${from.y}, ${to.x - 130} ${to.y}, ${to.x} ${to.y}`
+          const midX = Math.round((from.x + to.x) / 2)
+          const midY = Math.round((from.y + to.y) / 2)
+          const d = `M ${from.x} ${from.y} C ${from.x + ctrlOffset} ${from.y}, ${to.x - ctrlOffset} ${to.y}, ${to.x} ${to.y}`
           return (
-            <g key={`${edge.serverId}-${edge.clientId}`} opacity={muted ? 0.18 : 1} style={{ transition: 'opacity 140ms ease' }}>
+            <g key={`${edge.serverId}-${edge.clientId}`} opacity={muted ? 0.2 : 1} style={{ transition: 'opacity 140ms ease' }}>
               <path
                 d={d}
                 fill="none"
                 stroke={activeLink ? 'url(#edgeLinked)' : edge.enabled > 0 ? 'url(#edgePending)' : 'var(--line-strong)'}
-                strokeWidth={activeLink ? 2.4 : 1.6}
-                strokeDasharray={activeLink ? undefined : '5 5'}
+                strokeWidth={activeLink ? 1.8 : 1.25}
+                strokeDasharray={activeLink ? undefined : '4 4'}
               />
               <g transform={`translate(${midX}, ${midY})`} style={{ cursor: 'pointer' }} onClick={() => onNavigate('proxies')}>
-                <rect x="-46" y="-12" width="92" height="24" rx="12" fill="var(--surface-3)" stroke="var(--line-subtle)" strokeWidth="1" />
-                <text x="0" y="4" textAnchor="middle" fill={activeLink ? 'var(--good)' : 'var(--text-secondary)'} fontSize="11" fontFamily="var(--font-mono)">
-                  {edge.linked}/{edge.count} routes
+                <rect x="-26" y="-9.5" width="52" height="19" rx="9.5" fill="var(--surface-3)" stroke="var(--line-subtle)" strokeWidth="1" />
+                <text x="0" y="3.5" textAnchor="middle" fill={activeLink ? 'var(--good)' : 'var(--text-secondary)'} fontSize="10.5" fontFamily="var(--font-mono)">
+                  {edge.linked}/{edge.count}
                 </text>
               </g>
             </g>
           )
         })}
 
-        {/* Server Nodes */}
         {servers.map((node) => {
           const pos = serverCoords.get(node.id)!
           const online = !node.disabled && heartbeatOnline(node)
           const isHovered = hoverId === node.id
+          const sub = node.address ? endpoint(node.address, node.port) : ''
           return (
             <g
               key={node.id}
-              transform={`translate(24, ${pos.y - 28})`}
+              transform={`translate(${leftX}, ${Math.round(pos.y - nodeH / 2)})`}
               style={{ cursor: 'pointer' }}
               onMouseEnter={() => setHoverId(node.id)}
               onMouseLeave={() => setHoverId('')}
               onClick={() => onNavigate('servers')}
             >
               <rect
-                width="226"
-                height="56"
-                rx="12"
+                width={nodeW}
+                height={nodeH}
+                rx="8"
                 fill={isHovered ? 'var(--surface-3)' : 'var(--surface-1)'}
                 stroke={isHovered ? 'var(--accent-border)' : 'var(--line-subtle)'}
                 strokeWidth="1"
               />
-              <circle cx="18" cy="21" r="4.5" fill={online ? 'var(--good)' : node.disabled ? 'var(--text-muted)' : 'var(--warn)'} />
-              <text x="32" y="25" fill="var(--text-primary)" fontSize="13" fontWeight="500">
-                {node.name.length > 20 ? `${node.name.slice(0, 19)}…` : node.name}
+              <circle cx="12" cy={nodeH / 2} r="3.5" fill={online ? 'var(--good)' : node.disabled ? 'var(--text-muted)' : 'var(--warn)'} />
+              <text x="22" y={sub ? 15.5 : 23} fill="var(--text-primary)" fontSize="12" fontWeight="500">
+                {node.name.length > 16 ? `${node.name.slice(0, 15)}…` : node.name}
               </text>
-              <text x="32" y="43" fill="var(--text-muted)" fontSize="11" fontFamily="var(--font-mono)">
-                {node.address ? endpoint(node.address, node.port) : tunnelSummaryText(node).slice(0, 26)}
-              </text>
-              <circle cx="226" cy="28" r="4" fill="var(--accent)" />
+              {sub && (
+                <text x="22" y="29.5" fill="var(--text-muted)" fontSize="10" fontFamily="var(--font-mono)">
+                  {sub.length > 22 ? `${sub.slice(0, 21)}…` : sub}
+                </text>
+              )}
+              <circle cx={nodeW} cy={nodeH / 2} r="3" fill="var(--accent)" />
             </g>
           )
         })}
 
-        {/* Client Nodes */}
         {clients.map((node) => {
           const pos = clientCoords.get(node.id)!
           const online = !node.disabled && heartbeatOnline(node)
@@ -145,27 +166,27 @@ export function TopologyCanvas({ nodes, mappings, statuses, onNavigate }: Props)
           return (
             <g
               key={node.id}
-              transform={`translate(630, ${pos.y - 28})`}
+              transform={`translate(${rightX}, ${Math.round(pos.y - nodeH / 2)})`}
               style={{ cursor: 'pointer' }}
               onMouseEnter={() => setHoverId(node.id)}
               onMouseLeave={() => setHoverId('')}
               onClick={() => onNavigate('clients')}
             >
               <rect
-                width="226"
-                height="56"
-                rx="12"
+                width={nodeW}
+                height={nodeH}
+                rx="8"
                 fill={isHovered ? 'var(--surface-3)' : 'var(--surface-1)'}
                 stroke={isHovered ? 'var(--accent-border)' : 'var(--line-subtle)'}
                 strokeWidth="1"
               />
-              <circle cx="0" cy="28" r="4" fill={online ? 'var(--good)' : 'var(--text-muted)'} />
-              <circle cx="18" cy="21" r="4.5" fill={online ? 'var(--good)' : node.disabled ? 'var(--text-muted)' : 'var(--warn)'} />
-              <text x="32" y="25" fill="var(--text-primary)" fontSize="13" fontWeight="500">
-                {node.name.length > 20 ? `${node.name.slice(0, 19)}…` : node.name}
+              <circle cx="0" cy={nodeH / 2} r="3" fill={online ? 'var(--good)' : 'var(--text-muted)'} />
+              <circle cx="12" cy={nodeH / 2} r="3.5" fill={online ? 'var(--good)' : node.disabled ? 'var(--text-muted)' : 'var(--warn)'} />
+              <text x="22" y="15.5" fill="var(--text-primary)" fontSize="12" fontWeight="500">
+                {node.name.length > 16 ? `${node.name.slice(0, 15)}…` : node.name}
               </text>
-              <text x="32" y="43" fill="var(--text-muted)" fontSize="11" fontFamily="var(--font-mono)">
-                {routeCount} mapping{routeCount === 1 ? '' : 's'} · {node.software_version || 'agent'}
+              <text x="22" y="29.5" fill="var(--text-muted)" fontSize="10" fontFamily="var(--font-mono)">
+                {routeCount} 映射
               </text>
             </g>
           )

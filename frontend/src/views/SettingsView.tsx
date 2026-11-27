@@ -10,7 +10,7 @@ import { Segmented, Select, Switch } from '../components/ui/Controls'
 import { Popconfirm } from '../components/ui/Overlays'
 
 export function SettingsView() {
-  const { currentUser, refreshAccount, logout, theme, toggleTheme, locale, setLocale, setTourOpen, toast, dict } = useConsole()
+  const { currentUser, refreshAccount, requestLogout, theme, toggleTheme, locale, setLocale, setTourOpen, toast, dict } = useConsole()
 
   const [status, setStatus] = useState<WebStatus | null>(null)
   const [loading, setLoading] = useState(true)
@@ -172,22 +172,20 @@ export function SettingsView() {
             <div className="kpi-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))' }}>
               <div style={{ padding: 12, borderRadius: 'var(--radius-md)', background: 'var(--surface-1)' }}>
                 <div className="cell-sub">运行版本</div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBlockStart: 4, flexWrap: 'wrap' }}>
-                  <code className="tabular ltr-force" style={{ fontWeight: 'var(--fw-semibold)' }}>{status.active_version}</code>
-                  <Badge text="React 19 Embedded" tone="accent" />
-                </div>
-              </div>
-              <div style={{ padding: 12, borderRadius: 'var(--radius-md)', background: 'var(--surface-1)' }}>
-                <div className="cell-sub">当前监听端点</div>
-                <code className="tabular ltr-force" style={{ display: 'block', marginBlockStart: 6, fontWeight: 'var(--fw-medium)' }}>
-                  {serviceLoaded && service.listen_addr ? `${service.scheme}://${service.listen_addr}` : '加载中…'}
+                <code className="tabular ltr-force" style={{ display: 'block', marginBlockStart: 6, fontWeight: 'var(--fw-semibold)' }}>
+                  {status.active_version}
                 </code>
               </div>
               <div style={{ padding: 12, borderRadius: 'var(--radius-md)', background: 'var(--surface-1)' }}>
-                <div className="cell-sub">安全注册状态</div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBlockStart: 4, flexWrap: 'wrap' }}>
-                  <Badge text="公开注册已永久锁定" tone="good" dot />
-                  <span className="cell-sub tabular">活跃会话 {currentUser?.active_sessions ?? 1}</span>
+                <div className="cell-sub">监听端点</div>
+                <code className="tabular ltr-force" style={{ display: 'block', marginBlockStart: 6, fontWeight: 'var(--fw-medium)' }}>
+                  {serviceLoaded && service.listen_addr ? `${service.scheme}://${service.listen_addr}` : '—'}
+                </code>
+              </div>
+              <div style={{ padding: 12, borderRadius: 'var(--radius-md)', background: 'var(--surface-1)' }}>
+                <div className="cell-sub">活跃会话</div>
+                <div className="tabular" style={{ marginBlockStart: 6, fontWeight: 'var(--fw-medium)' }}>
+                  {currentUser?.active_sessions ?? 1}
                 </div>
               </div>
             </div>
@@ -214,7 +212,7 @@ export function SettingsView() {
                 </button>
               )}
             </Popconfirm>
-            <button type="button" className="btn btn-sm btn-danger-ghost" onClick={() => void logout()}>
+            <button type="button" className="btn btn-sm btn-danger-ghost" onClick={requestLogout}>
               <LogOut size={14} />
               <span>{dict.common.signOut}</span>
             </button>
@@ -223,17 +221,10 @@ export function SettingsView() {
 
         <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
           <div style={{ padding: 14, borderRadius: 'var(--radius-md)', background: 'var(--surface-1)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
-            <div style={{ display: 'grid', gap: 4 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                <strong className="ltr-force" style={{ fontSize: 15 }}>{currentUser?.email || '—'}</strong>
-                <Badge text="唯一管理员" tone="accent" />
-              </div>
-              <div className="cell-sub tabular">
-                {currentUser?.created_at ? `创建于 ${formatTime(currentUser.created_at)}` : ''}
-                {currentUser?.last_login ? ` · 最近登录 ${formatTime(currentUser.last_login)}` : ''}
-              </div>
+            <strong className="ltr-force" style={{ fontSize: 15 }}>{currentUser?.email || '—'}</strong>
+            <div className="cell-sub tabular">
+              {currentUser?.last_login ? `最近登录 ${formatTime(currentUser.last_login)}` : ''}
             </div>
-            <Badge text="PBKDF2-HMAC-SHA256" tone="good" />
           </div>
 
           <div className="bento-2">
@@ -362,26 +353,26 @@ export function SettingsView() {
         <div className="panel-body">
           <div className="form-grid-2">
             <div className="field">
-              <span className="field-label">界面外观主题</span>
+              <span className="field-label">外观</span>
               <Segmented<'dark' | 'light'>
                 ariaLabel="主题切换"
                 value={theme}
                 onChange={(next) => { if (next !== theme) toggleTheme() }}
                 options={[
-                  { value: 'dark', label: '深色碳墨（Dark）' },
-                  { value: 'light', label: '浅色纸感（Light）' },
+                  { value: 'dark', label: '深色' },
+                  { value: 'light', label: '浅色' },
                 ]}
               />
             </div>
             <div className="field">
-              <span className="field-label">控制台语言（支持 RTL 阿拉伯语与多语言排版）</span>
+              <span className="field-label">语言</span>
               <Select<LocaleCode>
                 ariaLabel="控制台语言"
                 value={locale}
                 onChange={setLocale}
                 options={LOCALES.map((item) => ({
                   value: item.code,
-                  label: `${item.native} · ${item.label}${item.dir === 'rtl' ? ' (RTL)' : ''}`,
+                  label: `${item.native}${item.dir === 'rtl' ? ' · RTL' : ''}`,
                 }))}
               />
             </div>

@@ -121,7 +121,101 @@ test('Email/password validation, Setup Wizard anti-visitor flow, and multi-resol
   const dashboardView = read('../src/views/DashboardView.tsx')
   const appShell = read('../src/components/AppShell.tsx')
   const notifCenter = read('../src/components/NotificationCenter.tsx')
+  const loginView = read('../src/views/LoginView.tsx')
+  const onboardingModal = read('../src/components/NodeOnboardingModal.tsx')
+  const topologyCanvas = read('../src/components/TopologyCanvas.tsx')
   assert.doesNotMatch(dashboardView, /<Alert\b/, 'Dashboard should not render inline top warning banners that shift KPI content')
   assert.match(appShell, /<NotificationCenter\s*\/>/)
+  assert.doesNotMatch(appShell, /page-subtitle/, 'Page headers must stay concise without verbose subtitles')
   assert.match(notifCenter, /notif-popover/)
+
+  // Minimal Login & Setup ("登录就是登录") and compact 1:1 TopologyCanvas
+  assert.doesNotMatch(loginView, /login-showcase|单管理员锁|Collapsible|PBKDF2/)
+  assert.doesNotMatch(setupView, /login-showcase|setup-stepper|PBKDF2/)
+  assert.doesNotMatch(onboardingModal, /<Collapsible|result\?\.warning/)
+  assert.match(topologyCanvas, /ResizeObserver/)
+  assert.match(topologyCanvas, /const nodeH = 38/)
+
+  // Sign-out secondary confirmation across AppShell and SettingsView
+  const settingsView = read('../src/views/SettingsView.tsx')
+  const consoleCtx = read('../src/context/ConsoleContext.tsx')
+  assert.match(appShell, /requestLogout/)
+  assert.doesNotMatch(appShell, /onClick=\{\(\) => void logout\(\)\}/)
+  assert.match(settingsView, /requestLogout/)
+  assert.match(consoleCtx, /logoutConfirmOpen/)
+})
+
+test('copyText falls back to synchronous mobile-compatible textarea selection when Clipboard API is blocked or missing', async () => {
+  const code = ts.transpileModule(read('../src/format.ts'), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+  }).outputText
+
+  let selectedRange = null
+  let execCopiedValue = null
+  let removed = false
+  const fakeTa = {
+    value: '',
+    style: { cssText: '' },
+    tabIndex: 0,
+    setAttribute() {},
+    focus() {},
+    select() {},
+    setSelectionRange(start, end) {
+      selectedRange = [start, end]
+    },
+    remove() {
+      removed = true
+    },
+  }
+  const fakeDoc = {
+    activeElement: { closest: () => null, focus() {} },
+    body: { appendChild() {} },
+    createElement: () => fakeTa,
+    execCommand: (cmd) => {
+      if (cmd === 'copy') {
+        execCopiedValue = fakeTa.value
+        return true
+      }
+      return false
+    },
+  }
+
+  // Case 1: iOS WKWebView / Brave where navigator.clipboard.writeText rejects with NotAllowedError
+  const m1 = { exports: {} }
+  vm.runInContext(
+    code,
+    vm.createContext({
+      exports: m1.exports,
+      module: m1,
+      TextEncoder,
+      document: fakeDoc,
+      navigator: {
+        clipboard: {
+          writeText: async () => {
+            throw new Error('NotAllowedError: Clipboard write blocked in WKWebView')
+          },
+        },
+      },
+    }),
+  )
+  await m1.exports.copyText('veilink-mobile-cmd-123')
+  assert.equal(execCopiedValue, 'veilink-mobile-cmd-123')
+  assert.deepEqual(selectedRange, [0, 'veilink-mobile-cmd-123'.length])
+  assert.equal(removed, true)
+
+  // Case 2: Non-HTTPS HTTP origin where navigator.clipboard is undefined
+  execCopiedValue = null
+  const m2 = { exports: {} }
+  vm.runInContext(
+    code,
+    vm.createContext({
+      exports: m2.exports,
+      module: m2,
+      TextEncoder,
+      document: fakeDoc,
+      navigator: {},
+    }),
+  )
+  await m2.exports.copyText('http-fallback-ok')
+  assert.equal(execCopiedValue, 'http-fallback-ok')
 })

@@ -3,8 +3,8 @@ import { Check, Copy, Download, RefreshCw } from 'lucide-react'
 import { api } from '../api'
 import { copyText, triggerHaptic } from '../format'
 import type { JoinResult, Node } from '../types'
-import { Alert, Badge, InlineAlert } from './ui/Badge'
-import { Collapsible, Segmented } from './ui/Controls'
+import { InlineAlert } from './ui/Badge'
+import { Segmented } from './ui/Controls'
 import { Modal } from './ui/Overlays'
 
 type CommandTab = 'docker' | 'offline-docker' | 'binary' | 'state'
@@ -21,7 +21,6 @@ export function NodeOnboardingModal({
   const [result, setResult] = useState<JoinResult | null>(null)
   const [generating, setGenerating] = useState(false)
   const [activeTab, setActiveTab] = useState<CommandTab>('docker')
-  const [status, setStatus] = useState('')
   const [error, setError] = useState('')
   const [copied, setCopied] = useState(false)
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
@@ -49,7 +48,7 @@ export function NodeOnboardingModal({
         (parsed.pathname !== '/' && parsed.pathname !== '') ||
         /[\r\n\t ]/.test(clean)
       ) {
-        setError('地址须使用 http:// 或 https://，不能含路径、凭据、查询或片段。')
+        setError('地址须使用 http:// 或 https://，不含路径或查询参数。')
         return
       }
       setError('')
@@ -61,7 +60,6 @@ export function NodeOnboardingModal({
         }
         setResult(res)
         setGeneratedURL(clean)
-        setStatus('')
       } catch (err) {
         setError(err instanceof Error ? err.message : '生成接入命令失败')
       } finally {
@@ -75,7 +73,6 @@ export function NodeOnboardingModal({
     if (!node) {
       setResult(null)
       setGeneratedURL('')
-      setStatus('')
       setError('')
       setCopied(false)
       return
@@ -99,15 +96,6 @@ export function NodeOnboardingModal({
           ? result.state_json || ''
           : result.command
 
-  const modeHint =
-    activeTab === 'offline-docker'
-      ? '内嵌节点凭据与当前隧道快照，无法连接 Hub 时也可直接启动容器。'
-      : activeTab === 'binary'
-        ? '单二进制直接携带完整脱机参数运行，网络恢复后自动重连 Hub。'
-        : activeTab === 'state'
-          ? '将此 JSON 写入节点 /data/state/state.json，即可脱机加载完整隧道配置。'
-          : '启动后连接 Hub 自动拉取并持续同步隧道与端口映射配置。'
-
   const handleCopy = async () => {
     if (!activeCommand) return
     setError('')
@@ -115,11 +103,10 @@ export function NodeOnboardingModal({
       await copyText(activeCommand)
       triggerHaptic(12)
       setCopied(true)
-      setStatus('已复制到剪贴板。')
       if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
       copyTimerRef.current = setTimeout(() => setCopied(false), 2500)
     } catch {
-      setError('复制失败，请手动选中命令复制。')
+      setError('复制失败，请手动选中复制。')
     }
   }
 
@@ -134,7 +121,6 @@ export function NodeOnboardingModal({
     a.click()
     document.body.removeChild(a)
     URL.revokeObjectURL(url)
-    setStatus('state.json 脱机配置已导出。')
   }
 
   return (
@@ -142,14 +128,12 @@ export function NodeOnboardingModal({
       open={!!node}
       onClose={onClose}
       size="lg"
-      kicker="Node Onboarding"
       title={`快捷接入 · ${node?.name || ''}`}
       hideSave
     >
       <div className="field">
         <label className="field-label" htmlFor="join-master-url">
-          <span>Hub 管理地址</span>
-          <Badge text="节点接入令牌持久有效" tone="good" />
+          Hub 地址
         </label>
         <div className="field-row">
           <input
@@ -173,7 +157,7 @@ export function NodeOnboardingModal({
             onClick={() => node && void generate(node, masterURL)}
           >
             <RefreshCw size={14} className={generating ? 'spin' : ''} />
-            <span>{generating ? '更新中…' : '更新地址'}</span>
+            <span>{generating ? '更新中…' : '更新'}</span>
           </button>
         </div>
         <InlineAlert message={error} />
@@ -198,14 +182,14 @@ export function NodeOnboardingModal({
                 ]}
               />
             ) : (
-              <strong style={{ fontSize: 13 }}>标准接入命令</strong>
+              <strong style={{ fontSize: 13 }}>接入命令</strong>
             )}
 
             <div style={{ display: 'flex', gap: 6 }}>
               {activeTab === 'state' && result.state_json && (
                 <button type="button" className="btn btn-sm btn-ghost" onClick={downloadStateJson}>
                   <Download size={14} />
-                  <span>导出文件</span>
+                  <span>导出</span>
                 </button>
               )}
               <button
@@ -214,12 +198,10 @@ export function NodeOnboardingModal({
                 onClick={() => void handleCopy()}
               >
                 {copied ? <Check size={14} /> : <Copy size={14} />}
-                <span>{copied ? '已复制' : '复制内容'}</span>
+                <span>{copied ? '已复制' : '复制'}</span>
               </button>
             </div>
           </div>
-
-          <p className="field-help">{modeHint}</p>
 
           <textarea
             className="mono ltr-force"
@@ -227,25 +209,11 @@ export function NodeOnboardingModal({
             readOnly
             rows={6}
             spellCheck={false}
-            style={{ fontSize: 12.5, lineHeight: 1.55 }}
+            style={{ fontSize: 12.5, lineHeight: 1.5 }}
+            onClick={(e) => e.currentTarget.select()}
           />
-          {status && <span className="field-help" style={{ color: 'var(--good)' }} role="status">{status}</span>}
         </div>
       )}
-
-      {result?.warning && <Alert tone="warn">{result.warning}</Alert>}
-
-      <Collapsible title="接入参数与通信说明">
-        <p className="field-help">
-          填写节点可访问的 Master 地址（含端口）；HTTPS 证书须匹配主机名。当节点无法连接 Hub 时，可使用「脱机容器 / 脱机二进制 / state.json」直接加载完整隧道与端口映射配置启动，待网络恢复后自动同步。
-        </p>
-        <p className="field-help">
-          统一镜像 <code className="ltr-force">ghcr.io/aurorax-neo/veilink:latest</code> 以 <code>server</code> 或 <code>client</code> 子命令区分角色。节点接入令牌持久有效，多次生成不会覆盖旧令牌。
-        </p>
-        <p className="field-help">
-          HTTP/h2c 不加密，仅用于可信网络；接入命令仅建立管理通信，客户端无需手写本地隧道 flags。
-        </p>
-      </Collapsible>
     </Modal>
   )
 }

@@ -374,7 +374,6 @@ export function ProxiesView() {
           <EmptyState
             icon={<ArrowLeftRight size={20} />}
             title={dict.proxies.noMappings}
-            description={dict.proxies.noMappingsHint}
             action={
               <button type="button" className="btn btn-sm btn-primary" onClick={() => openEditor()}>
                 <Plus size={14} />
@@ -597,9 +596,8 @@ export function ProxiesView() {
       <Drawer
         open={drawerOpen}
         onClose={() => setDrawerOpen(false)}
-        kicker="Tunnel Route Rule"
         title={draft.id ? `编辑映射 · ${draft.name}` : '新建端口映射'}
-        saveLabel={draft.id ? '保存映射配置' : '创建端口映射'}
+        saveLabel={draft.id ? '保存' : '创建'}
         disabled={!servers.length || !clients.length}
         onSubmit={saveMapping}
       >
@@ -649,18 +647,17 @@ export function ProxiesView() {
         </div>
 
         <div className="field">
-          <span className="field-label">客户端拨号接入入口</span>
+          <span className="field-label">连接入口</span>
           <Select
             ariaLabel="连接入口"
             value={draft.connectEndpointId}
             disabled={!activeConnections.length}
             options={[
-              { value: '', label: '自动按服务端启用地址顺序切换' },
+              { value: '', label: '自动' },
               ...activeConnections.map((c) => ({ value: c.id, label: `${c.name} · ${endpoint(c.host, c.port)}` })),
             ]}
             onChange={(connectEndpointId) => setDraft((p) => ({ ...p, connectEndpointId }))}
           />
-          <span className="field-help">仅控制 Client 建立到 Server 隧道的连接地址，协议与证书信任由网关统一下发。</span>
           {!activeConnections.length && <InlineAlert message="所选服务端没有启用的连接地址，请先编辑服务端。" />}
           {missingConnection && <InlineAlert message="原连接地址已停用或删除，请重新选择后保存。" />}
         </div>
@@ -710,7 +707,7 @@ export function ProxiesView() {
         </div>
 
         <div className="field">
-          <label className="field-label" htmlFor="map-bw">映射带宽上限（Mbps，0 表示不限速）</label>
+          <label className="field-label" htmlFor="map-bw">带宽上限 (Mbps)</label>
           <input
             id="map-bw"
             className="tabular ltr-force"
@@ -718,6 +715,7 @@ export function ProxiesView() {
             min={0}
             max={100000}
             step="0.000001"
+            placeholder="0 不限速"
             value={draft.bandwidthLimit}
             onChange={(e) => setDraft((p) => ({ ...p, bandwidthLimit: e.target.value }))}
           />
@@ -763,14 +761,13 @@ export function ProxiesView() {
       <AlertDialog
         open={!!deleteTarget}
         onClose={() => setDeleteTarget(null)}
-        title={`永久删除映射「${deleteTarget?.name || ''}」`}
+        title={`删除映射「${deleteTarget?.name || ''}」`}
         lossSummary={
           deleteTarget
-            ? `将立即移除 ${endpoint(deleteTarget.listen_host, deleteTarget.listen_port)} → ${endpoint(deleteTarget.target_host, deleteTarget.target_port)} 的转发规则，现有连接会立即断开。`
+            ? `将移除 ${endpoint(deleteTarget.listen_host, deleteTarget.listen_port)} → ${endpoint(deleteTarget.target_host, deleteTarget.target_port)} 转发规则。`
             : ''
         }
-        description="如果只是临时暂停流量，建议使用「停用」功能（支持一键撤销）。"
-        confirmLabel="确认永久删除映射"
+        confirmLabel="确认删除"
         onConfirm={commitDelete}
       />
     </div>

@@ -4,7 +4,7 @@ import { api } from '../api'
 import { PEM_MAX_BYTES, truncateFileName, validatePEM } from '../format'
 import { buildNodeSavePayload, effectiveXhttpMode, isFlowAllowed, nodeToDraft, parseXHTTPHeaders, type MetaPlacement, type NodeDraft, type NodeGenOptions, type PaddingPlacement, type XhttpMode } from '../lib/nodePayload'
 import type { ConnectEndpoint, Node, TunnelConfig } from '../types'
-import { Alert, Badge, InlineAlert } from './ui/Badge'
+import { Badge, InlineAlert } from './ui/Badge'
 import { Collapsible, SecretField, Segmented, Select, Switch } from './ui/Controls'
 import { Drawer } from './ui/Overlays'
 
@@ -243,9 +243,8 @@ export function NodeEditorDrawer({
       open={open}
       onClose={onClose}
       wide={isServer}
-      kicker={isServer ? 'Public Gateway Configuration' : 'Intranet Agent'}
       title={`${draft.id ? '编辑' : '新建'}${isServer ? '公网网关' : '内网节点'}`}
-      saveLabel={draft.id ? '保存节点配置' : isServer ? '创建公网网关' : '创建内网节点'}
+      saveLabel={draft.id ? '保存' : '创建'}
       disabled={readingPem || !!uploadErr || !!genBusy}
       onSubmit={handleSave}
     >
@@ -272,11 +271,6 @@ export function NodeEditorDrawer({
             onChange={(e) => updateDraft('name', e.target.value)}
           />
         </div>
-        {!isServer && (
-          <Alert tone="info">
-            内网客户端仅需维护名称。所有有效隧道协议、证书信任与加密参数均由映射关联的公网网关自动派生并统一下发，杜绝配置漂移。
-          </Alert>
-        )}
       </div>
 
       {isServer && (
@@ -319,7 +313,7 @@ export function NodeEditorDrawer({
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
               <div className="field-label">
-                <span>客户端连接地址（支持多候选故障切换）</span>
+                <span>连接地址</span>
                 <button
                   type="button"
                   className="btn btn-sm btn-soft"
@@ -419,9 +413,8 @@ export function NodeEditorDrawer({
               >
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                   <strong>VLESS</strong>
-                  <Badge text="推荐" tone="accent" />
+                  <Badge text="TCP / XHTTP" tone="accent" />
                 </div>
-                <span className="field-help">支持 TCP / XHTTP（H1/H2/H3）、TLS、REALITY、Vision 与后量子 Encryption。</span>
               </button>
               <button
                 type="button"
@@ -431,9 +424,8 @@ export function NodeEditorDrawer({
               >
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                   <strong>Hysteria2</strong>
-                  <Badge text="QUIC" tone="purple" />
+                  <Badge text="UDP / QUIC" tone="purple" />
                 </div>
-                <span className="field-help">基于 UDP/QUIC + TLS，适合高丢包弱网链路，需放行 UDP 端口。</span>
               </button>
             </div>
 
@@ -728,7 +720,6 @@ export function NodeEditorDrawer({
                         { value: 'xtls-rprx-vision', label: 'xtls-rprx-vision' },
                       ]}
                     />
-                    <span className="field-help">仅对 TCP + TLS/REALITY 生效；自动识别 TLS 1.3 记录边界。</span>
                   </div>
                 )}
               </Collapsible>

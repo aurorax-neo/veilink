@@ -4,6 +4,7 @@ import { applyLocaleToDocument, getDict, readStoredLocale, type Dict } from '../
 import { runPageRefresh } from '../pageRefresh'
 import { stream, type StreamState } from '../stream'
 import { pageFromHash, type Audit, type AuthStatusResponse, type AuthUser, type LocaleCode, type Mapping, type MappingStatus, type Node, type PageId, type ThemeMode, type TrafficRow } from '../types'
+import { Modal } from '../components/ui/Overlays'
 import { ToastRegion, type SnackbarItem, type ToastItem } from '../components/ui/ToastRegion'
 
 export interface ConsoleState {
@@ -18,6 +19,7 @@ export interface ConsoleState {
   completeSetup: (installSecret: string, email: string, password: string) => Promise<void>
   submitLogin: (email: string, password: string) => Promise<void>
   logout: () => Promise<void>
+  requestLogout: () => void
   refreshAccount: () => Promise<void>
 
   nodes: Node[]
@@ -98,6 +100,7 @@ export function ConsoleProvider({ children }: { children: ReactNode }) {
   const [streamState, setStreamState] = useState<StreamState>('disconnected')
   const [tourOpen, setTourOpen] = useState(false)
   const [notificationsOpen, setNotificationsOpen] = useState(false)
+  const [logoutConfirmOpen, setLogoutConfirmOpen] = useState(false)
 
   const [theme, setTheme] = useState<ThemeMode>(() => {
     try {
@@ -362,6 +365,7 @@ export function ConsoleProvider({ children }: { children: ReactNode }) {
   )
 
   const logout = useCallback(async () => {
+    setLogoutConfirmOpen(false)
     try {
       await api('/auth/logout', 'POST', {})
     } catch { /* ignore network errors during logout */ }
@@ -371,6 +375,10 @@ export function ConsoleProvider({ children }: { children: ReactNode }) {
     setPhase('login')
     document.title = 'Veilink · 控制平面'
   }, [resetAll])
+
+  const requestLogout = useCallback(() => {
+    setLogoutConfirmOpen(true)
+  }, [])
 
   const triggerPageRefresh = useCallback(async () => {
     if (loadingRef.current || refreshingRef.current) return
@@ -474,6 +482,7 @@ export function ConsoleProvider({ children }: { children: ReactNode }) {
     completeSetup,
     submitLogin,
     logout,
+    requestLogout,
     refreshAccount,
     nodes,
     mappings,
@@ -512,6 +521,23 @@ export function ConsoleProvider({ children }: { children: ReactNode }) {
   return (
     <ConsoleCtx.Provider value={value}>
       {children}
+      <Modal
+        open={logoutConfirmOpen && phase === 'app'}
+        onClose={() => setLogoutConfirmOpen(false)}
+        size="sm"
+        title={dict.common.signOutConfirm}
+        cancelLabel={dict.common.cancel}
+        saveLabel={dict.common.signOut}
+        danger
+        onSubmit={async () => {
+          await logout()
+          return true
+        }}
+      >
+        <p style={{ margin: 0, fontSize: 13.5, color: 'var(--text-secondary)' }}>
+          {currentUser?.email || ''}
+        </p>
+      </Modal>
       <ToastRegion
         toasts={toasts}
         snackbar={snackbar}

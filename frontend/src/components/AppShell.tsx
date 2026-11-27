@@ -63,7 +63,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   const {
     page,
     navigate,
-    logout,
+    requestLogout,
     currentUser,
     nodes,
     mappings,
@@ -313,11 +313,8 @@ export function AppShell({ children }: { children: ReactNode }) {
                 <span className="sidebar-avatar" aria-hidden="true">
                   {currentUser.email.slice(0, 1).toUpperCase()}
                 </span>
-                <span style={{ minWidth: 0, display: 'flex', flexDirection: 'column', lineHeight: 1.25 }}>
-                  <span className="ltr-force" style={{ fontSize: 12.5, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {currentUser.email}
-                  </span>
-                  <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>唯一管理员</span>
+                <span className="ltr-force" style={{ fontSize: 12.5, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {currentUser.email}
                 </span>
               </button>
             )}
@@ -334,7 +331,10 @@ export function AppShell({ children }: { children: ReactNode }) {
               type="button"
               className="nav-item"
               title={railCollapsed ? dict.common.signOut : undefined}
-              onClick={() => void logout()}
+              onClick={() => {
+                setMobileMenuOpen(false)
+                requestLogout()
+              }}
             >
               <span className="inline-icon" aria-hidden="true"><LogOut size={16} /></span>
               {!railCollapsed && <span>{dict.common.signOut}</span>}
@@ -457,10 +457,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           <main id="main" className="app-stage" tabIndex={-1}>
             <div className="stage-inner">
               <div className="page-header">
-                <div>
-                  <h1>{dict.pages[page].title}</h1>
-                  {dict.pages[page].subtitle && <p className="page-subtitle">{dict.pages[page].subtitle}</p>}
-                </div>
+                <h1>{dict.pages[page].title}</h1>
                 <div className="page-header-actions">
                   <button
                     type="button"

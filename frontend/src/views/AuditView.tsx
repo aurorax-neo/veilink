@@ -148,15 +148,7 @@ export function AuditView() {
         </header>
 
         {rows.length === 0 ? (
-          <EmptyState
-            icon={<FileClock size={20} />}
-            title="暂无审计记录"
-            description={
-              query.trim() || category !== 'all'
-                ? '没有匹配的审计条目，请重置筛选条件。'
-                : '节点保存、接入令牌签发、凭据吊销与映射变更均会自动记录在此。'
-            }
-          />
+          <EmptyState icon={<FileClock size={20} />} title="暂无记录" />
         ) : (
           <>
             <ol className="audit-list">

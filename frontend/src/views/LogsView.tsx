@@ -252,22 +252,14 @@ export function LogsView() {
             <h2>实时内存事件流</h2>
           </div>
           <span className="cell-sub tabular">
-            显示 {filteredLogs.length} / {logs.length} 条 · 随 SSE 实时刷新
+            {filteredLogs.length} / {logs.length}
           </span>
         </header>
 
         {loading && logs.length === 0 ? (
-          <EmptyState title="正在读取日志流…" />
+          <EmptyState title="加载中…" />
         ) : filteredLogs.length === 0 ? (
-          <EmptyState
-            icon={<Terminal size={20} />}
-            title={dict.logs.emptyTitle}
-            description={
-              query.trim()
-                ? '没有匹配的日志条目，请调整筛选条件。'
-                : '节点日志在成功接入 Master 后会自动上报；日志仅保存在 Master 内存环中，重启后不保留。'
-            }
-          />
+          <EmptyState icon={<Terminal size={20} />} title={dict.logs.emptyTitle} />
         ) : (
           <div ref={listRef} className="log-viewport" onScroll={handleScroll}>
             {filteredLogs.map((entry, idx) => {

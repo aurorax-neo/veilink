@@ -274,7 +274,6 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
         <EmptyState
           icon={isServer ? <Server size={20} /> : <Laptop size={20} />}
           title={dict.nodes.noNodes}
-          description={dict.nodes.noNodesHint}
           action={
             <button
               type="button"
@@ -576,7 +575,8 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
             <button
               type="button"
               className={`btn btn-sm btn-ghost ${copiedId === selectedNode.id ? 'copy-bounce' : ''}`}
-              style={{ minHeight: 26, padding: '0 6px' }}
+              style={{ minWidth: 34, minHeight: 34, padding: '0 8px' }}
+              aria-label="复制节点 ID"
               onClick={() => void handleCopy(selectedNode.id, selectedNode.id)}
             >
               {copiedId === selectedNode.id ? <Check size={12} style={{ color: 'var(--good)' }} /> : <Copy size={12} />}
@@ -650,10 +650,6 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
           )}
         </div>
       )}
-
-      <p className="field-help">
-        上报版本号仅作运维观测参考，不构成二进制验真；如需严格完整性校验，请在节点主机运行 <code>tools/verify-node.py</code> 对照发布 SHA-256。
-      </p>
 
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
         <button
@@ -754,7 +750,6 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
       <Drawer
         open={!!selectedNode && isMobileViewport}
         onClose={() => setSelectedId('')}
-        kicker={roleLabel}
         title={selectedNode?.name || ''}
         hideSave
       >
@@ -842,14 +837,13 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
         title={dangerAction?.kind === 'revoke' ? `吊销「${dangerAction.node.name}」凭据` : `永久删除「${dangerAction?.node.name || ''}」`}
         lossSummary={
           dangerAction?.kind === 'revoke'
-            ? `吊销后「${dangerAction.node.name}」将立即失去控制面认证权限且无法恢复原凭据。`
-            : `将永久删除「${dangerAction?.node.name || ''}」以及关联的 ${dangerAction ? nodeMappings(dangerAction.node.id).length : 0} 条端口映射，正在传输的连接会立即中断。`
+            ? `吊销后「${dangerAction.node.name}」将失去控制面认证权限。`
+            : `将删除「${dangerAction?.node.name || ''}」及关联的 ${dangerAction ? nodeMappings(dangerAction.node.id).length : 0} 条映射。`
         }
-        description="此操作不可逆，请确认不再需要该节点及其关联路由。"
         confirmLabel={
           dangerAction?.kind === 'revoke'
-            ? '确认永久吊销凭据'
-            : `永久删除节点与 ${dangerAction ? nodeMappings(dangerAction.node.id).length : 0} 条映射`
+            ? '确认吊销'
+            : `确认删除`
         }
         onConfirm={commitDanger}
       />
@@ -859,13 +853,9 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
         open={!!configNode}
         onClose={() => setConfigNode(null)}
         size="lg"
-        kicker="Derived Read-Only Config"
-        title={`有效派生隧道配置 · ${configNode?.name || ''}`}
+        title={`派生配置 · ${configNode?.name || ''}`}
         hideSave
       >
-        <p className="field-help">
-          以下配置由映射所关联的公网网关自动派生并统一下发至客户端，只读展示。实际运行状态请核对修订同步状态。
-        </p>
         {configNode &&
           effectiveSources(configNode).map((source) => {
             const jsonText = source.client_tunnel ? JSON.stringify(source.client_tunnel, null, 2) : '服务端尚无下发模板'
@@ -882,7 +872,14 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
                     <span>{copiedId === `cfg-${source.id}` ? '已复制' : '复制 JSON'}</span>
                   </button>
                 </div>
-                <textarea className="mono ltr-force" rows={9} readOnly spellCheck={false} value={jsonText} />
+                <textarea
+                  className="mono ltr-force"
+                  rows={9}
+                  readOnly
+                  spellCheck={false}
+                  value={jsonText}
+                  onClick={(e) => e.currentTarget.select()}
+                />
               </div>
             )
           })}
