@@ -25,7 +25,9 @@ cat <<EOF
     -v "${DATA_HOST_DIR}:/data" \
     "${IMAGE_REPO}:${VERSION}" master
 
-首次启动不会自动生成管理员 API Key，请手动创建（明文仅显示一次）：
+首次启动会自动启用防访客抢注安装锁（Install Lock）并生成一次性初始化令牌：
 
-  docker exec veilink-master /usr/local/bin/veilink keys create admin
+  docker exec veilink-master /usr/local/bin/veilink admin show-install-secret
+
+打开 Web 控制台输入该安全令牌，手工注册唯一管理员邮箱与密码后，安装入口将自动销毁并永久锁定。
 EOF

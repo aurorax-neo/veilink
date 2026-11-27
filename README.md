@@ -2,7 +2,7 @@
 
 用 Web 管理的私有反向隧道系统，将 Server 的 TCP/UDP 入口转发到 Client 可访问的目标服务。
 
-Veilink 使用 Rust (Tokio 异步运行时) 实现高性能节点与反向多路复用隧道，Vue 3 提供现代化单页管理界面。**单二进制打包内嵌 Web，一个 Docker 镜像承载三种运行角色**，控制面全 HTTP REST/长轮询架构，对 Nginx 等标准反代友好，无需 gRPC。
+Veilink 使用 Rust (Tokio 异步运行时) 实现高性能节点与反向多路复用隧道，React 19 提供全分辨率跨平台单页管理控制台。**单二进制打包内嵌 Web，一个 Docker 镜像承载三种运行角色**，控制面全 HTTP REST/长轮询架构，对 Nginx 等标准反代友好，无需 gRPC。
 
 [发布版本](https://github.com/aurorax-neo/veilink/releases) · [问题反馈](https://github.com/aurorax-neo/veilink/issues) · [许可证](LICENSE)
 
@@ -66,13 +66,13 @@ docker run -itd --restart unless-stopped --name veilink-master \
 ```
 
 首次启动自动完成：
-- 使用镜像内置前端界面，前后端随统一镜像一起更新
+- 使用镜像内置 React 19 前端界面，前后端随统一镜像一起更新
 - 数据目录自动初始化，无需手动 `mkdir`/`chown`
-- 不自动创建管理员。启动后执行一次 `veilink keys create`，明文只在该命令输出里出现一次
+- 自动启用**防访客抢注安装锁（Install Lock）**，生成一次性初始化安全令牌 `/data/.install_secret`（权限 `0600`），避免未授权访客抢先注册管理员
 
-创建管理员 API Key：
+查看一次性初始化安全令牌并在 Web 向导中手工注册唯一管理员（用户名须为有效电子邮箱）：
 ```sh
-docker exec veilink-master /usr/local/bin/veilink keys create admin
+docker exec veilink-master /usr/local/bin/veilink admin show-install-secret
 ```
 
 ### 镜像与版本
@@ -93,7 +93,7 @@ docker exec veilink-master /usr/local/bin/veilink keys create admin
 | `8444` | 内置 Server 首次默认隧道监听 | 按传输放行 TCP 或 UDP |
 | Web 中设置的映射端口 | 业务访问入口 | 实际业务访问来源 |
 
-首次启动前建议限制管理入口来源。管理员 API Key 由 `veilink keys create` 生成，明文只出现在该命令输出中，不会写入日志。
+首次启动前建议限制管理入口来源。完成首次管理员邮箱与密码注册后，`.install_secret` 文件会自动销毁，公开注册入口永久锁定（当前版本仅支持唯一管理员账户）。
 
 ## 启动 Master
 
@@ -109,13 +109,13 @@ docker run -itd \
 
 entrypoint 自动处理 `/data` 权限，无需手动 `mkdir`/`chown`。宿主机映射目录 `/opt/docker/veilink-master/data` 保存 SQLite 数据库与凭据（`veilink.db`）。Web 直接从 `veilink` 二进制内嵌资源提供服务，不读取或创建 `/data/web`，也不支持前端跳转地址、pull 模式、在线拉取版本或 GitHub 加速。旧 Web 文件不会覆盖新内嵌资源，升级不会自动删除旧文件或数据库。已发布的 schema 5 数据库自动升级：先备份数据库与部署密钥，再事务化清理已知旧 Web 字段、修复旧版缺失的 ML-DSA 验证公钥；未知结构或损坏配置仍拒绝启动，不删库。
 
-### 2. 获取 API Key
+### 2. 完成首次安装引导（注册唯一管理员）
 
 ```sh
-docker exec veilink-master /usr/local/bin/veilink keys create admin
+docker exec veilink-master /usr/local/bin/veilink admin show-install-secret
 ```
 
-命令输出里的 `vlk_` 明文只出现这一次。在浏览器打开 `http://服务器IP:2545`，输入 Key 进入控制台。Master 不会把 Key 写入日志。
+也可以通过 `docker logs veilink-master` 查看启动横幅中的一次性 `Install Secret`（`VLK-XXXX-XXXX-XXXX-XXXX`）。在浏览器打开管理入口，按首次安装向导依次输入 `Install Secret`、管理员电子邮箱和登录密码即可完成初始化；完成后令牌文件自动删除，注册接口永久返回 `403` 锁定。
 
 镜像名后必须先写 `master`，再写 flags。内置 Server 首次默认显示名为 `default`，端口为 `8444`；已有稳定身份和自定义名称保持不变。无需内置节点时，将 `-embedded-server-enabled` 改为 `false`。
 
@@ -163,7 +163,6 @@ server {
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_read_timeout 60s;
         proxy_send_timeout 60s;
-        # API Key 通过 Authorization 头传递，无需 cookie/CSRF 特殊处理
         proxy_buffering off;
     }
 }
@@ -178,8 +177,8 @@ curl -fsS https://panel.example.com:8843/api/version
 
 - Web/API 与节点控制面（`/api/control/*`）统一走 HTTP `proxy_pass`，兼容 HTTP/1.1 与 HTTP/2，无需配置 `grpc_pass`。
 - `proxy_buffering off;` 同时保障 `/api/v1/events`（SSE 实时事件流，每 25 秒发送保活心跳）与 `/api/control/events`（节点长轮询）即时透传，不产生反代缓冲延迟。
-- nginx 如果运行在独立 Bridge 容器，`127.0.0.1` 是 nginx 自己，必须换成能到达的受限回源地址；若需让 Master 信任非回环反代转发的 `X-Forwarded-For` 最后一跳以精确按客户端 IP 限流，可在 Master 容器设置环境变量 `VEILINK_TRUSTED_PROXIES=<nginx容器IP>`。
-- API Key 通过 `Authorization` 头传递，nginx 无需特殊处理；不要盲目信任客户端转发的头。
+- nginx 如果运行在独立 Bridge 容器，`127.0.0.1` 是 nginx 自己，必须换成能到达的受限回源地址；若需让 Master 信任非回环反代转发的 `X-Forwarded-For` 与 `X-Forwarded-Proto`，可在 Master 容器设置环境变量 `VEILINK_TRUSTED_PROXIES=<nginx容器IP>`。
+- Web 会话同时携带 `Bearer` 令牌与 `HttpOnly; SameSite=Lax` Cookie，服务端对 Cookie 写请求强制校验 `Sec-Fetch-Site` 与 `Origin/Host` 一致性，反代须保留原始 `Host: $host:$server_port`。
 - 此反代仅处理管理面和控制面；业务隧道端口需按传输直达或 L4 透传。它不是 XHTTP 业务反代配置。
 
 ### 方式二：可信内网直接 HTTP
@@ -206,7 +205,7 @@ curl -fsS https://panel.example.com:8843/api/version
 
 ## 首次配置与映射
 
-1. **获取 API Key**：Master 不自动创建管理员。执行 `docker exec veilink-master /usr/local/bin/veilink keys create admin`，明文只在命令输出中显示一次。在 Web 登录页输入该 Key。
+1. **初始化唯一管理员**：首次访问 Web 自动进入安装向导，输入 `veilink admin show-install-secret`（或 `/data/.install_secret`）中的一次性安全令牌，手工注册唯一管理员邮箱与密码。
 2. **配置 Server**：使用内置 `default` 或创建独立 Server。在 Web 保存隧道、连接入口和本地监听配置；客户端模板由 Server 配置自动派生。
 3. **创建 Client**：获取节点 ID 和接入令牌，按下文或 Web「快捷接入」生成的命令启动。生成命令和手工命令二选一。
 4. **创建映射**：选择 Server、Client、TCP/UDP、Server 监听地址与端口、Client 可达的目标地址与端口，以及 Pool（`1–32`）。没有独立的公开绑定管理。
@@ -217,30 +216,28 @@ Pool 是同一 Server/Client 授权下共享连接池的目标大小，启用映
 
 例如，Client 能访问 `192.168.10.20:8080` 的 HTTP 服务时，可建立 TCP 映射到 Server 的空闲业务端口。验证该映射应发送 HTTP 请求，而不是只确认 TCP 握手成功。目标必须从 Client 容器网络可达；容器内的 `127.0.0.1` 不是宿主机。
 
-### API Key 管理
+### 管理员账户与密码恢复
 
-Web 控制台「设置」页可直接管理（列表/新建/撤销），或用 CLI：
+Web 控制台「系统与账户」页支持修改唯一管理员邮箱、修改登录密码（可选同步吊销其他设备会话）及查看/注销活跃会话。若忘记管理员密码，可在宿主机通过 CLI 重置（重置后所有旧会话立即失效）：
 
 ```sh
-# 查看现有 Key（仅显示前缀，不显示明文）
-docker exec veilink-master /usr/local/bin/veilink keys list
+# 自动生成高强度新密码并打印（明文仅显示一次）
+docker exec veilink-master /usr/local/bin/veilink admin reset-password
 
-# 创建新 Key（明文仅显示一次）
-docker exec veilink-master /usr/local/bin/veilink keys create my-key
-
-# 吊销 Key
-docker exec veilink-master /usr/local/bin/veilink keys revoke <id>
+# 或指定新邮箱 / 新密码
+docker exec veilink-master /usr/local/bin/veilink admin reset-password -email admin@example.com -password 'YourStrongPassword!'
 ```
 
-旧版用户名密码用户升级：执行 `veilink keys list`。若旧 `admin` 表还没有 API Key，命令会生成 `migrated-admin` 并把明文只打印一次，然后才列出前缀。旧用户名密码即刻失效。
+如需供自动化脚本调用管理 API，仍可使用 CLI 维护的编程式 `veilink keys list|create|revoke`。
 
-### 设置页
+### 系统与账户页
 
-Web 控制台「设置」页集中管理：
+Web 控制台「系统与账户」页集中管理：
 
-- **Web 版本**：只读显示统一镜像内置版本，随镜像更新；Web/API 固定同源
+- **运行态概览**：只读显示内置版本、监听端点、安装锁状态与活跃会话数
+- **唯一管理员账户与会话安全**：修改管理员邮箱、修改登录密码、一键吊销其他设备会话
 - **服务配置**：监听地址、协议、证书（修改后需重启）
-- **API Key**：列表/新建/撤销（明文仅显示一次）
+- **多平台外观与语言**：深/浅色外观、7 种语言（含阿拉伯语 RTL）与功能导览
 
 ### 如何理解状态
 
@@ -433,22 +430,19 @@ tools/backup-master.sh restore master \
 
 先在隔离环境验证登录、节点身份、上报和业务探针，再切换正式挂载。保留原数据副本，禁止旧、新 Master 同时提供写服务。已知已发布 schema 自动备份后迁移；未知 schema 不自动迁移或删库，任何数据删除都须先备份并得到明确授权。
 
-### API Key 维护
+### 管理员维护与自动化凭据 CLI
 
-Web 控制台「设置」页可直接管理，或用 CLI：
+管理员日常通过 Web 控制台使用邮箱与密码登录；运维应急恢复在宿主机执行：
 
 ```sh
-# 列出所有 Key（仅显示前缀）
-docker exec veilink-master /usr/local/bin/veilink keys list
+# 查看未初始化实例的一次性安装安全令牌
+docker exec veilink-master /usr/local/bin/veilink admin show-install-secret
 
-# 创建新 Key（明文仅显示一次，请保存）
-docker exec veilink-master /usr/local/bin/veilink keys create my-key
-
-# 吊销 Key（最后一个 admin Key 受保护，不可删除）
-docker exec veilink-master /usr/local/bin/veilink keys revoke <id>
+# 重置唯一管理员密码（同时立即吊销全部既有登录会话）
+docker exec veilink-master /usr/local/bin/veilink admin reset-password
 ```
 
-使用自定义数据库路径时补充 `-database`、`-deployment-key` 参数。Key 吊销即时生效。
+使用自定义数据库路径时补充 `-database`、`-deployment-key` 参数。编程式 API Key CLI（`veilink keys list|create|revoke`）保留向下兼容供脚本自动化使用。
 
 ### 升级与回滚
 
@@ -457,6 +451,11 @@ docker exec veilink-master /usr/local/bin/veilink keys revoke <id>
 3. 拉取目标版本镜像，保留数据挂载，以原有角色和 flags 重建容器。
 4. 检查日志、健康接口、节点应用状态及实际业务请求。
 5. 回滚前备份当前状态，确认旧版本兼容性；不兼容时用匹配旧版本的成套备份在新目录验证，不直接覆盖数据库。
+
+**从 `v0.4.23` 及更早版本升级至 `v0.5.0+`**：
+
+- **节点、映射与隧道凭证 100% 无损保留**：原有 `veilink.db` 中的全部节点、连接入口、端口映射、审计日志与各节点 `state.json` 长期凭证完全兼容，升级无需重新接入节点。
+- **首次管理员认领（防访客抢注）**：`v0.5.0` 起 Web 控制台登录升级为**唯一管理员邮箱 + 密码**。旧实例升级重启后会自动生成 `/data/.install_secret`（可执行 `docker exec veilink-master /usr/local/bin/veilink admin show-install-secret` 读取），打开 Web 按引导输入该令牌注册管理员邮箱与密码即可锁定安装入口。
 
 **从 `v0.4.13` 及更早 Go 版本无痛升级至 Rust 版（`v0.4.14+`）**：
 
@@ -478,7 +477,7 @@ docker exec veilink-master /usr/local/bin/veilink keys revoke <id>
 | `flag provided but not defined` | 使用当前角色 `--help`；没有 `-embedded-server-server-name` 或 `-config` |
 | 远端无法访问 `127.0.0.1:2545` | 该地址仅本机可达；使用反代或受限内网监听 |
 | 反代连接超时或长轮询中断 | 检查 nginx `proxy_pass`、`proxy_http_version 1.1` 与 `proxy_read_timeout` |
-| API Key 无效 401 | 检查 `Authorization: Bearer` 头是否正确，Key 是否被吊销 |
+| 登录或会话返回 401 | 核对管理员邮箱与密码；若忘记密码执行 `veilink admin reset-password`；反代部署确认保留了 `Host` 头 |
 | 节点未上报 | 节点日志、Master 地址、证书名称/CA、端口、节点 ID、令牌和状态目录 |
 | 配置待应用或应用失败 | 对比期望/已应用修订，查看节点错误；刷新请求不是成功确认 |
 | 配置已应用但业务失败 | Server 业务端口、Client 容器目标可达性、TCP/UDP 协议、防火墙/NAT、目标认证 |
@@ -503,9 +502,9 @@ docker exec veilink-master /usr/local/bin/veilink master --help
 | --- | --- |
 | `backend/src/main.rs`、`backend/src/cli.rs`、`backend/src/config.rs` | 统一命令入口与角色参数 |
 | `backend/src/master.rs`、`backend/src/control.rs`、`backend/src/node.rs` | 管理服务、纯 HTTP 控制面与节点配置应用 |
-| `backend/src/store.rs`、`backend/src/httpapi.rs` | 配置持久化、控制面路由与 Web API |
+| `backend/src/auth.rs`、`backend/src/store.rs`、`backend/src/httpapi.rs` | 管理员认证与安装锁、配置持久化、控制面路由与 Web API |
 | `backend/src/tunnel/mod.rs` | 隧道、协议协商与数据传输 |
-| `frontend` | 唯一 Web 界面，Vue 3 + TypeScript + Vite |
+| `frontend` | 唯一 Web 控制台，React 19 + TypeScript + Vite |
 | `backend/tests/integration`、`backend/tests/deployment` | 集成与部署测试 |
 | `frontend/tests/acceptance` | 历史 Web 验收记录和截图 |
 | `tools` | 离线备份及节点验证工具 |

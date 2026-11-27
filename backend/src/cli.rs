@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::auth::{KeyStore, ROLE_ADMIN};
+use crate::auth::{install_secret_path, AuthStore, KeyStore, ROLE_ADMIN};
 use crate::buildinfo;
 use crate::config::{self, ParseFlagsError};
 use crate::master;
@@ -11,6 +11,8 @@ use crate::store::Store;
 use crate::tunnel;
 
 const KEYS_USAGE: &str = "Usage: veilink keys list|create|revoke [flags]\n\nSubcommands:\n  list              List API keys (prefix only, never plaintext)\n  create [name]     Create a new API key (plaintext shown once)\n  revoke <id>       Revoke an API key by ID\n\nFlags:\n  -database         Database path (default /data/veilink.db)\n  -deployment-key   Deployment key path (default /data/veilink.key)";
+
+const ADMIN_USAGE: &str = "Usage: veilink admin show-install-secret|reset-password [flags]\n\nSubcommands:\n  show-install-secret  Show current one-time .install_secret if setup is still pending\n  reset-password       Reset the sole administrator password (and optionally email)\n\nFlags:\n  -database            Database path (default /data/veilink.db)\n  -deployment-key      Deployment key path (default /data/veilink.key)\n  -email               Optional new administrator email address\n  -password            Optional new password (auto-generated if omitted)";
 
 pub async fn run<W: Write>(
     cancel: CancellationToken,
@@ -29,7 +31,7 @@ pub async fn run_with_input<R: Read, W: Write>(
 ) -> Result<(), String> {
     if raw_args.is_empty() {
         return Err(
-            "usage: veilink master|server|client|keys|x25519|mldsa65|vlessenc|version [flags]"
+            "usage: veilink master|server|client|admin|keys|x25519|mldsa65|vlessenc|version [flags]"
                 .to_string(),
         );
     }
@@ -39,7 +41,7 @@ pub async fn run_with_input<R: Read, W: Write>(
         if args.len() == 1 {
             writeln!(
                 out,
-                "Usage: veilink master|server|client|keys|x25519|mldsa65|vlessenc|version [flags]\nUse veilink help <command> for command help."
+                "Usage: veilink master|server|client|admin|keys|x25519|mldsa65|vlessenc|version [flags]\nUse veilink help <command> for command help."
             )
             .map_err(|e| e.to_string())?;
             return Ok(());
@@ -68,6 +70,11 @@ pub async fn run_with_input<R: Read, W: Write>(
 
     if cmd == "keys" && args.len() == 2 && (args[1] == "--help" || args[1] == "-h") {
         writeln!(out, "{}", KEYS_USAGE).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    if cmd == "admin" && args.len() == 2 && (args[1] == "--help" || args[1] == "-h") {
+        writeln!(out, "{}", ADMIN_USAGE).map_err(|e| e.to_string())?;
         return Ok(());
     }
 
@@ -109,6 +116,7 @@ pub async fn run_with_input<R: Read, W: Write>(
             return Ok(());
         }
         "keys" => return run_keys(&args[1..], out),
+        "admin" => return run_admin(&args[1..], out),
         _ => {}
     }
 
@@ -283,4 +291,90 @@ pub fn run_keys<W: Write>(args: &[String], out: &mut W) -> Result<(), String> {
         }
         _ => Err("usage: veilink keys list|create|revoke [flags]".to_string()),
     }
+}
+
+pub fn run_admin<W: Write>(args: &[String], out: &mut W) -> Result<(), String> {
+    for a in args {
+        if a == "--help" || a == "-h" {
+            writeln!(out, "{}", ADMIN_USAGE).map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+    }
+    if args.is_empty() {
+        return Err("usage: veilink admin show-install-secret|reset-password [flags]".to_string());
+    }
+    let subcmd = args[0].as_str();
+    if subcmd != "show-install-secret" && subcmd != "reset-password" {
+        return Err("usage: veilink admin show-install-secret|reset-password [flags]".to_string());
+    }
+
+    let mut db = "/data/veilink.db".to_string();
+    let mut key = "/data/veilink.key".to_string();
+    let mut email = String::new();
+    let mut password = String::new();
+
+    let mut idx = 1usize;
+    while idx < args.len() {
+        let raw = &args[idx];
+        if !raw.starts_with('-') || raw == "-" {
+            return Err(format!("unexpected arguments: {}", args[idx..].join(" ")));
+        }
+        let trimmed = raw
+            .strip_prefix("--")
+            .or_else(|| raw.strip_prefix('-'))
+            .unwrap_or("");
+        let (name, inline_val) = match trimmed.split_once('=') {
+            Some((n, v)) => (n, Some(v.to_string())),
+            None => (trimmed, None),
+        };
+        let next_val = |inline: Option<String>, pos: &mut usize| -> Result<String, String> {
+            if let Some(v) = inline {
+                return Ok(v);
+            }
+            *pos += 1;
+            if *pos >= args.len() {
+                return Err(format!("flag needs an argument: -{name}"));
+            }
+            Ok(args[*pos].clone())
+        };
+        match name {
+            "database" => db = next_val(inline_val, &mut idx)?,
+            "deployment-key" => key = next_val(inline_val, &mut idx)?,
+            "email" => email = next_val(inline_val, &mut idx)?,
+            "password" => password = next_val(inline_val, &mut idx)?,
+            _ => return Err(format!("flag provided but not defined: -{name}")),
+        }
+        idx += 1;
+    }
+
+    if subcmd == "show-install-secret" {
+        if let Some(path) = install_secret_path(&db) {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let secret = text.trim();
+                if !secret.is_empty() {
+                    writeln!(out, "Install Secret ({}):\n{}", path.display(), secret)
+                        .map_err(|e| e.to_string())?;
+                    return Ok(());
+                }
+            }
+        }
+        return Err("no pending .install_secret found (instance may already be initialized)".to_string());
+    }
+
+    let s = Store::open_existing(&db, &key).map_err(|e| format!("open database: {e}"))?;
+    let auth = AuthStore::new(s.db());
+    auth.migrate().map_err(|e| e.to_string())?;
+    let (final_email, final_pw) = auth
+        .cli_reset_password(
+            if email.is_empty() { None } else { Some(email.as_str()) },
+            if password.is_empty() { None } else { Some(password.as_str()) },
+        )
+        .map_err(|e| e.to_string())?;
+    writeln!(
+        out,
+        "Administrator password reset (all previous sessions revoked):\nEmail:    {}\nPassword: {}",
+        final_email, final_pw
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }

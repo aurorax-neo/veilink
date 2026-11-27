@@ -80,9 +80,9 @@ jobs:
           cp target/release/veilink ../bundle/veilink
           cp ../LICENSE ../NOTICE ../THIRD_PARTY_NOTICES.md ../README.md ../bundle/
           printf '%s\n' "Source: https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}" \
-            'Unified executable: master|server|client subcommands; no role-specific packages.' \
+            'Unified executable: master|server|client|admin|keys subcommands; no role-specific packages.' \
             'Development archive, not a host production deployment guide.' \
-            'Master Web assets are embedded in the veilink binary; default management transport is HTTP, TLS is optional.' > ../bundle/BUILD.txt
+            'Master Web assets (React 19) are embedded in the veilink binary; default management transport is HTTP, TLS is optional.' > ../bundle/BUILD.txt
           mkdir -p ../dist
           tar -czf "../dist/veilink-linux-amd64.tar.gz" -C ../bundle .
           (cd ../dist && sha256sum ./*.tar.gz > SHA256SUMS)

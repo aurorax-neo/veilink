@@ -26,7 +26,7 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use url::Url;
 
-use crate::auth::{KeyRole, KeyStore, ROLE_ADMIN, ROLE_READONLY};
+use crate::auth::{AuthError, AuthStore, KeyRole, KeyStore, ROLE_ADMIN, ROLE_READONLY};
 use crate::buildinfo;
 use crate::config::{self, MasterConfigUpdate};
 use crate::control::{
@@ -299,6 +299,7 @@ pub struct Api {
     ring: Option<Arc<Ring>>,
     node_ring: Option<NodeRing>,
     key_store: KeyStore,
+    auth_store: AuthStore,
     web_manager: WebManager,
     stream_hub: Arc<StreamHub>,
     token_store: Arc<StreamTokenStore>,
@@ -321,14 +322,48 @@ impl Api {
                 r.push_entry("master", "", "ERROR", &msg);
             }
         }
-        if let Ok(true) = key_store.legacy_admin_pending() {
+        let auth_store = AuthStore::new(store.db());
+        if let Err(err) = auth_store.migrate() {
+            let msg = format!("初始化 admin_accounts 表失败: {err}");
+            eprintln!("veilink master: {msg}");
             if let Some(ref r) = ring {
-                r.push_entry(
-                    "master",
-                    "",
-                    "WARN",
-                    "旧版管理员尚未迁移。请执行 veilink keys list，迁移出的 API Key 只在该命令输出中显示一次",
-                );
+                r.push_entry("master", "", "ERROR", &msg);
+            }
+        } else {
+            match auth_store.ensure_install_secret(&web_persist.db_path) {
+                Ok(Some((secret, secret_path))) => {
+                    let path_text = secret_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<in-memory>".to_string());
+                    eprintln!(
+                        "\n======================================================================\n\
+                         Veilink 首次安装引导（Install Lock 已启用，防访客抢注）\n\
+                         初始化安全令牌 (Install Secret): {secret}\n\
+                         令牌文件路径: {path_text}\n\
+                         请在 Web 控制台首次安装引导中输入此一次性令牌，注册唯一管理员邮箱与密码。\n\
+                         完成注册后安全令牌将自动销毁，公开注册入口永久锁定。\n\
+                         ======================================================================\n"
+                    );
+                    if let Some(ref r) = ring {
+                        r.push_entry(
+                            "master",
+                            "",
+                            "INFO",
+                            &format!(
+                                "first-time setup required; install secret written to {path_text}"
+                            ),
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    let msg = format!("生成初始化安全令牌失败: {err}");
+                    eprintln!("veilink master: {msg}");
+                    if let Some(ref r) = ring {
+                        r.push_entry("master", "", "ERROR", &msg);
+                    }
+                }
             }
         }
         let web_manager = WebManager::new(web_persist.html_dir.clone());
@@ -349,6 +384,7 @@ impl Api {
             ring,
             node_ring,
             key_store,
+            auth_store,
             web_manager,
             stream_hub: StreamHub::new(),
             token_store: StreamTokenStore::new(),
@@ -423,7 +459,15 @@ impl Api {
 
         let is_api = path.starts_with("/api/");
 
-        // 5. API Key authentication (except GET /api/v1/stream which uses one-time token)
+        // 4.5 Public Auth & First-Time Setup endpoints (unauthenticated, rate-limited)
+        if path == "/api/v1/auth/status"
+            || path == "/api/v1/auth/setup"
+            || path == "/api/v1/auth/login"
+        {
+            return self.serve_public_auth(req, &method, &path).await;
+        }
+
+        // 5. Session / API Key authentication (except GET /api/v1/stream which uses one-time token)
         let is_sse = path == "/api/v1/stream" && method == Method::GET;
         let mut role: KeyRole = String::new();
         if !is_sse {
@@ -436,6 +480,11 @@ impl Api {
                 }
                 return failure_response(StatusCode::UNAUTHORIZED, true);
             }
+        }
+
+        // 5.5 Authenticated Account & Session endpoints (/api/v1/auth/*)
+        if path.starts_with("/api/v1/auth/") {
+            return self.serve_authed_auth(req, &method, &path, &role).await;
         }
 
         // 6. SSE stream & token endpoints
@@ -570,7 +619,132 @@ impl Api {
         )
     }
 
+    fn extract_session_token(&self, req: &Request<Body>) -> Option<String> {
+        if let Some(bearer) = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+        {
+            let trimmed = bearer.trim();
+            if trimmed.starts_with("vls_") {
+                return Some(trimmed.to_string());
+            }
+        }
+        if !Self::cookie_csrf_allowed(req) {
+            return None;
+        }
+        if let Some(cookie_hdr) = req.headers().get(header::COOKIE).and_then(|v| v.to_str().ok()) {
+            for part in cookie_hdr.split(';') {
+                if let Some((k, v)) = part.trim().split_once('=') {
+                    if k.trim() == "veilink_session" {
+                        let val = v.trim();
+                        if val.starts_with("vls_") {
+                            return Some(val.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Block cross-site and same-site subdomain CSRF when authenticating solely
+    /// via the `veilink_session` cookie on state-mutating HTTP methods.
+    fn cookie_csrf_allowed(req: &Request<Body>) -> bool {
+        if matches!(
+            *req.method(),
+            Method::GET | Method::HEAD | Method::OPTIONS
+        ) {
+            return true;
+        }
+        if let Some(sfs) = req
+            .headers()
+            .get("Sec-Fetch-Site")
+            .and_then(|v| v.to_str().ok())
+        {
+            let sfs = sfs.trim();
+            if !sfs.eq_ignore_ascii_case("same-origin") && !sfs.eq_ignore_ascii_case("none") {
+                return false;
+            }
+        }
+        if let Some(origin_raw) = req.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+            let origin_raw = origin_raw.trim();
+            if origin_raw.eq_ignore_ascii_case("null") {
+                return false;
+            }
+            let Ok(origin_url) = Url::parse(origin_raw) else {
+                return false;
+            };
+            let Some(host_hdr) = req.headers().get(header::HOST).and_then(|v| v.to_str().ok()) else {
+                return false;
+            };
+            let Some(origin_host) = origin_url.host_str() else {
+                return false;
+            };
+            let origin_authority = match origin_url.port() {
+                Some(p) => {
+                    if origin_host.contains(':') && !origin_host.starts_with('[') {
+                        format!("[{origin_host}]:{p}")
+                    } else {
+                        format!("{origin_host}:{p}")
+                    }
+                }
+                None => {
+                    if origin_host.contains(':') && !origin_host.starts_with('[') {
+                        format!("[{origin_host}]")
+                    } else {
+                        origin_host.to_string()
+                    }
+                }
+            };
+            let host_trimmed = host_hdr.trim();
+            let default_port_authority = match origin_url.scheme() {
+                "https" => format!("{origin_authority}:443"),
+                "http" => format!("{origin_authority}:80"),
+                _ => String::new(),
+            };
+            if !host_trimmed.eq_ignore_ascii_case(&origin_authority)
+                && (default_port_authority.is_empty()
+                    || !host_trimmed.eq_ignore_ascii_case(&default_port_authority))
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn is_secure_request(&self, req: &Request<Body>) -> bool {
+        if !self.insecure {
+            return true;
+        }
+        let peer = req
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ci| ci.0.ip().to_string())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        if !is_trusted_proxy_ip(&peer) {
+            return false;
+        }
+        req.headers()
+            .get("X-Forwarded-Proto")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("https"))
+    }
+
+    fn session_cookie_header(token: &str, max_age_secs: i64, secure: bool) -> String {
+        let sec = if secure { "; Secure" } else { "" };
+        format!(
+            "veilink_session={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age_secs}{sec}"
+        )
+    }
+
     fn authenticate(&self, req: &Request<Body>) -> Option<KeyRole> {
+        if let Some(sess_tok) = self.extract_session_token(req) {
+            if let Some(ident) = self.auth_store.validate_session(&sess_tok) {
+                return Some(ident.role);
+            }
+        }
         let mut key = req
             .headers()
             .get(header::AUTHORIZATION)
@@ -588,6 +762,364 @@ impl Api {
             return None;
         }
         self.key_store.validate(key)
+    }
+
+    async fn serve_public_auth(
+        &self,
+        req: Request<Body>,
+        method: &Method,
+        path: &str,
+    ) -> Response<Body> {
+        let secure = self.is_secure_request(&req);
+        let ip = client_ip(&req);
+
+        if path == "/api/v1/auth/status" {
+            if *method != Method::GET {
+                return failure_response(StatusCode::METHOD_NOT_ALLOWED, true);
+            }
+            let installed = self.auth_store.is_installed();
+            let authed_session = self
+                .extract_session_token(&req)
+                .and_then(|t| self.auth_store.validate_session(&t));
+            let user_json = if let Some(ref _sess) = authed_session {
+                self.auth_store
+                    .account_info()
+                    .ok()
+                    .flatten()
+                    .map(|(acc, active_sessions)| {
+                        serde_json::json!({
+                            "email": acc.email,
+                            "created_at": acc.created_at,
+                            "updated_at": acc.updated_at,
+                            "last_login": acc.last_login,
+                            "active_sessions": active_sessions,
+                        })
+                    })
+            } else {
+                None
+            };
+            let secret_hint_path = crate::auth::install_secret_path(&self.web_persist.db_path)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "/data/.install_secret".to_string());
+            return json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "installed": installed,
+                    "locked": installed,
+                    "single_admin_only": true,
+                    "secret_file_hint": if installed { "" } else { secret_hint_path.as_str() },
+                    "authenticated": authed_session.is_some(),
+                    "user": user_json,
+                }),
+                true,
+            );
+        }
+
+        if path == "/api/v1/auth/setup" {
+            if *method != Method::POST {
+                return failure_response(StatusCode::METHOD_NOT_ALLOWED, true);
+            }
+            if self.auth_store.is_installed() {
+                return json_response(
+                    StatusCode::FORBIDDEN,
+                    &serde_json::json!({ "error": AuthError::AlreadyInstalled.to_string() }),
+                    true,
+                );
+            }
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct SetupReq {
+                install_secret: String,
+                email: String,
+                password: String,
+            }
+            let body: SetupReq = match decode_json_body(req, 16 << 10).await {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            match self.auth_store.setup_admin(
+                &self.web_persist.db_path,
+                &body.install_secret,
+                &body.email,
+                &body.password,
+            ) {
+                Ok((acc, token)) => {
+                    if let Some(ref r) = self.ring {
+                        r.push_entry(
+                            "master",
+                            "",
+                            "INFO",
+                            &format!("initial admin registered and setup locked email={}", acc.email),
+                        );
+                    }
+                    let mut resp = json_response(
+                        StatusCode::CREATED,
+                        &serde_json::json!({
+                            "ok": true,
+                            "token": token,
+                            "user": {
+                                "email": acc.email,
+                                "created_at": acc.created_at,
+                                "updated_at": acc.updated_at,
+                                "last_login": acc.last_login,
+                                "active_sessions": 1,
+                            },
+                        }),
+                        true,
+                    );
+                    if let Ok(hv) = header::HeaderValue::from_str(&Self::session_cookie_header(
+                        &token,
+                        7 * 24 * 3600,
+                        secure,
+                    )) {
+                        resp.headers_mut().insert(header::SET_COOKIE, hv);
+                    }
+                    return resp;
+                }
+                Err(err @ AuthError::AlreadyInstalled) => {
+                    return json_response(
+                        StatusCode::FORBIDDEN,
+                        &serde_json::json!({ "error": err.to_string() }),
+                        true,
+                    );
+                }
+                Err(err @ AuthError::InvalidInstallSecret) => {
+                    if !self.auth_fails.allow(&ip) {
+                        return failure_response(StatusCode::TOO_MANY_REQUESTS, true);
+                    }
+                    return json_response(
+                        StatusCode::UNAUTHORIZED,
+                        &serde_json::json!({ "error": err.to_string() }),
+                        true,
+                    );
+                }
+                Err(err @ AuthError::InvalidEmail(_)) | Err(err @ AuthError::InvalidPassword(_)) => {
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        &serde_json::json!({ "error": err.to_string() }),
+                        true,
+                    );
+                }
+                Err(err) => {
+                    return json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &serde_json::json!({ "error": err.to_string() }),
+                        true,
+                    );
+                }
+            }
+        }
+
+        if path == "/api/v1/auth/login" {
+            if *method != Method::POST {
+                return failure_response(StatusCode::METHOD_NOT_ALLOWED, true);
+            }
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct LoginReq {
+                email: String,
+                password: String,
+            }
+            let body: LoginReq = match decode_json_body(req, 16 << 10).await {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            match self.auth_store.login(&body.email, &body.password) {
+                Ok((acc, token)) => {
+                    let active_sessions = self
+                        .auth_store
+                        .account_info()
+                        .ok()
+                        .flatten()
+                        .map(|(_, c)| c)
+                        .unwrap_or(1);
+                    let mut resp = json_response(
+                        StatusCode::OK,
+                        &serde_json::json!({
+                            "ok": true,
+                            "token": token,
+                            "user": {
+                                "email": acc.email,
+                                "created_at": acc.created_at,
+                                "updated_at": acc.updated_at,
+                                "last_login": acc.last_login,
+                                "active_sessions": active_sessions,
+                            },
+                        }),
+                        true,
+                    );
+                    if let Ok(hv) = header::HeaderValue::from_str(&Self::session_cookie_header(
+                        &token,
+                        7 * 24 * 3600,
+                        secure,
+                    )) {
+                        resp.headers_mut().insert(header::SET_COOKIE, hv);
+                    }
+                    return resp;
+                }
+                Err(err @ AuthError::NotInstalled) => {
+                    return json_response(
+                        StatusCode::CONFLICT,
+                        &serde_json::json!({ "error": err.to_string() }),
+                        true,
+                    );
+                }
+                Err(err @ AuthError::InvalidCredentials) => {
+                    if !self.auth_fails.allow(&ip) {
+                        return failure_response(StatusCode::TOO_MANY_REQUESTS, true);
+                    }
+                    return json_response(
+                        StatusCode::UNAUTHORIZED,
+                        &serde_json::json!({ "error": err.to_string() }),
+                        true,
+                    );
+                }
+                Err(err) => {
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        &serde_json::json!({ "error": err.to_string() }),
+                        true,
+                    );
+                }
+            }
+        }
+
+        failure_response(StatusCode::NOT_FOUND, true)
+    }
+
+    async fn serve_authed_auth(
+        &self,
+        req: Request<Body>,
+        method: &Method,
+        path: &str,
+        role: &str,
+    ) -> Response<Body> {
+        let secure = self.is_secure_request(&req);
+        let sess_tok = self.extract_session_token(&req);
+
+        if path == "/api/v1/auth/me" && *method == Method::GET {
+            return match self.auth_store.account_info() {
+                Ok(Some((acc, active_sessions))) => json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({
+                        "email": acc.email,
+                        "role": role,
+                        "created_at": acc.created_at,
+                        "updated_at": acc.updated_at,
+                        "last_login": acc.last_login,
+                        "active_sessions": active_sessions,
+                    }),
+                    true,
+                ),
+                Ok(None) => failure_response(StatusCode::NOT_FOUND, true),
+                Err(_) => failure_response(StatusCode::INTERNAL_SERVER_ERROR, true),
+            };
+        }
+
+        if path == "/api/v1/auth/logout" && *method == Method::POST {
+            if let Some(ref tok) = sess_tok {
+                self.auth_store.logout_session(tok);
+            }
+            let mut resp = json_response(StatusCode::OK, &serde_json::json!({ "ok": true }), true);
+            if let Ok(hv) =
+                header::HeaderValue::from_str(&Self::session_cookie_header("", 0, secure))
+            {
+                resp.headers_mut().insert(header::SET_COOKIE, hv);
+            }
+            return resp;
+        }
+
+        if role != ROLE_ADMIN {
+            return failure_response(StatusCode::FORBIDDEN, true);
+        }
+
+        if path == "/api/v1/auth/password" && *method == Method::POST {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct ChangePasswordReq {
+                current_password: String,
+                new_password: String,
+                #[serde(default)]
+                revoke_other_sessions: bool,
+            }
+            let body: ChangePasswordReq = match decode_json_body(req, 16 << 10).await {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            return match self.auth_store.change_password(
+                &body.current_password,
+                &body.new_password,
+                sess_tok.as_deref(),
+                body.revoke_other_sessions,
+            ) {
+                Ok(revoked) => json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({ "ok": true, "revoked_sessions": revoked }),
+                    true,
+                ),
+                Err(AuthError::InvalidCredentials) => json_response(
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::json!({ "error": "当前密码不正确" }),
+                    true,
+                ),
+                Err(err) => json_response(
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::json!({ "error": err.to_string() }),
+                    true,
+                ),
+            };
+        }
+
+        if path == "/api/v1/auth/email" && *method == Method::POST {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct ChangeEmailReq {
+                current_password: String,
+                new_email: String,
+            }
+            let body: ChangeEmailReq = match decode_json_body(req, 16 << 10).await {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            };
+            return match self
+                .auth_store
+                .change_email(&body.current_password, &body.new_email)
+            {
+                Ok(acc) => json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({
+                        "ok": true,
+                        "email": acc.email,
+                        "updated_at": acc.updated_at,
+                    }),
+                    true,
+                ),
+                Err(AuthError::InvalidCredentials) => json_response(
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::json!({ "error": "当前密码不正确" }),
+                    true,
+                ),
+                Err(err) => json_response(
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::json!({ "error": err.to_string() }),
+                    true,
+                ),
+            };
+        }
+
+        if path == "/api/v1/auth/sessions/revoke-others" && *method == Method::POST {
+            let revoked = sess_tok
+                .as_deref()
+                .map(|t| self.auth_store.revoke_other_sessions(t))
+                .unwrap_or(0);
+            return json_response(
+                StatusCode::OK,
+                &serde_json::json!({ "ok": true, "revoked_sessions": revoked }),
+                true,
+            );
+        }
+
+        failure_response(StatusCode::NOT_FOUND, true)
     }
 
     async fn serve_control(
@@ -2126,5 +2658,245 @@ mod tests {
         // Proxy HTML 401/403 must not be mistaken for Master credential rejection
         assert!(!is_master_auth_error(b"<html>401 Authorization Required</html>"));
         assert!(!is_master_auth_error(b"{\"error\":\"forbidden\"}"));
+    }
+
+    #[tokio::test]
+    async fn email_password_setup_lock_and_session_flow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("veilink.db").to_string_lossy().to_string();
+        let key_path = tmp.path().join("master.key").to_string_lossy().to_string();
+        let store = Arc::new(Store::open(&db_path, &key_path).unwrap());
+        let api = Api::new(
+            Arc::clone(&store),
+            true,
+            None,
+            WebPersistConfig {
+                db_path: db_path.clone(),
+                html_dir: String::new(),
+            },
+        );
+
+        // 1. Fresh install reports installed=false and generated .install_secret on disk
+        let st_resp = api
+            .handle(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/auth/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(st_resp.status(), StatusCode::OK);
+        let st_json: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(st_resp.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(st_json["installed"], false);
+        assert_eq!(st_json["locked"], false);
+
+        let secret_path = tmp.path().join(".install_secret");
+        assert!(secret_path.is_file());
+        let real_secret = std::fs::read_to_string(&secret_path).unwrap().trim().to_string();
+
+        // 2. Visitor with wrong secret is rejected (401)
+        let bad_secret = api
+            .handle(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/auth/setup")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "install_secret": "VLK-FAKE-0000-0000-0000",
+                            "email": "attacker@example.com",
+                            "password": "Password123!"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(bad_secret.status(), StatusCode::UNAUTHORIZED);
+
+        // 3. Non-email username is rejected (400)
+        let bad_email = api
+            .handle(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/auth/setup")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "install_secret": real_secret,
+                            "email": "not-an-email",
+                            "password": "Password123!"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(bad_email.status(), StatusCode::BAD_REQUEST);
+
+        // 4. Legitimate setup succeeds (201), sets HttpOnly cookie, deletes .install_secret
+        let ok_setup = api
+            .handle(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/auth/setup")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "install_secret": real_secret,
+                            "email": "admin@veilink.io",
+                            "password": "Password123!"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(ok_setup.status(), StatusCode::CREATED);
+        let cookie_hdr = ok_setup
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(cookie_hdr.contains("veilink_session=vls_"));
+        assert!(cookie_hdr.contains("HttpOnly"));
+        assert!(!secret_path.exists());
+        let setup_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(ok_setup.into_body(), 4096).await.unwrap(),
+        )
+        .unwrap();
+        let token = setup_body["token"].as_str().unwrap().to_string();
+
+        // 5. Repeat registration is permanently locked (403)
+        let locked_setup = api
+            .handle(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/auth/setup")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "install_secret": real_secret,
+                            "email": "second@veilink.io",
+                            "password": "Password123!"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(locked_setup.status(), StatusCode::FORBIDDEN);
+
+        // 6. Authenticated /api/v1/auth/me & /api/v1/stats succeed using Bearer session token
+        let me_resp = api
+            .handle(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/auth/me")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(me_resp.status(), StatusCode::OK);
+        let me_json: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(me_resp.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(me_json["email"], "admin@veilink.io");
+
+        // 7. Cookie-only CSRF guard blocks cross-site / same-site subdomain POST, while allowing same-origin
+        let csrf_sub = api
+            .handle(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/auth/logout")
+                    .header(header::COOKIE, format!("veilink_session={token}"))
+                    .header("Sec-Fetch-Site", "same-site")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(csrf_sub.status(), StatusCode::UNAUTHORIZED);
+
+        let csrf_origin = api
+            .handle(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/auth/logout")
+                    .header(header::COOKIE, format!("veilink_session={token}"))
+                    .header(header::HOST, "panel.veilink.io")
+                    .header(header::ORIGIN, "https://other.veilink.io")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(csrf_origin.status(), StatusCode::UNAUTHORIZED);
+
+        // 8. Same-origin Cookie logout invalidates session
+        let out_resp = api
+            .handle(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/auth/logout")
+                    .header(header::COOKIE, format!("veilink_session={token}"))
+                    .header(header::HOST, "panel.veilink.io:8843")
+                    .header(header::ORIGIN, "https://panel.veilink.io:8843")
+                    .header("Sec-Fetch-Site", "same-origin")
+                    .header("X-Forwarded-Proto", "https")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(out_resp.status(), StatusCode::OK);
+        assert!(out_resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("; Secure"));
+        let after_logout = api
+            .handle(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/stats")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(after_logout.status(), StatusCode::UNAUTHORIZED);
+
+        // 9. Re-login with email + password succeeds; untrusted peer X-Forwarded-Proto does not force Secure cookie
+        let mut untrusted_login_req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/auth/login")
+            .header("Content-Type", "application/json")
+            .header("X-Forwarded-Proto", "https")
+            .body(Body::from(
+                serde_json::json!({
+                    "email": "admin@veilink.io",
+                    "password": "Password123!"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        untrusted_login_req.extensions_mut().insert(ConnectInfo(
+            "203.0.113.9:40000".parse::<SocketAddr>().unwrap(),
+        ));
+        let login_resp = api.handle(untrusted_login_req).await;
+        assert_eq!(login_resp.status(), StatusCode::OK);
+        assert!(!login_resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("; Secure"));
     }
 }

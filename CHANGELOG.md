@@ -8,6 +8,24 @@ Release。
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-27
+
+### Authentication & Security
+
+- 管理控制台认证体系重构为**唯一管理员电子邮箱 + 密码**，并引入类 Nginx-UI **首次安装引导与防访客抢注安装锁（Install Lock）**（`auth.rs` / `httpapi.rs` / `cli.rs`）：
+  - 全新部署或旧实例首次升级启动时，服务端自动生成高熵一次性初始化令牌（`VLK-XXXX-XXXX-XXXX-XXXX`）写入 `<db_dir>/.install_secret`（Unix `0600` 权限）并在日志输出引导横幅；未持有该令牌的外部访客无法抢注管理员（返回 `401` 且按客户端 IP 速率限制）。
+  - 登录用户名强制校验标准电子邮箱格式，密码采用 `PBKDF2-HMAC-SHA256`（发行版 `210,000` 轮）与随机盐派生；通过 SQLite `CHECK (id = 1)` 与 `IMMEDIATE` 事务从存储层强制保证全局仅存在唯一管理员账户。
+  - 完成首次手工注册（`POST /api/v1/auth/setup`）后立即自动删除 `.install_secret` 文件、擦除内存令牌并永久锁定公开注册入口（重复请求返回 `403`）。
+  - 会话支持 `Bearer vls_...` 与 `HttpOnly; SameSite=Lax` Cookie 双通道鉴权，写操作针对纯 Cookie 请求校验 `Sec-Fetch-Site` 与 `Origin/Host` 一致性以阻断跨站及同站子域 CSRF，并对 `X-Forwarded-Proto` 严格限定可信反代来源；控制台内支持修改管理员邮箱、修改密码（可选同步注销其他设备会话）与一键吊销其他活跃会话。
+  - 新增运维恢复子命令 `veilink admin show-install-secret` 与 `veilink admin reset-password`（重置密码同时立即吊销全部旧会话）；原有节点、映射数据及编程式 `veilink keys` CLI 保持无损兼容。
+
+### Frontend Rewrite & Multi-Platform UX
+
+- 前端管理控制台彻底抛弃旧 Vue 3 界面，基于 **React 19 + TypeScript + Vite 6** 全新设计与实现：
+  - 构建现代化双主题（暗黑墨色层阶 / 暖纸浅色）设计系统：支持实时反向隧道拓扑图（`TopologyCanvas`）、命令面板（`⌘K / Ctrl+K`）、公网网关/内网节点可拖拽双栏检视器（`SplitPane`）、四栏分段式脱机与容器快捷接入弹窗、渐进式协议配置抽屉、可逆操作底部撤销 `Snackbar` 及高危操作量化损失确认框（`AlertDialog`）。
+  - 新增顶栏常驻**统一通知中心（Notification Center）**：集中收纳异常/待关注节点、版本兼容提示、流量/状态遥测异常与 SSE 重连状态，支持单条忽略、会话已读、恢复提醒与一键直达节点排查，彻底消除首页及子页面顶部告警横幅引发的内容下移（零 CLS）。
+  - 全分辨率与全平台深度适配：覆盖 4K 超宽屏（`1680px` 流体画布）、标准桌面与紧凑笔记本（`1440px / 1280px` 单行五卡 KPI）、平板区间自动图标轨与零露边抽屉（`768px–1180px`）、移动端（`390px / 360px` 专用触控卡片列表、`30%/60%/80%` 三档跟手 `BottomSheet` 详情抽屉、底部五项安全区拇指导航栏、iOS `16px` 输入防放大）以及含德语长词与阿拉伯语 RTL 在内的 7 语言国际化。
+
 ## [0.4.23] - 2026-11-25
 
 ### Bug Fixes & Stability

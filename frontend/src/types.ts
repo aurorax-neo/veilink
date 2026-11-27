@@ -25,6 +25,53 @@ export interface ConnectEndpoint {
   enabled: boolean
 }
 
+export interface XhttpConfig {
+  host?: string
+  path: string
+  download_endpoint_id?: string
+  mode: 'packet-up' | 'stream-up' | 'stream-one' | 'auto'
+  tls: boolean
+  headers?: Record<string, string>
+  http_version?: '1.1' | '2' | '3'
+  max_each_post_bytes?: number
+  post_bytes_max?: number
+  max_buffered_posts?: number
+  max_concurrent_posts?: number
+  uplink_data_placement?: 'body' | 'header' | 'cookie'
+  uplink_data_key?: string
+  uplink_chunk_size?: number
+  xmux?: {
+    max_concurrency?: number
+    max_connections?: number
+    c_max_reuse_times?: number
+    h_max_request_times?: number
+    h_max_reusable_secs?: number
+    keep_alive_period?: number
+  }
+  stream_up_server_secs?: number
+  stream_up_server_max_secs?: number
+  request_timeout_seconds?: number
+  padding_bytes?: number
+  padding_max_bytes?: number
+  padding_obfs_mode?: boolean
+  padding_placement?: 'query_in_header' | 'query' | 'header' | 'cookie'
+  padding_key?: string
+  padding_header?: string
+  padding_method?: 'repeat-x' | 'tokenish'
+  no_grpc_header?: boolean
+  no_sse_header?: boolean
+  server_max_header_bytes?: number
+  uplink_http_method?: 'POST' | 'PUT' | 'OPTIONS'
+  min_posts_interval_ms?: number
+  max_posts_interval_ms?: number
+  session_id_placement?: 'path' | 'query' | 'header' | 'cookie'
+  session_id_key?: string
+  seq_placement?: 'path' | 'query' | 'header' | 'cookie'
+  seq_key?: string
+  session_id_table?: string
+  session_id_length?: number
+}
+
 export interface TunnelConfig {
   protocol?: 'vless' | 'hysteria2' | ''
   transport_security?: 'tls' | 'plain' | ''
@@ -38,7 +85,7 @@ export interface TunnelConfig {
   encryption?: string
   reality?: RealityConfig
   hysteria2?: Hysteria2Config
-  xhttp?: { host?: string; path: string; download_endpoint_id?: string; mode: 'packet-up' | 'stream-up' | 'stream-one' | 'auto'; tls: boolean; headers?: Record<string, string>; http_version?: '1.1' | '2' | '3'; max_each_post_bytes?: number; post_bytes_max?: number; max_buffered_posts?: number; max_concurrent_posts?: number; uplink_data_placement?: 'body' | 'header' | 'cookie'; uplink_data_key?: string; uplink_chunk_size?: number; xmux?: { max_concurrency?: number; max_connections?: number; c_max_reuse_times?: number; h_max_request_times?: number; h_max_reusable_secs?: number; keep_alive_period?: number }; stream_up_server_secs?: number; stream_up_server_max_secs?: number; request_timeout_seconds?: number; padding_bytes?: number; padding_max_bytes?: number; padding_obfs_mode?: boolean; padding_placement?: 'query_in_header' | 'query' | 'header' | 'cookie'; padding_key?: string; padding_header?: string; padding_method?: 'repeat-x' | 'tokenish'; no_grpc_header?: boolean; no_sse_header?: boolean; server_max_header_bytes?: number; uplink_http_method?: 'POST' | 'PUT' | 'OPTIONS'; min_posts_interval_ms?: number; max_posts_interval_ms?: number; session_id_placement?: 'path' | 'query' | 'header' | 'cookie'; session_id_key?: string; seq_placement?: 'path' | 'query' | 'header' | 'cookie'; seq_key?: string; session_id_table?: string; session_id_length?: number }
+  xhttp?: XhttpConfig
 }
 
 export interface Node {
@@ -62,7 +109,6 @@ export interface Node {
 }
 
 export interface Mapping {
-
   bandwidth_limit?: string
   id: string
   name: string
@@ -79,6 +125,18 @@ export interface Mapping {
   network?: string
   enabled: boolean
 }
+
+export interface EndpointStatus {
+  acknowledged: boolean
+  reason: string
+  linked?: boolean
+}
+
+export interface MappingStatus {
+  server: EndpointStatus
+  client: EndpointStatus
+}
+
 export interface TrafficRow {
   mapping_id: string
   up_bytes: number
@@ -102,62 +160,76 @@ export interface LogEntry {
 }
 
 export interface Stats {
-  online_servers: number
-  online_clients: number
+  online_servers?: number
+  online_clients?: number
+  online_nodes?: number
   total_nodes: number
-  active_mappings: number
+  total_mappings?: number
+  enabled_mappings?: number
+  active_mappings?: number
+}
+
+export interface AuthUser {
+  email: string
+  role?: string
+  created_at: string
+  updated_at?: string
+  last_login?: string
+  active_sessions?: number
+}
+
+export interface AuthStatusResponse {
+  installed: boolean
+  locked: boolean
+  single_admin_only: boolean
+  secret_file_hint: string
+  authenticated: boolean
+  user?: AuthUser | null
+}
+
+export interface WebStatus {
+  mode: string
+  active_version: string
+  serving: boolean
+  prebundled: boolean
+}
+
+export interface MasterServiceConfig {
+  listen_addr: string
+  scheme: 'http' | 'https'
+  cert_file: string
+  key_file: string
+}
+
+export interface JoinResult {
+  prepare?: string
+  command: string
+  offline_command?: string
+  offline_binary_command?: string
+  bootstrap_state?: string
+  state_json?: string
+  expires_at: number
+  token: string
+  warning: string
 }
 
 export type PageId = 'dashboard' | 'servers' | 'clients' | 'proxies' | 'logs' | 'audit' | 'settings'
+export type LocaleCode = 'zh-CN' | 'en' | 'de' | 'id' | 'th' | 'vi' | 'ar'
+export type ThemeMode = 'dark' | 'light'
 
-export const pages: Record<PageId, { title: string; kicker: string; lead: string; icon: string }> = {
-  dashboard: {
-    title: '仪表盘',
-    kicker: 'DASHBOARD',
-    lead: '系统概览和拓扑状态。',
-    icon: '◉',
-  },
-  servers: {
-    title: '服务端',
-    kicker: 'SERVERS',
-    lead: '公网网关节点。承载反向隧道入口和端口映射。',
-    icon: '▲',
-  },
-  clients: {
-    title: '客户端',
-    kicker: 'CLIENTS',
-    lead: '内网节点。主动连出到网关，转发流量到本地目标。',
-    icon: '●',
-  },
-  proxies: {
-    title: '端口映射',
-    kicker: 'PROXIES',
-    lead: '从公网监听地址转到内网目标。TCP 和 UDP 映射。',
-    icon: '⇌',
-  },
-  logs: {
-    title: '日志',
-    kicker: 'LOGS',
-    lead: '管理中心和节点的运行日志。',
-    icon: '☰',
-  },
-  audit: {
-    title: '审计',
-    kicker: 'AUDIT',
-    lead: '管理写操作记录。',
-    icon: '✎',
-  },
-  settings: {
-    title: '设置',
-    kicker: 'SETTINGS',
-    lead: '',
-    icon: '⚙',
-  },
-}
+export const PAGE_IDS: readonly PageId[] = [
+  'dashboard',
+  'servers',
+  'clients',
+  'proxies',
+  'logs',
+  'audit',
+  'settings',
+] as const
 
-export function pageFromHash(hash = location.hash): PageId {
+export function pageFromHash(hash = typeof location !== 'undefined' ? location.hash : ''): PageId {
   const id = hash.replace(/^#\/?/, '') as PageId
-  if (id in pages) {
+  if ((PAGE_IDS as readonly string[]).includes(id)) {
     try {
       globalThis.sessionStorage?.setItem('veilink_page', id)
       globalThis.localStorage?.setItem('veilink_page', id)
@@ -166,7 +238,7 @@ export function pageFromHash(hash = location.hash): PageId {
   }
   try {
     const saved = (globalThis.sessionStorage?.getItem('veilink_page') || globalThis.localStorage?.getItem('veilink_page')) as PageId | null
-    if (saved && saved in pages) return saved
+    if (saved && (PAGE_IDS as readonly string[]).includes(saved)) return saved
   } catch { /* ignore */ }
   return 'dashboard'
 }

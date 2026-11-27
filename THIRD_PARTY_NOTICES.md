@@ -34,16 +34,17 @@ Veilink 原创代码及文档（另有声明者除外）采用 **GPL-3.0-or-late
 
 ## 3. 前端依赖与参考资料
 
-`frontend/` 是 Vue 3 + TypeScript 静态页面，仅 Master 提供其构建产物。以下保留前端主要组件的许可索引；不是本次 Go 直接依赖核查的覆盖范围，发布应以锁文件与实际产物另行审计。
+`frontend/` 是 React 19 + TypeScript 静态单页控制台，构建产物通过 `rust-embed` 内嵌进单个二进制，仅 Master 提供其静态资源服务。以下列出前端主要直接组件的开源许可索引（精确锁定版本见 `frontend/package-lock.json`）。
 
 | 模块 | 用途 | 开源许可证 |
 | :--- | :--- | :--- |
-| `vue` | 前端 UI 框架 | MIT |
-| `vite` | 构建工具（编译期） | MIT |
-| `typescript` | 类型系统（编译期） | Apache-2.0 |
-| `vue-tsc` | 类型检查（编译期） | MIT |
-| `@vitejs/plugin-vue` | Vue SFC 编译插件（编译期） | MIT |
-| `@vitejs/plugin-basic-ssl` | 开发 HTTPS 插件（编译期） | MIT |
+| `react`、`react-dom` | 前端 UI 渲染框架 | MIT |
+| `lucide-react` | 矢量图标组件库 | ISC |
+| `vite` | 前端构建打包工具（编译期） | MIT |
+| `typescript` | 静态类型系统与编译器（编译期） | Apache-2.0 |
+| `@vitejs/plugin-react` | React 编译与热更新插件（编译期） | MIT |
+| `@vitejs/plugin-basic-ssl` | 本地开发 HTTPS 插件（编译期） | MIT |
+| `@types/react`、`@types/react-dom` | React TypeScript 类型定义（编译期） | MIT |
 
 `ref/frp-panel`（AGPL-3.0）仅作为架构参考，未引入其代码或界面资源。`ref/` 参考检出本身不是发布资源；从上游复制到正式源码目录或通过模块引用的代码仍属于第三方组件，不能用排除 `ref/` 打包来否认其许可义务。不要改写 `ref/` 或 vendor 内的第三方许可证。
 

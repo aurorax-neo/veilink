@@ -1,118 +1,135 @@
-// 同源 API 封装：/api/v1 前缀 + API Key 认证 + 401 自动跳登录
+// 同源 API 封装：/api/v1 前缀 + 管理员邮箱/密码会话认证（HttpOnly Cookie + Bearer）+ 首次安装引导锁
 
-const API_PREFIX = '/api/v1';
-const KEY_STORAGE = 'veilink_api_key';
+const API_PREFIX = '/api/v1'
+const SESSION_STORAGE = 'veilink_session_token'
+
 export class ApiError extends Error {
-  status: number;
+  status: number
   constructor(message: string, status: number) {
-    super(message);
-    this.name = 'ApiError';
-    this.status = status;
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
   }
 }
 
 function browserStorage(kind: 'session' | 'local'): Storage | null {
   try {
-    const root = typeof window !== 'undefined' ? window : globalThis;
-    const store = kind === 'session' ? root.sessionStorage : root.localStorage;
-    return store ?? null;
+    const root = typeof window !== 'undefined' ? window : globalThis
+    const store = kind === 'session' ? root.sessionStorage : root.localStorage
+    return store ?? null
   } catch {
-    return null;
+    return null
   }
 }
 
-export function getApiKey(): string | null {
-  return browserStorage('session')?.getItem(KEY_STORAGE) || null;
+export function getSessionToken(): string | null {
+  return browserStorage('session')?.getItem(SESSION_STORAGE) || null
 }
 
-export function setApiKey(key: string): void {
-  browserStorage('session')?.setItem(KEY_STORAGE, key);
-  browserStorage('local')?.removeItem(KEY_STORAGE);
+export function setSessionToken(token: string): void {
+  browserStorage('session')?.setItem(SESSION_STORAGE, token)
+  browserStorage('local')?.removeItem(SESSION_STORAGE)
+  browserStorage('local')?.removeItem('veilink_api_key')
+  browserStorage('session')?.removeItem('veilink_api_key')
 }
 
-export function clearApiKey(): void {
-  browserStorage('session')?.removeItem(KEY_STORAGE);
-  browserStorage('local')?.removeItem(KEY_STORAGE);
+export function clearSessionToken(): void {
+  browserStorage('session')?.removeItem(SESSION_STORAGE)
+  browserStorage('local')?.removeItem(SESSION_STORAGE)
+  browserStorage('session')?.removeItem('veilink_api_key')
+  browserStorage('local')?.removeItem('veilink_api_key')
 }
 
 export function buildUrl(path: string): string {
-  return `/${path.replace(/^\/+/, '')}`;
+  return `/${path.replace(/^\/+/, '')}`
 }
 
-let onUnauthorized: () => void = () => {};
+let onUnauthorized: () => void = () => {}
 
 export function setUnauthorized(handler: () => void) {
-  onUnauthorized = handler;
+  onUnauthorized = handler
 }
 
-// 兼容旧签名：api(path, method, data)
+const PUBLIC_AUTH_PATHS = new Set(['/auth/status', '/auth/setup', '/auth/login'])
+
 export async function api<T>(path: string, method = 'GET', data?: unknown): Promise<T> {
-  const key = getApiKey();
-  const headers: Record<string, string> = { Accept: 'application/json' };
-  if (key) headers['Authorization'] = `Bearer ${key}`;
-  if (method !== 'GET' && data !== undefined) headers['Content-Type'] = 'application/json';
+  const token = getSessionToken()
+  const headers: Record<string, string> = { Accept: 'application/json' }
+  if (token) headers['Authorization'] = `Bearer ${token}`
+  if (method !== 'GET' && data !== undefined) headers['Content-Type'] = 'application/json'
 
   const res = await fetch(buildUrl(`${API_PREFIX}${path}`), {
     method,
     headers,
+    credentials: 'same-origin',
     body: data !== undefined ? JSON.stringify(data) : undefined,
-  });
+  })
 
-  if (res.status === 401) {
-    clearApiKey();
-    onUnauthorized();
-    throw new ApiError('未授权，请重新输入 API Key', 401);
+  const isPublicAuth = PUBLIC_AUTH_PATHS.has(path)
+
+  if (res.status === 401 && !isPublicAuth) {
+    clearSessionToken()
+    onUnauthorized()
+    throw new ApiError('登录会话已失效，请重新登录', 401)
   }
+
   if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string }
+    if (body?.error && typeof body.error === 'string' && body.error.trim()) {
+      throw new ApiError(body.error, res.status)
+    }
+    if (res.status === 400 && (method === 'POST' || method === 'PUT') && /^\/nodes(?:\/[^/]+)?$/.test(path)) {
+      throw new ApiError(
+        '节点保存失败：请核对字段、端口和配对模板。TLS 核对证书/私钥、CA 与连接地址；plain 必须有 VLESS Encryption；REALITY 核对密钥、Short ID 与域名；Hysteria2 核对 TLS 与密码且不能配 REALITY；XHTTP 核对路径、模式与安全组合；Vision 仅支持 TCP + TLS/REALITY。',
+        400,
+      )
+    }
     const hints: Record<number, string> = {
       400: '请求无效或资源冲突，请检查字段、端口占用及关联配置。',
-      403: '没有执行该操作的权限。',
+      401: '认证失败，请核对凭据后重试。',
+      403: '没有执行该操作的权限或安装已锁定。',
       404: '请求的资源不存在。',
-      409: '请求无效或资源冲突。',
-      429: '请求过于频繁，请稍后重试。',
-    };
-    if (res.status === 400 && (method === 'POST' || method === 'PUT') && /^\/nodes(?:\/[^/]+)?$/.test(path)) {
-      throw new ApiError('节点保存失败：请核对字段、端口和配对模板。TLS 核对证书/私钥、CA 与连接地址；plain 必须有 VLESS Encryption；REALITY 核对密钥、Short ID 与域名；Hysteria2 核对 TLS 与密码且不能配 REALITY；XHTTP 支持 packet-up、stream-up、stream-one，核对规范路径、连接 HTTPS 与回源安全，HTTP 须 Encryption；流模式仅允许直连 HTTPS + TLS 回源的 HTTP/2 或 HTTP/3；Vision 仅支持 TCP + TLS/REALITY。', 400);
+      409: '请求状态冲突，请刷新页面后重试。',
+      429: '尝试过于频繁，请稍后再试。',
     }
-    const body = await res.json().catch(() => ({}));
-    throw new ApiError(hints[res.status] || body?.error || `请求失败 (${res.status})`, res.status);
+    throw new ApiError(hints[res.status] || `请求失败 (${res.status})`, res.status)
   }
-  if (res.status === 204) return null as T;
-  const text = await res.text();
-  if (!text) return null as T;
-  const parsed = JSON.parse(text);
-  const nowSec = Math.floor(Date.now() / 1000);
+
+  if (res.status === 204) return null as T
+  const text = await res.text()
+  if (!text) return null as T
+  const parsed = JSON.parse(text)
+  const nowSec = Math.floor(Date.now() / 1000)
   const clampLastSeen = (item: unknown) => {
     if (item && typeof item === 'object' && typeof (item as Record<string, unknown>).last_seen === 'number') {
-      const rec = item as Record<string, number>;
-      if (rec.last_seen > nowSec) rec.last_seen = nowSec;
+      const rec = item as Record<string, number>
+      if (rec.last_seen > nowSec) rec.last_seen = nowSec
     }
-  };
-  if (Array.isArray(parsed)) parsed.forEach(clampLastSeen);
-  else clampLastSeen(parsed);
-  return parsed as T;
+  }
+  if (Array.isArray(parsed)) parsed.forEach(clampLastSeen)
+  else clampLastSeen(parsed)
+  return parsed as T
 }
 
 export interface VersionInfo {
-  api_version: string;
-  backend_version: string;
-  web_version: string;
-  web_mode?: string;
+  api_version: string
+  backend_version: string
+  web_version: string
+  web_mode?: string
 }
 
 export async function getVersionInfo(): Promise<VersionInfo> {
-  const res = await fetch(buildUrl('/api/version'));
+  const res = await fetch(buildUrl('/api/version'), { credentials: 'same-origin' })
   if (!res.ok) {
-    throw new Error(`获取版本失败: ${res.status}`);
+    throw new Error(`获取版本失败: ${res.status}`)
   }
-  return res.json();
+  return res.json()
 }
 
-// 启动时检查 API 契约版本
 export async function checkApiCompatibility(): Promise<void> {
-  const res = await getVersionInfo();
-  const REQUIRED = 'v1';
+  const res = await getVersionInfo()
+  const REQUIRED = 'v1'
   if (res.api_version !== REQUIRED) {
-    throw new Error(`后端 API 版本不兼容：需要 ${REQUIRED}，实际 ${res.api_version}`);
+    throw new Error(`后端 API 版本不兼容：需要 ${REQUIRED}，实际 ${res.api_version}`)
   }
 }

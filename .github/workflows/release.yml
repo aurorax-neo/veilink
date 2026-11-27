@@ -33,10 +33,11 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-      - name: Install dependencies and build frontend
+      - name: Install dependencies, test, and build frontend
         working-directory: frontend
         run: |
           npm ci
+          npm test
           npm run build
       - name: Upload frontend artifact
         uses: actions/upload-artifact@v4
@@ -132,8 +133,8 @@ jobs:
           printf '%s\n' \
             "Source: https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}" \
             "Version: ${tag}" \
-            "Unified executable: master|server|client subcommands." \
-            "Management Web assets are embedded in the veilink binary." > ../release-pkg/BUILD.txt
+            "Unified executable: master|server|client|admin|keys subcommands." \
+            "Management Web assets (React 19) are embedded in the veilink binary." > ../release-pkg/BUILD.txt
           tar -czf "../release-packages/veilink-${GOOS}-${GOARCH}.tar.gz" -C ../release-pkg .
       - name: Upload package artifact
         uses: actions/upload-artifact@v4

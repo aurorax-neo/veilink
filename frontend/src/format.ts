@@ -1,6 +1,6 @@
 import type { Mapping, Node } from './types'
 
-export type Tone = '' | 'good' | 'warn' | 'bad'
+export type Tone = 'neutral' | 'good' | 'warn' | 'bad' | 'accent' | 'purple'
 
 const actions: Record<string, string> = {
   'node.save': '保存节点',
@@ -10,6 +10,10 @@ const actions: Record<string, string> = {
   'node.credential.reset': '重置节点凭证',
   'mapping.save': '保存映射',
   'mapping.delete': '删除映射',
+  'auth.setup': '初始化注册管理员',
+  'auth.password.change': '修改管理员密码',
+  'auth.email.change': '修改管理员邮箱',
+  'auth.password.reset': '重置管理员密码',
 }
 
 export function actionLabel(action: string): string {
@@ -18,9 +22,61 @@ export function actionLabel(action: string): string {
 
 export function actionTone(action: string): Tone {
   if (action === 'node.revoke' || action === 'mapping.delete') return 'bad'
-  if (action === 'node.enroll.revoke' || action === 'node.credential.reset') return 'warn'
-  if (action === 'node.save' || action === 'mapping.save' || action === 'node.enroll.token') return 'good'
-  return ''
+  if (action === 'node.enroll.revoke' || action === 'node.credential.reset' || action === 'auth.password.reset') return 'warn'
+  if (
+    action === 'node.save' ||
+    action === 'mapping.save' ||
+    action === 'node.enroll.token' ||
+    action === 'auth.setup' ||
+    action === 'auth.password.change' ||
+    action === 'auth.email.change'
+  ) {
+    return 'good'
+  }
+  return 'neutral'
+}
+
+export function validateEmailAddress(raw: string): string | null {
+  const email = raw.trim().toLowerCase()
+  if (!email) return '请输入管理员邮箱地址。'
+  if (email.length > 254 || /\s/.test(email)) return '邮箱地址不能包含空格且不能超过 254 字符。'
+  const parts = email.split('@')
+  if (parts.length !== 2) return '用户名必须是有效的电子邮箱格式，例如 admin@example.com。'
+  const [local, domain] = parts
+  if (!local || local.length > 64 || local.startsWith('.') || local.endsWith('.') || local.includes('..')) {
+    return '邮箱前缀格式无效。'
+  }
+  if (!/^[a-z0-9._%+-]+$/.test(local)) return '邮箱前缀包含不支持的字符。'
+  const labels = domain.split('.')
+  if (labels.length < 2 || domain.length > 253) return '邮箱域名须包含有效顶级后缀，例如 example.com。'
+  if (labels.some((l) => !l || l.length > 63 || l.startsWith('-') || l.endsWith('-') || !/^[a-z0-9-]+$/.test(l))) {
+    return '邮箱域名格式无效。'
+  }
+  const tld = labels[labels.length - 1]
+  if (tld.length < 2 || !/^[a-z]+$/.test(tld)) return '邮箱顶级域名无效。'
+  return null
+}
+
+export function evaluatePasswordStrength(pw: string): {
+  score: 0 | 1 | 2 | 3 | 4
+  label: string
+  tone: Tone
+  valid: boolean
+} {
+  if (!pw) return { score: 0, label: '未输入', tone: 'neutral', valid: false }
+  const lenOk = pw.length >= 8 && pw.length <= 128 && pw.trim().length > 0
+  let score = 0
+  if (pw.length >= 8) score += 1
+  if (pw.length >= 12) score += 1
+  const classes = [/[a-z]/.test(pw), /[A-Z]/.test(pw), /\d/.test(pw), /[^A-Za-z0-9]/.test(pw)].filter(Boolean).length
+  if (classes >= 2) score += 1
+  if (classes >= 3 && pw.length >= 10) score += 1
+  const clamped = Math.min(4, score) as 0 | 1 | 2 | 3 | 4
+  if (!lenOk) return { score: 1, label: '长度不足（至少 8 位）', tone: 'bad', valid: false }
+  if (clamped <= 1) return { score: 1, label: '较弱', tone: 'bad', valid: true }
+  if (clamped === 2) return { score: 2, label: '一般', tone: 'warn', valid: true }
+  if (clamped === 3) return { score: 3, label: '良好', tone: 'accent', valid: true }
+  return { score: 4, label: '强密码', tone: 'good', valid: true }
 }
 
 export function formatTime(value: number | string | Date): string {
@@ -38,6 +94,13 @@ export function formatTime(value: number | string | Date): string {
   })
 }
 
+export function formatBytes(n: number): string {
+  if (!Number.isSafeInteger(n) || n < 0) return '—'
+  if (n < 1024) return `${n} B`
+  const unit = Math.min(Math.floor(Math.log(n) / Math.log(1024)), 4)
+  return `${(n / 1024 ** unit).toFixed(1)} ${['B', 'KiB', 'MiB', 'GiB', 'TiB'][unit]}`
+}
+
 export function endpoint(host: string, port: number): string {
   const shown = host.includes(':') ? `[${host}]` : host
   return `${shown}:${port}`
@@ -47,7 +110,6 @@ export function nodeName(nodes: Node[], id: string): string {
   return nodes.find((n) => n.id === id)?.name || id
 }
 
-// Stable even when the API returns map-backed rows in a different order.
 export function byNameAndId<T extends { name: string; id: string }>(a: T, b: T): number {
   return (a.name || '').localeCompare(b.name || '', 'zh-CN') || a.id.localeCompare(b.id)
 }
@@ -58,20 +120,66 @@ export function heartbeatOnline(node: Node, now = Date.now()): boolean {
 
 export function presence(node: Node, now = Date.now()): { text: string; tone: Tone } {
   if (node.revoked) return { text: '已吊销', tone: 'bad' }
-  if (node.disabled) return { text: '已停用', tone: '' }
+  if (node.disabled) return { text: '已停用', tone: 'neutral' }
   if (heartbeatOnline(node, now)) return { text: '近期在线', tone: 'good' }
-  if (!node.last_seen) return { text: '尚未连接', tone: '' }
+  if (!node.last_seen) return { text: '尚未连接', tone: 'neutral' }
   if (now / 1000 < node.last_seen) return { text: '时钟超前', tone: 'warn' }
   return { text: '心跳超时', tone: 'warn' }
 }
 
 export function revisionState(node: Node): { text: string; tone: Tone } {
-  if (node.revoked) return { text: '不再同步', tone: '' }
+  if (node.revoked) return { text: '不再同步', tone: 'neutral' }
   if (node.error) return { text: '应用失败', tone: 'bad' }
-  if (!node.desired_revision) return { text: '尚无配置', tone: '' }
-  if (!node.applied_revision) return { text: '待应用', tone: 'warn' }
-  if (node.applied_revision === node.desired_revision) return { text: '已应用', tone: 'good' }
-  return { text: '待应用', tone: 'warn' }
+  if (!node.desired_revision) return { text: '尚无配置', tone: 'neutral' }
+  if (!node.applied_revision && !node.last_seen) return { text: '未上报', tone: 'warn' }
+  if (node.applied_revision === node.desired_revision) return { text: '已同步', tone: 'good' }
+  return { text: '待同步', tone: 'warn' }
+}
+
+export function tunnelBadges(node: Node): Array<{ text: string; tone: Tone }> {
+  const t = node.tunnel
+  if (!t) return [{ text: '未配置', tone: 'neutral' }]
+  const protocol = t.protocol || (t.hysteria2?.password ? 'hysteria2' : 'vless')
+  if (protocol === 'hysteria2') {
+    return [
+      { text: 'Hysteria2', tone: 'purple' },
+      { text: 'QUIC + TLS', tone: 'neutral' },
+    ]
+  }
+  const chips: Array<{ text: string; tone: Tone }> = [{ text: 'VLESS', tone: 'accent' }]
+  if (t.xhttp?.path) {
+    chips.push({ text: `XHTTP · ${t.xhttp.mode || 'packet-up'}`, tone: 'neutral' })
+    if (t.xhttp.http_version) chips.push({ text: `H${t.xhttp.http_version}`, tone: 'neutral' })
+  } else {
+    chips.push({ text: 'TCP', tone: 'neutral' })
+  }
+  if (t.reality && Object.values(t.reality).some(Boolean)) {
+    chips.push({ text: 'REALITY', tone: 'good' })
+  } else if (t.transport_security === 'tls') {
+    chips.push({ text: 'TLS', tone: 'good' })
+  } else if (t.transport_security === 'plain') {
+    chips.push({ text: 'Plain', tone: 'warn' })
+  }
+  if (t.flow === 'xtls-rprx-vision') chips.push({ text: 'Vision', tone: 'purple' })
+  if (t.decryption && t.decryption !== 'none') chips.push({ text: 'Encryption', tone: 'purple' })
+  return chips
+}
+
+export function tunnelSummaryText(node: Node): string {
+  const t = node.tunnel
+  const protocol = t?.protocol || (t?.hysteria2?.password ? 'hysteria2' : 'vless')
+  const enc = protocol === 'vless' ? t?.decryption : ''
+  const additive = enc && enc !== 'none' ? ' + Encryption' : ''
+  if (protocol === 'hysteria2') return 'Hysteria2 / QUIC + TLS'
+  if (t?.xhttp?.path) {
+    return `VLESS / XHTTP · ${t.xhttp.mode || 'packet-up'} · 连接 ${t.xhttp.tls ? 'HTTPS' : 'HTTP'} · 回源 ${t.transport_security === 'tls' ? 'HTTPS' : 'HTTP'}${additive}`
+  }
+  if (t?.reality && Object.values(t.reality).some(Boolean)) {
+    return `VLESS / TCP · REALITY${t.flow ? ` · ${t.flow}` : ''}${additive}`
+  }
+  if (t?.transport_security === 'plain') return 'VLESS / TCP · Encryption'
+  if (t?.transport_security === 'tls') return `VLESS / TCP · TLS${t.flow ? ` · ${t.flow}` : ''}${additive}`
+  return '未配置安全模式'
 }
 
 export function attentionReasons(node: Node, now = Date.now()): string[] {
@@ -93,12 +201,23 @@ export function seenText(unix: number, now = Date.now(), relative = true): strin
   if (!relative) return abs
   const delta = Math.round(now / 1000 - unix)
   if (delta < -5) return `${abs}（比本机时钟晚 ${-delta} 秒）`
-  if (delta < 90) return `${abs}（${Math.max(delta, 0)} 秒前）`
+  if (delta < 90) return `${Math.max(delta, 0)} 秒前`
   const minutes = Math.floor(delta / 60)
-  if (minutes < 120) return `${abs}（${minutes} 分钟前）`
+  if (minutes < 120) return `${minutes} 分钟前`
   const hours = Math.floor(minutes / 60)
-  if (hours < 48) return `${abs}（${hours} 小时前）`
+  if (hours < 48) return `${hours} 小时前`
   return abs
+}
+
+export function relativeAge(unix: number, now = Date.now()): string {
+  if (!unix) return '—'
+  const delta = Math.max(0, Math.round(now / 1000 - unix))
+  if (delta < 60) return `${delta} 秒前`
+  const minutes = Math.floor(delta / 60)
+  if (minutes < 60) return `${minutes} 分钟前`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours} 小时前`
+  return `${Math.floor(hours / 24)} 天前`
 }
 
 export function looksLikeIP(value: string): boolean {
@@ -108,23 +227,32 @@ export function looksLikeIP(value: string): boolean {
 
 function normalizedIP(value: string): string | null {
   const input = value.trim().toLowerCase()
-  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(input)) return input.split('.').map(part => String(Number(part))).join('.')
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(input)) return input.split('.').map((part) => String(Number(part))).join('.')
   if (!input.includes(':') || !/^[0-9a-f:.]+$/.test(input)) return null
   const parts = input.split('::')
   if (parts.length > 2) return null
-  const expand = (side: string) => side ? side.split(':').flatMap(part => {
-    if (!part.includes('.')) return [part]
-    const bytes = part.split('.').map(Number)
-    return bytes.length === 4 && bytes.every(byte => byte >= 0 && byte <= 255) ? [((bytes[0] << 8) | bytes[1]).toString(16), ((bytes[2] << 8) | bytes[3]).toString(16)] : ['invalid']
-  }) : []
-  const left = expand(parts[0]), right = expand(parts[1] || '')
+  const expand = (side: string) =>
+    side
+      ? side.split(':').flatMap((part) => {
+          if (!part.includes('.')) return [part]
+          const bytes = part.split('.').map(Number)
+          return bytes.length === 4 && bytes.every((byte) => byte >= 0 && byte <= 255)
+            ? [((bytes[0] << 8) | bytes[1]).toString(16), ((bytes[2] << 8) | bytes[3]).toString(16)]
+            : ['invalid']
+        })
+      : []
+  const left = expand(parts[0])
+  const right = expand(parts[1] || '')
   const missing = 8 - left.length - right.length
-  if ((parts.length === 2 ? missing < 1 : missing !== 0) || [...left, ...right].some(part => !/^[0-9a-f]{1,4}$/.test(part))) return null
-  return [...left, ...Array(missing).fill('0'), ...right].map(part => part.padStart(4, '0')).join(':')
+  if ((parts.length === 2 ? missing < 1 : missing !== 0) || [...left, ...right].some((part) => !/^[0-9a-f]{1,4}$/.test(part))) {
+    return null
+  }
+  return [...left, ...Array(missing).fill('0'), ...right].map((part) => part.padStart(4, '0')).join(':')
 }
 
 function listenOverlap(a: string, b: string): boolean {
-  const first = normalizedIP(a), second = normalizedIP(b)
+  const first = normalizedIP(a)
+  const second = normalizedIP(b)
   if (!first || !second) return false
   const wildcard = (value: string) => value === '0.0.0.0' || value === '0000:0000:0000:0000:0000:0000:0000:0000'
   return first === second || wildcard(first) || wildcard(second)
@@ -145,7 +273,6 @@ function portNumber(value: string): number | null {
 
 export const PEM_MAX_BYTES = 64 * 1024
 
-// Envelope validation only; the server verifies X.509 parsing and key matching.
 export function validatePEM(value: string, kind: 'cert' | 'key' | 'ca'): string | null {
   const label = { cert: '证书', key: '私钥', ca: 'CA' }[kind]
   if (new TextEncoder().encode(value).length > PEM_MAX_BYTES) return `${label}不能超过 64 KiB。`
@@ -154,25 +281,44 @@ export function validatePEM(value: string, kind: 'cert' | 'key' | 'ca'): string 
   const pattern = /-----BEGIN (CERTIFICATE|PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY)-----\s+([A-Za-z0-9+/=\s]+?)\s+-----END \1-----/g
   const blocks = [...text.matchAll(pattern)]
   const complete = blocks.length > 0 && !text.replace(pattern, '').trim()
-  const correctKind = blocks.every(block => kind === 'key' ? block[1] !== 'CERTIFICATE' : block[1] === 'CERTIFICATE')
-  if (!complete || !correctKind || (kind === 'key' && blocks.length !== 1)) return `${label}需要完整 PEM（含 BEGIN / END）；私钥须未加密。`
+  const correctKind = blocks.every((block) => (kind === 'key' ? block[1] !== 'CERTIFICATE' : block[1] === 'CERTIFICATE'))
+  if (!complete || !correctKind || (kind === 'key' && blocks.length !== 1)) {
+    return `${label}需要完整 PEM（含 BEGIN / END）；私钥须未加密。`
+  }
   return null
 }
 
-export function validateNode(input: { name: string; role: string; address: string; port: string; listen: string; listenPort?: string; protocol?: string; transport: string; security: string; cert: string; key: string; ca: string }): string | null {
+export function validateNode(input: {
+  name: string
+  role: string
+  address: string
+  port: string
+  listen: string
+  listenPort?: string
+  protocol?: string
+  transport: string
+  security: string
+  cert: string
+  key: string
+  ca: string
+}): string | null {
   const name = input.name.trim()
   if (!name || name.length > 128) return '节点名称需要 1 到 128 个字符。'
   if (input.role !== 'server' && input.role !== 'client') return '角色只能是公网网关或内网节点。'
   if (input.role === 'server') {
-    if (!validHost(input.address, true)) return '网关地址要是域名或 IP，不要带协议和端口。'
-    if (portNumber(input.port) === null) return '客户端接入端口要在 1 到 65535 之间。'
+    if (!validHost(input.address, true)) return '网关地址须为域名或 IP，不要带协议和端口。'
+    if (portNumber(input.port) === null) return '客户端接入端口须在 1 到 65535 之间。'
   }
   if (input.role === 'client') return null
-  if (input.listen.trim() && !looksLikeIP(input.listen.trim())) return '隧道监听地址必须是 IP，例如 0.0.0.0、127.0.0.1 或 ::。'
-  if (portNumber(input.listenPort || '') === null) return '本地监听端口要在 1 到 65535 之间。'
+  if (input.listen.trim() && !looksLikeIP(input.listen.trim())) {
+    return '隧道监听地址必须是 IP，例如 0.0.0.0、127.0.0.1 或 ::。'
+  }
+  if (portNumber(input.listenPort || '') === null) return '本地监听端口须在 1 到 65535 之间。'
   const protocol = input.protocol || (input.transport === 'hysteria2' ? 'hysteria2' : 'vless')
   const tls = protocol === 'hysteria2' || input.transport === 'hysteria2' || input.security === 'tls'
-  if (protocol === 'hysteria2' && (input.transport !== 'quic' && input.transport !== 'hysteria2' || input.security !== 'tls')) return 'Hysteria2 只能使用 QUIC 和 TLS。'
+  if (protocol === 'hysteria2' && ((input.transport !== 'quic' && input.transport !== 'hysteria2') || input.security !== 'tls')) {
+    return 'Hysteria2 只能使用 QUIC 和 TLS。'
+  }
   if (protocol === 'hysteria2' && input.transport === 'xhttp') return 'Hysteria2 不支持 XHTTP。'
   if (protocol === 'hysteria2' && input.security === 'reality') return 'Hysteria2 不支持 REALITY。'
   if (tls) {
@@ -181,16 +327,27 @@ export function validateNode(input: { name: string; role: string; address: strin
       const problem = validatePEM(input[kind], kind)
       if (problem) return problem
     }
-  }
-  if (tls) {
-    const problem = validatePEM(input.ca, 'ca')
-    if (problem) return problem
+    const caProblem = validatePEM(input.ca, 'ca')
+    if (caProblem) return caProblem
   }
   return null
 }
 
 export function validateMapping(
-  input: { name: string; serverId: string; clientId: string; connectEndpointId?: string; bandwidthLimit?: string; pool: number; listenHost: string; listenPort: string; targetHost: string; targetPort: string; network?: string; enabled?: boolean },
+  input: {
+    name: string
+    serverId: string
+    clientId: string
+    connectEndpointId?: string
+    bandwidthLimit?: string
+    pool: number
+    listenHost: string
+    listenPort: string
+    targetHost: string
+    targetPort: string
+    network?: string
+    enabled?: boolean
+  },
   nodes: Node[],
   mappings: Mapping[],
   selfId = '',
@@ -199,36 +356,51 @@ export function validateMapping(
   if (!name || name.length > 128) return '映射名称需要 1 到 128 个字符。'
   const limit = String(input.bandwidthLimit ?? '').trim()
   if (limit) {
-    if (!/^[0-9]+(?:\.[0-9]{1,6})?$/.test(limit) || !Number.isFinite(Number(limit)) || Number(limit) > 100000 || (Number(limit) > 0 && Number(limit) < 0.001)) return '带宽上限需为 0 或 0.001 到 100000 的数字，最多六位小数。'
+    if (
+      !/^[0-9]+(?:\.[0-9]{1,6})?$/.test(limit) ||
+      !Number.isFinite(Number(limit)) ||
+      Number(limit) > 100000 ||
+      (Number(limit) > 0 && Number(limit) < 0.001)
+    ) {
+      return '带宽上限需为 0 或 0.001 到 100000 的数字，最多六位小数。'
+    }
   }
   const net = (input.network || 'tcp').toLowerCase()
   if (net !== 'tcp' && net !== 'udp') return '网络协议只能是 TCP 或 UDP。'
   const server = nodes.find((node) => node.id === input.serverId && node.role === 'server' && !node.revoked)
   const client = nodes.find((node) => node.id === input.clientId && node.role === 'client' && !node.revoked)
   if (!server || !client) return '请选择可用的服务端和客户端。'
-  const candidates = server.connect_endpoints?.length ? server.connect_endpoints : server.address && server.port ? [{ id: 'primary', enabled: true }] : []
-  if (!candidates.some(candidate => candidate.enabled)) return '所选服务端没有启用的客户端连接地址，请先编辑服务端。'
-  if (input.connectEndpointId && !candidates.some(candidate => candidate.enabled && candidate.id === input.connectEndpointId)) return '所选连接地址已停用、删除或不属于此服务端，请重新选择。'
+  const candidates = server.connect_endpoints?.length
+    ? server.connect_endpoints
+    : server.address && server.port
+      ? [{ id: 'primary', enabled: true }]
+      : []
+  if (!candidates.some((candidate) => candidate.enabled)) {
+    return '所选服务端没有启用的客户端连接地址，请先编辑服务端。'
+  }
+  if (input.connectEndpointId && !candidates.some((candidate) => candidate.enabled && candidate.id === input.connectEndpointId)) {
+    return '所选连接地址已停用、删除或不属于此服务端，请重新选择。'
+  }
   if (!Number.isInteger(input.pool) || input.pool < 1 || input.pool > 32) return 'Pool 范围为 1–32。'
   if (!looksLikeIP(input.listenHost.trim())) return '公网监听地址必须是 IP。0.0.0.0 表示全部 IPv4 接口。'
   const listenPort = portNumber(input.listenPort)
   const targetPort = portNumber(input.targetPort)
-  if (listenPort === null || targetPort === null) return '端口要在 1 到 65535 之间。'
-  if (!validHost(input.targetHost, true)) return '内网目标要是节点能访问的域名或 IP，不要带协议和端口。'
+  if (listenPort === null || targetPort === null) return '端口须在 1 到 65535 之间。'
+  if (!validHost(input.targetHost, true)) return '内网目标须为节点可访问的域名或 IP，不要带协议和端口。'
   const tunnelNet = server.tunnel?.hysteria2?.password ? 'udp' : 'tcp'
   const tunnelHost = server.tunnel?.listen_host?.trim() || '127.0.0.1'
   const tunnelPort = server.tunnel?.listen_port
   const mappingHost = input.listenHost.trim()
-  const overlap = listenOverlap(mappingHost, tunnelHost)
-  if (net === tunnelNet && listenPort === tunnelPort && overlap) return '监听地址与服务端本地隧道监听冲突。'
+  if (net === tunnelNet && listenPort === tunnelPort && listenOverlap(mappingHost, tunnelHost)) {
+    return '监听地址与服务端本地隧道监听冲突。'
+  }
   if (input.enabled === false) return null
-  const listenHost = input.listenHost.trim()
   const clash = mappings.find((mapping) => {
     if (!mapping.enabled || mapping.id === selfId || mapping.listen_port !== listenPort) return false
     const mappingNet = (mapping.network || 'tcp').toLowerCase()
     if (mappingNet !== net) return false
     if (mapping.server_id !== input.serverId) return false
-    return listenOverlap(mapping.listen_host, listenHost)
+    return listenOverlap(mapping.listen_host, mappingHost)
   })
   if (clash) return `与已启用的「${clash.name}」在同一网关和端口上重叠。`
   return null
@@ -241,13 +413,16 @@ export async function copyText(value: string): Promise<void> {
 
 export function logLevelTone(level: string): Tone {
   switch (level) {
-    case 'ERROR': return 'bad'
-    case 'WARN': return 'warn'
-    default: return 'good'
+    case 'ERROR':
+      return 'bad'
+    case 'WARN':
+      return 'warn'
+    default:
+      return 'good'
   }
 }
 
-// Spec 7.6: Keep file extension visible when truncating long filenames (e.g. "2025年度财务报告-最终版...pdf").
+// Spec 7.6: Preserve file extension when truncating long filenames (e.g. "2025年度财务报告-最终版...pdf").
 export function truncateFileName(name: string, maxStem = 16): string {
   const trimmed = (name || '').trim()
   if (!trimmed) return ''
@@ -262,7 +437,11 @@ export function truncateFileName(name: string, maxStem = 16): string {
 }
 
 // Spec 7.1: Block Enter while IME is composing or within 500ms after compositionend (Safari quirk).
-export function isImeComposingEnter(event: KeyboardEvent, lastCompositionEndAt = 0, now = Date.now()): boolean {
+export function isImeComposingEnter(
+  event: { key: string; isComposing?: boolean; keyCode?: number },
+  lastCompositionEndAt = 0,
+  now = Date.now(),
+): boolean {
   if (event.key !== 'Enter') return false
   if (event.isComposing || event.keyCode === 229) return true
   return lastCompositionEndAt > 0 && now - lastCompositionEndAt < 500
