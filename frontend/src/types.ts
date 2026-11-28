@@ -234,7 +234,7 @@ export interface OfflineExportResult {
   state_json: string
 }
 
-export type PageId = 'dashboard' | 'servers' | 'clients' | 'proxies' | 'logs' | 'audit' | 'settings'
+export type PageId = 'dashboard' | 'servers' | 'clients' | 'proxies' | 'logs' | 'audit' | 'settings' | 'account'
 export type LocaleCode = 'zh-CN' | 'en' | 'de' | 'id' | 'th' | 'vi' | 'ar'
 export type ThemeMode = 'dark' | 'light'
 
@@ -246,6 +246,7 @@ export const PAGE_IDS: readonly PageId[] = [
   'logs',
   'audit',
   'settings',
+  'account',
 ] as const
 
 export function pageFromHash(hash = typeof location !== 'undefined' ? location.hash : ''): PageId {

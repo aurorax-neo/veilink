@@ -15,7 +15,6 @@ import {
   Server,
   ShieldOff,
   Trash2,
-  X,
 } from 'lucide-react'
 import { api } from '../api'
 import { useConsole } from '../context/ConsoleContext'
@@ -42,8 +41,8 @@ import type { Node } from '../types'
 import { NodeEditorDrawer } from '../components/NodeEditorDrawer'
 import { NodeOnboardingModal } from '../components/NodeOnboardingModal'
 import { Alert, Badge, EmptyState, Tooltip } from '../components/ui/Badge'
-import { Dropdown, Segmented, SplitPane } from '../components/ui/Controls'
-import { ActionSheet, AlertDialog, Drawer, Modal, Popconfirm } from '../components/ui/Overlays'
+import { Dropdown, Segmented } from '../components/ui/Controls'
+import { ActionSheet, AlertDialog, Modal, Popconfirm } from '../components/ui/Overlays'
 
 type NodeFilter = 'all' | 'online' | 'offline' | 'attention' | 'disabled'
 
@@ -62,18 +61,6 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
   const [onboardingNode, setOnboardingNode] = useState<Node | null>(null)
   const [configNode, setConfigNode] = useState<Node | null>(null)
   const [mobileSheetNode, setMobileSheetNode] = useState<Node | null>(null)
-  const [isMobileViewport, setIsMobileViewport] = useState(() =>
-    typeof window !== 'undefined' ? window.innerWidth <= 768 : false,
-  )
-
-  useEffect(() => {
-    if (typeof window === 'undefined' || !window.matchMedia) return
-    const mq = window.matchMedia('(max-width: 768px)')
-    const sync = () => setIsMobileViewport(mq.matches)
-    sync()
-    mq.addEventListener?.('change', sync)
-    return () => mq.removeEventListener?.('change', sync)
-  }, [])
   const [dangerAction, setDangerAction] = useState<{ node: Node; kind: 'delete' | 'revoke' } | null>(null)
 
   const [refreshingIds, setRefreshingIds] = useState<Set<string>>(() => new Set())
@@ -465,9 +452,9 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
                             items={[
                               {
                                 id: 'inspect',
-                                label: isSelected ? '收起详情面板' : '查看节点详情',
+                                label: '查看节点详情',
                                 icon: <Server size={14} />,
-                                onSelect: () => setSelectedId((curr) => (curr === node.id ? '' : node.id)),
+                                onSelect: () => setSelectedId(node.id),
                               },
                               ...(role === 'client'
                                 ? [
@@ -612,30 +599,26 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
     </div>
   )
 
-  const inspectorPane = selectedNode ? (
-    <div style={{ padding: 18, display: 'flex', flexDirection: 'column', gap: 16 }}>
-      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10 }}>
-        <div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-            <h2 style={{ fontSize: 17 }}>{selectedNode.name}</h2>
-            <Badge text={presence(selectedNode, renderNow).text} tone={presence(selectedNode, renderNow).tone} dot />
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBlockStart: 4 }}>
-            <code className="cell-sub ltr-force">{selectedNode.id}</code>
-            <button
-              type="button"
-              className={`btn btn-sm btn-ghost ${copiedId === selectedNode.id ? 'copy-bounce' : ''}`}
-              style={{ minWidth: 34, minHeight: 34, padding: '0 8px' }}
-              aria-label="复制节点 ID"
-              onClick={() => void handleCopy(selectedNode.id, selectedNode.id)}
-            >
-              {copiedId === selectedNode.id ? <Check size={12} style={{ color: 'var(--good)' }} /> : <Copy size={12} />}
-            </button>
-          </div>
+  const inspectorContent = selectedNode ? (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+          <Badge text={presence(selectedNode, renderNow).text} tone={presence(selectedNode, renderNow).tone} dot />
+          {selectedNode.embedded && <Badge text="内置" tone="accent" />}
+          {isOfflineNode(selectedNode) && <Badge text="脱机模式" tone="info" />}
         </div>
-        <button type="button" className="icon-btn icon-btn-compact" aria-label="关闭详情" onClick={() => setSelectedId('')}>
-          <X size={16} />
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <code className="cell-sub ltr-force">{selectedNode.id}</code>
+          <button
+            type="button"
+            className={`btn btn-sm btn-ghost ${copiedId === selectedNode.id ? 'copy-bounce' : ''}`}
+            style={{ minWidth: 34, minHeight: 34, padding: '0 8px' }}
+            aria-label="复制节点 ID"
+            onClick={() => void handleCopy(selectedNode.id, selectedNode.id)}
+          >
+            {copiedId === selectedNode.id ? <Check size={12} style={{ color: 'var(--good)' }} /> : <Copy size={12} />}
+          </button>
+        </div>
       </div>
 
       {selectedNode.error && !isOfflineNode(selectedNode) && <Alert tone="bad">{selectedNode.error}</Alert>}
@@ -688,7 +671,11 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
               type="button"
               className="btn btn-sm btn-soft"
               disabled={selectedNode.revoked || selectedNode.disabled || !effectiveSources(selectedNode).length}
-              onClick={() => setConfigNode(selectedNode)}
+              onClick={() => {
+                const target = selectedNode
+                setSelectedId('')
+                setConfigNode(target)
+              }}
             >
               <FileCode2 size={13} />
               <span>查看完整 JSON</span>
@@ -713,7 +700,9 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
           className="btn btn-sm btn-primary"
           disabled={selectedNode.revoked}
           onClick={() => {
-            setEditingNode(selectedNode)
+            const target = selectedNode
+            setSelectedId('')
+            setEditingNode(target)
             setEditorOpen(true)
           }}
         >
@@ -725,7 +714,11 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
             type="button"
             className="btn btn-sm btn-soft"
             disabled={selectedNode.revoked}
-            onClick={() => setOnboardingNode(selectedNode)}
+            onClick={() => {
+              const target = selectedNode
+              setSelectedId('')
+              setOnboardingNode(target)
+            }}
           >
             {isOfflineNode(selectedNode) ? <Download size={14} /> : <QrCode size={14} />}
             <span>{isOfflineNode(selectedNode) ? '导出脱机配置' : '快捷接入'}</span>
@@ -745,7 +738,11 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
             type="button"
             className="btn btn-sm btn-danger-ghost"
             disabled={selectedNode.revoked}
-            onClick={() => setDangerAction({ node: selectedNode, kind: 'revoke' })}
+            onClick={() => {
+              const target = selectedNode
+              setSelectedId('')
+              setDangerAction({ node: target, kind: 'revoke' })
+            }}
           >
             <ShieldOff size={14} />
             <span>吊销凭据</span>
@@ -795,23 +792,17 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
         </button>
       </div>
 
-      {/* Spec 7.5 Resizable SplitPane on desktop/tablet; Spec 2.3 BottomSheet Drawer on mobile (<= 768px) */}
-      <SplitPane
-        start={tablePane}
-        end={inspectorPane}
-        showEnd={!!selectedNode && !isMobileViewport}
-        defaultRatio={64}
-        restoreEndLabel="展开节点详情"
-      />
+      <div className="panel">{tablePane}</div>
 
-      <Drawer
-        open={!!selectedNode && isMobileViewport}
+      <Modal
+        open={!!selectedNode}
         onClose={() => setSelectedId('')}
-        title={selectedNode?.name || ''}
+        size="md"
+        title={selectedNode ? `${roleLabel}详情 · ${selectedNode.name}` : ''}
         hideSave
       >
-        {inspectorPane}
-      </Drawer>
+        {inspectorContent}
+      </Modal>
 
       <NodeEditorDrawer
         open={editorOpen}

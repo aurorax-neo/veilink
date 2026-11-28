@@ -136,12 +136,14 @@ test('Email/password validation, Setup Wizard anti-visitor flow, and multi-resol
   assert.match(topologyCanvas, /ResizeObserver/)
   assert.match(topologyCanvas, /const nodeH = 38/)
 
-  // Sign-out secondary confirmation across AppShell and SettingsView
+  // Sign-out secondary confirmation across AppShell and AccountView (SettingsView stays purely system-focused)
   const settingsView = read('../src/views/SettingsView.tsx')
+  const accountView = read('../src/views/AccountView.tsx')
   const consoleCtx = read('../src/context/ConsoleContext.tsx')
   assert.match(appShell, /requestLogout/)
   assert.doesNotMatch(appShell, /onClick=\{\(\) => void logout\(\)\}/)
-  assert.match(settingsView, /requestLogout/)
+  assert.match(accountView, /requestLogout/)
+  assert.doesNotMatch(settingsView, /requestLogout/)
   assert.match(consoleCtx, /logoutConfirmOpen/)
 })
 
@@ -317,6 +319,19 @@ test('Server clock calibration eliminates false clock-ahead warnings and all edi
   assert.match(editor, /<Modal[\s\S]*isForm/)
   assert.doesNotMatch(proxies, /<Drawer\b/)
   assert.match(proxies, /<Modal[\s\S]*isForm/)
+
+  // NodesView details inspector must also render centered <Modal, with zero <SplitPane or <Drawer
+  assert.doesNotMatch(nodesView, /<SplitPane\b/)
+  assert.doesNotMatch(nodesView, /<Drawer\b/)
+  assert.match(nodesView, /open=\{!!selectedNode\}/)
+
+  // AppShell must NOT duplicate version in sidebar-foot, must route Account Dropdown to dedicated account view + signOut without duplicating settings
+  const appShell = read('../src/components/AppShell.tsx')
+  assert.doesNotMatch(appShell, /HardDrive/)
+  assert.match(appShell, /sidebar-account-btn/)
+  assert.match(appShell, /id:\s*'account-security'/)
+  assert.match(appShell, /id:\s*'account-logout'/)
+  assert.doesNotMatch(appShell, /id:\s*'account-settings'/)
 
   // NodesView inspector and rows must pass calibrated renderNow, never stale raw Date.now()
   assert.doesNotMatch(nodesView, /Date\.now\(\)/)

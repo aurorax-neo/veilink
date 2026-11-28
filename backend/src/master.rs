@@ -479,7 +479,7 @@ pub async fn run_embedded_attempt(
         ));
     }
 
-    let mut srv_config = embedded_config(&c, &n);
+    let srv_config = embedded_config(&c, &n);
     let state_path = PathBuf::from(&srv_config.state_dir).join("state.json");
     let mut cached = DiskState {
         node_id: n.id.clone(),
@@ -489,10 +489,10 @@ pub async fn run_embedded_attempt(
     };
     match fs::read(&state_path) {
         Ok(body) => {
-            let parsed: DiskState = serde_json::from_slice(&body).map_err(|_| {
+            let mut parsed: DiskState = serde_json::from_slice(&body).map_err(|_| {
                 NodeError::Other("embedded node state identity mismatch or corruption".to_string())
             })?;
-            if parsed.node_id != n.id || parsed.master != srv_config.master_addr {
+            if parsed.node_id != n.id {
                 return Err(NodeError::Other(
                     "embedded node state identity mismatch or corruption".to_string(),
                 ));
@@ -504,6 +504,7 @@ pub async fn run_embedded_attempt(
                     ));
                 }
             }
+            parsed.master = srv_config.master_addr.clone();
             cached = parsed;
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -525,55 +526,31 @@ pub async fn run_embedded_attempt(
             }
             cached.credential.clear();
             cached.snapshot = None;
-            node::save_disk_state(&state_path, &cached).map_err(|e| {
-                NodeError::Other(format!("cannot reset expired embedded credential: {}", e))
-            })?;
         }
     }
 
-    let issued_enroll_token = cached.credential.is_empty();
-    if issued_enroll_token {
-        let token = s
-            .enroll_token(&n.id, Duration::from_secs(60))
-            .map_err(|e| {
-                NodeError::Other(format!(
-                    "failed to issue enrollment token for embedded server: {}",
-                    e
-                ))
-            })?;
-        srv_config.enroll_token = token;
-        let watch_store = Arc::clone(&s);
-        let watch_id = n.id.clone();
-        let watch_path = state_path.clone();
-        let watch_cancel = cancel.clone();
-        tokio::spawn(async move {
-            for _ in 0..30 {
-                tokio::select! {
-                    _ = watch_cancel.cancelled() => {
-                        let _ = watch_store.revoke_enroll_token(&watch_id);
-                        return;
-                    }
-                    _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                        if let Ok(data) = fs::read(&watch_path) {
-                            if let Ok(st) = serde_json::from_slice::<DiskState>(&data) {
-                                if !st.credential.is_empty() {
-                                    let _ = watch_store.revoke_enroll_token(&watch_id);
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            let _ = watch_store.revoke_enroll_token(&watch_id);
-        });
-    }
-
-    let res = node::run_with_ring(cancel, srv_config, "server", ring).await;
-    if issued_enroll_token {
+    // Provision or reuse the embedded server's credential directly in-process without
+    // issuing/revoking temporary enrollment tokens or polluting the admin audit log.
+    if cached.credential.is_empty() {
+        let cred = s.ensure_embedded_credential(&n.id).map_err(|e| {
+            NodeError::Other(format!(
+                "failed to provision embedded server credential: {}",
+                e
+            ))
+        })?;
+        cached.credential = cred;
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        node::save_disk_state(&state_path, &cached).map_err(|e| {
+            NodeError::Other(format!("cannot persist embedded node state: {}", e))
+        })?;
+    } else {
+        // Also purge any legacy enrollment token left by previous versions silently
         let _ = s.revoke_enroll_token(&n.id);
     }
-    res
+
+    node::run_with_ring(cancel, srv_config, "server", ring).await
 }
 
 fn split_host_port(addr: &str) -> (String, String) {

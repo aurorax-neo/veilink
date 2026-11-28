@@ -152,6 +152,13 @@ struct State {
         deserialize_with = "deserialize_secrets"
     )]
     secrets: BTreeMap<String, Vec<u8>>,
+    #[serde(
+        rename = "ExportedFingerprints",
+        alias = "exported_fingerprints",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    exported_fingerprints: BTreeMap<String, String>,
 }
 
 fn serialize_secrets<S>(
@@ -584,6 +591,7 @@ impl Store {
                             n.last_seen = 0;
                             n.error.clear();
                             n.exported_revision = 0;
+                            st.exported_fingerprints.remove(&n.id);
                             purge_control_auth = true;
                         }
                         (true, false) => {
@@ -591,12 +599,14 @@ impl Store {
                             n.last_seen = 0;
                             n.error.clear();
                             n.exported_revision = 0;
+                            st.exported_fingerprints.remove(&n.id);
                         }
                         (false, false) => {
                             n.applied_revision = old.applied_revision;
                             n.last_seen = old.last_seen;
                             n.error = old.error.clone();
                             n.exported_revision = 0;
+                            st.exported_fingerprints.remove(&n.id);
                         }
                     }
                 } else {
@@ -604,6 +614,7 @@ impl Store {
                     n.last_seen = 0;
                     n.error.clear();
                     n.exported_revision = 0;
+                    st.exported_fingerprints.remove(&n.id);
                     if n.is_offline() {
                         purge_control_auth = true;
                     }
@@ -673,6 +684,19 @@ impl Store {
     }
 
     pub fn set_node_disabled(&self, id: &str, disabled: bool) -> Result<(), StoreError> {
+        {
+            let g = self.inner.lock();
+            let st = load_from_conn(&g.db.lock())?;
+            let Some(n) = st.nodes.get(id) else {
+                return Err(StoreError::Invalid(String::new()));
+            };
+            if n.revoked {
+                return Err(StoreError::Invalid(String::new()));
+            }
+            if n.disabled == disabled {
+                return Ok(());
+            }
+        }
         self.mutate("node.disable", id, |st, _key| {
             let Some(mut n) = st.nodes.get(id).cloned() else {
                 return Err(StoreError::Invalid(String::new()));
@@ -713,6 +737,7 @@ impl Store {
                 }
                 st.secrets.remove(&enrollment_credential_key(id));
                 st.secrets.remove(&enrollment_token_key(id));
+                st.exported_fingerprints.remove(id);
                 Ok(())
             },
             Some(Box::new(|tx: &Transaction| {
@@ -741,17 +766,73 @@ impl Store {
         let raw: Vec<u8> = tx.query_row("SELECT data FROM config WHERE id=1", [], |r| r.get(0))?;
         let mut st: State =
             serde_json::from_slice(&raw).map_err(|e| StoreError::Other(e.to_string()))?;
+        let is_embedded = st.nodes.get(id).is_some_and(|n| n.embedded);
         let removed_secret = st.secrets.remove(&enrollment_token_key(id)).is_some();
         if removed_secret {
             let body = serde_json::to_vec(&st).map_err(|e| StoreError::Other(e.to_string()))?;
             tx.execute("UPDATE config SET data=?1 WHERE id=1", params![&body])?;
         }
         let deleted_rows = tx.execute("DELETE FROM enroll WHERE node=?1", params![id])?;
-        if removed_secret || deleted_rows > 0 {
+        if !is_embedded && (removed_secret || deleted_rows > 0) {
             insert_audit(&tx, Utc::now().timestamp(), "node.enroll.revoke", id)?;
         }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn ensure_embedded_credential(&self, id: &str) -> Result<String, StoreError> {
+        let g = self.inner.lock();
+        let mut conn = g.db.lock();
+        let tx = conn.transaction()?;
+        let raw: Vec<u8> = tx.query_row("SELECT data FROM config WHERE id=1", [], |r| r.get(0))?;
+        let mut st: State =
+            serde_json::from_slice(&raw).map_err(|e| StoreError::Other(e.to_string()))?;
+        let Some(n) = st.nodes.get(id) else {
+            return Err(StoreError::Invalid(String::new()));
+        };
+        if !n.embedded || n.revoked || n.is_offline() || n.role != "server" {
+            return Err(StoreError::Invalid(String::new()));
+        }
+        let existing_cred: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT hash,expires FROM credentials WHERE node=?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let mut reused = None;
+        if let Some((cred_hash, _)) = existing_cred {
+            if let Some(sealed) = st.secrets.get(&enrollment_credential_key(id)) {
+                if let Ok(opened) = auth::open(&g.key, sealed) {
+                    if auth::hash(&opened) == cred_hash {
+                        reused = Some(opened);
+                    }
+                }
+            }
+        }
+        // Clean up any leftover enrollment token from older versions silently without audit noise
+        let had_stale_token = st.secrets.remove(&enrollment_token_key(id)).is_some();
+        let _ = tx.execute("DELETE FROM enroll WHERE node=?1", params![id])?;
+        if let Some(cred) = reused {
+            if had_stale_token {
+                let body = serde_json::to_vec(&st).map_err(|e| StoreError::Other(e.to_string()))?;
+                tx.execute("UPDATE config SET data=?1 WHERE id=1", params![&body])?;
+            }
+            tx.commit()?;
+            Ok(cred)
+        } else {
+            let cred = auth::token();
+            let sealed = auth::seal(&g.key, &cred)?;
+            st.secrets.insert(enrollment_credential_key(id), sealed);
+            tx.execute(
+                "INSERT OR REPLACE INTO credentials(node,hash,expires) VALUES(?1,?2,0)",
+                params![id, auth::hash(&cred)],
+            )?;
+            let body = serde_json::to_vec(&st).map_err(|e| StoreError::Other(e.to_string()))?;
+            tx.execute("UPDATE config SET data=?1 WHERE id=1", params![&body])?;
+            tx.commit()?;
+            Ok(cred)
+        }
     }
 
     pub fn enroll_token(&self, id: &str, ttl: Duration) -> Result<String, StoreError> {
@@ -999,18 +1080,27 @@ impl Store {
             st.revision = st.revision.max(0) + 1;
             n.desired_revision = st.revision;
         }
-        let changed = n.exported_revision != n.desired_revision;
-        if changed {
+        let rev_changed = n.exported_revision != n.desired_revision;
+        let fp = offline_snapshot_fingerprint(&st, &g.key, id);
+        let fp_changed = fp
+            .as_ref()
+            .is_some_and(|h| st.exported_fingerprints.get(id) != Some(h));
+        if rev_changed || fp_changed {
             n.exported_revision = n.desired_revision;
             st.nodes.insert(id.to_string(), n);
+            if let Some(h) = fp {
+                st.exported_fingerprints.insert(id.to_string(), h);
+            }
             let body = serde_json::to_vec(&st).map_err(|e| StoreError::Other(e.to_string()))?;
             let tx = conn.transaction()?;
             tx.execute("UPDATE config SET data=?1 WHERE id=1", params![&body])?;
-            insert_audit(&tx, Utc::now().timestamp(), "node.offline.export", id)?;
+            if rev_changed {
+                insert_audit(&tx, Utc::now().timestamp(), "node.offline.export", id)?;
+            }
             tx.commit()?;
         }
         let snap = build_snapshot_from_state(&st, &g.key, id)?;
-        Ok((snap, changed))
+        Ok((snap, rev_changed))
     }
 
     pub fn heartbeat(
@@ -1467,6 +1557,20 @@ impl Store {
         let key = g.key.clone();
         let before = load_from_conn(&g.db.lock())?;
         let mut st = before.clone();
+        // Lazily backfill exported snapshot fingerprints for already-exported offline nodes
+        // upgraded from older state blobs so no-op roundtrips (e.g. disable -> enable) stay exported.
+        for (node_id, old_n) in &before.nodes {
+            if old_n.is_offline()
+                && !old_n.revoked
+                && old_n.desired_revision > 0
+                && old_n.exported_revision >= old_n.desired_revision
+                && !st.exported_fingerprints.contains_key(node_id)
+            {
+                if let Some(fp) = offline_snapshot_fingerprint(&before, &key, node_id) {
+                    st.exported_fingerprints.insert(node_id.clone(), fp);
+                }
+            }
+        }
         f(&mut st, &key)?;
         let affected = affected_nodes(&before, &st);
         st.revision += 1;
@@ -1481,6 +1585,7 @@ impl Store {
                 n.desired_revision = rev;
             }
         }
+        reconcile_offline_export_states(&mut st, &key);
         let body = serde_json::to_vec(&st).map_err(|e| StoreError::Other(e.to_string()))?;
         {
             let mut conn = g.db.lock();
@@ -1921,6 +2026,65 @@ fn node_config_equal(a: &Node, b: &Node) -> bool {
     node_runtime_config(a.clone()) == node_runtime_config(b.clone())
 }
 
+fn offline_snapshot_fingerprint(st: &State, key: &[u8], id: &str) -> Option<String> {
+    let mut snap = build_snapshot_from_state(st, key, id).ok()?;
+    snap.revision = 0;
+    snap.node = node_runtime_config(snap.node);
+    // Disabled mappings do not run on the node; ignore them and cosmetic names so
+    // creating/toggling/reverting inactive entries never forces a redundant re-export.
+    snap.mappings.retain(|m| m.enabled);
+    for m in &mut snap.mappings {
+        m.name.clear();
+    }
+    snap.mappings.sort_by(|a, b| a.id.cmp(&b.id));
+    let active_bids: HashSet<String> = snap.mappings.iter().map(|m| m.binding_id.clone()).collect();
+    snap.bindings.retain(|b| active_bids.contains(&b.id));
+    snap.bindings.sort_by(|a, b| a.id.cmp(&b.id));
+    let active_peers: HashSet<String> = snap.bindings.iter().map(|b| b.server_id.clone()).collect();
+    snap.nodes.retain(|p| active_peers.contains(&p.id));
+    for p in &mut snap.nodes {
+        *p = node_runtime_config(p.clone());
+    }
+    snap.nodes.sort_by(|a, b| a.id.cmp(&b.id));
+    let data = serde_json::to_vec(&snap).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&data);
+    Some(hex::encode(hasher.finalize()))
+}
+
+fn reconcile_offline_export_states(st: &mut State, key: &[u8]) {
+    let valid_offline: HashSet<String> = st
+        .nodes
+        .iter()
+        .filter(|(_, n)| n.is_offline() && !n.revoked)
+        .map(|(id, _)| id.clone())
+        .collect();
+    st.exported_fingerprints
+        .retain(|id, _| valid_offline.contains(id));
+
+    let updates: Vec<(String, i64)> = st
+        .nodes
+        .iter()
+        .filter_map(|(id, n)| {
+            if !n.is_offline() || n.revoked || n.desired_revision <= 0 {
+                return None;
+            }
+            let exported_fp = st.exported_fingerprints.get(id)?;
+            let current_fp = offline_snapshot_fingerprint(st, key, id)?;
+            if &current_fp == exported_fp && n.exported_revision < n.desired_revision {
+                Some((id.clone(), n.desired_revision))
+            } else {
+                None
+            }
+        })
+        .collect();
+    for (id, rev) in updates {
+        if let Some(n) = st.nodes.get_mut(&id) {
+            n.exported_revision = rev;
+        }
+    }
+}
+
 fn server_client_config_equal(a: &Node, b: &Node) -> bool {
     let a = node_runtime_config(a.clone());
     let b = node_runtime_config(b.clone());
@@ -2041,20 +2205,6 @@ fn affected_nodes(before: &State, after: &State) -> HashSet<String> {
 fn mapping_policy(st: &State, m: &Mapping) -> String {
     let mut b = st.bindings.get(&m.binding_id).cloned().unwrap_or_default();
     b.uuid.clear();
-    let mut pool = 0i64;
-    let mut mux_set = BTreeMap::new();
-    for other in st.mappings.values() {
-        if other.binding_id != m.binding_id || !other.enabled {
-            continue;
-        }
-        if other.pool > pool {
-            pool = other.pool;
-        }
-        if other.mux {
-            mux_set.insert(other.mux_type.clone(), true);
-        }
-    }
-    let types: Vec<String> = mux_set.into_keys().collect();
     let mut m_clean = m.clone();
     m_clean.name.clear();
     let srv = st
@@ -2075,16 +2225,12 @@ fn mapping_policy(st: &State, m: &Mapping) -> String {
         binding: Binding,
         server: Node,
         client: Node,
-        pool: i64,
-        mux: Vec<String>,
     }
     let data = serde_json::to_vec(&PolicyDoc {
         mapping: m_clean,
         binding: b,
         server: srv,
         client: cli,
-        pool,
-        mux: types,
     })
     .unwrap_or_default();
     let mut hasher = Sha256::new();
@@ -2594,20 +2740,43 @@ mod tests {
         store.revoke_enroll_token(&embedded.id).unwrap();
         assert_eq!(store.audit().unwrap().len(), 1);
 
-        // Issuing an enrollment token and revoking it records exactly one revoke entry;
-        // a duplicate revoke afterwards does not emit another audit row.
-        let _tok = store
+        // Direct in-process credential provisioning for embedded server produces zero audit noise
+        // and remains idempotent across simulated container recreations.
+        let cred1 = store.ensure_embedded_credential(&embedded.id).unwrap();
+        let cred2 = store.ensure_embedded_credential(&embedded.id).unwrap();
+        assert_eq!(cred1, cred2);
+        assert_eq!(store.audit().unwrap().len(), 1);
+
+        // Even if a legacy enrollment token existed on embedded, revoking it never pollutes audit.
+        let _legacy_tok = store
             .enroll_token(&embedded.id, Duration::from_secs(60))
             .unwrap();
-        assert_eq!(store.audit().unwrap().len(), 2);
+        let audit_after_legacy = store.audit().unwrap().len();
         store.revoke_enroll_token(&embedded.id).unwrap();
-        let audits_after = store.audit().unwrap();
-        assert_eq!(audits_after.len(), 3);
-        assert_eq!(audits_after[0].action, "node.enroll.revoke");
-        assert_eq!(audits_after[0].object, embedded.id);
+        assert_eq!(store.audit().unwrap().len(), audit_after_legacy);
 
-        store.revoke_enroll_token(&embedded.id).unwrap();
-        assert_eq!(store.audit().unwrap().len(), 3);
+        // On a regular non-embedded node, issuing and revoking an enrollment token records exactly
+        // one revoke entry, and a duplicate revoke afterwards is a clean no-op.
+        let regular = store
+            .save_node(Node {
+                name: "edge-1".to_string(),
+                role: "client".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        let count_before = store.audit().unwrap().len();
+        let _tok = store
+            .enroll_token(&regular.id, Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(store.audit().unwrap().len(), count_before + 1);
+        store.revoke_enroll_token(&regular.id).unwrap();
+        let audits_after = store.audit().unwrap();
+        assert_eq!(audits_after.len(), count_before + 2);
+        assert_eq!(audits_after[0].action, "node.enroll.revoke");
+        assert_eq!(audits_after[0].object, regular.id);
+
+        store.revoke_enroll_token(&regular.id).unwrap();
+        assert_eq!(store.audit().unwrap().len(), count_before + 2);
     }
 
     #[test]
@@ -2733,5 +2902,153 @@ mod tests {
         assert!(st_after[&mapping.id].client.acknowledged);
         assert!(st_after[&mapping.id].server.linked);
         assert!(st_after[&mapping.id].client.linked);
+    }
+
+    #[test]
+    fn offline_node_noop_roundtrips_keep_exported_status_without_reexport_prompt() {
+        let dir = std::env::temp_dir().join(format!(
+            "veilink-offline-noop-test-{}",
+            crate::auth::token()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("veilink.db");
+        let key_path = dir.join("veilink.key");
+        let store = Store::open(db.to_str().unwrap(), key_path.to_str().unwrap()).unwrap();
+
+        let (priv_k, _) = crate::tunnel::generate_x25519().unwrap();
+        let srv = store
+            .save_node(Node {
+                name: "Offline-GW".to_string(),
+                role: "server".to_string(),
+                mode: "offline".to_string(),
+                address: "127.0.0.1".to_string(),
+                port: 24443,
+                tunnel: LocalTLS {
+                    protocol: "vless".to_string(),
+                    listen_host: "127.0.0.1".to_string(),
+                    listen_port: 24443,
+                    reality: crate::model::Reality {
+                        dest: "www.microsoft.com:443".to_string(),
+                        private_key: priv_k,
+                        short_ids: "01020304".to_string(),
+                        server_names: "www.microsoft.com".to_string(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .unwrap();
+        let cli = store
+            .save_node(Node {
+                name: "Offline-NAS".to_string(),
+                role: "client".to_string(),
+                mode: "offline".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        let mapping = store
+            .save_mapping(Mapping {
+                name: "ssh".to_string(),
+                server_id: srv.id.clone(),
+                client_id: cli.id.clone(),
+                listen_host: "127.0.0.1".to_string(),
+                listen_port: 22222,
+                target_host: "127.0.0.1".to_string(),
+                target_port: 22,
+                network: "tcp".to_string(),
+                pool: 1,
+                bandwidth_limit: "10Mbps".to_string(),
+                enabled: true,
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Export both offline nodes
+        store.export_offline_snapshot(&srv.id).unwrap();
+        store.export_offline_snapshot(&cli.id).unwrap();
+
+        let is_synced = |id: &str| {
+            let n = store.nodes().unwrap().into_iter().find(|x| x.id == id).unwrap();
+            n.desired_revision > 0 && n.exported_revision >= n.desired_revision
+        };
+        assert!(is_synced(&srv.id));
+        assert!(is_synced(&cli.id));
+
+        // 1) Disable offline server and re-enable it -> neither server nor peer client needs re-export
+        store.set_node_disabled(&srv.id, true).unwrap();
+        assert!(!is_synced(&cli.id), "peer should reflect change while server stays disabled");
+        store.set_node_disabled(&srv.id, false).unwrap();
+        assert!(is_synced(&srv.id), "re-enabled offline server with identical config must stay exported");
+        assert!(is_synced(&cli.id), "peer offline client must return to exported once server re-enabled");
+        let st1 = store.mapping_statuses().unwrap();
+        assert_eq!(st1[&mapping.id].server.reason, "offline_exported");
+        assert_eq!(st1[&mapping.id].client.reason, "offline_exported");
+
+        // 2) Disable mapping then re-enable it -> both return to exported
+        let mut m_off = mapping.clone();
+        m_off.binding_id.clear();
+        m_off.enabled = false;
+        store.save_mapping(m_off).unwrap();
+        assert!(!is_synced(&srv.id));
+        assert!(!is_synced(&cli.id));
+        let mut m_on = mapping.clone();
+        m_on.binding_id.clear();
+        m_on.enabled = true;
+        store.save_mapping(m_on).unwrap();
+        assert!(is_synced(&srv.id));
+        assert!(is_synced(&cli.id));
+
+        // 3) Creating a disabled mapping does not force re-export
+        let m_disabled = store
+            .save_mapping(Mapping {
+                name: "staging".to_string(),
+                server_id: srv.id.clone(),
+                client_id: cli.id.clone(),
+                listen_host: "127.0.0.1".to_string(),
+                listen_port: 22223,
+                target_host: "127.0.0.1".to_string(),
+                target_port: 80,
+                network: "tcp".to_string(),
+                pool: 1,
+                enabled: false,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(is_synced(&srv.id));
+        assert!(is_synced(&cli.id));
+        store.delete_mapping(&m_disabled.id).unwrap();
+        assert!(is_synced(&srv.id));
+        assert!(is_synced(&cli.id));
+
+        // 4) Real config edit DOES require re-export, and reverting restores exported state
+        let mut m_edit = mapping.clone();
+        m_edit.binding_id.clear();
+        m_edit.bandwidth_limit = "25Mbps".to_string();
+        store.save_mapping(m_edit).unwrap();
+        assert!(!is_synced(&srv.id), "real bandwidth edit must require re-export");
+        assert!(!is_synced(&cli.id), "real bandwidth edit must require re-export");
+        let mut m_revert = mapping.clone();
+        m_revert.binding_id.clear();
+        m_revert.bandwidth_limit = "10Mbps".to_string();
+        store.save_mapping(m_revert).unwrap();
+        assert!(is_synced(&srv.id), "reverting edit to exported config must clear re-export prompt");
+        assert!(is_synced(&cli.id));
+
+        // 5) Legacy DB without persisted exported_fingerprints still self-heals on disable -> enable
+        {
+            let g = store.inner.lock();
+            let conn = g.db.lock();
+            let mut raw_st = load_from_conn(&conn).unwrap();
+            raw_st.exported_fingerprints.clear();
+            let body = serde_json::to_vec(&raw_st).unwrap();
+            conn.execute("UPDATE config SET data=?1 WHERE id=1", params![&body]).unwrap();
+        }
+        store.set_node_disabled(&cli.id, true).unwrap();
+        store.set_node_disabled(&cli.id, false).unwrap();
+        assert!(is_synced(&cli.id), "legacy exported offline node must backfill fingerprint before disable");
+        assert!(is_synced(&srv.id));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

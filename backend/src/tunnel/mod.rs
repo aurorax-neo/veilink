@@ -2836,16 +2836,17 @@ async fn demux_stream_frame(
     }
 }
 
-struct RunningInstance {
+struct ServerTransportHandle {
+    local: LocalTLS,
+    bindings: Arc<parking_lot::RwLock<Vec<Binding>>>,
     stop_tx: watch::Sender<bool>,
-    linked: Arc<Mutex<HashSet<String>>>,
     listeners: Vec<std::net::TcpListener>,
     udp_sockets: Vec<std::net::UdpSocket>,
     quic_endpoints: Vec<quinn::Endpoint>,
     tasks: Vec<tokio::task::AbortHandle>,
 }
 
-impl RunningInstance {
+impl ServerTransportHandle {
     fn stop(&mut self) {
         let _ = self.stop_tx.send(true);
         for ep in self.quic_endpoints.drain(..) {
@@ -2862,6 +2863,384 @@ impl RunningInstance {
         }
         self.listeners.clear();
         self.udp_sockets.clear();
+    }
+}
+
+type LiveLimiter = Arc<parking_lot::RwLock<Arc<BandwidthLimiter>>>;
+type Hy2UdpRouteMap = Arc<
+    Mutex<HashMap<u32, (SocketAddr, Arc<tokio::net::UdpSocket>, String, LiveLimiter)>>,
+>;
+
+struct ServerMappingHandle {
+    listen_key: (String, i64, String, bool),
+    route: Arc<parking_lot::RwLock<Mapping>>,
+    up_limiter: LiveLimiter,
+    dn_limiter: LiveLimiter,
+    raw_limit: String,
+    stop_tx: watch::Sender<bool>,
+    listener: Option<std::net::TcpListener>,
+    udp_socket: Option<std::net::UdpSocket>,
+    task: Option<tokio::task::AbortHandle>,
+}
+
+impl ServerMappingHandle {
+    fn stop(&mut self) {
+        let _ = self.stop_tx.send(true);
+        if let Some(t) = self.task.take() {
+            t.abort();
+        }
+        if let Some(ref ln) = self.listener {
+            let _ = socket2::SockRef::from(ln).shutdown(std::net::Shutdown::Both);
+        }
+        self.listener = None;
+        self.udp_socket = None;
+    }
+}
+
+struct ServerRuntime {
+    transport: Option<ServerTransportHandle>,
+    mappings: HashMap<String, ServerMappingHandle>,
+    sessions: SessionMap,
+    pending_apps: PendingAppMap,
+    mux_pool: MuxPoolMap,
+    mux_notify: Arc<tokio::sync::Notify>,
+    hy2_sessions: Arc<Mutex<HashMap<String, Vec<Arc<hysteria2::Hy2ServerSession>>>>>,
+    hy2_udp_routes: Hy2UdpRouteMap,
+    app_req_seq: Arc<AtomicU32>,
+    hy2_udp_sid_seq: Arc<AtomicU32>,
+}
+
+impl ServerRuntime {
+    fn new() -> Self {
+        Self {
+            transport: None,
+            mappings: HashMap::new(),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            pending_apps: Arc::new(Mutex::new(HashMap::new())),
+            mux_pool: Arc::new(Mutex::new(HashMap::new())),
+            mux_notify: Arc::new(tokio::sync::Notify::new()),
+            hy2_sessions: Arc::new(Mutex::new(HashMap::new())),
+            hy2_udp_routes: Arc::new(Mutex::new(HashMap::new())),
+            app_req_seq: Arc::new(AtomicU32::new(1)),
+            hy2_udp_sid_seq: Arc::new(AtomicU32::new(1)),
+        }
+    }
+
+    fn evict_removed_bindings(
+        &self,
+        keep_ids: &HashSet<String>,
+        linked: &Mutex<HashSet<String>>,
+        state_notify: &tokio::sync::Notify,
+    ) {
+        let mut evicted_handles = Vec::new();
+        {
+            let mut sg = self.sessions.lock().unwrap();
+            sg.retain(|bid, list| {
+                if keep_ids.contains(bid) {
+                    true
+                } else {
+                    evicted_handles.extend(list.drain(..));
+                    false
+                }
+            });
+        }
+        for h in evicted_handles {
+            h.evict();
+        }
+        {
+            let mut hg = self.hy2_sessions.lock().unwrap();
+            hg.retain(|bid, list| {
+                if keep_ids.contains(bid) {
+                    true
+                } else {
+                    for s in list.drain(..) {
+                        s.conn.close(0u32.into(), b"binding removed");
+                    }
+                    false
+                }
+            });
+        }
+        self.mux_pool
+            .lock()
+            .unwrap()
+            .retain(|(bid, _), _| keep_ids.contains(bid));
+        self.pending_apps
+            .lock()
+            .unwrap()
+            .retain(|(bid, _), _| keep_ids.contains(bid));
+        let mut unlinked_any = false;
+        {
+            let mut lg = linked.lock().unwrap();
+            let before = lg.len();
+            lg.retain(|bid| keep_ids.contains(bid));
+            if lg.len() != before {
+                unlinked_any = true;
+            }
+        }
+        if unlinked_any {
+            state_notify.notify_waiters();
+        }
+    }
+
+    fn stop_all(&mut self, linked: &Mutex<HashSet<String>>) {
+        for (_, mut mh) in self.mappings.drain() {
+            mh.stop();
+        }
+        if let Some(mut th) = self.transport.take() {
+            th.stop();
+        }
+        let empty = HashSet::new();
+        let dummy_notify = tokio::sync::Notify::new();
+        self.evict_removed_bindings(&empty, linked, &dummy_notify);
+        self.hy2_udp_routes.lock().unwrap().clear();
+    }
+}
+
+struct ClientSharedTable {
+    mappings: parking_lot::RwLock<Vec<Mapping>>,
+    limiters: parking_lot::RwLock<HashMap<String, (String, Arc<BandwidthLimiter>)>>,
+}
+
+impl ClientSharedTable {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            mappings: parking_lot::RwLock::new(Vec::new()),
+            limiters: parking_lot::RwLock::new(HashMap::new()),
+        })
+    }
+
+    fn sync(&self, next: &[Mapping]) {
+        {
+            let mut lg = self.limiters.write();
+            let enabled_ids: HashSet<&str> = next
+                .iter()
+                .filter(|m| m.enabled)
+                .map(|m| m.id.as_str())
+                .collect();
+            lg.retain(|id, _| enabled_ids.contains(id.as_str()));
+            for m in next {
+                if !m.enabled {
+                    continue;
+                }
+                let reuse = lg
+                    .get(&m.id)
+                    .is_some_and(|(raw, _)| raw == &m.bandwidth_limit);
+                if !reuse {
+                    let rate_bps = bandwidth_bytes(&m.bandwidth_limit).unwrap_or(0) as u64;
+                    lg.insert(
+                        m.id.clone(),
+                        (m.bandwidth_limit.clone(), BandwidthLimiter::new(rate_bps)),
+                    );
+                }
+            }
+        }
+        *self.mappings.write() = next.to_vec();
+    }
+
+    fn limiter_for_id(&self, id: &str) -> Arc<BandwidthLimiter> {
+        if let Some((_, lim)) = self.limiters.read().get(id) {
+            return lim.clone();
+        }
+        BandwidthLimiter::new(0)
+    }
+
+    fn limiter_for(&self, m: &Mapping) -> Arc<BandwidthLimiter> {
+        if let Some((_, lim)) = self.limiters.read().get(&m.id) {
+            return lim.clone();
+        }
+        let rate_bps = bandwidth_bytes(&m.bandwidth_limit).unwrap_or(0) as u64;
+        BandwidthLimiter::new(rate_bps)
+    }
+
+    fn find_dial_app(
+        &self,
+        binding_id: &str,
+        host: &str,
+        port: i64,
+    ) -> Option<(Mapping, Arc<BandwidthLimiter>)> {
+        let m = self
+            .mappings
+            .read()
+            .iter()
+            .find(|m| {
+                m.enabled
+                    && m.binding_id == binding_id
+                    && mapping_net(&m.network) == "tcp"
+                    && m.effective_mux_type().unwrap_or_default().is_empty()
+                    && m.target_host == host
+                    && m.target_port == port
+            })
+            .cloned()?;
+        let lim = self.limiter_for(&m);
+        Some((m, lim))
+    }
+
+    fn allow_mux_proto(&self, binding_id: &str, proto_str: &str) -> bool {
+        self.mappings.read().iter().any(|m| {
+            m.enabled
+                && m.binding_id == binding_id
+                && mapping_net(&m.network) == "tcp"
+                && m.effective_mux_type().unwrap_or_default() == proto_str
+        })
+    }
+
+    fn find_mux_substream(
+        &self,
+        binding_id: &str,
+        proto_str: &str,
+        host: &str,
+        port: i64,
+    ) -> Option<(Mapping, Arc<BandwidthLimiter>)> {
+        let m = self
+            .mappings
+            .read()
+            .iter()
+            .find(|m| {
+                m.enabled
+                    && m.binding_id == binding_id
+                    && mapping_net(&m.network) == "tcp"
+                    && m.effective_mux_type().unwrap_or_default() == proto_str
+                    && m.target_host == host
+                    && m.target_port == port
+            })
+            .cloned()?;
+        let lim = self.limiter_for(&m);
+        Some((m, lim))
+    }
+
+    fn find_frame_open(
+        &self,
+        binding_id: &str,
+        host: &str,
+        port: i64,
+        has_meta: bool,
+        req_net: &str,
+        req_mux: &str,
+    ) -> Option<(Mapping, Arc<BandwidthLimiter>)> {
+        let m = self
+            .mappings
+            .read()
+            .iter()
+            .find(|m| {
+                if !m.enabled
+                    || m.binding_id != binding_id
+                    || m.target_host != host
+                    || m.target_port != port
+                {
+                    return false;
+                }
+                if has_meta {
+                    let m_net = mapping_net(&m.network);
+                    let m_mux = m.effective_mux_type().unwrap_or_default();
+                    m_net == req_net && m_mux == req_mux
+                } else {
+                    true
+                }
+            })
+            .cloned()?;
+        let lim = self.limiter_for(&m);
+        Some((m, lim))
+    }
+
+    fn find_hy2_udp(
+        &self,
+        binding_id: &str,
+        host: &str,
+        port: i64,
+    ) -> Option<(Mapping, Arc<BandwidthLimiter>)> {
+        let m = self
+            .mappings
+            .read()
+            .iter()
+            .find(|m| {
+                m.enabled
+                    && m.binding_id == binding_id
+                    && mapping_net(&m.network) == "udp"
+                    && m.target_host == host
+                    && m.target_port == port
+            })
+            .cloned()?;
+        let lim = self.limiter_for(&m);
+        Some((m, lim))
+    }
+}
+
+#[derive(Clone, PartialEq)]
+struct ClientBindingSpec {
+    binding: Binding,
+    eps: Vec<ConnectEndpoint>,
+    client_cfg: LocalTLS,
+    gw_addr: String,
+}
+
+struct ClientWorkerHandle {
+    stop_tx: watch::Sender<bool>,
+    abort: tokio::task::AbortHandle,
+}
+
+struct ClientBindingGroup {
+    spec: ClientBindingSpec,
+    vless_enc_cli: Option<Arc<vless_enc::ClientInstance>>,
+    active_workers: Arc<AtomicUsize>,
+    workers: Vec<ClientWorkerHandle>,
+}
+
+impl ClientBindingGroup {
+    fn stop_all(&mut self, linked: &Mutex<HashSet<String>>, state_notify: &tokio::sync::Notify) {
+        for w in self.workers.drain(..) {
+            let _ = w.stop_tx.send(true);
+            w.abort.abort();
+        }
+        self.active_workers.store(0, Ordering::SeqCst);
+        if linked.lock().unwrap().remove(&self.spec.binding.id) {
+            state_notify.notify_waiters();
+        }
+    }
+}
+
+struct ClientRuntime {
+    shared: Arc<ClientSharedTable>,
+    groups: HashMap<String, ClientBindingGroup>,
+}
+
+impl ClientRuntime {
+    fn new() -> Self {
+        Self {
+            shared: ClientSharedTable::new(),
+            groups: HashMap::new(),
+        }
+    }
+
+    fn stop_all(&mut self, linked: &Mutex<HashSet<String>>, state_notify: &tokio::sync::Notify) {
+        for (_, mut grp) in self.groups.drain() {
+            grp.stop_all(linked, state_notify);
+        }
+        self.shared.sync(&[]);
+    }
+}
+
+struct RunningInstance {
+    role: String,
+    linked: Arc<Mutex<HashSet<String>>>,
+    server: ServerRuntime,
+    client: ClientRuntime,
+}
+
+impl RunningInstance {
+    fn new(role: &str) -> Self {
+        Self {
+            role: role.to_string(),
+            linked: Arc::new(Mutex::new(HashSet::new())),
+            server: ServerRuntime::new(),
+            client: ClientRuntime::new(),
+        }
+    }
+
+    fn stop(&mut self) {
+        let dummy_notify = tokio::sync::Notify::new();
+        self.server.stop_all(&self.linked);
+        self.client.stop_all(&self.linked, &dummy_notify);
+        self.linked.lock().unwrap().clear();
     }
 }
 
@@ -3638,889 +4017,337 @@ async fn serve_established_session(
     }
 }
 
-fn start_instance(
-    s: &Snapshot,
+fn start_server_transport(
+    bindings_init: &[Binding],
     local: &LocalTLS,
+    server: &ServerRuntime,
     traffic: Arc<Traffic>,
+    linked: Arc<Mutex<HashSet<String>>>,
     state_notify: Arc<tokio::sync::Notify>,
     logger: TunnelLogger,
-) -> Result<RunningInstance, String> {
-    validate(s, local)?;
+) -> Result<ServerTransportHandle, String> {
     let (stop_tx, stop_rx) = watch::channel(false);
-    let linked = Arc::new(Mutex::new(HashSet::new()));
+    let bindings_live = Arc::new(parking_lot::RwLock::new(bindings_init.to_vec()));
     let mut listeners = Vec::new();
     let mut udp_sockets = Vec::new();
     let mut quic_endpoints = Vec::new();
     let mut tasks = Vec::new();
-    let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
-    let pending_apps: PendingAppMap = Arc::new(Mutex::new(HashMap::new()));
-    let mux_pool: MuxPoolMap = Arc::new(Mutex::new(HashMap::new()));
-    let mux_notify = Arc::new(tokio::sync::Notify::new());
-    let hy2_sessions: Arc<Mutex<HashMap<String, Vec<Arc<hysteria2::Hy2ServerSession>>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    let hy2_udp_routes: Arc<
-        Mutex<HashMap<u32, (SocketAddr, Arc<tokio::net::UdpSocket>, String)>>,
-    > = Arc::new(Mutex::new(HashMap::new()));
 
-    if s.node.role == "server" {
-        let mut transport_ln: Option<std::net::TcpListener> = None;
-        let mut transport_udp: Option<std::net::UdpSocket> = None;
-        if !s.bindings.is_empty() {
-            let addr = format!("{}:{}", listen_host(&local.listen_host), local.listen_port);
-            if local.hysteria2.enabled() || (local.xhttp.enabled() && local.xhttp.http_version == "3")
-            {
-                let sock = bind_udp_with_retry(&addr)
-                    .map_err(|e| format!("bind transport udp {}: {}", addr, e))?;
-                if let Ok(cloned) = sock.try_clone() {
-                    transport_udp = Some(cloned);
-                }
-                udp_sockets.push(sock);
-                if local.xhttp.enabled() {
-                    if let Ok(ln) = bind_tcp_with_retry(&addr) {
-                        if let Ok(cloned) = ln.try_clone() {
-                            transport_ln = Some(cloned);
-                        }
-                        listeners.push(ln);
-                    }
-                }
-            } else {
-                let ln = bind_tcp_with_retry(&addr)
-                    .map_err(|e| format!("bind transport tcp {}: {}", addr, e))?;
+    let mut transport_ln: Option<std::net::TcpListener> = None;
+    let mut transport_udp: Option<std::net::UdpSocket> = None;
+    let addr = format!("{}:{}", listen_host(&local.listen_host), local.listen_port);
+    if local.hysteria2.enabled() || (local.xhttp.enabled() && local.xhttp.http_version == "3") {
+        let sock = bind_udp_with_retry(&addr)
+            .map_err(|e| format!("bind transport udp {}: {}", addr, e))?;
+        if let Ok(cloned) = sock.try_clone() {
+            transport_udp = Some(cloned);
+        }
+        udp_sockets.push(sock);
+        if local.xhttp.enabled() {
+            if let Ok(ln) = bind_tcp_with_retry(&addr) {
                 if let Ok(cloned) = ln.try_clone() {
                     transport_ln = Some(cloned);
                 }
                 listeners.push(ln);
             }
-            log_tunnel(
-                &logger,
-                "INFO",
-                format!(
-                    "server tunnel listening role=server protocol={} addr={}",
-                    local.effective_protocol(),
-                    addr
-                ),
-            );
         }
-        let mut mapping_tcp_lns: Vec<(Mapping, std::net::TcpListener)> = Vec::new();
-        let mut mapping_udp_socks: Vec<(Mapping, std::net::UdpSocket)> = Vec::new();
-        for m in &s.mappings {
-            if !m.enabled {
-                continue;
-            }
-            let addr = format!("{}:{}", listen_host(&m.listen_host), m.listen_port);
-            if mapping_net(&m.network) == "udp" {
-                let sock = bind_udp_with_retry(&addr)
-                    .map_err(|e| format!("bind mapping udp {}: {}", addr, e))?;
-                if let Ok(cloned) = sock.try_clone() {
-                    mapping_udp_socks.push((m.clone(), cloned));
-                }
-                udp_sockets.push(sock);
-            } else {
-                let ln = bind_tcp_with_retry(&addr)
-                    .map_err(|e| format!("bind mapping tcp {}: {}", addr, e))?;
-                if let Ok(cloned) = ln.try_clone() {
-                    mapping_tcp_lns.push((m.clone(), cloned));
-                }
-                listeners.push(ln);
-            }
+    } else {
+        let ln = bind_tcp_with_retry(&addr)
+            .map_err(|e| format!("bind transport tcp {}: {}", addr, e))?;
+        if let Ok(cloned) = ln.try_clone() {
+            transport_ln = Some(cloned);
         }
+        listeners.push(ln);
+    }
+    log_tunnel(
+        &logger,
+        "INFO",
+        format!(
+            "server tunnel listening role=server protocol={} addr={}",
+            local.effective_protocol(),
+            addr
+        ),
+    );
 
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let shared_xhttp_state = if local.xhttp.enabled() {
-                Some(xhttp::XhttpServerState::new())
-            } else {
-                None
-            };
-            if local.hysteria2.enabled() {
-                if let Some(std_udp) = transport_udp {
-                    let server_cfg = hysteria2::build_quic_server_config(local)?;
-                    if let Ok(quic_ep) = quinn::Endpoint::new(
-                        quinn::EndpointConfig::default(),
-                        Some(server_cfg),
-                        std_udp,
-                        Arc::new(quinn::TokioRuntime),
-                    ) {
-                        quic_endpoints.push(quic_ep.clone());
-                        let bindings = s.bindings.clone();
-                        let local_clone = local.clone();
-                        let sessions_clone = sessions.clone();
-                        let pending_apps_c = pending_apps.clone();
-                        let mux_pool_c = mux_pool.clone();
-                        let mux_notify_c = mux_notify.clone();
-                        let hy2_sessions_c = hy2_sessions.clone();
-                        let hy2_udp_routes_c = hy2_udp_routes.clone();
-                        let traffic_hy2 = traffic.clone();
-                        let linked_clone = linked.clone();
-                        let notify_clone = state_notify.clone();
-                        let logger_clone = logger.clone();
-                        let mut rx = stop_rx.clone();
-                        let jh = handle.spawn(async move {
-                            loop {
-                                tokio::select! {
-                                    _ = rx.changed() => {
-                                        quic_ep.close(0x100u32.into(), b"shutdown");
-                                        break;
-                                    }
-                                    inc = quic_ep.accept() => {
-                                        let Some(incoming) = inc else { break };
-                                        let bindings = bindings.clone();
-                                        let local_c = local_clone.clone();
-                                        let sessions = sessions_clone.clone();
-                                        let pa = pending_apps_c.clone();
-                                        let mp = mux_pool_c.clone();
-                                        let mn = mux_notify_c.clone();
-                                        let hs_map = hy2_sessions_c.clone();
-                                        let udp_routes = hy2_udp_routes_c.clone();
-                                        let t_hy2 = traffic_hy2.clone();
-                                        let linked = linked_clone.clone();
-                                        let notify_c = notify_clone.clone();
-                                        let log_c = logger_clone.clone();
-                                        let mut conn_stop = rx.clone();
-                                        tokio::spawn(async move {
-                                            let Ok(Ok(conn)) = tokio::time::timeout(
-                                                Duration::from_secs(10),
-                                                incoming,
-                                            ).await else {
-                                                return;
-                                            };
-                                            let Ok(hy2_sess) =
-                                                hysteria2::hy2_accept_authenticated(conn, &local_c, &bindings).await
-                                            else {
-                                                return;
-                                            };
-                                            let binding_id = hy2_sess.binding.id.clone();
-                                            {
-                                                let mut g = hs_map.lock().unwrap();
-                                                let list = g.entry(binding_id.clone()).or_default();
-                                                list.retain(|x| x.conn.close_reason().is_none());
-                                                list.push(hy2_sess.clone());
-                                            }
-                                            let dgram_conn = hy2_sess.conn.clone();
-                                            let mut dgram_stop = conn_stop.clone();
-                                            let dgram_task = tokio::spawn(async move {
-                                                let mut defrag = hysteria2::Hy2UdpDefragmenter::new();
-                                                loop {
-                                                    tokio::select! {
-                                                        _ = dgram_stop.changed() => break,
-                                                        dg_res = dgram_conn.read_datagram() => {
-                                                            let Ok(dg) = dg_res else { break };
-                                                            if let Some((sid, _addr, payload)) = defrag.push(&dg) {
-                                                                let route = udp_routes.lock().unwrap().get(&sid).cloned();
-                                                                if let Some((peer_sa, sock, mid)) = route {
-                                                                    t_hy2.add(&mid, 0, payload.len());
-                                                                    let _ = sock.send_to(&payload, peer_sa).await;
-                                                                }
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let shared_xhttp_state = if local.xhttp.enabled() {
+            Some(xhttp::XhttpServerState::new())
+        } else {
+            None
+        };
+        if local.hysteria2.enabled() {
+            if let Some(std_udp) = transport_udp {
+                let server_cfg = hysteria2::build_quic_server_config(local)?;
+                if let Ok(quic_ep) = quinn::Endpoint::new(
+                    quinn::EndpointConfig::default(),
+                    Some(server_cfg),
+                    std_udp,
+                    Arc::new(quinn::TokioRuntime),
+                ) {
+                    quic_endpoints.push(quic_ep.clone());
+                    let bindings_ref = bindings_live.clone();
+                    let local_clone = local.clone();
+                    let sessions_clone = server.sessions.clone();
+                    let pending_apps_c = server.pending_apps.clone();
+                    let mux_pool_c = server.mux_pool.clone();
+                    let mux_notify_c = server.mux_notify.clone();
+                    let hy2_sessions_c = server.hy2_sessions.clone();
+                    let hy2_udp_routes_c = server.hy2_udp_routes.clone();
+                    let traffic_hy2 = traffic.clone();
+                    let linked_clone = linked.clone();
+                    let notify_clone = state_notify.clone();
+                    let logger_clone = logger.clone();
+                    let mut rx = stop_rx.clone();
+                    let jh = handle.spawn(async move {
+                        loop {
+                            tokio::select! {
+                                _ = rx.changed() => {
+                                    quic_ep.close(0x100u32.into(), b"shutdown");
+                                    break;
+                                }
+                                inc = quic_ep.accept() => {
+                                    let Some(incoming) = inc else { break };
+                                    let bindings_snap = bindings_ref.read().clone();
+                                    let local_c = local_clone.clone();
+                                    let sessions = sessions_clone.clone();
+                                    let pa = pending_apps_c.clone();
+                                    let mp = mux_pool_c.clone();
+                                    let mn = mux_notify_c.clone();
+                                    let hs_map = hy2_sessions_c.clone();
+                                    let udp_routes = hy2_udp_routes_c.clone();
+                                    let t_hy2 = traffic_hy2.clone();
+                                    let linked = linked_clone.clone();
+                                    let notify_c = notify_clone.clone();
+                                    let log_c = logger_clone.clone();
+                                    let mut conn_stop = rx.clone();
+                                    tokio::spawn(async move {
+                                        let Ok(Ok(conn)) = tokio::time::timeout(
+                                            Duration::from_secs(10),
+                                            incoming,
+                                        ).await else {
+                                            return;
+                                        };
+                                        let Ok(hy2_sess) =
+                                            hysteria2::hy2_accept_authenticated(conn, &local_c, &bindings_snap).await
+                                        else {
+                                            return;
+                                        };
+                                        let binding_id = hy2_sess.binding.id.clone();
+                                        {
+                                            let mut g = hs_map.lock().unwrap();
+                                            let list = g.entry(binding_id.clone()).or_default();
+                                            list.retain(|x| x.conn.close_reason().is_none());
+                                            list.push(hy2_sess.clone());
+                                        }
+                                        let dgram_conn = hy2_sess.conn.clone();
+                                        let mut dgram_stop = conn_stop.clone();
+                                        let dgram_task = tokio::spawn(async move {
+                                            let mut defrag = hysteria2::Hy2UdpDefragmenter::new();
+                                            loop {
+                                                tokio::select! {
+                                                    _ = dgram_stop.changed() => break,
+                                                    dg_res = dgram_conn.read_datagram() => {
+                                                        let Ok(dg) = dg_res else { break };
+                                                        if let Some((sid, _addr, payload)) = defrag.push(&dg) {
+                                                            let route = udp_routes.lock().unwrap().get(&sid).cloned();
+                                                            if let Some((peer_sa, sock, mid, dn_lim_ref)) = route {
+                                                                let cur_lim = dn_lim_ref.read().clone();
+                                                                cur_lim.wait(payload.len()).await;
+                                                                t_hy2.add(&mid, 0, payload.len());
+                                                                let _ = sock.send_to(&payload, peer_sa).await;
                                                             }
                                                         }
                                                     }
                                                 }
-                                            });
-                                            loop {
-                                                tokio::select! {
-                                                    _ = conn_stop.changed() => break,
-                                                    accepted = hysteria2::hy2_accept_tcp_stream(&hy2_sess) => {
-                                                        let Ok((stream, _host, port)) = accepted else {
-                                                            if hy2_sess.conn.close_reason().is_some() {
-                                                                break;
-                                                            }
-                                                            continue;
-                                                        };
-                                                        let b_st = hy2_sess.binding.clone();
-                                                        let s_st = sessions.clone();
-                                                        let pa_st = pa.clone();
-                                                        let mp_st = mp.clone();
-                                                        let mn_st = mn.clone();
-                                                        let l_st = linked.clone();
-                                                        let n_st = notify_c.clone();
-                                                        let lg_st = log_c.clone();
-                                                        let cs_st = conn_stop.clone();
-                                                        tokio::spawn(async move {
-                                                            if port == mux_proto::PORT_APPLICATION
-                                                                || port == mux_proto::PORT_SING_MUX
-                                                            {
-                                                                accept_reverse_subchannel(
-                                                                    stream, port, &b_st, &pa_st, &mp_st, &mn_st,
-                                                                )
-                                                                .await;
-                                                            } else {
-                                                                serve_established_session(
-                                                                    stream,
-                                                                    b_st,
-                                                                    s_st,
-                                                                    Some(pa_st),
-                                                                    l_st,
-                                                                    n_st,
-                                                                    lg_st,
-                                                                    cs_st,
-                                                                )
-                                                                .await;
-                                                            }
-                                                        });
-                                                    }
-                                                }
-                                            }
-                                            dgram_task.abort();
-                                            let mut g = hs_map.lock().unwrap();
-                                            if let Some(list) = g.get_mut(&binding_id) {
-                                                list.retain(|x| !Arc::ptr_eq(x, &hy2_sess) && x.conn.close_reason().is_none());
-                                                if list.is_empty() {
-                                                    g.remove(&binding_id);
-                                                }
                                             }
                                         });
-                                    }
-                                }
-                            }
-                        });
-                        tasks.push(jh.abort_handle());
-                    }
-                }
-            } else if local.xhttp.enabled() && local.xhttp.http_version == "3" {
-                if let (Some(std_udp), Some(xs_root)) = (transport_udp, shared_xhttp_state.clone()) {
-                    let server_cfg = hysteria2::build_quic_server_config(local)?;
-                    let vless_dec_h3 = vless_enc::ServerInstance::from_raw(&local.decryption)?;
-                    if let Ok(quic_ep) = quinn::Endpoint::new(
-                        quinn::EndpointConfig::default(),
-                        Some(server_cfg),
-                        std_udp,
-                        Arc::new(quinn::TokioRuntime),
-                    ) {
-                        quic_endpoints.push(quic_ep.clone());
-                        let bindings = s.bindings.clone();
-                        let local_clone = local.clone();
-                        let sessions_clone = sessions.clone();
-                        let pending_apps_c = pending_apps.clone();
-                        let mux_pool_c = mux_pool.clone();
-                        let mux_notify_c = mux_notify.clone();
-                        let linked_clone = linked.clone();
-                        let notify_clone = state_notify.clone();
-                        let logger_clone = logger.clone();
-                        let mut rx = stop_rx.clone();
-                        let jh = handle.spawn(async move {
-                            loop {
-                                tokio::select! {
-                                    _ = rx.changed() => {
-                                        quic_ep.close(0x100u32.into(), b"shutdown");
-                                        break;
-                                    }
-                                    inc = quic_ep.accept() => {
-                                        let Some(incoming) = inc else { break };
-                                        let bindings = bindings.clone();
-                                        let local_c = local_clone.clone();
-                                        let sessions = sessions_clone.clone();
-                                        let pa = pending_apps_c.clone();
-                                        let mp = mux_pool_c.clone();
-                                        let mn = mux_notify_c.clone();
-                                        let linked = linked_clone.clone();
-                                        let notify_c = notify_clone.clone();
-                                        let log_c = logger_clone.clone();
-                                        let v_dec = vless_dec_h3.clone();
-                                        let xs_conn = xs_root.clone();
-                                        let mut conn_stop = rx.clone();
-                                        tokio::spawn(async move {
-                                            let Ok(Ok(conn)) = tokio::time::timeout(
-                                                Duration::from_secs(10),
-                                                incoming,
-                                            ).await else {
-                                                return;
-                                            };
-                                            let Ok(Ok(uni_abort)) = tokio::time::timeout(
-                                                Duration::from_secs(5),
-                                                hysteria2::init_h3_connection(&conn),
-                                            )
-                                            .await
-                                            else {
-                                                conn.close(0x100u32.into(), b"h3 control err");
-                                                return;
-                                            };
-                                            loop {
-                                                tokio::select! {
-                                                    _ = conn_stop.changed() => {
-                                                        conn.close(0x100u32.into(), b"shutdown");
-                                                        break;
-                                                    }
-                                                    bi = conn.accept_bi() => {
-                                                        let Ok((send, recv)) = bi else { break };
-                                                        let conn_st = conn.clone();
-                                                        let local_st = local_c.clone();
-                                                        let local_in = local_c.clone();
-                                                        let xs_st = xs_conn.clone();
-                                                        let b_st = bindings.clone();
-                                                        let s_st = sessions.clone();
-                                                        let pa_st = pa.clone();
-                                                        let mp_st = mp.clone();
-                                                        let mn_st = mn.clone();
-                                                        let l_st = linked.clone();
-                                                        let n_st = notify_c.clone();
-                                                        let lg_st = log_c.clone();
-                                                        let vd_st = v_dec.clone();
-                                                        let cs_st = conn_stop.clone();
-                                                        let mut stop_st = conn_stop.clone();
-                                                        tokio::spawn(async move {
-                                                            tokio::select! {
-                                                                _ = stop_st.changed() => {}
-                                                                _ = xhttp::handle_xhttp_h3_stream(
-                                                                    send,
-                                                                    recv,
-                                                                    conn_st,
-                                                                    local_st,
-                                                                    xs_st,
-                                                                    move |tunnel_stream| {
-                                                                        let b = b_st.clone();
-                                                                        let s = s_st.clone();
-                                                                        let pa_i = pa_st.clone();
-                                                                        let mp_i = mp_st.clone();
-                                                                        let mn_i = mn_st.clone();
-                                                                        let l = l_st.clone();
-                                                                        let n = n_st.clone();
-                                                                        let cs = cs_st.clone();
-                                                                        let vd = vd_st.clone();
-                                                                        let lc = local_in.clone();
-                                                                        let lg = lg_st.clone();
-                                                                        tokio::spawn(async move {
-                                                                            serve_vless_session(
-                                                                                vision::VisionInner::Boxed(tunnel_stream),
-                                                                                lc,
-                                                                                vd,
-                                                                                b,
-                                                                                s,
-                                                                                pa_i,
-                                                                                mp_i,
-                                                                                mn_i,
-                                                                                l,
-                                                                                n,
-                                                                                lg,
-                                                                                cs,
-                                                                            )
-                                                                            .await;
-                                                                        });
-                                                                    },
-                                                                ) => {}
-                                                            }
-                                                        });
-                                                    }
+                                        loop {
+                                            tokio::select! {
+                                                _ = conn_stop.changed() => break,
+                                                accepted = hysteria2::hy2_accept_tcp_stream(&hy2_sess) => {
+                                                    let Ok((stream, _host, port)) = accepted else {
+                                                        if hy2_sess.conn.close_reason().is_some() {
+                                                            break;
+                                                        }
+                                                        continue;
+                                                    };
+                                                    let b_st = hy2_sess.binding.clone();
+                                                    let s_st = sessions.clone();
+                                                    let pa_st = pa.clone();
+                                                    let mp_st = mp.clone();
+                                                    let mn_st = mn.clone();
+                                                    let l_st = linked.clone();
+                                                    let n_st = notify_c.clone();
+                                                    let lg_st = log_c.clone();
+                                                    let cs_st = conn_stop.clone();
+                                                    tokio::spawn(async move {
+                                                        if port == mux_proto::PORT_APPLICATION
+                                                            || port == mux_proto::PORT_SING_MUX
+                                                        {
+                                                            accept_reverse_subchannel(
+                                                                stream, port, &b_st, &pa_st, &mp_st, &mn_st,
+                                                            )
+                                                            .await;
+                                                        } else {
+                                                            serve_established_session(
+                                                                stream,
+                                                                b_st,
+                                                                s_st,
+                                                                Some(pa_st),
+                                                                l_st,
+                                                                n_st,
+                                                                lg_st,
+                                                                cs_st,
+                                                            )
+                                                            .await;
+                                                        }
+                                                    });
                                                 }
                                             }
-                                            uni_abort.abort();
-                                        });
-                                    }
+                                        }
+                                        dgram_task.abort();
+                                        let mut g = hs_map.lock().unwrap();
+                                        if let Some(list) = g.get_mut(&binding_id) {
+                                            list.retain(|x| !Arc::ptr_eq(x, &hy2_sess) && x.conn.close_reason().is_none());
+                                            if list.is_empty() {
+                                                g.remove(&binding_id);
+                                            }
+                                        }
+                                    });
                                 }
                             }
-                        });
-                        tasks.push(jh.abort_handle());
-                    }
+                        }
+                    });
+                    tasks.push(jh.abort_handle());
                 }
             }
-
-            if let Some(std_ln) = transport_ln {
-                let _ = std_ln.set_nonblocking(true);
-                if let Ok(tokio_ln) = TcpListener::from_std(std_ln) {
-                    let bindings = s.bindings.clone();
-                    let sessions_clone = sessions.clone();
-                    let pending_apps_c = pending_apps.clone();
-                    let mux_pool_c = mux_pool.clone();
-                    let mux_notify_c = mux_notify.clone();
+        } else if local.xhttp.enabled() && local.xhttp.http_version == "3" {
+            if let (Some(std_udp), Some(xs_root)) = (transport_udp, shared_xhttp_state.clone()) {
+                let server_cfg = hysteria2::build_quic_server_config(local)?;
+                let vless_dec_h3 = vless_enc::ServerInstance::from_raw(&local.decryption)?;
+                if let Ok(quic_ep) = quinn::Endpoint::new(
+                    quinn::EndpointConfig::default(),
+                    Some(server_cfg),
+                    std_udp,
+                    Arc::new(quinn::TokioRuntime),
+                ) {
+                    quic_endpoints.push(quic_ep.clone());
+                    let bindings_ref = bindings_live.clone();
+                    let local_clone = local.clone();
+                    let sessions_clone = server.sessions.clone();
+                    let pending_apps_c = server.pending_apps.clone();
+                    let mux_pool_c = server.mux_pool.clone();
+                    let mux_notify_c = server.mux_notify.clone();
                     let linked_clone = linked.clone();
                     let notify_clone = state_notify.clone();
-                    let local_clone = local.clone();
-                    let tls_server_cfg = if !local.reality.enabled()
-                        && !local.cert_pem.is_empty()
-                        && !local.key_pem.is_empty()
-                        && (local.transport_security == "tls" || (local.xhttp.enabled() && local.xhttp.tls))
-                    {
-                        Some(build_tls_server_config(local)?)
-                    } else {
-                        None
-                    };
-                    let reality_cfg = if local.reality.enabled() {
-                        Some(build_reality_server_cfg(local)?)
-                    } else {
-                        None
-                    };
-                    let vless_dec = vless_enc::ServerInstance::from_raw(&local.decryption)?;
-                    let xhttp_state = shared_xhttp_state;
                     let logger_clone = logger.clone();
                     let mut rx = stop_rx.clone();
-                    let conn_sem = Arc::new(tokio::sync::Semaphore::new(4096));
                     let jh = handle.spawn(async move {
                         loop {
                             tokio::select! {
-                                _ = rx.changed() => break,
-                                accepted = tokio_ln.accept() => {
-                                    let Ok((tcp_stream, _)) = accepted else { break };
-                                    let Ok(permit) = conn_sem.clone().try_acquire_owned() else {
-                                        drop(tcp_stream);
-                                        continue;
-                                    };
-                                    configure_tcp_stream(&tcp_stream);
-                                    let bindings = bindings.clone();
+                                _ = rx.changed() => {
+                                    quic_ep.close(0x100u32.into(), b"shutdown");
+                                    break;
+                                }
+                                inc = quic_ep.accept() => {
+                                    let Some(incoming) = inc else { break };
+                                    let bindings_ref_c = bindings_ref.clone();
+                                    let local_c = local_clone.clone();
                                     let sessions = sessions_clone.clone();
                                     let pa = pending_apps_c.clone();
                                     let mp = mux_pool_c.clone();
                                     let mn = mux_notify_c.clone();
                                     let linked = linked_clone.clone();
                                     let notify_c = notify_clone.clone();
-                                    let local_c = local_clone.clone();
-                                    let tls_scfg = tls_server_cfg.clone();
-                                    let r_cfg = reality_cfg.clone();
-                                    let v_dec = vless_dec.clone();
-                                    let x_state = xhttp_state.clone();
                                     let log_c = logger_clone.clone();
-                                    let conn_stop = rx.clone();
+                                    let v_dec = vless_dec_h3.clone();
+                                    let xs_conn = xs_root.clone();
+                                    let mut conn_stop = rx.clone();
                                     tokio::spawn(async move {
-                                        let _permit = permit;
-                                        let mut outer_stop = conn_stop.clone();
-                                        if *outer_stop.borrow() {
-                                            return;
-                                        }
-                                        let Some(outer_stream) =
-                                            accept_outer_vision_inner(tcp_stream, &local_c, tls_scfg, r_cfg).await
-                                        else {
+                                        let Ok(Ok(conn)) = tokio::time::timeout(
+                                            Duration::from_secs(10),
+                                            incoming,
+                                        ).await else {
                                             return;
                                         };
-                                        if let Some(xs) = x_state {
-                                            let local_inner = local_c.clone();
-                                            let log_inner = log_c.clone();
-                                            let notify_inner = notify_c.clone();
-                                            tokio::select! {
-                                                _ = outer_stop.changed() => {}
-                                                _ = xhttp::handle_xhttp_server_conn(
-                                                    outer_stream.into_box_stream(),
-                                                    local_c,
-                                                    xs,
-                                                    move |tunnel_stream| {
-                                                        let b = bindings.clone();
-                                                        let s = sessions.clone();
-                                                        let pa_i = pa.clone();
-                                                        let mp_i = mp.clone();
-                                                        let mn_i = mn.clone();
-                                                        let l = linked.clone();
-                                                        let n = notify_inner.clone();
-                                                        let cs = conn_stop.clone();
-                                                        let vd = v_dec.clone();
-                                                        let lc = local_inner.clone();
-                                                        let lg = log_inner.clone();
-                                                        tokio::spawn(async move {
-                                                            serve_vless_session(
-                                                                vision::VisionInner::Boxed(tunnel_stream),
-                                                                lc,
-                                                                vd,
-                                                                b,
-                                                                s,
-                                                                pa_i,
-                                                                mp_i,
-                                                                mn_i,
-                                                                l,
-                                                                n,
-                                                                lg,
-                                                                cs,
-                                                            )
-                                                            .await;
-                                                        });
-                                                    },
-                                                ) => {}
-                                            }
-                                        } else {
-                                            serve_vless_session(
-                                                outer_stream,
-                                                local_c,
-                                                v_dec,
-                                                bindings,
-                                                sessions,
-                                                pa,
-                                                mp,
-                                                mn,
-                                                linked,
-                                                notify_c,
-                                                log_c,
-                                                conn_stop,
-                                            )
-                                            .await;
-                                        }
-                                    });
-                                }
-                            }
-                        }
-                    });
-                    tasks.push(jh.abort_handle());
-                }
-            }
-
-            let app_req_seq = Arc::new(AtomicU32::new(1));
-            for (m, std_ln) in mapping_tcp_lns {
-                let _ = std_ln.set_nonblocking(true);
-                if let Ok(tokio_ln) = TcpListener::from_std(std_ln) {
-                    let sessions_clone = sessions.clone();
-                    let pending_apps_c = pending_apps.clone();
-                    let mux_pool_c = mux_pool.clone();
-                    let mux_notify_c = mux_notify.clone();
-                    let app_seq_c = app_req_seq.clone();
-                    let traffic_clone = traffic.clone();
-                    let notify_map = state_notify.clone();
-                    let mut rx = stop_rx.clone();
-                    let jh = handle.spawn(async move {
-                        let rate_bps = bandwidth_bytes(&m.bandwidth_limit).unwrap_or(0) as u64;
-                        let up_limiter = BandwidthLimiter::new(rate_bps);
-                        let mux_type = m.effective_mux_type().unwrap_or_default();
-                        loop {
-                            tokio::select! {
-                                _ = rx.changed() => break,
-                                accepted = tokio_ln.accept() => {
-                                    let Ok((pub_stream, _)) = accepted else { break };
-                                    configure_tcp_stream(&pub_stream);
-                                    let sessions_req = sessions_clone.clone();
-                                    let pa_req = pending_apps_c.clone();
-                                    let mp_req = mux_pool_c.clone();
-                                    let mn_req = mux_notify_c.clone();
-                                    let seq_req = app_seq_c.clone();
-                                    let notify_req = notify_map.clone();
-                                    let mut stop_req = rx.clone();
-                                    let m_clone = m.clone();
-                                    let traffic_conn = traffic_clone.clone();
-                                    let mux_t = mux_type.clone();
-                                    let up_lim = up_limiter.clone();
-                                    tokio::spawn(async move {
-                                        let mut sess_opt = pick_session(&sessions_req, &m_clone.binding_id);
-                                        if sess_opt.is_none() {
-                                            let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
-                                            while tokio::time::Instant::now() < deadline {
-                                                let notified = notify_req.notified();
-                                                tokio::select! {
-                                                    _ = stop_req.changed() => return,
-                                                    _ = notified => {}
-                                                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-                                                }
-                                                sess_opt = pick_session(&sessions_req, &m_clone.binding_id);
-                                                if sess_opt.is_some() {
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        let Some(sess) = sess_opt else { return };
-                                        sess.maybe_probe_on_open();
-
-                                        let remote_stream: BoxStream = if mux_t.is_empty() {
-                                            // Genuine 1:1 unframed reverse connection on PORT_APPLICATION = 1
-                                            let mut req_id = seq_req.fetch_add(1, Ordering::Relaxed);
-                                            if req_id == 0 {
-                                                req_id = seq_req.fetch_add(1, Ordering::Relaxed);
-                                            }
-                                            let (tx, rx_app) = tokio::sync::oneshot::channel();
-                                            pa_req
-                                                .lock()
-                                                .unwrap()
-                                                .insert((m_clone.binding_id.clone(), req_id), tx);
-                                            let mut dial_payload = Vec::with_capacity(2 + m_clone.target_host.len());
-                                            dial_payload.extend_from_slice(&(m_clone.target_port as u16).to_be_bytes());
-                                            dial_payload.extend_from_slice(m_clone.target_host.as_bytes());
-                                            if sess
-                                                .sender
-                                                .send_ctrl(FRAME_DIAL_APP, req_id, dial_payload)
-                                                .await
-                                                .is_err()
-                                            {
-                                                pa_req
-                                                    .lock()
-                                                    .unwrap()
-                                                    .remove(&(m_clone.binding_id.clone(), req_id));
-                                                return;
-                                            }
-                                            match tokio::select! {
-                                                _ = stop_req.changed() => Err(()),
-                                                res = tokio::time::timeout(Duration::from_secs(8), rx_app) => {
-                                                    res.map_err(|_| ()).and_then(|r| r.map_err(|_| ()))
-                                                }
-                                            } {
-                                                Ok(s) => s,
-                                                Err(()) => {
-                                                    pa_req
-                                                        .lock()
-                                                        .unwrap()
-                                                        .remove(&(m_clone.binding_id.clone(), req_id));
-                                                    return;
-                                                }
-                                            }
-                                        } else {
-                                            // Genuine sing-mux (smux v2 / yamux / h2mux) on PORT_SING_MUX = 2
-                                            let desired_pool = m_clone.pool.clamp(1, 16) as usize;
-                                            let Some(opener) = acquire_mux_opener(
-                                                &mp_req,
-                                                &mn_req,
-                                                &sess,
-                                                &m_clone.binding_id,
-                                                &mux_t,
-                                                desired_pool,
-                                                &mut stop_req,
-                                            )
-                                            .await
-                                            else {
-                                                return;
-                                            };
-                                            match opener
-                                                .open_tcp_substream(
-                                                    &m_clone.target_host,
-                                                    m_clone.target_port as u16,
-                                                )
-                                                .await
-                                            {
-                                                Ok(sub) => sub,
-                                                Err(_) => {
-                                                    {
-                                                        let mut g = mp_req.lock().unwrap();
-                                                        if let Some(list) = g.get_mut(&(
-                                                            m_clone.binding_id.clone(),
-                                                            mux_t.clone(),
-                                                        )) {
-                                                            list.retain(|o| !Arc::ptr_eq(o, &opener) && !o.is_closed());
-                                                        }
-                                                    }
-                                                    let Some(retry_op) = acquire_mux_opener(
-                                                        &mp_req,
-                                                        &mn_req,
-                                                        &sess,
-                                                        &m_clone.binding_id,
-                                                        &mux_t,
-                                                        desired_pool,
-                                                        &mut stop_req,
-                                                    )
-                                                    .await
-                                                    else {
-                                                        return;
-                                                    };
-                                                    match retry_op
-                                                        .open_tcp_substream(
-                                                            &m_clone.target_host,
-                                                            m_clone.target_port as u16,
-                                                        )
-                                                        .await
-                                                    {
-                                                        Ok(sub) => sub,
-                                                        Err(_) => return,
-                                                    }
-                                                }
-                                            }
-                                        };
-
-                                        relay_raw_streams_gateway(
-                                            pub_stream,
-                                            remote_stream,
-                                            up_lim,
-                                            traffic_conn,
-                                            &m_clone.id,
+                                        let Ok(Ok(uni_abort)) = tokio::time::timeout(
+                                            Duration::from_secs(5),
+                                            hysteria2::init_h3_connection(&conn),
                                         )
-                                        .await;
-                                    });
-                                }
-                            }
-                        }
-                    });
-                    tasks.push(jh.abort_handle());
-                }
-            }
-
-            let is_hy2_server = local.hysteria2.enabled();
-            let hy2_udp_sid_seq = Arc::new(AtomicU32::new(1));
-            for (m, std_udp) in mapping_udp_socks {
-                let _ = std_udp.set_nonblocking(true);
-                if let Ok(tokio_udp) = tokio::net::UdpSocket::from_std(std_udp) {
-                    let udp_sock = Arc::new(tokio_udp);
-                    let sessions_clone = sessions.clone();
-                    let hy2_sessions_u = hy2_sessions.clone();
-                    let hy2_routes_u = hy2_udp_routes.clone();
-                    let hy2_sid_gen = hy2_udp_sid_seq.clone();
-                    let traffic_clone = traffic.clone();
-                    let mut rx = stop_rx.clone();
-                    let jh = handle.spawn(async move {
-                        let rate_bps = bandwidth_bytes(&m.bandwidth_limit).unwrap_or(0) as u64;
-                        let up_limiter = BandwidthLimiter::new(rate_bps);
-                        let mut xudp_base_key = [0u8; 32];
-                        rand::rng().fill_bytes(&mut xudp_base_key);
-                        let mut peer_streams: HashMap<SocketAddr, mpsc::Sender<Vec<u8>>> =
-                            HashMap::new();
-                        let mut peer_hy2_sids: HashMap<SocketAddr, (u32, std::time::Instant)> =
-                            HashMap::new();
-                        let mut hy2_pkt_id: u16 = 0;
-                        let mut next_xudp_sid: u16 = 1;
-                        let mut buf = vec![0u8; 65535];
-                        loop {
-                            tokio::select! {
-                                _ = rx.changed() => break,
-                                recv_res = udp_sock.recv_from(&mut buf) => {
-                                    let Ok((n, peer_addr)) = recv_res else { break };
-                                    if is_hy2_server {
-                                        let hy2_sess_opt = {
-                                            let mut g = hy2_sessions_u.lock().unwrap();
-                                            g.get_mut(&m.binding_id).and_then(|list| {
-                                                list.retain(|x| x.conn.close_reason().is_none());
-                                                list.first().cloned()
-                                            })
-                                        };
-                                        if let Some(hy2_sess) = hy2_sess_opt {
-                                            let now_inst = std::time::Instant::now();
-                                            if peer_hy2_sids.len() >= 1024 && !peer_hy2_sids.contains_key(&peer_addr) {
-                                                let mut expired_sids = Vec::new();
-                                                peer_hy2_sids.retain(|_, (sid, ts)| {
-                                                    if now_inst.saturating_duration_since(*ts) < Duration::from_secs(60) {
-                                                        true
-                                                    } else {
-                                                        expired_sids.push(*sid);
-                                                        false
-                                                    }
-                                                });
-                                                if !expired_sids.is_empty() {
-                                                    let mut rg = hy2_routes_u.lock().unwrap();
-                                                    for sid in expired_sids {
-                                                        rg.remove(&sid);
-                                                    }
-                                                }
-                                            }
-                                            let sid = match peer_hy2_sids.get_mut(&peer_addr) {
-                                                Some((sid, ts)) => {
-                                                    *ts = now_inst;
-                                                    *sid
-                                                }
-                                                None => {
-                                                    let mut sid = hy2_sid_gen.fetch_add(1, Ordering::Relaxed);
-                                                    if sid == 0 {
-                                                        sid = hy2_sid_gen.fetch_add(1, Ordering::Relaxed);
-                                                    }
-                                                    peer_hy2_sids.insert(peer_addr, (sid, now_inst));
-                                                    hy2_routes_u.lock().unwrap().insert(
-                                                        sid,
-                                                        (peer_addr, udp_sock.clone(), m.id.clone()),
-                                                    );
-                                                    sid
-                                                }
-                                            };
-                                            up_limiter.wait(n).await;
-                                            traffic_clone.add(&m.id, n, 0);
-                                            hy2_pkt_id = hy2_pkt_id.wrapping_add(1);
-                                            let target_addr = hysteria2::format_hy2_addr(
-                                                &m.target_host,
-                                                m.target_port as u16,
-                                            );
-                                            let max_dg = hy2_sess.conn.max_datagram_size().unwrap_or(1200);
-                                            for dg in hysteria2::encode_hy2_udp_datagrams(
-                                                sid,
-                                                hy2_pkt_id,
-                                                &target_addr,
-                                                &buf[..n],
-                                                max_dg,
-                                            ) {
-                                                let _ = hy2_sess.conn.send_datagram(dg);
-                                            }
-                                            continue;
-                                        }
-                                    }
-
-                                    if n + 64 > MAX_PAYLOAD {
-                                        continue;
-                                    }
-                                    let pkt = buf[..n].to_vec();
-                                    if let Some(tx) = peer_streams.get(&peer_addr) {
-                                        match tx.try_send(pkt.clone()) {
-                                            Ok(()) => {
-                                                traffic_clone.add(&m.id, n, 0);
-                                                continue;
-                                            }
-                                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                                continue;
-                                            }
-                                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                                peer_streams.remove(&peer_addr);
-                                            }
-                                        }
-                                    }
-                                    if peer_streams.len() >= 64 {
-                                        peer_streams.retain(|_, tx| !tx.is_closed());
-                                        if peer_streams.len() >= 4096 {
-                                            continue;
-                                        }
-                                    }
-                                    let Some(sess) = pick_session(&sessions_clone, &m.binding_id) else { continue };
-                                    let Some((stream_id, mut in_rx)) = sess.open_stream() else { continue };
-                                    let xudp_sid = next_xudp_sid;
-                                    next_xudp_sid = next_xudp_sid.wrapping_add(1).max(1);
-                                    let global_id = mux_proto::compute_xudp_global_id(peer_addr, &xudp_base_key);
-                                    let (pkt_tx, mut pkt_rx) = mpsc::channel::<Vec<u8>>(256);
-                                    let _ = pkt_tx.try_send(pkt);
-                                    traffic_clone.add(&m.id, n, 0);
-                                    peer_streams.insert(peer_addr, pkt_tx);
-                                    let m_clone = m.clone();
-                                    let udp_reply = udp_sock.clone();
-                                    let traffic_down = traffic_clone.clone();
-                                    let up_lim = up_limiter.clone();
-                                    tokio::spawn(async move {
-                                        let meta = format!("{}\0udp\0", m_clone.target_host);
-                                        let mut open_payload = Vec::with_capacity(2 + meta.len());
-                                        open_payload.extend_from_slice(&(m_clone.target_port as u16).to_be_bytes());
-                                        open_payload.extend_from_slice(meta.as_bytes());
-                                        sess.maybe_probe_on_open();
-                                        if sess
-                                            .sender
-                                            .send_ctrl(FRAME_OPEN, stream_id, open_payload)
-                                            .await
-                                            .is_err()
-                                        {
-                                            sess.close_stream(stream_id);
+                                        .await
+                                        else {
+                                            conn.close(0x100u32.into(), b"h3 control err");
                                             return;
-                                        }
-                                        let sender_up = sess.sender.clone();
-                                        let target_host = m_clone.target_host.clone();
-                                        let target_port = m_clone.target_port as u16;
-                                        let up_task = tokio::spawn(async move {
-                                            let mut sent_new = false;
-                                            while let Some(dg) = pkt_rx.recv().await {
-                                                up_lim.wait(dg.len()).await;
-                                                let xudp = if !sent_new {
-                                                    sent_new = true;
-                                                    let Ok(f) = mux_proto::encode_xudp_new(
-                                                        xudp_sid,
-                                                        &target_host,
-                                                        target_port,
-                                                        &dg,
-                                                        Some(global_id),
-                                                    ) else {
-                                                        break;
-                                                    };
-                                                    f
-                                                } else {
-                                                    mux_proto::encode_xudp_keep(xudp_sid, &dg)
-                                                };
-                                                if xudp.len() > MAX_PAYLOAD {
-                                                    continue;
-                                                }
-                                                if sender_up
-                                                    .send_data(FRAME_DATA, stream_id, xudp)
-                                                    .await
-                                                    .is_err()
-                                                {
+                                        };
+                                        loop {
+                                            tokio::select! {
+                                                _ = conn_stop.changed() => {
+                                                    conn.close(0x100u32.into(), b"shutdown");
                                                     break;
                                                 }
-                                            }
-                                            let end_f = mux_proto::encode_xudp_end(xudp_sid);
-                                            let _ = sender_up.send_data(FRAME_DATA, stream_id, end_f).await;
-                                        });
-                                        loop {
-                                            match tokio::time::timeout(Duration::from_secs(30), in_rx.recv()).await {
-                                                Ok(Some((FRAME_DATA, data))) => {
-                                                    let Ok(dec) = mux_proto::decode_xudp_packet(&data) else {
-                                                        break;
-                                                    };
-                                                    if dec.status == mux_proto::XUDP_STATUS_END {
-                                                        break;
-                                                    }
-                                                    if !dec.payload.is_empty() {
-                                                        traffic_down.add(&m_clone.id, 0, dec.payload.len());
-                                                        let _ = udp_reply.send_to(dec.payload, peer_addr).await;
-                                                    }
+                                                bi = conn.accept_bi() => {
+                                                    let Ok((send, recv)) = bi else { break };
+                                                    let conn_st = conn.clone();
+                                                    let local_st = local_c.clone();
+                                                    let local_in = local_c.clone();
+                                                    let xs_st = xs_conn.clone();
+                                                    let b_ref_st = bindings_ref_c.clone();
+                                                    let s_st = sessions.clone();
+                                                    let pa_st = pa.clone();
+                                                    let mp_st = mp.clone();
+                                                    let mn_st = mn.clone();
+                                                    let l_st = linked.clone();
+                                                    let n_st = notify_c.clone();
+                                                    let lg_st = log_c.clone();
+                                                    let vd_st = v_dec.clone();
+                                                    let cs_st = conn_stop.clone();
+                                                    let mut stop_st = conn_stop.clone();
+                                                    tokio::spawn(async move {
+                                                        tokio::select! {
+                                                            _ = stop_st.changed() => {}
+                                                            _ = xhttp::handle_xhttp_h3_stream(
+                                                                send,
+                                                                recv,
+                                                                conn_st,
+                                                                local_st,
+                                                                xs_st,
+                                                                move |tunnel_stream| {
+                                                                    let b = b_ref_st.read().clone();
+                                                                    let s = s_st.clone();
+                                                                    let pa_i = pa_st.clone();
+                                                                    let mp_i = mp_st.clone();
+                                                                    let mn_i = mn_st.clone();
+                                                                    let l = l_st.clone();
+                                                                    let n = n_st.clone();
+                                                                    let cs = cs_st.clone();
+                                                                    let vd = vd_st.clone();
+                                                                    let lc = local_in.clone();
+                                                                    let lg = lg_st.clone();
+                                                                    tokio::spawn(async move {
+                                                                        serve_vless_session(
+                                                                            vision::VisionInner::Boxed(tunnel_stream),
+                                                                            lc,
+                                                                            vd,
+                                                                            b,
+                                                                            s,
+                                                                            pa_i,
+                                                                            mp_i,
+                                                                            mn_i,
+                                                                            l,
+                                                                            n,
+                                                                            lg,
+                                                                            cs,
+                                                                        )
+                                                                        .await;
+                                                                    });
+                                                                },
+                                                            ) => {}
+                                                        }
+                                                    });
                                                 }
-                                                _ => break,
                                             }
                                         }
-                                        up_task.abort();
-                                        sess.close_stream(stream_id);
-                                        sess.sender.send_ctrl_bg(FRAME_RESET, stream_id, Vec::new());
+                                        uni_abort.abort();
                                     });
                                 }
                             }
@@ -4530,356 +4357,1192 @@ fn start_instance(
                 }
             }
         }
-    } else if s.node.role == "client" && !s.bindings.is_empty() {
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let mut mapping_limiters: HashMap<String, Arc<BandwidthLimiter>> = HashMap::new();
-            for m in &s.mappings {
-                if m.enabled {
-                    let rate_bps = bandwidth_bytes(&m.bandwidth_limit).unwrap_or(0) as u64;
-                    mapping_limiters.insert(m.id.clone(), BandwidthLimiter::new(rate_bps));
-                }
-            }
-            let mapping_limiters = Arc::new(mapping_limiters);
-            for b in &s.bindings {
-                let Some(gw) = s.nodes.iter().find(|n| n.id == b.server_id).cloned() else {
-                    continue;
-                };
-                let Ok(bound_gw) = binding_gateway(gw, b) else {
-                    continue;
-                };
-                let eps = enabled_endpoints(&bound_gw);
-                if eps.is_empty() {
-                    continue;
-                }
-                let Ok(client_cfg) = gateway_client_config(local, &bound_gw) else {
-                    continue;
-                };
-                let vless_enc_cli = vless_enc::ClientInstance::from_raw(&client_cfg.encryption)?;
-                let pool_count = s
-                    .mappings
-                    .iter()
-                    .filter(|m| m.enabled && m.binding_id == b.id)
-                    .map(|m| m.pool.clamp(1, 32) as usize)
-                    .max()
-                    .unwrap_or(1);
-                let active_workers = Arc::new(AtomicUsize::new(0));
 
-                for worker_idx in 0..pool_count {
-                    let b_clone = b.clone();
-                    let mappings = s.mappings.clone();
-                    let limiters_clone = mapping_limiters.clone();
-                    let linked_clone = linked.clone();
-                    let notify_clone = state_notify.clone();
-                    let eps_clone = eps.clone();
-                    let cfg_clone = client_cfg.clone();
-                    let gw_addr = bound_gw.address.clone();
-                    let enc_cli = vless_enc_cli.clone();
-                    let workers_ref = active_workers.clone();
-                    let log_c = logger.clone();
-                    let mut rx = stop_rx.clone();
-                    let jh = handle.spawn(async move {
-                        let Ok(uuid_bytes) = parse_uuid(&b_clone.uuid) else { return };
-                        let mut ep_cursor = worker_idx;
-                        let mut fail_streak = 0u32;
-                        let mut ever_connected = false;
-                        loop {
-                            if *rx.borrow() {
-                                break;
+        if let Some(std_ln) = transport_ln {
+            let _ = std_ln.set_nonblocking(true);
+            if let Ok(tokio_ln) = TcpListener::from_std(std_ln) {
+                let bindings_ref = bindings_live.clone();
+                let sessions_clone = server.sessions.clone();
+                let pending_apps_c = server.pending_apps.clone();
+                let mux_pool_c = server.mux_pool.clone();
+                let mux_notify_c = server.mux_notify.clone();
+                let linked_clone = linked.clone();
+                let notify_clone = state_notify.clone();
+                let local_clone = local.clone();
+                let tls_server_cfg = if !local.reality.enabled()
+                    && !local.cert_pem.is_empty()
+                    && !local.key_pem.is_empty()
+                    && (local.transport_security == "tls" || (local.xhttp.enabled() && local.xhttp.tls))
+                {
+                    Some(build_tls_server_config(local)?)
+                } else {
+                    None
+                };
+                let reality_cfg = if local.reality.enabled() {
+                    Some(build_reality_server_cfg(local)?)
+                } else {
+                    None
+                };
+                let vless_dec = vless_enc::ServerInstance::from_raw(&local.decryption)?;
+                let xhttp_state = shared_xhttp_state;
+                let logger_clone = logger.clone();
+                let mut rx = stop_rx.clone();
+                let conn_sem = Arc::new(tokio::sync::Semaphore::new(4096));
+                let jh = handle.spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = rx.changed() => break,
+                            accepted = tokio_ln.accept() => {
+                                let Ok((tcp_stream, _)) = accepted else { break };
+                                let Ok(permit) = conn_sem.clone().try_acquire_owned() else {
+                                    drop(tcp_stream);
+                                    continue;
+                                };
+                                configure_tcp_stream(&tcp_stream);
+                                let bindings_ref_c = bindings_ref.clone();
+                                let sessions = sessions_clone.clone();
+                                let pa = pending_apps_c.clone();
+                                let mp = mux_pool_c.clone();
+                                let mn = mux_notify_c.clone();
+                                let linked = linked_clone.clone();
+                                let notify_c = notify_clone.clone();
+                                let local_c = local_clone.clone();
+                                let tls_scfg = tls_server_cfg.clone();
+                                let r_cfg = reality_cfg.clone();
+                                let v_dec = vless_dec.clone();
+                                let x_state = xhttp_state.clone();
+                                let log_c = logger_clone.clone();
+                                let conn_stop = rx.clone();
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    let mut outer_stop = conn_stop.clone();
+                                    if *outer_stop.borrow() {
+                                        return;
+                                    }
+                                    let Some(outer_stream) =
+                                        accept_outer_vision_inner(tcp_stream, &local_c, tls_scfg, r_cfg).await
+                                    else {
+                                        return;
+                                    };
+                                    if let Some(xs) = x_state {
+                                        let local_inner = local_c.clone();
+                                        let log_inner = log_c.clone();
+                                        let notify_inner = notify_c.clone();
+                                        tokio::select! {
+                                            _ = outer_stop.changed() => {}
+                                            _ = xhttp::handle_xhttp_server_conn(
+                                                outer_stream.into_box_stream(),
+                                                local_c,
+                                                xs,
+                                                move |tunnel_stream| {
+                                                    let b = bindings_ref_c.read().clone();
+                                                    let s = sessions.clone();
+                                                    let pa_i = pa.clone();
+                                                    let mp_i = mp.clone();
+                                                    let mn_i = mn.clone();
+                                                    let l = linked.clone();
+                                                    let n = notify_inner.clone();
+                                                    let cs = conn_stop.clone();
+                                                    let vd = v_dec.clone();
+                                                    let lc = local_inner.clone();
+                                                    let lg = log_inner.clone();
+                                                    tokio::spawn(async move {
+                                                        serve_vless_session(
+                                                            vision::VisionInner::Boxed(tunnel_stream),
+                                                            lc,
+                                                            vd,
+                                                            b,
+                                                            s,
+                                                            pa_i,
+                                                            mp_i,
+                                                            mn_i,
+                                                            l,
+                                                            n,
+                                                            lg,
+                                                            cs,
+                                                        )
+                                                        .await;
+                                                    });
+                                                },
+                                            ) => {}
+                                        }
+                                    } else {
+                                        let bindings_snap = bindings_ref_c.read().clone();
+                                        serve_vless_session(
+                                            outer_stream,
+                                            local_c,
+                                            v_dec,
+                                            bindings_snap,
+                                            sessions,
+                                            pa,
+                                            mp,
+                                            mn,
+                                            linked,
+                                            notify_c,
+                                            log_c,
+                                            conn_stop,
+                                        )
+                                        .await;
+                                    }
+                                });
                             }
-                            let dial_ep = &eps_clone[ep_cursor % eps_clone.len()];
-                            ep_cursor = ep_cursor.wrapping_add(1);
+                        }
+                    }
+                });
+                tasks.push(jh.abort_handle());
+            }
+        }
+    }
 
-                            let maybe_connected: Result<(BoxStream, ClientSubchannelDialer, Option<tokio::task::AbortHandle>), String> =
-                                if cfg_clone.hysteria2.enabled() {
-                                    match resolve_socket_addrs(&dial_ep.host, dial_ep.port).await {
-                                        Ok(addrs) => {
-                                            let mut last_e = String::from("no hy2 remote addresses");
-                                            let mut ok_res = None;
-                                            for sa in addrs {
-                                                match hysteria2::hy2_connect_session(
-                                                    sa,
-                                                    &cfg_clone,
-                                                    &b_clone,
-                                                    &gw_addr,
-                                                )
-                                                .await
-                                                {
-                                                    Ok(hy2_sess) => {
-                                                        match hy2_sess
-                                                            .open_tcp_stream(
-                                                                b_clone.domain.trim(),
-                                                                mux_proto::PORT_CONTROL,
-                                                            )
-                                                            .await
-                                                        {
-                                                            Ok(ctrl_s) => {
-                                                                let udp_abort = if worker_idx == 0
-                                                                    && hy2_sess.udp_supported
-                                                                {
-                                                                    Some(spawn_hy2_client_udp_responder(
-                                                                        hy2_sess.clone(),
-                                                                        b_clone.clone(),
-                                                                        mappings.clone(),
-                                                                        limiters_clone.clone(),
-                                                                        rx.clone(),
-                                                                    ))
-                                                                } else {
-                                                                    None
-                                                                };
-                                                                let dialer = ClientSubchannelDialer::Hy2(
-                                                                    hy2_sess,
-                                                                    b_clone.clone(),
-                                                                );
-                                                                ok_res = Some((ctrl_s, dialer, udp_abort));
-                                                                break;
-                                                            }
-                                                            Err(e) => last_e = e,
-                                                        }
-                                                    }
-                                                    Err(e) => last_e = e,
+    Ok(ServerTransportHandle {
+        local: local.clone(),
+        bindings: bindings_live,
+        stop_tx,
+        listeners,
+        udp_sockets,
+        quic_endpoints,
+        tasks,
+    })
+}
+
+fn start_server_mapping(
+    m: &Mapping,
+    is_hy2_server: bool,
+    server: &ServerRuntime,
+    traffic: Arc<Traffic>,
+    state_notify: Arc<tokio::sync::Notify>,
+) -> Result<ServerMappingHandle, String> {
+    let net = mapping_net(&m.network).to_string();
+    let host_key = listen_host(&m.listen_host).to_string();
+    let addr = format!("{}:{}", host_key, m.listen_port);
+    let listen_key = (host_key, m.listen_port, net.clone(), is_hy2_server);
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let route = Arc::new(parking_lot::RwLock::new(m.clone()));
+    let rate_bps = bandwidth_bytes(&m.bandwidth_limit).unwrap_or(0) as u64;
+    let up_limiter: LiveLimiter = Arc::new(parking_lot::RwLock::new(BandwidthLimiter::new(rate_bps)));
+    let dn_limiter: LiveLimiter = Arc::new(parking_lot::RwLock::new(BandwidthLimiter::new(rate_bps)));
+
+    if net == "udp" {
+        let sock = bind_udp_with_retry(&addr)
+            .map_err(|e| format!("bind mapping udp {}: {}", addr, e))?;
+        let std_udp = sock.try_clone().map_err(|e| format!("clone udp {}: {}", addr, e))?;
+        let task = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let _ = std_udp.set_nonblocking(true);
+            if let Ok(tokio_udp) = tokio::net::UdpSocket::from_std(std_udp) {
+                let udp_sock = Arc::new(tokio_udp);
+                let sessions_clone = server.sessions.clone();
+                let hy2_sessions_u = server.hy2_sessions.clone();
+                let hy2_routes_u = server.hy2_udp_routes.clone();
+                let hy2_sid_gen = server.hy2_udp_sid_seq.clone();
+                let traffic_clone = traffic.clone();
+                let route_ref = route.clone();
+                let up_lim_ref = up_limiter.clone();
+                let dn_lim_ref = dn_limiter.clone();
+                let mut rx = stop_rx.clone();
+                let jh = handle.spawn(async move {
+                    let mut xudp_base_key = [0u8; 32];
+                    rand::rng().fill_bytes(&mut xudp_base_key);
+                    let mut peer_streams: HashMap<SocketAddr, mpsc::Sender<Vec<u8>>> = HashMap::new();
+                    let mut peer_hy2_sids: HashMap<SocketAddr, (u32, std::time::Instant)> = HashMap::new();
+                    let mut last_target: Option<(String, String, i64)> = None;
+                    let mut hy2_pkt_id: u16 = 0;
+                    let mut next_xudp_sid: u16 = 1;
+                    let mut buf = vec![0u8; 65535];
+                    loop {
+                        tokio::select! {
+                            _ = rx.changed() => break,
+                            recv_res = udp_sock.recv_from(&mut buf) => {
+                                let Ok((n, peer_addr)) = recv_res else { break };
+                                let m_cur = route_ref.read().clone();
+                                let cur_target = (
+                                    m_cur.binding_id.clone(),
+                                    m_cur.target_host.clone(),
+                                    m_cur.target_port,
+                                );
+                                if last_target.as_ref() != Some(&cur_target) {
+                                    peer_streams.clear();
+                                    if !peer_hy2_sids.is_empty() {
+                                        let mut rg = hy2_routes_u.lock().unwrap();
+                                        for (_, (sid, _)) in peer_hy2_sids.drain() {
+                                            rg.remove(&sid);
+                                        }
+                                    }
+                                    last_target = Some(cur_target);
+                                }
+                                if is_hy2_server {
+                                    let hy2_sess_opt = {
+                                        let mut g = hy2_sessions_u.lock().unwrap();
+                                        g.get_mut(&m_cur.binding_id).and_then(|list| {
+                                            list.retain(|x| x.conn.close_reason().is_none());
+                                            list.first().cloned()
+                                        })
+                                    };
+                                    if let Some(hy2_sess) = hy2_sess_opt {
+                                        let now_inst = std::time::Instant::now();
+                                        if peer_hy2_sids.len() >= 1024 && !peer_hy2_sids.contains_key(&peer_addr) {
+                                            let mut expired_sids = Vec::new();
+                                            peer_hy2_sids.retain(|_, (sid, ts)| {
+                                                if now_inst.saturating_duration_since(*ts) < Duration::from_secs(60) {
+                                                    true
+                                                } else {
+                                                    expired_sids.push(*sid);
+                                                    false
                                                 }
-                                            }
-                                            match ok_res {
-                                                Some(v) => Ok(v),
-                                                None => {
-                                                    invalidate_dns_cache(&dial_ep.host, dial_ep.port);
-                                                    Err(last_e)
+                                            });
+                                            if !expired_sids.is_empty() {
+                                                let mut rg = hy2_routes_u.lock().unwrap();
+                                                for sid in expired_sids {
+                                                    rg.remove(&sid);
                                                 }
                                             }
                                         }
-                                        Err(e) => Err(e),
-                                    }
-                                } else {
-                                    dial_client_session(
-                                        dial_ep,
-                                        &eps_clone,
-                                        &cfg_clone,
-                                        &b_clone,
-                                        uuid_bytes,
-                                        &gw_addr,
-                                        enc_cli.clone(),
-                                    )
-                                    .await
-                                    .map(|ctrl_s| {
-                                        let dialer = ClientSubchannelDialer::Vless {
-                                            dial_ep: dial_ep.clone(),
-                                            all_eps: eps_clone.clone(),
-                                            client_cfg: cfg_clone.clone(),
-                                            binding: b_clone.clone(),
-                                            uuid_bytes,
-                                            gw_addr: gw_addr.clone(),
-                                            vless_enc_cli: enc_cli.clone(),
+                                        let sid = match peer_hy2_sids.get_mut(&peer_addr) {
+                                            Some((sid, ts)) => {
+                                                *ts = now_inst;
+                                                *sid
+                                            }
+                                            None => {
+                                                let mut sid = hy2_sid_gen.fetch_add(1, Ordering::Relaxed);
+                                                if sid == 0 {
+                                                    sid = hy2_sid_gen.fetch_add(1, Ordering::Relaxed);
+                                                }
+                                                peer_hy2_sids.insert(peer_addr, (sid, now_inst));
+                                                hy2_routes_u.lock().unwrap().insert(
+                                                    sid,
+                                                    (peer_addr, udp_sock.clone(), m_cur.id.clone(), dn_lim_ref.clone()),
+                                                );
+                                                sid
+                                            }
                                         };
-                                        (ctrl_s, dialer, None)
-                                    })
-                                };
+                                        let cur_up = up_lim_ref.read().clone();
+                                        cur_up.wait(n).await;
+                                        traffic_clone.add(&m_cur.id, n, 0);
+                                        hy2_pkt_id = hy2_pkt_id.wrapping_add(1);
+                                        let target_addr = hysteria2::format_hy2_addr(
+                                            &m_cur.target_host,
+                                            m_cur.target_port as u16,
+                                        );
+                                        let max_dg = hy2_sess.conn.max_datagram_size().unwrap_or(1200);
+                                        for dg in hysteria2::encode_hy2_udp_datagrams(
+                                            sid,
+                                            hy2_pkt_id,
+                                            &target_addr,
+                                            &buf[..n],
+                                            max_dg,
+                                        ) {
+                                            let _ = hy2_sess.conn.send_datagram(dg);
+                                        }
+                                        continue;
+                                    }
+                                }
 
-                            match maybe_connected {
-                                Ok((stream, sub_dialer, hy2_udp_abort)) => {
-                                    let prev_fails = fail_streak;
-                                    fail_streak = 0;
-                                    let (prev_workers, newly_linked) = {
-                                        let mut lg = linked_clone.lock().unwrap();
-                                        let prev = workers_ref.fetch_add(1, Ordering::SeqCst);
-                                        let ins = lg.insert(b_clone.id.clone());
-                                        (prev, ins)
-                                    };
-                                    if (worker_idx == 0 && !ever_connected)
-                                        || (prev_workers == 0 && prev_fails > 0)
+                                if n + 64 > MAX_PAYLOAD {
+                                    continue;
+                                }
+                                let pkt = buf[..n].to_vec();
+                                if let Some(tx) = peer_streams.get(&peer_addr) {
+                                    match tx.try_send(pkt.clone()) {
+                                        Ok(()) => {
+                                            traffic_clone.add(&m_cur.id, n, 0);
+                                            continue;
+                                        }
+                                        Err(mpsc::error::TrySendError::Full(_)) => {
+                                            continue;
+                                        }
+                                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                                            peer_streams.remove(&peer_addr);
+                                        }
+                                    }
+                                }
+                                if peer_streams.len() >= 64 {
+                                    peer_streams.retain(|_, tx| !tx.is_closed());
+                                    if peer_streams.len() >= 4096 {
+                                        continue;
+                                    }
+                                }
+                                let Some(sess) = pick_session(&sessions_clone, &m_cur.binding_id) else { continue };
+                                let Some((stream_id, mut in_rx)) = sess.open_stream() else { continue };
+                                let xudp_sid = next_xudp_sid;
+                                next_xudp_sid = next_xudp_sid.wrapping_add(1).max(1);
+                                let global_id = mux_proto::compute_xudp_global_id(peer_addr, &xudp_base_key);
+                                let (pkt_tx, mut pkt_rx) = mpsc::channel::<Vec<u8>>(256);
+                                let _ = pkt_tx.try_send(pkt);
+                                traffic_clone.add(&m_cur.id, n, 0);
+                                peer_streams.insert(peer_addr, pkt_tx);
+                                let m_clone = m_cur;
+                                let udp_reply = udp_sock.clone();
+                                let traffic_down = traffic_clone.clone();
+                                let up_lim = up_lim_ref.clone();
+                                let dn_lim = dn_lim_ref.clone();
+                                tokio::spawn(async move {
+                                    let meta = format!("{}\0udp\0", m_clone.target_host);
+                                    let mut open_payload = Vec::with_capacity(2 + meta.len());
+                                    open_payload.extend_from_slice(&(m_clone.target_port as u16).to_be_bytes());
+                                    open_payload.extend_from_slice(meta.as_bytes());
+                                    sess.maybe_probe_on_open();
+                                    if sess
+                                        .sender
+                                        .send_ctrl(FRAME_OPEN, stream_id, open_payload)
+                                        .await
+                                        .is_err()
                                     {
-                                        ever_connected = true;
-                                        log_tunnel(
-                                            &log_c,
-                                            "INFO",
-                                            format!(
-                                                "client tunnel connected role=client id={} node_id={} network={} addr={} port={}",
-                                                b_clone.id,
-                                                b_clone.server_id,
-                                                cfg_clone.effective_protocol(),
-                                                dial_ep.host,
-                                                dial_ep.port
-                                            ),
-                                        );
+                                        sess.close_stream(stream_id);
+                                        return;
                                     }
-                                    if newly_linked {
-                                        notify_clone.notify_waiters();
-                                    }
-                                    let (ctrl_tx, ctrl_rx) =
-                                        mpsc::channel::<(u8, u32, Vec<u8>)>(SESSION_CTRL_CHAN_CAP);
-                                    let (data_tx, data_rx) =
-                                        mpsc::channel::<(u8, u32, Vec<u8>)>(SESSION_DATA_CHAN_CAP);
-                                    let sender = SessionSender::new(ctrl_tx, data_tx);
-                                    let last_rx_ms = Arc::new(AtomicU64::new(mono_now_ms()));
-                                    let streams_map: Arc<
-                                        Mutex<HashMap<u32, mpsc::Sender<(u8, Vec<u8>)>>>,
-                                    > = Arc::new(Mutex::new(HashMap::new()));
-                                    let (mut rd, wr) = split_tunnel_stream(stream);
-                                    let (write_done_tx, mut write_done_rx) = watch::channel(false);
-                                    let write_task = spawn_session_writer(
-                                        wr,
-                                        ctrl_rx,
-                                        data_rx,
-                                        last_rx_ms.clone(),
-                                        rx.clone(),
-                                        None,
-                                        write_done_tx,
-                                    );
-                                    let sender_ping = sender.clone();
-                                    let ping_task = tokio::spawn(async move {
-                                        let mut ping_interval = tokio::time::interval(PING_INTERVAL);
-                                        ping_interval.set_missed_tick_behavior(
-                                            tokio::time::MissedTickBehavior::Delay,
-                                        );
-                                        ping_interval.tick().await;
-                                        loop {
-                                            ping_interval.tick().await;
-                                            if sender_ping
-                                                .send_ctrl(FRAME_PING, 0, Vec::new())
+                                    let sender_up = sess.sender.clone();
+                                    let target_host = m_clone.target_host.clone();
+                                    let target_port = m_clone.target_port as u16;
+                                    let up_task = tokio::spawn(async move {
+                                        let mut sent_new = false;
+                                        while let Some(dg) = pkt_rx.recv().await {
+                                            let cur_up = up_lim.read().clone();
+                                            cur_up.wait(dg.len()).await;
+                                            let xudp = if !sent_new {
+                                                sent_new = true;
+                                                let Ok(f) = mux_proto::encode_xudp_new(
+                                                    xudp_sid,
+                                                    &target_host,
+                                                    target_port,
+                                                    &dg,
+                                                    Some(global_id),
+                                                ) else {
+                                                    break;
+                                                };
+                                                f
+                                            } else {
+                                                mux_proto::encode_xudp_keep(xudp_sid, &dg)
+                                            };
+                                            if xudp.len() > MAX_PAYLOAD {
+                                                continue;
+                                            }
+                                            if sender_up
+                                                .send_data(FRAME_DATA, stream_id, xudp)
                                                 .await
                                                 .is_err()
                                             {
                                                 break;
                                             }
                                         }
+                                        let end_f = mux_proto::encode_xudp_end(xudp_sid);
+                                        let _ = sender_up.send_data(FRAME_DATA, stream_id, end_f).await;
                                     });
                                     loop {
-                                        tokio::select! {
-                                            _ = rx.changed() => break,
-                                            _ = write_done_rx.changed() => break,
-                                            frame = tokio::time::timeout(SESSION_READ_TIMEOUT, read_frame(&mut rd)) => {
-                                                let Ok(Ok((kind, id, payload))) = frame else { break };
-                                                last_rx_ms.store(mono_now_ms(), Ordering::Relaxed);
-                                                match kind {
-                                                    FRAME_PING => {
-                                                        sender.send_ctrl_bg(FRAME_PONG, 0, Vec::new());
-                                                    }
-                                                    FRAME_PONG => {}
-                                                    FRAME_DIAL_APP => {
-                                                        handle_client_dial_app(
-                                                            id,
-                                                            payload,
-                                                            &b_clone,
-                                                            &mappings,
-                                                            &limiters_clone,
-                                                            &sender,
-                                                            sub_dialer.clone(),
-                                                        );
-                                                    }
-                                                    FRAME_DIAL_MUX => {
-                                                        handle_client_dial_mux(
-                                                            payload,
-                                                            &b_clone,
-                                                            &mappings,
-                                                            &limiters_clone,
-                                                            sub_dialer.clone(),
-                                                            rx.clone(),
-                                                        );
-                                                    }
-                                                    FRAME_OPEN => {
-                                                        handle_client_frame_open(
-                                                            id,
-                                                            payload,
-                                                            &b_clone,
-                                                            &mappings,
-                                                            &limiters_clone,
-                                                            &sender,
-                                                            &streams_map,
-                                                        );
-                                                    }
-                                                    FRAME_DATA | FRAME_HALF | FRAME_RESET => {
-                                                        demux_stream_frame(
-                                                            kind,
-                                                            id,
-                                                            payload,
-                                                            &streams_map,
-                                                            None,
-                                                            &sender,
-                                                        )
-                                                        .await;
-                                                    }
-                                                    _ => break,
+                                        match tokio::time::timeout(Duration::from_secs(30), in_rx.recv()).await {
+                                            Ok(Some((FRAME_DATA, data))) => {
+                                                let Ok(dec) = mux_proto::decode_xudp_packet(&data) else {
+                                                    break;
+                                                };
+                                                if dec.status == mux_proto::XUDP_STATUS_END {
+                                                    break;
                                                 }
+                                                if !dec.payload.is_empty() {
+                                                    let cur_dn = dn_lim.read().clone();
+                                                    cur_dn.wait(dec.payload.len()).await;
+                                                    traffic_down.add(&m_clone.id, 0, dec.payload.len());
+                                                    let _ = udp_reply.send_to(dec.payload, peer_addr).await;
+                                                }
+                                            }
+                                            _ => break,
+                                        }
+                                    }
+                                    up_task.abort();
+                                    sess.close_stream(stream_id);
+                                    sess.sender.send_ctrl_bg(FRAME_RESET, stream_id, Vec::new());
+                                });
+                            }
+                        }
+                    }
+                });
+                Some(jh.abort_handle())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Ok(ServerMappingHandle {
+            listen_key,
+            route,
+            up_limiter,
+            dn_limiter,
+            raw_limit: m.bandwidth_limit.clone(),
+            stop_tx,
+            listener: None,
+            udp_socket: Some(sock),
+            task,
+        })
+    } else {
+        let ln = bind_tcp_with_retry(&addr)
+            .map_err(|e| format!("bind mapping tcp {}: {}", addr, e))?;
+        let std_ln = ln.try_clone().map_err(|e| format!("clone tcp {}: {}", addr, e))?;
+        let task = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let _ = std_ln.set_nonblocking(true);
+            if let Ok(tokio_ln) = TcpListener::from_std(std_ln) {
+                let sessions_clone = server.sessions.clone();
+                let pending_apps_c = server.pending_apps.clone();
+                let mux_pool_c = server.mux_pool.clone();
+                let mux_notify_c = server.mux_notify.clone();
+                let app_seq_c = server.app_req_seq.clone();
+                let traffic_clone = traffic.clone();
+                let notify_map = state_notify.clone();
+                let route_ref = route.clone();
+                let up_lim_ref = up_limiter.clone();
+                let dn_lim_ref = dn_limiter.clone();
+                let mut rx = stop_rx.clone();
+                let jh = handle.spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = rx.changed() => break,
+                            accepted = tokio_ln.accept() => {
+                                let Ok((pub_stream, _)) = accepted else { break };
+                                configure_tcp_stream(&pub_stream);
+                                let m_clone = route_ref.read().clone();
+                                let mux_t = m_clone.effective_mux_type().unwrap_or_default();
+                                let sessions_req = sessions_clone.clone();
+                                let pa_req = pending_apps_c.clone();
+                                let mp_req = mux_pool_c.clone();
+                                let mn_req = mux_notify_c.clone();
+                                let seq_req = app_seq_c.clone();
+                                let notify_req = notify_map.clone();
+                                let mut stop_req = rx.clone();
+                                let traffic_conn = traffic_clone.clone();
+                                let up_lim = up_lim_ref.clone();
+                                let dn_lim = dn_lim_ref.clone();
+                                tokio::spawn(async move {
+                                    let mut sess_opt = pick_session(&sessions_req, &m_clone.binding_id);
+                                    if sess_opt.is_none() {
+                                        let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+                                        while tokio::time::Instant::now() < deadline {
+                                            let notified = notify_req.notified();
+                                            tokio::select! {
+                                                _ = stop_req.changed() => return,
+                                                _ = notified => {}
+                                                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                                            }
+                                            sess_opt = pick_session(&sessions_req, &m_clone.binding_id);
+                                            if sess_opt.is_some() {
+                                                break;
                                             }
                                         }
                                     }
-                                    if let Some(ab) = hy2_udp_abort {
-                                        ab.abort();
-                                    }
-                                    ping_task.abort();
-                                    write_task.abort();
-                                    drop(sender);
-                                    streams_map.lock().unwrap().clear();
-                                    let (rem_workers, unlinked) = {
-                                        let mut lg = linked_clone.lock().unwrap();
-                                        let prev = workers_ref.fetch_sub(1, Ordering::SeqCst);
-                                        let rem = prev.saturating_sub(1);
-                                        let unl = if rem == 0 {
-                                            lg.remove(&b_clone.id)
-                                        } else {
-                                            false
+                                    let Some(sess) = sess_opt else { return };
+                                    sess.maybe_probe_on_open();
+
+                                    let remote_stream: BoxStream = if mux_t.is_empty() {
+                                        let mut req_id = seq_req.fetch_add(1, Ordering::Relaxed);
+                                        if req_id == 0 {
+                                            req_id = seq_req.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        let (tx, rx_app) = tokio::sync::oneshot::channel();
+                                        pa_req
+                                            .lock()
+                                            .unwrap()
+                                            .insert((m_clone.binding_id.clone(), req_id), tx);
+                                        let mut dial_payload = Vec::with_capacity(2 + m_clone.target_host.len());
+                                        dial_payload.extend_from_slice(&(m_clone.target_port as u16).to_be_bytes());
+                                        dial_payload.extend_from_slice(m_clone.target_host.as_bytes());
+                                        if sess
+                                            .sender
+                                            .send_ctrl(FRAME_DIAL_APP, req_id, dial_payload)
+                                            .await
+                                            .is_err()
+                                        {
+                                            pa_req
+                                                .lock()
+                                                .unwrap()
+                                                .remove(&(m_clone.binding_id.clone(), req_id));
+                                            return;
+                                        }
+                                        match tokio::select! {
+                                            _ = stop_req.changed() => Err(()),
+                                            res = tokio::time::timeout(Duration::from_secs(8), rx_app) => {
+                                                res.map_err(|_| ()).and_then(|r| r.map_err(|_| ()))
+                                            }
+                                        } {
+                                            Ok(s) => s,
+                                            Err(()) => {
+                                                pa_req
+                                                    .lock()
+                                                    .unwrap()
+                                                    .remove(&(m_clone.binding_id.clone(), req_id));
+                                                return;
+                                            }
+                                        }
+                                    } else {
+                                        let desired_pool = m_clone.pool.clamp(1, 16) as usize;
+                                        let Some(opener) = acquire_mux_opener(
+                                            &mp_req,
+                                            &mn_req,
+                                            &sess,
+                                            &m_clone.binding_id,
+                                            &mux_t,
+                                            desired_pool,
+                                            &mut stop_req,
+                                        )
+                                        .await
+                                        else {
+                                            return;
                                         };
-                                        (rem, unl)
+                                        match opener
+                                            .open_tcp_substream(
+                                                &m_clone.target_host,
+                                                m_clone.target_port as u16,
+                                            )
+                                            .await
+                                        {
+                                            Ok(sub) => sub,
+                                            Err(_) => {
+                                                {
+                                                    let mut g = mp_req.lock().unwrap();
+                                                    if let Some(list) = g.get_mut(&(
+                                                        m_clone.binding_id.clone(),
+                                                        mux_t.clone(),
+                                                    )) {
+                                                        list.retain(|o| !Arc::ptr_eq(o, &opener) && !o.is_closed());
+                                                    }
+                                                }
+                                                let Some(retry_op) = acquire_mux_opener(
+                                                    &mp_req,
+                                                    &mn_req,
+                                                    &sess,
+                                                    &m_clone.binding_id,
+                                                    &mux_t,
+                                                    desired_pool,
+                                                    &mut stop_req,
+                                                )
+                                                .await
+                                                else {
+                                                    return;
+                                                };
+                                                match retry_op
+                                                    .open_tcp_substream(
+                                                        &m_clone.target_host,
+                                                        m_clone.target_port as u16,
+                                                    )
+                                                    .await
+                                                {
+                                                    Ok(sub) => sub,
+                                                    Err(_) => return,
+                                                }
+                                            }
+                                        }
                                     };
-                                    if unlinked {
-                                        notify_clone.notify_waiters();
-                                    }
-                                    if rem_workers == 0 && !*rx.borrow() {
-                                        log_tunnel(
-                                            &log_c,
-                                            "INFO",
-                                            format!(
-                                                "client tunnel session closed; reconnecting role=client id={} node_id={}",
-                                                b_clone.id, b_clone.server_id
-                                            ),
-                                        );
-                                    }
-                                }
-                                Err(err) => {
-                                    fail_streak = fail_streak.saturating_add(1);
-                                    if worker_idx == 0 && (fail_streak == 1 || fail_streak % 10 == 0) {
-                                        log_tunnel(
-                                            &log_c,
-                                            "WARN",
-                                            format!(
-                                                "client tunnel connection failed; backing off role=client id={} node_id={} attempt={} network={} addr={} port={} err={}",
-                                                b_clone.id,
-                                                b_clone.server_id,
-                                                fail_streak,
-                                                cfg_clone.effective_protocol(),
-                                                dial_ep.host,
-                                                dial_ep.port,
-                                                err
-                                            ),
-                                        );
-                                    }
-                                }
-                            }
-                            let retry_delay = if fail_streak <= eps_clone.len() as u32 {
-                                Duration::from_millis(50)
-                            } else {
-                                let exp = (fail_streak - eps_clone.len() as u32).min(6);
-                                Duration::from_millis((50u64 << exp).min(5000))
-                            };
-                            tokio::select! {
-                                _ = rx.changed() => break,
-                                _ = tokio::time::sleep(retry_delay) => {}
+
+                                    relay_raw_streams_gateway(
+                                        pub_stream,
+                                        remote_stream,
+                                        up_lim,
+                                        dn_lim,
+                                        traffic_conn,
+                                        &m_clone.id,
+                                    )
+                                    .await;
+                                });
                             }
                         }
-                    });
-                    tasks.push(jh.abort_handle());
-                }
+                    }
+                });
+                Some(jh.abort_handle())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Ok(ServerMappingHandle {
+            listen_key,
+            route,
+            up_limiter,
+            dn_limiter,
+            raw_limit: m.bandwidth_limit.clone(),
+            stop_tx,
+            listener: Some(ln),
+            udp_socket: None,
+            task,
+        })
+    }
+}
+
+fn reconcile_server(
+    inst: &mut RunningInstance,
+    s: &Snapshot,
+    local: &LocalTLS,
+    traffic: Arc<Traffic>,
+    state_notify: Arc<tokio::sync::Notify>,
+    logger: TunnelLogger,
+) -> Result<(), String> {
+    let need_transport = !s.node.disabled && !s.bindings.is_empty();
+    let keep_bids: HashSet<String> = if need_transport {
+        s.bindings.iter().map(|b| b.id.clone()).collect()
+    } else {
+        HashSet::new()
+    };
+
+    // 1. Reconcile transport core ONLY if transport config changed or toggled on/off.
+    let reuse_transport = need_transport
+        && inst
+            .server
+            .transport
+            .as_ref()
+            .is_some_and(|t| t.local == *local);
+    if reuse_transport {
+        if let Some(ref th) = inst.server.transport {
+            *th.bindings.write() = s.bindings.clone();
+        }
+        inst.server
+            .evict_removed_bindings(&keep_bids, &inst.linked, &state_notify);
+    } else {
+        if let Some(mut old_t) = inst.server.transport.take() {
+            old_t.stop();
+        }
+        let empty = HashSet::new();
+        inst.server
+            .evict_removed_bindings(&empty, &inst.linked, &state_notify);
+        if need_transport {
+            let th = start_server_transport(
+                &s.bindings,
+                local,
+                &inst.server,
+                traffic.clone(),
+                inst.linked.clone(),
+                state_notify.clone(),
+                logger,
+            )?;
+            inst.server.transport = Some(th);
+        }
+    }
+
+    // 2. Reconcile per-mapping listeners in complete isolation (keyed by mapping.id).
+    let is_hy2_server = local.hysteria2.enabled();
+    let mut desired: HashMap<String, &Mapping> = HashMap::new();
+    if !s.node.disabled {
+        for m in &s.mappings {
+            if m.enabled {
+                desired.insert(m.id.clone(), m);
             }
         }
     }
 
-    Ok(RunningInstance {
+    let mut to_stop_ids = Vec::new();
+    for (mid, existing) in &inst.server.mappings {
+        match desired.get(mid) {
+            Some(m) => {
+                let key = (
+                    listen_host(&m.listen_host).to_string(),
+                    m.listen_port,
+                    mapping_net(&m.network).to_string(),
+                    is_hy2_server,
+                );
+                if existing.listen_key != key {
+                    to_stop_ids.push(mid.clone());
+                }
+            }
+            None => to_stop_ids.push(mid.clone()),
+        }
+    }
+    for mid in &to_stop_ids {
+        if let Some(mut mh) = inst.server.mappings.remove(mid) {
+            mh.stop();
+        }
+        inst.server
+            .hy2_udp_routes
+            .lock()
+            .unwrap()
+            .retain(|_, (_, _, route_mid, _)| route_mid != mid);
+    }
+
+    // Update kept mappings in-place (zero listener drop; live rate-limit & target updates)
+    for (mid, mh) in inst.server.mappings.iter_mut() {
+        if let Some(m) = desired.get(mid) {
+            *mh.route.write() = (*m).clone();
+            if mh.raw_limit != m.bandwidth_limit {
+                let rate_bps = bandwidth_bytes(&m.bandwidth_limit).unwrap_or(0) as u64;
+                *mh.up_limiter.write() = BandwidthLimiter::new(rate_bps);
+                *mh.dn_limiter.write() = BandwidthLimiter::new(rate_bps);
+                mh.raw_limit = m.bandwidth_limit.clone();
+            }
+        }
+    }
+
+    // Bind & spawn ONLY newly added or rebound mappings
+    let mut started_new = Vec::new();
+    for m in &s.mappings {
+        if s.node.disabled || !m.enabled || inst.server.mappings.contains_key(&m.id) {
+            continue;
+        }
+        match start_server_mapping(m, is_hy2_server, &inst.server, traffic.clone(), state_notify.clone()) {
+            Ok(mh) => {
+                started_new.push(m.id.clone());
+                inst.server.mappings.insert(m.id.clone(), mh);
+            }
+            Err(err) => {
+                for new_id in started_new {
+                    if let Some(mut mh) = inst.server.mappings.remove(&new_id) {
+                        mh.stop();
+                    }
+                }
+                return Err(err);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_client_worker(
+    handle: &tokio::runtime::Handle,
+    worker_idx: usize,
+    spec: &ClientBindingSpec,
+    vless_enc_cli: Option<Arc<vless_enc::ClientInstance>>,
+    shared: Arc<ClientSharedTable>,
+    active_workers: Arc<AtomicUsize>,
+    linked: Arc<Mutex<HashSet<String>>>,
+    state_notify: Arc<tokio::sync::Notify>,
+    logger: TunnelLogger,
+) -> ClientWorkerHandle {
+    let (stop_tx, mut rx) = watch::channel(false);
+    let b_clone = spec.binding.clone();
+    let eps_clone = spec.eps.clone();
+    let cfg_clone = spec.client_cfg.clone();
+    let gw_addr = spec.gw_addr.clone();
+    let enc_cli = vless_enc_cli;
+    let workers_ref = active_workers;
+    let linked_clone = linked;
+    let notify_clone = state_notify;
+    let log_c = logger;
+
+    let jh = handle.spawn(async move {
+        let Ok(uuid_bytes) = parse_uuid(&b_clone.uuid) else { return };
+        let mut ep_cursor = worker_idx;
+        let mut fail_streak = 0u32;
+        let mut ever_connected = false;
+        loop {
+            if *rx.borrow() {
+                break;
+            }
+            let dial_ep = &eps_clone[ep_cursor % eps_clone.len()];
+            ep_cursor = ep_cursor.wrapping_add(1);
+
+            let maybe_connected: Result<
+                (BoxStream, ClientSubchannelDialer, Option<tokio::task::AbortHandle>),
+                String,
+            > = if cfg_clone.hysteria2.enabled() {
+                match resolve_socket_addrs(&dial_ep.host, dial_ep.port).await {
+                    Ok(addrs) => {
+                        let mut last_e = String::from("no hy2 remote addresses");
+                        let mut ok_res = None;
+                        for sa in addrs {
+                            match hysteria2::hy2_connect_session(sa, &cfg_clone, &b_clone, &gw_addr)
+                                .await
+                            {
+                                Ok(hy2_sess) => {
+                                    match hy2_sess
+                                        .open_tcp_stream(
+                                            b_clone.domain.trim(),
+                                            mux_proto::PORT_CONTROL,
+                                        )
+                                        .await
+                                    {
+                                        Ok(ctrl_s) => {
+                                            let udp_abort =
+                                                if hy2_sess.udp_supported {
+                                                    Some(spawn_hy2_client_udp_responder(
+                                                        hy2_sess.clone(),
+                                                        b_clone.clone(),
+                                                        shared.clone(),
+                                                        rx.clone(),
+                                                    ))
+                                                } else {
+                                                    None
+                                                };
+                                            let dialer = ClientSubchannelDialer::Hy2(
+                                                hy2_sess,
+                                                b_clone.clone(),
+                                            );
+                                            ok_res = Some((ctrl_s, dialer, udp_abort));
+                                            break;
+                                        }
+                                        Err(e) => last_e = e,
+                                    }
+                                }
+                                Err(e) => last_e = e,
+                            }
+                        }
+                        match ok_res {
+                            Some(v) => Ok(v),
+                            None => {
+                                invalidate_dns_cache(&dial_ep.host, dial_ep.port);
+                                Err(last_e)
+                            }
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                dial_client_session(
+                    dial_ep,
+                    &eps_clone,
+                    &cfg_clone,
+                    &b_clone,
+                    uuid_bytes,
+                    &gw_addr,
+                    enc_cli.clone(),
+                )
+                .await
+                .map(|ctrl_s| {
+                    let dialer = ClientSubchannelDialer::Vless {
+                        dial_ep: dial_ep.clone(),
+                        all_eps: eps_clone.clone(),
+                        client_cfg: cfg_clone.clone(),
+                        binding: b_clone.clone(),
+                        uuid_bytes,
+                        gw_addr: gw_addr.clone(),
+                        vless_enc_cli: enc_cli.clone(),
+                    };
+                    (ctrl_s, dialer, None)
+                })
+            };
+
+            match maybe_connected {
+                Ok((stream, sub_dialer, hy2_udp_abort)) => {
+                    let prev_fails = fail_streak;
+                    fail_streak = 0;
+                    let (prev_workers, newly_linked) = {
+                        let mut lg = linked_clone.lock().unwrap();
+                        let prev = workers_ref.fetch_add(1, Ordering::SeqCst);
+                        let ins = lg.insert(b_clone.id.clone());
+                        (prev, ins)
+                    };
+                    if (worker_idx == 0 && !ever_connected)
+                        || (prev_workers == 0 && prev_fails > 0)
+                    {
+                        ever_connected = true;
+                        log_tunnel(
+                            &log_c,
+                            "INFO",
+                            format!(
+                                "client tunnel connected role=client id={} node_id={} network={} addr={} port={}",
+                                b_clone.id,
+                                b_clone.server_id,
+                                cfg_clone.effective_protocol(),
+                                dial_ep.host,
+                                dial_ep.port
+                            ),
+                        );
+                    }
+                    if newly_linked {
+                        notify_clone.notify_waiters();
+                    }
+                    let (ctrl_tx, ctrl_rx) =
+                        mpsc::channel::<(u8, u32, Vec<u8>)>(SESSION_CTRL_CHAN_CAP);
+                    let (data_tx, data_rx) =
+                        mpsc::channel::<(u8, u32, Vec<u8>)>(SESSION_DATA_CHAN_CAP);
+                    let sender = SessionSender::new(ctrl_tx, data_tx);
+                    let last_rx_ms = Arc::new(AtomicU64::new(mono_now_ms()));
+                    let streams_map: Arc<Mutex<HashMap<u32, mpsc::Sender<(u8, Vec<u8>)>>>> =
+                        Arc::new(Mutex::new(HashMap::new()));
+                    let (mut rd, wr) = split_tunnel_stream(stream);
+                    let (write_done_tx, mut write_done_rx) = watch::channel(false);
+                    let write_task = spawn_session_writer(
+                        wr,
+                        ctrl_rx,
+                        data_rx,
+                        last_rx_ms.clone(),
+                        rx.clone(),
+                        None,
+                        write_done_tx,
+                    );
+                    let sender_ping = sender.clone();
+                    let ping_task = tokio::spawn(async move {
+                        let mut ping_interval = tokio::time::interval(PING_INTERVAL);
+                        ping_interval
+                            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        ping_interval.tick().await;
+                        loop {
+                            ping_interval.tick().await;
+                            if sender_ping
+                                .send_ctrl(FRAME_PING, 0, Vec::new())
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                    loop {
+                        tokio::select! {
+                            _ = rx.changed() => break,
+                            _ = write_done_rx.changed() => break,
+                            frame = tokio::time::timeout(SESSION_READ_TIMEOUT, read_frame(&mut rd)) => {
+                                let Ok(Ok((kind, id, payload))) = frame else { break };
+                                last_rx_ms.store(mono_now_ms(), Ordering::Relaxed);
+                                match kind {
+                                    FRAME_PING => {
+                                        sender.send_ctrl_bg(FRAME_PONG, 0, Vec::new());
+                                    }
+                                    FRAME_PONG => {}
+                                    FRAME_DIAL_APP => {
+                                        handle_client_dial_app(
+                                            id,
+                                            payload,
+                                            &b_clone,
+                                            &shared,
+                                            &sender,
+                                            sub_dialer.clone(),
+                                        );
+                                    }
+                                    FRAME_DIAL_MUX => {
+                                        handle_client_dial_mux(
+                                            payload,
+                                            &b_clone,
+                                            &shared,
+                                            sub_dialer.clone(),
+                                            rx.clone(),
+                                        );
+                                    }
+                                    FRAME_OPEN => {
+                                        handle_client_frame_open(
+                                            id,
+                                            payload,
+                                            &b_clone,
+                                            &shared,
+                                            &sender,
+                                            &streams_map,
+                                        );
+                                    }
+                                    FRAME_DATA | FRAME_HALF | FRAME_RESET => {
+                                        demux_stream_frame(
+                                            kind,
+                                            id,
+                                            payload,
+                                            &streams_map,
+                                            None,
+                                            &sender,
+                                        )
+                                        .await;
+                                    }
+                                    _ => break,
+                                }
+                            }
+                        }
+                    }
+                    if let Some(ab) = hy2_udp_abort {
+                        ab.abort();
+                    }
+                    ping_task.abort();
+                    write_task.abort();
+                    drop(sender);
+                    streams_map.lock().unwrap().clear();
+                    let (rem_workers, unlinked) = {
+                        let mut lg = linked_clone.lock().unwrap();
+                        let prev = workers_ref.fetch_sub(1, Ordering::SeqCst);
+                        let rem = prev.saturating_sub(1);
+                        let unl = if rem == 0 {
+                            lg.remove(&b_clone.id)
+                        } else {
+                            false
+                        };
+                        (rem, unl)
+                    };
+                    if unlinked {
+                        notify_clone.notify_waiters();
+                    }
+                    if rem_workers == 0 && !*rx.borrow() {
+                        log_tunnel(
+                            &log_c,
+                            "INFO",
+                            format!(
+                                "client tunnel session closed; reconnecting role=client id={} node_id={}",
+                                b_clone.id, b_clone.server_id
+                            ),
+                        );
+                    }
+                }
+                Err(err) => {
+                    fail_streak = fail_streak.saturating_add(1);
+                    if worker_idx == 0 && (fail_streak == 1 || fail_streak % 10 == 0) {
+                        log_tunnel(
+                            &log_c,
+                            "WARN",
+                            format!(
+                                "client tunnel connection failed; backing off role=client id={} node_id={} attempt={} network={} addr={} port={} err={}",
+                                b_clone.id,
+                                b_clone.server_id,
+                                fail_streak,
+                                cfg_clone.effective_protocol(),
+                                dial_ep.host,
+                                dial_ep.port,
+                                err
+                            ),
+                        );
+                    }
+                }
+            }
+            let retry_delay = if fail_streak <= eps_clone.len() as u32 {
+                Duration::from_millis(50)
+            } else {
+                let exp = (fail_streak - eps_clone.len() as u32).min(6);
+                Duration::from_millis((50u64 << exp).min(5000))
+            };
+            tokio::select! {
+                _ = rx.changed() => break,
+                _ = tokio::time::sleep(retry_delay) => {}
+            }
+        }
+    });
+
+    ClientWorkerHandle {
         stop_tx,
-        linked,
-        listeners,
-        udp_sockets,
-        quic_endpoints,
-        tasks,
-    })
+        abort: jh.abort_handle(),
+    }
+}
+
+fn reconcile_client(
+    inst: &mut RunningInstance,
+    s: &Snapshot,
+    local: &LocalTLS,
+    state_notify: Arc<tokio::sync::Notify>,
+    logger: TunnelLogger,
+) -> Result<(), String> {
+    if s.node.disabled || s.bindings.is_empty() {
+        inst.client.stop_all(&inst.linked, &state_notify);
+        return Ok(());
+    }
+
+    // Atomically refresh dynamic mapping routing & bandwidth limiters in-place
+    // so existing tunnel sessions and active streams never drop!
+    inst.client.shared.sync(&s.mappings);
+
+    let mut desired: HashMap<String, (ClientBindingSpec, usize)> = HashMap::new();
+    for b in &s.bindings {
+        let Some(gw) = s.nodes.iter().find(|n| n.id == b.server_id).cloned() else {
+            continue;
+        };
+        let Ok(bound_gw) = binding_gateway(gw, b) else {
+            continue;
+        };
+        let eps = enabled_endpoints(&bound_gw);
+        if eps.is_empty() {
+            continue;
+        }
+        let Ok(client_cfg) = gateway_client_config(local, &bound_gw) else {
+            continue;
+        };
+        let pool_count = s
+            .mappings
+            .iter()
+            .filter(|m| m.enabled && m.binding_id == b.id)
+            .map(|m| m.pool.clamp(1, 32) as usize)
+            .max()
+            .unwrap_or(1);
+        desired.insert(
+            b.id.clone(),
+            (
+                ClientBindingSpec {
+                    binding: b.clone(),
+                    eps,
+                    client_cfg,
+                    gw_addr: bound_gw.address.clone(),
+                },
+                pool_count,
+            ),
+        );
+    }
+
+    // Stop ONLY removed bindings or bindings whose server transport config changed
+    let mut to_stop = Vec::new();
+    for (bid, grp) in &inst.client.groups {
+        match desired.get(bid) {
+            Some((spec, _)) if &grp.spec == spec => {}
+            _ => to_stop.push(bid.clone()),
+        }
+    }
+    for bid in to_stop {
+        if let Some(mut grp) = inst.client.groups.remove(&bid) {
+            grp.stop_all(&inst.linked, &state_notify);
+        }
+    }
+
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return Ok(());
+    };
+
+    for (bid, (spec, pool_count)) in desired {
+        if let Some(grp) = inst.client.groups.get_mut(&bid) {
+            let cur_len = grp.workers.len();
+            if pool_count > cur_len {
+                for worker_idx in cur_len..pool_count {
+                    let w = spawn_client_worker(
+                        &handle,
+                        worker_idx,
+                        &grp.spec,
+                        grp.vless_enc_cli.clone(),
+                        inst.client.shared.clone(),
+                        grp.active_workers.clone(),
+                        inst.linked.clone(),
+                        state_notify.clone(),
+                        logger.clone(),
+                    );
+                    grp.workers.push(w);
+                }
+            } else if pool_count < cur_len {
+                // Gracefully signal surplus workers to exit so active_workers decrements cleanly
+                // while keeping workers 0..pool_count continuously connected!
+                for w in grp.workers.drain(pool_count..) {
+                    let _ = w.stop_tx.send(true);
+                }
+            }
+        } else {
+            let vless_enc_cli = vless_enc::ClientInstance::from_raw(&spec.client_cfg.encryption)?;
+            let active_workers = Arc::new(AtomicUsize::new(0));
+            let mut workers = Vec::with_capacity(pool_count);
+            for worker_idx in 0..pool_count {
+                workers.push(spawn_client_worker(
+                    &handle,
+                    worker_idx,
+                    &spec,
+                    vless_enc_cli.clone(),
+                    inst.client.shared.clone(),
+                    active_workers.clone(),
+                    inst.linked.clone(),
+                    state_notify.clone(),
+                    logger.clone(),
+                ));
+            }
+            inst.client.groups.insert(
+                bid,
+                ClientBindingGroup {
+                    spec,
+                    vless_enc_cli,
+                    active_workers,
+                    workers,
+                },
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn reconcile_instance(
+    inst: &mut RunningInstance,
+    s: &Snapshot,
+    local: &LocalTLS,
+    traffic: Arc<Traffic>,
+    state_notify: Arc<tokio::sync::Notify>,
+    logger: TunnelLogger,
+) -> Result<(), String> {
+    validate(s, local)?;
+    if s.node.role == "server" {
+        reconcile_server(inst, s, local, traffic, state_notify, logger)
+    } else if s.node.role == "client" {
+        reconcile_client(inst, s, local, state_notify, logger)
+    } else {
+        Ok(())
+    }
 }
 
 fn dns_cache_map(
@@ -5065,7 +5728,8 @@ async fn acquire_mux_opener(
 async fn relay_raw_streams_gateway(
     pub_stream: TcpStream,
     remote_stream: BoxStream,
-    up_lim: Arc<BandwidthLimiter>,
+    up_lim: LiveLimiter,
+    dn_lim: LiveLimiter,
     traffic: Arc<Traffic>,
     mapping_id: &str,
 ) {
@@ -5079,10 +5743,11 @@ async fn relay_raw_streams_gateway(
     let t_up = traffic.clone();
     let mid_up = mapping_id.to_string();
     let up_fut = async move {
-        let read_cap = up_lim.read_size(32768);
-        let mut buf = vec![0u8; read_cap];
+        let mut buf = vec![0u8; 32768];
         loop {
-            match tokio::time::timeout(Duration::from_secs(15), pr.read(&mut buf)).await {
+            let cur_lim = up_lim.read().clone();
+            let read_cap = cur_lim.read_size(buf.len());
+            match tokio::time::timeout(Duration::from_secs(15), pr.read(&mut buf[..read_cap])).await {
                 Ok(Ok(0)) => {
                     up_half.store(true, Ordering::Relaxed);
                     let _ = rw.shutdown().await;
@@ -5090,7 +5755,7 @@ async fn relay_raw_streams_gateway(
                 }
                 Ok(Ok(n)) => {
                     up_active.store(mono_now_ms(), Ordering::Relaxed);
-                    up_lim.wait(n).await;
+                    cur_lim.wait(n).await;
                     t_up.add(&mid_up, n, 0);
                     if tokio::time::timeout(STREAM_SOCKET_WRITE_TIMEOUT, async {
                         rw.write_all(&buf[..n]).await?;
@@ -5123,7 +5788,9 @@ async fn relay_raw_streams_gateway(
     let dn_fut = async move {
         let mut buf = vec![0u8; 32768];
         loop {
-            match tokio::time::timeout(Duration::from_secs(15), rr.read(&mut buf)).await {
+            let cur_lim = dn_lim.read().clone();
+            let read_cap = cur_lim.read_size(buf.len());
+            match tokio::time::timeout(Duration::from_secs(15), rr.read(&mut buf[..read_cap])).await {
                 Ok(Ok(0)) => {
                     dn_half.store(true, Ordering::Relaxed);
                     let _ = pw.shutdown().await;
@@ -5131,6 +5798,7 @@ async fn relay_raw_streams_gateway(
                 }
                 Ok(Ok(n)) => {
                     dn_active.store(mono_now_ms(), Ordering::Relaxed);
+                    cur_lim.wait(n).await;
                     traffic.add(&mid_dn, 0, n);
                     if tokio::time::timeout(STREAM_SOCKET_WRITE_TIMEOUT, pw.write_all(&buf[..n]))
                         .await
@@ -5160,7 +5828,8 @@ async fn relay_raw_streams_gateway(
 async fn relay_raw_streams_client(
     target_stream: TcpStream,
     tunnel_stream: BoxStream,
-    dn_lim: Arc<BandwidthLimiter>,
+    shared: Arc<ClientSharedTable>,
+    mapping_id: String,
 ) {
     let (mut tr, mut tw) = target_stream.into_split();
     let (mut rr, mut rw) = tokio::io::split(tunnel_stream);
@@ -5170,10 +5839,11 @@ async fn relay_raw_streams_client(
     let rt_active = last_active_ms.clone();
     let rt_half = half_closed.clone();
     let target_to_tunnel = async move {
-        let read_cap = dn_lim.read_size(32768);
-        let mut buf = vec![0u8; read_cap];
+        let mut buf = vec![0u8; 32768];
         loop {
-            match tokio::time::timeout(Duration::from_secs(15), tr.read(&mut buf)).await {
+            let cur_lim = shared.limiter_for_id(&mapping_id);
+            let read_cap = cur_lim.read_size(buf.len());
+            match tokio::time::timeout(Duration::from_secs(15), tr.read(&mut buf[..read_cap])).await {
                 Ok(Ok(0)) => {
                     rt_half.store(true, Ordering::Relaxed);
                     let _ = rw.shutdown().await;
@@ -5181,7 +5851,7 @@ async fn relay_raw_streams_client(
                 }
                 Ok(Ok(n)) => {
                     rt_active.store(mono_now_ms(), Ordering::Relaxed);
-                    dn_lim.wait(n).await;
+                    cur_lim.wait(n).await;
                     if tokio::time::timeout(STREAM_SOCKET_WRITE_TIMEOUT, async {
                         rw.write_all(&buf[..n]).await?;
                         rw.flush().await
@@ -5248,8 +5918,7 @@ async fn relay_raw_streams_client(
 fn spawn_hy2_client_udp_responder(
     hy2_sess: Arc<hysteria2::Hy2ClientSession>,
     binding: Binding,
-    mappings: Vec<Mapping>,
-    mapping_limiters: Arc<HashMap<String, Arc<BandwidthLimiter>>>,
+    shared: Arc<ClientSharedTable>,
     mut stop_rx: watch::Receiver<bool>,
 ) -> tokio::task::AbortHandle {
     tokio::spawn(async move {
@@ -5275,14 +5944,7 @@ fn spawn_hy2_client_udp_responder(
                     let Ok((host, port)) = hysteria2::parse_hy2_addr(&addr_str) else {
                         continue;
                     };
-                    let matched = mappings.iter().find(|m| {
-                        m.enabled
-                            && m.binding_id == binding.id
-                            && mapping_net(&m.network) == "udp"
-                            && m.target_host == host
-                            && m.target_port == port as i64
-                    });
-                    let Some(m) = matched else {
+                    let Some((m, _)) = shared.find_hy2_udp(&binding.id, &host, port as i64) else {
                         continue;
                     };
                     if sessions.len() >= 256 {
@@ -5291,13 +5953,8 @@ fn spawn_hy2_client_udp_responder(
                             continue;
                         }
                     }
-                    let limiter = mapping_limiters
-                        .get(&m.id)
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            let rate_bps = bandwidth_bytes(&m.bandwidth_limit).unwrap_or(0) as u64;
-                            BandwidthLimiter::new(rate_bps)
-                        });
+                    let mid = m.id.clone();
+                    let shared_lim = shared.clone();
                     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
                     let _ = tx.try_send(payload);
                     sessions.insert(sid, tx);
@@ -5327,7 +5984,7 @@ fn spawn_hy2_client_udp_responder(
                             while let Ok(Ok(n)) =
                                 tokio::time::timeout(Duration::from_secs(30), udp_recv.recv(&mut buf)).await
                             {
-                                limiter.wait(n).await;
+                                shared_lim.limiter_for_id(&mid).wait(n).await;
                                 pkt_id = pkt_id.wrapping_add(1);
                                 let max_dg = sess_reply.max_datagram_size();
                                 for out_dg in hysteria2::encode_hy2_udp_datagrams(
@@ -5610,8 +6267,7 @@ fn handle_client_dial_app(
     req_id: u32,
     payload: Vec<u8>,
     binding: &Binding,
-    mappings: &[Mapping],
-    mapping_limiters: &Arc<HashMap<String, Arc<BandwidthLimiter>>>,
+    shared: &Arc<ClientSharedTable>,
     sender: &SessionSender,
     sub_dialer: ClientSubchannelDialer,
 ) {
@@ -5624,25 +6280,12 @@ fn handle_client_dial_app(
         sender.send_ctrl_bg(FRAME_RESET, req_id, Vec::new());
         return;
     };
-    let matched = mappings.iter().find(|m| {
-        m.enabled
-            && m.binding_id == binding.id
-            && mapping_net(&m.network) == "tcp"
-            && m.effective_mux_type().unwrap_or_default().is_empty()
-            && m.target_host == host
-            && m.target_port == port
-    });
-    let Some(m) = matched else {
+    let Some((m, _)) = shared.find_dial_app(&binding.id, &host, port) else {
         sender.send_ctrl_bg(FRAME_RESET, req_id, Vec::new());
         return;
     };
-    let limiter = mapping_limiters
-        .get(&m.id)
-        .cloned()
-        .unwrap_or_else(|| {
-            let rate_bps = bandwidth_bytes(&m.bandwidth_limit).unwrap_or(0) as u64;
-            BandwidthLimiter::new(rate_bps)
-        });
+    let mid = m.id.clone();
+    let shared_c = shared.clone();
     let sender_fail = sender.clone();
 
     tokio::spawn(async move {
@@ -5676,15 +6319,14 @@ fn handle_client_dial_app(
             return;
         }
 
-        relay_raw_streams_client(target_stream, app_stream, limiter).await;
+        relay_raw_streams_client(target_stream, app_stream, shared_c, mid).await;
     });
 }
 
 fn handle_client_dial_mux(
     payload: Vec<u8>,
     binding: &Binding,
-    mappings: &[Mapping],
-    mapping_limiters: &Arc<HashMap<String, Arc<BandwidthLimiter>>>,
+    shared: &Arc<ClientSharedTable>,
     sub_dialer: ClientSubchannelDialer,
     mut stop_rx: watch::Receiver<bool>,
 ) {
@@ -5694,19 +6336,12 @@ fn handle_client_dial_mux(
     let Some(proto) = mux_proto::SingMuxProto::from_mux_type(mux_type_str) else {
         return;
     };
-    let allowed = mappings.iter().any(|m| {
-        m.enabled
-            && m.binding_id == binding.id
-            && mapping_net(&m.network) == "tcp"
-            && m.effective_mux_type().unwrap_or_default() == proto.as_str()
-    });
-    if !allowed {
+    if !shared.allow_mux_proto(&binding.id, proto.as_str()) {
         return;
     }
 
     let binding_c = binding.clone();
-    let mappings_c = mappings.to_vec();
-    let limiters_c = mapping_limiters.clone();
+    let shared_c = shared.clone();
 
     tokio::spawn(async move {
         let Ok(mut mux_stream) = sub_dialer.dial_port(mux_proto::PORT_SING_MUX).await else {
@@ -5730,8 +6365,7 @@ fn handle_client_dial_mux(
             _ = stop_rx.changed() => {}
             _ = mux_proto::serve_sing_mux_responder(mux_stream, proto, move |mut sub| {
                 let b_sub = binding_c.clone();
-                let m_sub = mappings_c.clone();
-                let l_sub = limiters_c.clone();
+                let s_sub = shared_c.clone();
                 tokio::spawn(async move {
                     let Ok(Ok((host, port, is_udp))) = tokio::time::timeout(
                         Duration::from_secs(8),
@@ -5745,25 +6379,10 @@ fn handle_client_dial_mux(
                         let _ = mux_proto::write_sing_mux_stream_response(&mut sub, Some("udp unsupported on tcp mux")).await;
                         return;
                     }
-                    let matched = m_sub.iter().find(|m| {
-                        m.enabled
-                            && m.binding_id == b_sub.id
-                            && mapping_net(&m.network) == "tcp"
-                            && m.effective_mux_type().unwrap_or_default() == proto.as_str()
-                            && m.target_host == host
-                            && m.target_port == port as i64
-                    });
-                    let Some(m) = matched else {
+                    let Some((m, _)) = s_sub.find_mux_substream(&b_sub.id, proto.as_str(), &host, port as i64) else {
                         let _ = mux_proto::write_sing_mux_stream_response(&mut sub, Some("mapping not authorized")).await;
                         return;
                     };
-                    let limiter = l_sub
-                        .get(&m.id)
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            let rate_bps = bandwidth_bytes(&m.bandwidth_limit).unwrap_or(0) as u64;
-                            BandwidthLimiter::new(rate_bps)
-                        });
                     let Ok(addrs) = resolve_socket_addrs(&host, port as i64).await else {
                         let _ = mux_proto::write_sing_mux_stream_response(&mut sub, Some("dns failed")).await;
                         return;
@@ -5784,7 +6403,7 @@ fn handle_client_dial_mux(
                     {
                         return;
                     }
-                    relay_raw_streams_client(target_stream, sub, limiter).await;
+                    relay_raw_streams_client(target_stream, sub, s_sub, m.id).await;
                 });
             }) => {}
         }
@@ -5795,8 +6414,7 @@ fn handle_client_frame_open(
     id: u32,
     payload: Vec<u8>,
     binding: &Binding,
-    mappings: &[Mapping],
-    mapping_limiters: &Arc<HashMap<String, Arc<BandwidthLimiter>>>,
+    shared: &Arc<ClientSharedTable>,
     sender: &SessionSender,
     streams_map: &Arc<Mutex<HashMap<u32, mpsc::Sender<(u8, Vec<u8>)>>>>,
 ) {
@@ -5815,33 +6433,12 @@ fn handle_client_frame_open(
     let req_mux = parts.next().unwrap_or("");
     let has_meta = raw_meta.contains('\0');
 
-    let matched_mapping = mappings.iter().find(|m| {
-        if !m.enabled
-            || m.binding_id != binding.id
-            || m.target_host != host
-            || m.target_port != port
-        {
-            return false;
-        }
-        if has_meta {
-            let m_net = mapping_net(&m.network);
-            let m_mux = m.effective_mux_type().unwrap_or_default();
-            m_net == req_net && m_mux == req_mux
-        } else {
-            true
-        }
-    });
-    let Some(matched_m) = matched_mapping else {
+    let Some((matched_m, _)) = shared.find_frame_open(&binding.id, &host, port, has_meta, req_net, req_mux) else {
         sender.send_ctrl_bg(FRAME_RESET, id, Vec::new());
         return;
     };
-    let limiter = mapping_limiters
-        .get(&matched_m.id)
-        .cloned()
-        .unwrap_or_else(|| {
-            let rate_bps = bandwidth_bytes(&matched_m.bandwidth_limit).unwrap_or(0) as u64;
-            BandwidthLimiter::new(rate_bps)
-        });
+    let mid_lim = matched_m.id.clone();
+    let shared_lim = shared.clone();
 
     let (stx, mut srx) = mpsc::channel::<(u8, Vec<u8>)>(STREAM_CHAN_CAP);
     streams_map.lock().unwrap().insert(id, stx);
@@ -5873,7 +6470,8 @@ fn handle_client_frame_open(
             let udp_arc = Arc::new(udp_sock);
             let udp_recv = udp_arc.clone();
             let sender_read = sender_back.clone();
-            let lim_read = limiter.clone();
+            let shared_read = shared_lim.clone();
+            let mid_read = mid_lim.clone();
             let xudp_sid_shared = Arc::new(std::sync::atomic::AtomicU16::new(0));
             let xudp_sid_reply = xudp_sid_shared.clone();
             let read_target = tokio::spawn(async move {
@@ -5881,7 +6479,7 @@ fn handle_client_frame_open(
                 while let Ok(Ok(n)) =
                     tokio::time::timeout(Duration::from_secs(30), udp_recv.recv(&mut buf)).await
                 {
-                    lim_read.wait(n).await;
+                    shared_read.limiter_for_id(&mid_read).wait(n).await;
                     let sid = xudp_sid_reply.load(Ordering::Relaxed);
                     let xudp = mux_proto::encode_xudp_keep(sid, &buf[..n]);
                     if xudp.len() > MAX_PAYLOAD {
@@ -5941,16 +6539,18 @@ fn handle_client_frame_open(
             configure_tcp_stream(&target_stream);
             let (mut tr, mut tw) = target_stream.into_split();
             let sender_read = sender_back.clone();
-            let lim_read = limiter.clone();
+            let shared_read = shared_lim.clone();
+            let mid_read = mid_lim.clone();
             let last_active_ms = Arc::new(AtomicU64::new(mono_now_ms()));
             let any_half_closed = Arc::new(AtomicBool::new(false));
             let rt_active = last_active_ms.clone();
             let rt_half = any_half_closed.clone();
             let mut read_target = tokio::spawn(async move {
-                let read_cap = lim_read.read_size(OPTIMAL_DATA_CHUNK);
-                let mut buf = vec![0u8; read_cap];
+                let mut buf = vec![0u8; OPTIMAL_DATA_CHUNK];
                 loop {
-                    match tokio::time::timeout(Duration::from_secs(15), tr.read(&mut buf)).await {
+                    let cur_lim = shared_read.limiter_for_id(&mid_read);
+                    let read_cap = cur_lim.read_size(buf.len());
+                    match tokio::time::timeout(Duration::from_secs(15), tr.read(&mut buf[..read_cap])).await {
                         Ok(Ok(0)) => {
                             rt_half.store(true, Ordering::Relaxed);
                             let _ = sender_read.send_data(FRAME_HALF, id, Vec::new()).await;
@@ -5958,7 +6558,7 @@ fn handle_client_frame_open(
                         }
                         Ok(Ok(n)) => {
                             rt_active.store(mono_now_ms(), Ordering::Relaxed);
-                            lim_read.wait(n).await;
+                            cur_lim.wait(n).await;
                             if sender_read
                                 .send_data(FRAME_DATA, id, buf[..n].to_vec())
                                 .await
@@ -6158,24 +6758,31 @@ impl Runtime {
             return Ok(());
         }
         let old_revision = g.revision;
-        if let Some(mut inst) = g.instance.take() {
-            inst.stop();
-            g.revision = -1;
-        }
         let logger = self.logger.lock().unwrap().clone();
         self.traffic
             .prepare_active(&s.mappings, s.node.role == "server");
-        match start_instance(
+
+        let mut inst = match g.instance.take() {
+            Some(existing) if existing.role == s.node.role => existing,
+            Some(mut existing) => {
+                existing.stop();
+                RunningInstance::new(&s.node.role)
+            }
+            None => RunningInstance::new(&s.node.role),
+        };
+
+        match reconcile_instance(
+            &mut inst,
             &s,
             &effective,
             self.traffic.clone(),
             self.state_notify.clone(),
             logger.clone(),
         ) {
-            Ok(instance) => {
+            Ok(()) => {
                 self.traffic
                     .set_active(&s.mappings, s.node.role == "server");
-                g.instance = Some(instance);
+                g.instance = Some(inst);
                 g.good = Some(s.clone());
                 g.good_local = effective;
                 g.document = document;
@@ -6186,22 +6793,24 @@ impl Runtime {
             }
             Err(err) => {
                 if idle_snapshot(&s) {
+                    inst.stop();
                     self.traffic.set_active(&[], false);
                     return Err(format!("stop listeners: {}", err));
                 }
                 if let Some(good) = g.good.clone() {
                     let good_local = g.good_local.clone();
-                    match start_instance(
+                    match reconcile_instance(
+                        &mut inst,
                         &good,
                         &good_local,
                         self.traffic.clone(),
                         self.state_notify.clone(),
                         logger,
                     ) {
-                        Ok(restored) => {
+                        Ok(()) => {
                             self.traffic
                                 .set_active(&good.mappings, good.node.role == "server");
-                            g.instance = Some(restored);
+                            g.instance = Some(inst);
                             g.revision = if old_revision < 0 {
                                 g.high_water
                             } else {
@@ -6213,6 +6822,7 @@ impl Runtime {
                             ));
                         }
                         Err(rollback_err) => {
+                            inst.stop();
                             self.traffic.set_active(&[], false);
                             return Err(format!(
                                 "start failed: {}; rollback failed: {}",
@@ -6221,6 +6831,7 @@ impl Runtime {
                         }
                     }
                 }
+                inst.stop();
                 self.traffic.set_active(&[], false);
                 Err(format!("start tunnel: {}", err))
             }
@@ -8090,5 +8701,489 @@ mod tests {
         let _ = cli_rt.close();
         let _ = srv_rt.close();
         echo_task.abort();
+    }
+
+    #[tokio::test]
+    async fn hot_apply_isolates_unrelated_mappings_and_bindings_under_active_traffic() {
+        let echo_ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = echo_ln.local_addr().unwrap().port() as i64;
+        let echo_task = tokio::spawn(async move {
+            while let Ok((mut s, _)) = echo_ln.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                    let _ = w.shutdown().await;
+                });
+            }
+        });
+
+        let (dec_cfg, _, _, _) = generate_vless_enc().unwrap();
+        let tp1 = reserve_free_tcp_port();
+        let tp2 = reserve_free_tcp_port();
+        let m1_port = reserve_free_tcp_port();
+        let m2_port = reserve_free_tcp_port();
+        let m2_port_edited = reserve_free_tcp_port();
+        let m3_port = reserve_free_tcp_port();
+
+        let make_srv = |id: &str, tp: i64, dec: &str| -> (Node, LocalTLS) {
+            let local = LocalTLS {
+                protocol: "vless".to_string(),
+                transport_security: "plain".to_string(),
+                decryption: dec.to_string(),
+                listen_host: "127.0.0.1".to_string(),
+                listen_port: tp,
+                ..Default::default()
+            };
+            let srv = Node {
+                id: id.to_string(),
+                name: id.to_string(),
+                role: "server".to_string(),
+                address: "127.0.0.1".to_string(),
+                port: tp,
+                connect_endpoints: vec![ConnectEndpoint {
+                    id: "ep-1".to_string(),
+                    name: "primary".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: tp,
+                    enabled: true,
+                }],
+                tunnel: local.clone(),
+                ..Default::default()
+            };
+            (srv, local)
+        };
+
+        let (srv1, srv1_local) = make_srv("srv-1", tp1, &dec_cfg);
+        let mut srv1_for_cli = srv1.clone();
+        srv1_for_cli.tunnel = derive_client_tunnel(&LocalTLS::default(), &srv1_local, &srv1).unwrap();
+
+        let (dec_cfg2, _, _, _) = generate_vless_enc().unwrap();
+        let (srv2, srv2_local) = make_srv("srv-2", tp2, &dec_cfg2);
+        let mut srv2_for_cli = srv2.clone();
+        srv2_for_cli.tunnel = derive_client_tunnel(&LocalTLS::default(), &srv2_local, &srv2).unwrap();
+
+        let cli = Node {
+            id: "cli-1".to_string(),
+            name: "cli-1".to_string(),
+            role: "client".to_string(),
+            ..Default::default()
+        };
+        let bind1 = Binding {
+            id: "bind-1".to_string(),
+            server_id: "srv-1".to_string(),
+            client_id: "cli-1".to_string(),
+            uuid: "550e8400-e29b-41d4-a716-446655440011".to_string(),
+            domain: "b1.veilink.internal".to_string(),
+            ..Default::default()
+        };
+        let bind2 = Binding {
+            id: "bind-2".to_string(),
+            server_id: "srv-2".to_string(),
+            client_id: "cli-1".to_string(),
+            uuid: "550e8400-e29b-41d4-a716-446655440022".to_string(),
+            domain: "b2.veilink.internal".to_string(),
+            ..Default::default()
+        };
+        let m1 = Mapping {
+            id: "map-1".to_string(),
+            name: "m1".to_string(),
+            binding_id: "bind-1".to_string(),
+            server_id: "srv-1".to_string(),
+            client_id: "cli-1".to_string(),
+            pool: 1,
+            listen_host: "127.0.0.1".to_string(),
+            listen_port: m1_port,
+            target_host: "127.0.0.1".to_string(),
+            target_port,
+            network: "tcp".to_string(),
+            enabled: true,
+            ..Default::default()
+        };
+
+        let srv1_rt = Runtime::new(LocalTLS::default());
+        let srv2_rt = Runtime::new(LocalTLS::default());
+        let cli_rt = Runtime::new(LocalTLS::default());
+
+        srv1_rt
+            .apply(Snapshot {
+                revision: 1,
+                node: srv1.clone(),
+                nodes: vec![srv1.clone()],
+                bindings: vec![bind1.clone()],
+                mappings: vec![m1.clone()],
+            })
+            .unwrap();
+        cli_rt
+            .apply(Snapshot {
+                revision: 1,
+                node: cli.clone(),
+                nodes: vec![srv1_for_cli.clone()],
+                bindings: vec![bind1.clone()],
+                mappings: vec![m1.clone()],
+            })
+            .unwrap();
+
+        for _ in 0..80 {
+            if srv1_rt.linked_bindings().contains(&"bind-1".to_string())
+                && cli_rt.linked_bindings().contains(&"bind-1".to_string())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(srv1_rt.linked_bindings().contains(&"bind-1".to_string()));
+
+        // Open a persistent TCP connection on Mapping 1 BEFORE adding/editing Mapping 2 & Server 2
+        let mut persistent = TcpStream::connect(format!("127.0.0.1:{}", m1_port))
+            .await
+            .unwrap();
+        persistent.write_all(b"phase-0").await.unwrap();
+        let mut buf = [0u8; 7];
+        persistent.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"phase-0");
+
+        // 1. Add Mapping 2 (smux, pool=2) on the SAME (srv-1, cli-1) binding
+        let m2 = Mapping {
+            id: "map-2".to_string(),
+            name: "m2".to_string(),
+            binding_id: "bind-1".to_string(),
+            server_id: "srv-1".to_string(),
+            client_id: "cli-1".to_string(),
+            pool: 2,
+            mux: true,
+            mux_type: "smux".to_string(),
+            listen_host: "127.0.0.1".to_string(),
+            listen_port: m2_port,
+            target_host: "127.0.0.1".to_string(),
+            target_port,
+            network: "tcp".to_string(),
+            enabled: true,
+            ..Default::default()
+        };
+        srv1_rt
+            .apply(Snapshot {
+                revision: 2,
+                node: srv1.clone(),
+                nodes: vec![srv1.clone()],
+                bindings: vec![bind1.clone()],
+                mappings: vec![m1.clone(), m2.clone()],
+            })
+            .unwrap();
+        cli_rt
+            .apply(Snapshot {
+                revision: 2,
+                node: cli.clone(),
+                nodes: vec![srv1_for_cli.clone()],
+                bindings: vec![bind1.clone()],
+                mappings: vec![m1.clone(), m2.clone()],
+            })
+            .unwrap();
+
+        // bind-1 MUST remain linked immediately without a single drop, and persistent stream MUST stay alive!
+        assert!(srv1_rt.linked_bindings().contains(&"bind-1".to_string()));
+        assert!(cli_rt.linked_bindings().contains(&"bind-1".to_string()));
+        persistent.write_all(b"phase-1").await.unwrap();
+        persistent.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"phase-1");
+
+        // Verify newly added Mapping 2 works immediately
+        let mut s2 = TcpStream::connect(format!("127.0.0.1:{}", m2_port))
+            .await
+            .unwrap();
+        s2.write_all(b"map2-ok").await.unwrap();
+        s2.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"map2-ok");
+        drop(s2);
+
+        // 2. Edit Mapping 2 (change listen port + switch smux -> yamux)
+        let mut m2_edited = m2.clone();
+        m2_edited.listen_port = m2_port_edited;
+        m2_edited.mux_type = "yamux".to_string();
+        srv1_rt
+            .apply(Snapshot {
+                revision: 3,
+                node: srv1.clone(),
+                nodes: vec![srv1.clone()],
+                bindings: vec![bind1.clone()],
+                mappings: vec![m1.clone(), m2_edited.clone()],
+            })
+            .unwrap();
+        cli_rt
+            .apply(Snapshot {
+                revision: 3,
+                node: cli.clone(),
+                nodes: vec![srv1_for_cli.clone()],
+                bindings: vec![bind1.clone()],
+                mappings: vec![m1.clone(), m2_edited.clone()],
+            })
+            .unwrap();
+
+        assert!(srv1_rt.linked_bindings().contains(&"bind-1".to_string()));
+        assert!(cli_rt.linked_bindings().contains(&"bind-1".to_string()));
+        persistent.write_all(b"phase-2").await.unwrap();
+        persistent.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"phase-2");
+
+        let mut s2_new = TcpStream::connect(format!("127.0.0.1:{}", m2_port_edited))
+            .await
+            .unwrap();
+        s2_new.write_all(b"yamuxok").await.unwrap();
+        s2_new.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"yamuxok");
+        drop(s2_new);
+
+        // 3. Add a completely separate Server 2 + binding 2 on the same Client
+        let m3 = Mapping {
+            id: "map-3".to_string(),
+            name: "m3".to_string(),
+            binding_id: "bind-2".to_string(),
+            server_id: "srv-2".to_string(),
+            client_id: "cli-1".to_string(),
+            pool: 1,
+            listen_host: "127.0.0.1".to_string(),
+            listen_port: m3_port,
+            target_host: "127.0.0.1".to_string(),
+            target_port,
+            network: "tcp".to_string(),
+            enabled: true,
+            ..Default::default()
+        };
+        srv2_rt
+            .apply(Snapshot {
+                revision: 1,
+                node: srv2.clone(),
+                nodes: vec![srv2.clone()],
+                bindings: vec![bind2.clone()],
+                mappings: vec![m3.clone()],
+            })
+            .unwrap();
+        cli_rt
+            .apply(Snapshot {
+                revision: 4,
+                node: cli.clone(),
+                nodes: vec![srv1_for_cli.clone(), srv2_for_cli.clone()],
+                bindings: vec![bind1.clone(), bind2.clone()],
+                mappings: vec![m1.clone(), m2_edited.clone(), m3.clone()],
+            })
+            .unwrap();
+
+        // bind-1 stays uninterrupted while bind-2 connects
+        assert!(cli_rt.linked_bindings().contains(&"bind-1".to_string()));
+        persistent.write_all(b"phase-3").await.unwrap();
+        persistent.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"phase-3");
+
+        for _ in 0..80 {
+            if srv2_rt.linked_bindings().contains(&"bind-2".to_string())
+                && cli_rt.linked_bindings().contains(&"bind-2".to_string())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(srv2_rt.linked_bindings().contains(&"bind-2".to_string()));
+        let mut s3 = TcpStream::connect(format!("127.0.0.1:{}", m3_port))
+            .await
+            .unwrap();
+        s3.write_all(b"srv2-ok").await.unwrap();
+        s3.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"srv2-ok");
+
+        drop(s3);
+        drop(persistent);
+        let _ = cli_rt.close();
+        let _ = srv1_rt.close();
+        let _ = srv2_rt.close();
+        echo_task.abort();
+    }
+
+    #[tokio::test]
+    async fn bandwidth_limit_enforces_upload_and_download_even_with_shared_target() {
+        // Target server: reads 1 byte ('U' = upload sink, 'D' = download source) then transfers 512 KiB
+        let target_ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target_ln.local_addr().unwrap().port() as i64;
+        const TRANSFER_BYTES: usize = 512 * 1024;
+        let target_task = tokio::spawn(async move {
+            while let Ok((mut s, _)) = target_ln.accept().await {
+                tokio::spawn(async move {
+                    let mut mode = [0u8; 1];
+                    if s.read_exact(&mut mode).await.is_err() {
+                        return;
+                    }
+                    if mode[0] == b'U' {
+                        let mut rem = TRANSFER_BYTES;
+                        let mut buf = vec![0u8; 32768];
+                        while rem > 0 {
+                            let Ok(n) = s.read(&mut buf).await else { return };
+                            if n == 0 {
+                                return;
+                            }
+                            rem = rem.saturating_sub(n);
+                        }
+                        let _ = s.write_all(b"OK").await;
+                    } else if mode[0] == b'D' {
+                        let chunk = vec![0x5Au8; 32768];
+                        let mut rem = TRANSFER_BYTES;
+                        while rem > 0 {
+                            let n = rem.min(chunk.len());
+                            if s.write_all(&chunk[..n]).await.is_err() {
+                                return;
+                            }
+                            rem -= n;
+                        }
+                        let _ = s.shutdown().await;
+                    }
+                });
+            }
+        });
+
+        let (dec_cfg, _, _, _) = generate_vless_enc().unwrap();
+        let tp = reserve_free_tcp_port();
+        let unlimited_port = reserve_free_tcp_port();
+        let limited_port = reserve_free_tcp_port();
+        let srv_local = LocalTLS {
+            protocol: "vless".to_string(),
+            transport_security: "plain".to_string(),
+            decryption: dec_cfg,
+            listen_host: "127.0.0.1".to_string(),
+            listen_port: tp,
+            ..Default::default()
+        };
+        let srv = Node {
+            id: "srv-bw".to_string(),
+            name: "srv-bw".to_string(),
+            role: "server".to_string(),
+            address: "127.0.0.1".to_string(),
+            port: tp,
+            connect_endpoints: vec![ConnectEndpoint {
+                id: "ep-1".to_string(),
+                name: "primary".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: tp,
+                enabled: true,
+            }],
+            tunnel: srv_local.clone(),
+            ..Default::default()
+        };
+        let mut srv_for_cli = srv.clone();
+        srv_for_cli.tunnel = derive_client_tunnel(&LocalTLS::default(), &srv_local, &srv).unwrap();
+        let cli = Node {
+            id: "cli-bw".to_string(),
+            name: "cli-bw".to_string(),
+            role: "client".to_string(),
+            ..Default::default()
+        };
+        let bind = Binding {
+            id: "bind-bw".to_string(),
+            server_id: "srv-bw".to_string(),
+            client_id: "cli-bw".to_string(),
+            uuid: "550e8400-e29b-41d4-a716-446655440099".to_string(),
+            domain: "bw.veilink.internal".to_string(),
+            ..Default::default()
+        };
+        // Sibling mapping pointing to the EXACT SAME target_host:target_port, with NO limit!
+        let m_unlimited = Mapping {
+            id: "map-unlim".to_string(),
+            name: "unlim".to_string(),
+            binding_id: "bind-bw".to_string(),
+            server_id: "srv-bw".to_string(),
+            client_id: "cli-bw".to_string(),
+            pool: 1,
+            listen_host: "127.0.0.1".to_string(),
+            listen_port: unlimited_port,
+            target_host: "127.0.0.1".to_string(),
+            target_port,
+            network: "tcp".to_string(),
+            enabled: true,
+            ..Default::default()
+        };
+        // Limited mapping: 8Mbps (= 1,000,000 B/s), so 512 KiB (524,288 B) must take ~470ms..900ms!
+        let m_limited = Mapping {
+            id: "map-lim".to_string(),
+            name: "lim".to_string(),
+            binding_id: "bind-bw".to_string(),
+            server_id: "srv-bw".to_string(),
+            client_id: "cli-bw".to_string(),
+            pool: 1,
+            bandwidth_limit: "8Mbps".to_string(),
+            listen_host: "127.0.0.1".to_string(),
+            listen_port: limited_port,
+            target_host: "127.0.0.1".to_string(),
+            target_port,
+            network: "tcp".to_string(),
+            enabled: true,
+            ..Default::default()
+        };
+
+        let srv_rt = Runtime::new(LocalTLS::default());
+        let cli_rt = Runtime::new(LocalTLS::default());
+        srv_rt
+            .apply(Snapshot {
+                revision: 1,
+                node: srv.clone(),
+                nodes: vec![srv.clone()],
+                bindings: vec![bind.clone()],
+                mappings: vec![m_unlimited.clone(), m_limited.clone()],
+            })
+            .unwrap();
+        cli_rt
+            .apply(Snapshot {
+                revision: 1,
+                node: cli.clone(),
+                nodes: vec![srv_for_cli.clone()],
+                bindings: vec![bind.clone()],
+                mappings: vec![m_unlimited.clone(), m_limited.clone()],
+            })
+            .unwrap();
+
+        for _ in 0..80 {
+            if srv_rt.linked_bindings().contains(&"bind-bw".to_string())
+                && cli_rt.linked_bindings().contains(&"bind-bw".to_string())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // Measure Upload on limited mapping (8Mbps -> 512 KiB >= 380ms)
+        let t0 = std::time::Instant::now();
+        let mut s_up = TcpStream::connect(format!("127.0.0.1:{}", limited_port))
+            .await
+            .unwrap();
+        s_up.write_all(b"U").await.unwrap();
+        s_up.write_all(&vec![0xABu8; TRANSFER_BYTES]).await.unwrap();
+        let mut ack = [0u8; 2];
+        s_up.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"OK");
+        let up_dur = t0.elapsed();
+        assert!(
+            up_dur >= Duration::from_millis(380) && up_dur <= Duration::from_millis(2500),
+            "8Mbps upload of 512KiB out of expected range: {:?}",
+            up_dur
+        );
+
+        // Measure Download on limited mapping (shared target with unlimited mapping! Server dn_lim MUST enforce 8Mbps!)
+        let t1 = std::time::Instant::now();
+        let mut s_dn = TcpStream::connect(format!("127.0.0.1:{}", limited_port))
+            .await
+            .unwrap();
+        s_dn.write_all(b"D").await.unwrap();
+        let mut got = 0usize;
+        let mut rbuf = vec![0u8; 32768];
+        while got < TRANSFER_BYTES {
+            let n = s_dn.read(&mut rbuf).await.unwrap();
+            assert!(n > 0);
+            got += n;
+        }
+        let dn_dur = t1.elapsed();
+        assert!(
+            dn_dur >= Duration::from_millis(380) && dn_dur <= Duration::from_millis(2500),
+            "8Mbps download of 512KiB (shared target) out of expected range: {:?}",
+            dn_dur
+        );
+
+        let _ = cli_rt.close();
+        let _ = srv_rt.close();
+        target_task.abort();
     }
 }

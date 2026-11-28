@@ -169,7 +169,8 @@ const zhCN: Dict = {
     proxies: { title: '端口映射', subtitle: '公网监听端口到内网目标服务的 TCP / UDP 隧道路由表' },
     logs: { title: '实时日志流', subtitle: 'Master 控制面与已接入节点的实时内存运行事件流' },
     audit: { title: '审计轨迹', subtitle: '节点配置、接入令牌、凭据变更与映射写操作记录' },
-    settings: { title: '系统与账户', subtitle: '管理员账户安全、控制面监听配置、运行状态与多平台界面偏好' },
+    settings: { title: '系统设置', subtitle: '控制面运行态、Master 服务监听配置与界面偏好' },
+    account: { title: '账户与安全', subtitle: '唯一管理员身份、登录邮箱、密码与多设备会话管理' },
   },
   common: {
     refresh: '刷新',
@@ -318,7 +319,8 @@ const en: Dict = {
     proxies: { title: 'Port Mappings', subtitle: 'TCP & UDP ingress-to-target tunnel routing table' },
     logs: { title: 'Live Logs', subtitle: 'Real-time in-memory stream from control plane and connected nodes' },
     audit: { title: 'Audit Trail', subtitle: 'Immutable record of administrative write operations' },
-    settings: { title: 'Settings & Account', subtitle: 'Administrator security, listener configuration, runtime status, and preferences' },
+    settings: { title: 'System Settings', subtitle: 'Control plane runtime status, Master listener configuration, and UI preferences' },
+    account: { title: 'Account & Security', subtitle: 'Administrator email, password, and active session management' },
   },
   common: {
     refresh: 'Refresh',
@@ -467,7 +469,8 @@ const de: Dict = {
     proxies: { title: 'Portweiterleitungen', subtitle: 'TCP- und UDP-Tunnel-Routing-Konfiguration' },
     logs: { title: 'Echtzeit-Protokolle', subtitle: 'Laufende System- und Knotenprotokolle im Arbeitsspeicher' },
     audit: { title: 'Prüfprotokoll', subtitle: 'Nachvollziehbare Änderungs- und Sicherheitsereignisse' },
-    settings: { title: 'System & Konto', subtitle: 'Administratorkonto, Listener-Konfiguration und Systemeinstellungen' },
+    settings: { title: 'Systemeinstellungen', subtitle: 'Laufzeitstatus, Master-Listener-Konfiguration und Oberflächeneinstellungen' },
+    account: { title: 'Konto & Sicherheit', subtitle: 'Administratorkonto, E-Mail, Passwort und aktive Sitzungen' },
   },
   common: {
     ...en.common,
@@ -517,7 +520,8 @@ const id: Dict = {
     proxies: { title: 'Pemetaan Port', subtitle: 'Aturan perutean TCP & UDP dari gerbang ke target internal' },
     logs: { title: 'Catatan Aktivitas', subtitle: 'Aliran log memori langsung dari pusat kendali dan simpul' },
     audit: { title: 'Jejak Audit', subtitle: 'Riwayat perubahan konfigurasi dan kredensial keamanan' },
-    settings: { title: 'Pengaturan & Akun', subtitle: 'Keamanan akun administrator, konfigurasi pendengar, dan preferensi' },
+    settings: { title: 'Pengaturan Sistem', subtitle: 'Status runtime, konfigurasi pendengar Master, dan preferensi antarmuka' },
+    account: { title: 'Akun & Keamanan', subtitle: 'Email administrator, kata sandi, dan pengelolaan sesi aktif' },
   },
   common: {
     ...en.common,
@@ -550,7 +554,8 @@ const th: Dict = {
     proxies: { title: 'การจับคู่พอร์ต', subtitle: 'เส้นทางการส่งต่อ TCP และ UDP ผ่านอุโมงค์เข้ารหัส' },
     logs: { title: 'บันทึกการทำงานสด', subtitle: 'สตรีมบันทึกเหตุการณ์แบบเรียลไทม์จากศูนย์ควบคุมและโหนด' },
     audit: { title: 'ประวัติการตรวจสอบ', subtitle: 'บันทึกการแก้ไขการตั้งค่าและการจัดการสิทธิ์ทั้งหมด' },
-    settings: { title: 'ตั้งค่าและบัญชี', subtitle: 'ความปลอดภัยบัญชีผู้ดูแล สถานะการทำงาน และการตั้งค่าพอร์ต' },
+    settings: { title: 'ตั้งค่าระบบ', subtitle: 'สถานะการทำงาน การตั้งค่าพอร์ต Master และรูปแบบการใช้งาน' },
+    account: { title: 'บัญชีและความปลอดภัย', subtitle: 'อีเมลผู้ดูแล รหัสผ่าน และการจัดการเซสชันที่ใช้งานอยู่' },
   },
   common: {
     ...en.common,
@@ -582,7 +587,8 @@ const vi: Dict = {
     proxies: { title: 'Ánh xạ Cổng', subtitle: 'Bảng định tuyến TCP và UDP từ cổng công cộng vào đích nội bộ' },
     logs: { title: 'Nhật ký Trực tiếp', subtitle: 'Luồng sự kiện thời gian thực từ trung tâm và các nút' },
     audit: { title: 'Nhật ký Kiểm toán', subtitle: 'Lịch sử các thao tác thay đổi cấu hình và khóa xác thực' },
-    settings: { title: 'Cài đặt & Tài khoản', subtitle: 'Bảo mật tài khoản quản trị, trạng thái hệ thống và cổng lắng nghe' },
+    settings: { title: 'Cài đặt Hệ thống', subtitle: 'Trạng thái vận hành, cấu hình cổng lắng nghe Master và giao diện' },
+    account: { title: 'Tài khoản & Bảo mật', subtitle: 'Email quản trị, mật khẩu và quản lý phiên đăng nhập' },
   },
   common: {
     ...en.common,
@@ -614,7 +620,8 @@ const ar: Dict = {
     proxies: { title: 'توجيه المنافذ', subtitle: 'جدول توجيه حركة TCP و UDP عبر الأنفاق الآمنة' },
     logs: { title: 'السجلات المباشرة', subtitle: 'تدفق الأحداث المباشر من مركز التحكم والعقد المتصلة' },
     audit: { title: 'سجل التدقيق', subtitle: 'سجل عمليات التعديل وإدارة المفاتيح والشهادات' },
-    settings: { title: 'الإعدادات والحساب', subtitle: 'أمان حساب المسؤول وإعدادات الاستماع وحالة التشغيل' },
+    settings: { title: 'إعدادات النظام', subtitle: 'حالة التشغيل وإعدادات مستمع Master وتفضيلات الواجهة' },
+    account: { title: 'الحساب والأمان', subtitle: 'حساب المسؤول والبريد الإلكتروني وكلمة المرور وإدارة الجلسات' },
   },
   common: {
     ...en.common,

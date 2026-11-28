@@ -8,6 +8,7 @@ import { ProxiesView } from './views/ProxiesView'
 import { LogsView } from './views/LogsView'
 import { AuditView } from './views/AuditView'
 import { SettingsView } from './views/SettingsView'
+import { AccountView } from './views/AccountView'
 
 function RouterView() {
   const { phase, page, dict } = useConsole()
@@ -55,6 +56,7 @@ function RouterView() {
           {page === 'logs' && <LogsView />}
           {page === 'audit' && <AuditView />}
           {page === 'settings' && <SettingsView />}
+          {page === 'account' && <AccountView />}
         </AppShell>
       )}
     </>

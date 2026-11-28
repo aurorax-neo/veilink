@@ -1576,7 +1576,7 @@ textarea:disabled {
 
 .topology-canvas-wrap {
   width: 100%;
-  max-height: 240px;
+  max-height: 280px;
   overflow: auto;
   padding: 8px 14px 10px;
   direction: ltr; /* Spec 5.5: visual network diagram stays LTR */
@@ -1902,6 +1902,16 @@ textarea {
   display: grid;
   place-items: center;
   flex-shrink: 0;
+}
+
+.sidebar-foot .dropdown-root {
+  display: flex;
+  width: 100%;
+}
+
+.sidebar-account-btn {
+  width: 100%;
+  min-height: 40px;
 }
 
 /* ============================================================================

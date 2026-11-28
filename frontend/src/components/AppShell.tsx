@@ -2,10 +2,10 @@ import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import {
   Activity,
   ArrowLeftRight,
+  ChevronsUpDown,
   Compass,
   FileClock,
   Globe,
-  HardDrive,
   Laptop,
   LayoutDashboard,
   LogOut,
@@ -17,6 +17,7 @@ import {
   Search,
   Server,
   Settings,
+  ShieldCheck,
   Sun,
   Terminal,
   X,
@@ -79,6 +80,8 @@ function navIcon(id: PageId) {
       return <FileClock size={17} />
     case 'settings':
       return <Settings size={17} />
+    case 'account':
+      return <ShieldCheck size={17} />
   }
 }
 
@@ -167,7 +170,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   const sseTone = streamState === 'connected' ? 'good' : streamState === 'reconnecting' || streamState === 'connecting' ? 'warn' : 'neutral'
 
   const commands = useMemo<CommandEntry[]>(() => {
-    const navCmds: CommandEntry[] = (['dashboard', 'servers', 'clients', 'proxies', 'logs', 'audit', 'settings'] as PageId[]).map(
+    const navCmds: CommandEntry[] = (['dashboard', 'servers', 'clients', 'proxies', 'logs', 'audit', 'settings', 'account'] as PageId[]).map(
       (id) => ({
         id: `nav-${id}`,
         group: '页面导航',
@@ -299,46 +302,66 @@ export function AppShell({ children }: { children: ReactNode }) {
           </div>
 
           <div className="sidebar-foot">
-            {!railCollapsed && currentUser?.email && (
-              <button
-                type="button"
-                className="nav-item"
-                style={{ minHeight: 38, marginBlockEnd: 2 }}
-                title={currentUser.email}
-                onClick={() => {
-                  navigate('settings')
-                  setMobileMenuOpen(false)
-                }}
-              >
-                <span className="sidebar-avatar" aria-hidden="true">
-                  {currentUser.email.slice(0, 1).toUpperCase()}
-                </span>
-                <span className="ltr-force" style={{ fontSize: 12.5, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {currentUser.email}
-                </span>
-              </button>
-            )}
-            {!railCollapsed && (
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '4px 10px', fontSize: 12, color: 'var(--text-muted)' }}>
-                <span className="inline-icon" style={{ gap: 6 }}>
-                  <HardDrive size={13} />
-                  <span className="tabular ltr-force">{software?.backend_version || 'veilink'}</span>
-                </span>
-                <span className="tabular ltr-force">{software?.api_version || 'v1'}</span>
-              </div>
-            )}
-            <button
-              type="button"
-              className="nav-item"
-              title={railCollapsed ? dict.common.signOut : undefined}
-              onClick={() => {
-                setMobileMenuOpen(false)
-                requestLogout()
-              }}
-            >
-              <span className="inline-icon" aria-hidden="true"><LogOut size={16} /></span>
-              {!railCollapsed && <span>{dict.common.signOut}</span>}
-            </button>
+            <Dropdown
+              align="start"
+              menuLabel="账户菜单"
+              trigger={(_open, toggle) => (
+                <button
+                  type="button"
+                  className="nav-item sidebar-account-btn"
+                  aria-current={page === 'account' ? 'page' : undefined}
+                  title={railCollapsed ? currentUser?.email || dict.pages.account.title : undefined}
+                  aria-label="账户菜单"
+                  onClick={toggle}
+                >
+                  <span className="sidebar-avatar" aria-hidden="true">
+                    {(currentUser?.email || 'A').slice(0, 1).toUpperCase()}
+                  </span>
+                  {!railCollapsed && (
+                    <>
+                      <span
+                        className="ltr-force"
+                        style={{
+                          flex: 1,
+                          minWidth: 0,
+                          fontSize: 12.5,
+                          color: 'var(--text-primary)',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                          textAlign: 'start',
+                        }}
+                      >
+                        {currentUser?.email || dict.pages.account.title}
+                      </span>
+                      <ChevronsUpDown size={14} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />
+                    </>
+                  )}
+                </button>
+              )}
+              items={[
+                {
+                  id: 'account-security',
+                  label: dict.pages.account.title,
+                  icon: <ShieldCheck size={14} />,
+                  onSelect: () => {
+                    navigate('account')
+                    setMobileMenuOpen(false)
+                  },
+                },
+                {
+                  id: 'account-logout',
+                  label: dict.common.signOut,
+                  icon: <LogOut size={14} />,
+                  danger: true,
+                  separatorBefore: true,
+                  onSelect: () => {
+                    setMobileMenuOpen(false)
+                    requestLogout()
+                  },
+                },
+              ]}
+            />
           </div>
         </aside>
 
