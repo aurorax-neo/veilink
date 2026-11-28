@@ -387,6 +387,11 @@ impl Store {
 
     pub fn has_active_listener(&self, id: &str) -> bool {
         let g = self.inner.lock();
+        if let Ok(st) = load_from_conn(&g.db.lock()) {
+            if st.nodes.get(id).is_some_and(|n| n.is_offline() || n.revoked) {
+                return false;
+            }
+        }
         g.listeners.values().any(|(nid, _)| nid == id)
     }
 
@@ -396,12 +401,12 @@ impl Store {
         let Some(n) = st.nodes.get(id) else {
             return Err(StoreError::Invalid(String::new()));
         };
-        if n.revoked {
+        if n.revoked || n.is_offline() {
             return Err(StoreError::Invalid(String::new()));
         }
         let now = Utc::now().timestamp();
         let has_listener = g.listeners.values().any(|(nid, _)| nid == id);
-        let recent_seen = n.last_seen > 0 && now >= n.last_seen && (now - n.last_seen) < 30;
+        let recent_seen = n.last_seen > 0 && now + 10 >= n.last_seen && (now - n.last_seen) < 30;
         let connected = has_listener || recent_seen;
         g.pending_refresh.insert(id.to_string());
         g.refresh_waiting.insert(id.to_string());
@@ -413,18 +418,20 @@ impl Store {
 
     pub fn control_connected(&self, id: &str) -> bool {
         let g = self.inner.lock();
+        let Ok(st) = load_from_conn(&g.db.lock()) else {
+            return false;
+        };
+        let Some(n) = st.nodes.get(id) else {
+            return false;
+        };
+        if n.revoked || n.is_offline() {
+            return false;
+        }
         if g.listeners.values().any(|(nid, _)| nid == id) {
             return true;
         }
-        if let Ok(st) = load_from_conn(&g.db.lock()) {
-            if let Some(n) = st.nodes.get(id) {
-                let now = Utc::now().timestamp();
-                if !n.revoked && n.last_seen > 0 && now >= n.last_seen && (now - n.last_seen) < 30 {
-                    return true;
-                }
-            }
-        }
-        false
+        let now = Utc::now().timestamp();
+        n.last_seen > 0 && now + 10 >= n.last_seen && (now - n.last_seen) < 30
     }
 
     pub fn find_node_by_name(&self, name: &str) -> Result<Option<Node>, StoreError> {
@@ -472,6 +479,25 @@ impl Store {
         if seed.role != "server" {
             return Err(StoreError::Invalid(String::new()));
         }
+        {
+            let g = self.inner.lock();
+            let st = load_from_conn(&g.db.lock())?;
+            let mut existing: Option<Node> = None;
+            for candidate in st.nodes.values() {
+                if candidate.embedded {
+                    if existing.is_some() {
+                        return Err(StoreError::Invalid(String::new()));
+                    }
+                    existing = Some(candidate.clone());
+                }
+            }
+            if let Some(ex) = existing {
+                if ex.role != "server" || ex.revoked {
+                    return Err(StoreError::Invalid(String::new()));
+                }
+                return Ok(ex);
+            }
+        }
         seed.id.clear();
         self.save_node_internal(seed, true)
     }
@@ -482,79 +508,168 @@ impl Store {
         }
         let action_id = n.id.clone();
         let mut saved_node = n.clone();
-        self.mutate("node.save", &action_id, |st, _key| {
-            if embedded {
-                let mut existing: Option<Node> = None;
-                for candidate in st.nodes.values() {
-                    if candidate.embedded {
-                        if existing.is_some() {
+        let mut purge_control_auth = false;
+        let purge_node_id = n.id.clone();
+        self.mutate_with(
+            "node.save",
+            &action_id,
+            |st, _key| {
+                if embedded {
+                    let mut existing: Option<Node> = None;
+                    for candidate in st.nodes.values() {
+                        if candidate.embedded {
+                            if existing.is_some() {
+                                return Err(StoreError::Invalid(String::new()));
+                            }
+                            existing = Some(candidate.clone());
+                        }
+                    }
+                    if let Some(ex) = existing {
+                        if ex.role != "server" || ex.revoked {
                             return Err(StoreError::Invalid(String::new()));
                         }
-                        existing = Some(candidate.clone());
+                        n = ex;
                     }
                 }
-                if let Some(ex) = existing {
-                    if ex.role != "server" || ex.revoked {
-                        return Err(StoreError::Invalid(String::new()));
-                    }
-                    n = ex;
+                let was_embedded = st.nodes.get(&n.id).map(|o| o.embedded).unwrap_or(false);
+                if !embedded && n.embedded && !was_embedded {
+                    return Err(StoreError::Invalid(String::new()));
                 }
-            }
-            let was_embedded = st.nodes.get(&n.id).map(|o| o.embedded).unwrap_or(false);
-            if !embedded && n.embedded && !was_embedded {
-                return Err(StoreError::Invalid(String::new()));
-            }
-            n.embedded = embedded;
-            if n.role == "client" && (n.tunnel != LocalTLS::default() || n.client_tunnel.is_some())
-            {
-                return Err(StoreError::Invalid(String::new()));
-            }
-            validate_tunnel(&n.role, &n.tunnel)?;
-            if n.name.is_empty() || n.name.len() > 128 || (n.role != "server" && n.role != "client")
-            {
-                return Err(StoreError::Invalid(String::new()));
-            }
-            if n.role == "server" {
-                if !host_ok(&n.address)
-                    || !(1..=65535).contains(&n.port)
-                    || validate_connect_endpoints(&n).is_err()
+                let normalized_mode = match n.mode.trim() {
+                    "" | "online" => String::new(),
+                    "offline" => "offline".to_string(),
+                    _ => return Err(StoreError::Invalid(String::new())),
+                };
+                if (embedded || was_embedded) && normalized_mode == "offline" {
+                    return Err(StoreError::Invalid(String::new()));
+                }
+                n.mode = normalized_mode;
+                n.embedded = embedded;
+                if n.role == "client"
+                    && (n.tunnel != LocalTLS::default() || n.client_tunnel.is_some())
                 {
                     return Err(StoreError::Invalid(String::new()));
                 }
-                n.connect_endpoints = connect_endpoints(&n);
-            }
-            if let Some(old) = st.nodes.get(&n.id) {
-                if old.role != n.role || old.revoked {
+                validate_tunnel(&n.role, &n.tunnel)?;
+                if n.name.is_empty()
+                    || n.name.len() > 128
+                    || (n.role != "server" && n.role != "client")
+                {
                     return Err(StoreError::Invalid(String::new()));
                 }
-                n.applied_revision = old.applied_revision;
-                n.last_seen = old.last_seen;
-                n.error = old.error.clone();
-                n.embedded = old.embedded || embedded;
-                n.disabled = old.disabled;
-            }
-            if n.role == "server" {
-                if !n.tunnel.reality.private_key.is_empty() {
-                    let public = crate::model::derive_x25519_public(&n.tunnel.reality.private_key);
-                    if !n.tunnel.reality.public_key.is_empty()
-                        && n.tunnel.reality.public_key != public
+                if n.role == "server" {
+                    if !host_ok(&n.address)
+                        || !(1..=65535).contains(&n.port)
+                        || validate_connect_endpoints(&n).is_err()
                     {
                         return Err(StoreError::Invalid(String::new()));
                     }
-                    n.tunnel.reality.public_key = public;
+                    n.connect_endpoints = connect_endpoints(&n);
                 }
-                let paired = client_template(&n)?;
-                n.client_tunnel = paired;
-            }
-            n.revoked = false;
-            st.nodes.insert(n.id.clone(), n.clone());
-            validate_state(st)?;
-            saved_node = st.nodes.get(&n.id).cloned().unwrap_or(n.clone());
-            Ok(())
-        })?;
-        let g = self.inner.lock();
+                if let Some(old) = st.nodes.get(&n.id).cloned() {
+                    if old.role != n.role || old.revoked {
+                        return Err(StoreError::Invalid(String::new()));
+                    }
+                    n.embedded = old.embedded || embedded;
+                    n.disabled = old.disabled;
+                    match (old.is_offline(), n.is_offline()) {
+                        (true, true) => {
+                            n.applied_revision = 0;
+                            n.last_seen = 0;
+                            n.error.clear();
+                            n.exported_revision = old.exported_revision;
+                        }
+                        (false, true) => {
+                            n.applied_revision = 0;
+                            n.last_seen = 0;
+                            n.error.clear();
+                            n.exported_revision = 0;
+                            purge_control_auth = true;
+                        }
+                        (true, false) => {
+                            n.applied_revision = 0;
+                            n.last_seen = 0;
+                            n.error.clear();
+                            n.exported_revision = 0;
+                        }
+                        (false, false) => {
+                            n.applied_revision = old.applied_revision;
+                            n.last_seen = old.last_seen;
+                            n.error = old.error.clone();
+                            n.exported_revision = 0;
+                        }
+                    }
+                } else {
+                    n.applied_revision = 0;
+                    n.last_seen = 0;
+                    n.error.clear();
+                    n.exported_revision = 0;
+                    if n.is_offline() {
+                        purge_control_auth = true;
+                    }
+                }
+                if purge_control_auth {
+                    st.secrets.remove(&enrollment_credential_key(&n.id));
+                    st.secrets.remove(&enrollment_token_key(&n.id));
+                }
+                if n.role == "server" {
+                    if !n.tunnel.reality.private_key.is_empty() {
+                        let public =
+                            crate::model::derive_x25519_public(&n.tunnel.reality.private_key);
+                        if !n.tunnel.reality.public_key.is_empty()
+                            && n.tunnel.reality.public_key != public
+                        {
+                            return Err(StoreError::Invalid(String::new()));
+                        }
+                        n.tunnel.reality.public_key = public;
+                    }
+                    let paired = client_template(&n)?;
+                    n.client_tunnel = paired;
+                }
+                n.revoked = false;
+                st.nodes.insert(n.id.clone(), n.clone());
+                validate_state(st)?;
+                saved_node = st.nodes.get(&n.id).cloned().unwrap_or(n.clone());
+                Ok(())
+            },
+            Some(Box::new(move |tx: &Transaction| {
+                let raw: Vec<u8> =
+                    tx.query_row("SELECT data FROM config WHERE id=1", [], |r| r.get(0))?;
+                if let Ok(cur_st) = serde_json::from_slice::<State>(&raw) {
+                    if cur_st
+                        .nodes
+                        .get(&purge_node_id)
+                        .is_some_and(|cur| cur.is_offline())
+                    {
+                        tx.execute(
+                            "DELETE FROM credentials WHERE node=?1",
+                            params![&purge_node_id],
+                        )?;
+                        tx.execute(
+                            "DELETE FROM enroll WHERE node=?1",
+                            params![&purge_node_id],
+                        )?;
+                    }
+                }
+                Ok(())
+            })),
+        )?;
+        let mut g = self.inner.lock();
         let st = load_from_conn(&g.db.lock())?;
-        Ok(st.nodes.get(&saved_node.id).cloned().unwrap_or(saved_node))
+        let final_node = st.nodes.get(&saved_node.id).cloned().unwrap_or(saved_node);
+        if final_node.is_offline() {
+            let nid = final_node.id.clone();
+            g.software.remove(&nid);
+            g.links.remove(&nid);
+            g.traffic.remove(&nid);
+            g.pending_refresh.remove(&nid);
+            g.refresh_waiting.remove(&nid);
+            g.listeners.retain(|_, (lid, _)| lid != &nid);
+            for endpoints in g.mapping_acks.values_mut() {
+                endpoints.remove(&nid);
+            }
+        }
+        Ok(final_node)
     }
 
     pub fn set_node_disabled(&self, id: &str, disabled: bool) -> Result<(), StoreError> {
@@ -626,12 +741,15 @@ impl Store {
         let raw: Vec<u8> = tx.query_row("SELECT data FROM config WHERE id=1", [], |r| r.get(0))?;
         let mut st: State =
             serde_json::from_slice(&raw).map_err(|e| StoreError::Other(e.to_string()))?;
-        if st.secrets.remove(&enrollment_token_key(id)).is_some() {
+        let removed_secret = st.secrets.remove(&enrollment_token_key(id)).is_some();
+        if removed_secret {
             let body = serde_json::to_vec(&st).map_err(|e| StoreError::Other(e.to_string()))?;
             tx.execute("UPDATE config SET data=?1 WHERE id=1", params![&body])?;
         }
-        tx.execute("DELETE FROM enroll WHERE node=?1", params![id])?;
-        insert_audit(&tx, Utc::now().timestamp(), "node.enroll.revoke", id)?;
+        let deleted_rows = tx.execute("DELETE FROM enroll WHERE node=?1", params![id])?;
+        if removed_secret || deleted_rows > 0 {
+            insert_audit(&tx, Utc::now().timestamp(), "node.enroll.revoke", id)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -646,7 +764,7 @@ impl Store {
         let Some(n) = st.nodes.get(id) else {
             return Err(StoreError::Invalid(String::new()));
         };
-        if n.revoked || ttl.is_zero() || ttl > Duration::from_secs(7 * 86400) {
+        if n.revoked || n.is_offline() || ttl.is_zero() || ttl > Duration::from_secs(7 * 86400) {
             return Err(StoreError::Invalid(String::new()));
         }
         let now = Utc::now().timestamp();
@@ -711,7 +829,7 @@ impl Store {
         let Some(n) = st.nodes.get(id) else {
             return Err(StoreError::Invalid(String::new()));
         };
-        if n.embedded {
+        if n.embedded || n.revoked || n.is_offline() {
             return Err(StoreError::Invalid(String::new()));
         }
         let tx = conn.transaction()?;
@@ -763,7 +881,7 @@ impl Store {
         let Some(n) = st.nodes.get(id) else {
             return Err(StoreError::Auth);
         };
-        if n.revoked {
+        if n.revoked || n.is_offline() {
             return Err(StoreError::Auth);
         }
         let existing_cred: Option<(String, i64)> = tx
@@ -815,7 +933,7 @@ impl Store {
             let Some(n) = st.nodes.get(id) else {
                 return Err(StoreError::Invalid(String::new()));
             };
-            if n.revoked || n.embedded || (n.role != "server" && n.role != "client") {
+            if n.revoked || n.embedded || n.is_offline() || (n.role != "server" && n.role != "client") {
                 return Err(StoreError::Invalid(String::new()));
             }
             let existing_cred: Option<(String, i64)> = tx
@@ -864,72 +982,35 @@ impl Store {
         if !authorized(&conn, &st, id, credential) {
             return Err(StoreError::Auth);
         }
-        let mut current_node = st.nodes.get(id).cloned().ok_or(StoreError::Auth)?;
-        current_node.client_tunnel = None;
-        if current_node.role == "client" {
-            current_node.tunnel = LocalTLS::default();
-        }
-        let mut out = Snapshot {
-            revision: current_node.desired_revision,
-            node: current_node.clone(),
-            nodes: Vec::new(),
-            bindings: Vec::new(),
-            mappings: Vec::new(),
+        build_snapshot_from_state(&st, &g.key, id)
+    }
+
+    pub fn export_offline_snapshot(&self, id: &str) -> Result<(Snapshot, bool), StoreError> {
+        let g = self.inner.lock();
+        let mut conn = g.db.lock();
+        let mut st = load_from_conn(&conn)?;
+        let Some(mut n) = st.nodes.get(id).cloned() else {
+            return Err(StoreError::Invalid(String::new()));
         };
-        if current_node.disabled {
-            return Ok(out);
+        if n.revoked || n.embedded || !n.is_offline() || (n.role != "server" && n.role != "client") {
+            return Err(StoreError::Invalid(String::new()));
         }
-        let mut peers = BTreeMap::new();
-        for (bid, b) in &st.bindings {
-            let Some(a) = st.nodes.get(&b.server_id) else {
-                continue;
-            };
-            let Some(c) = st.nodes.get(&b.client_id) else {
-                continue;
-            };
-            if a.revoked
-                || c.revoked
-                || a.disabled
-                || c.disabled
-                || (b.server_id != id && b.client_id != id)
-            {
-                continue;
-            }
-            if !valid_endpoint_selection(a, &b.connect_endpoint_id) {
-                return Err(StoreError::Invalid(String::new()));
-            }
-            let secret = st
-                .secrets
-                .get(bid)
-                .ok_or_else(|| StoreError::Invalid(String::new()))?;
-            let mut b_copy = b.clone();
-            b_copy.uuid = auth::open(&g.key, secret)?;
-            out.bindings.push(b_copy.clone());
-            peers.insert(b.server_id.clone(), true);
-            for m in st.mappings.values() {
-                if m.binding_id == *bid {
-                    if !mapping_matches_binding(m, &b_copy) {
-                        return Err(StoreError::Invalid(String::new()));
-                    }
-                    out.mappings.push(m.clone());
-                }
-            }
+        if n.desired_revision <= 0 {
+            st.revision = st.revision.max(0) + 1;
+            n.desired_revision = st.revision;
         }
-        for peer_id in peers.keys() {
-            let mut peer_node = st
-                .nodes
-                .get(peer_id)
-                .cloned()
-                .ok_or_else(|| StoreError::Invalid(String::new()))?;
-            if id != peer_id {
-                peer_node.tunnel = public_tunnel(&peer_node)?;
-                peer_node.tunnel.listen_host.clear();
-                peer_node.tunnel.listen_port = 0;
-            }
-            peer_node.client_tunnel = None;
-            out.nodes.push(peer_node);
+        let changed = n.exported_revision != n.desired_revision;
+        if changed {
+            n.exported_revision = n.desired_revision;
+            st.nodes.insert(id.to_string(), n);
+            let body = serde_json::to_vec(&st).map_err(|e| StoreError::Other(e.to_string()))?;
+            let tx = conn.transaction()?;
+            tx.execute("UPDATE config SET data=?1 WHERE id=1", params![&body])?;
+            insert_audit(&tx, Utc::now().timestamp(), "node.offline.export", id)?;
+            tx.commit()?;
         }
-        Ok(out)
+        let snap = build_snapshot_from_state(&st, &g.key, id)?;
+        Ok((snap, changed))
     }
 
     pub fn heartbeat(
@@ -1194,7 +1275,18 @@ impl Store {
         let now = Utc::now().timestamp();
         for (id, m) in &st.mappings {
             let policy = mapping_policy(&st, m);
-            let endpoint = |node_id: &str| -> MappingEndpointStatus {
+            let online_binding_linked = |node_id: &str| -> bool {
+                let Some(n) = st.nodes.get(node_id) else {
+                    return false;
+                };
+                if n.revoked || n.disabled || n.is_offline() || n.last_seen <= 0 || now - n.last_seen >= 90 {
+                    return false;
+                }
+                g.links
+                    .get(node_id)
+                    .is_some_and(|links| links.contains(&m.binding_id))
+            };
+            let endpoint = |node_id: &str, peer_id: &str| -> MappingEndpointStatus {
                 let mut status = MappingEndpointStatus {
                     acknowledged: false,
                     reason: "unknown".to_string(),
@@ -1204,18 +1296,31 @@ impl Store {
                     status.reason = "node_unavailable".to_string();
                     return status;
                 };
-                if !n.revoked && !n.disabled && n.last_seen > 0 && now - n.last_seen < 90 {
-                    if let Some(links) = g.links.get(node_id) {
-                        if links.contains(&m.binding_id) {
-                            status.linked = true;
-                        }
-                    }
-                }
                 if n.revoked {
                     status.reason = "node_unavailable".to_string();
                     return status;
                 }
-                if !m.enabled {
+                if n.is_offline() {
+                    if !n.disabled && m.enabled {
+                        status.linked = online_binding_linked(peer_id);
+                    }
+                    if !m.enabled || n.disabled {
+                        status.reason = "disabled".to_string();
+                        return status;
+                    }
+                    if n.desired_revision > 0 && n.exported_revision >= n.desired_revision {
+                        status.acknowledged = true;
+                        status.reason = "offline_exported".to_string();
+                    } else {
+                        status.acknowledged = false;
+                        status.reason = "offline_export_pending".to_string();
+                    }
+                    return status;
+                }
+                if online_binding_linked(node_id) {
+                    status.linked = true;
+                }
+                if !m.enabled || n.disabled {
                     status.reason = "disabled".to_string();
                     return status;
                 }
@@ -1224,7 +1329,7 @@ impl Store {
                 };
                 if ack.policy != policy {
                     return status;
-                }
+                };
                 if ack.failed {
                     status.reason = "apply_failed".to_string();
                     return status;
@@ -1236,8 +1341,8 @@ impl Store {
             out.insert(
                 id.clone(),
                 MappingStatus {
-                    server: endpoint(&m.server_id),
-                    client: endpoint(&m.client_id),
+                    server: endpoint(&m.server_id, &m.client_id),
+                    client: endpoint(&m.client_id, &m.server_id),
                 },
             );
         }
@@ -1688,7 +1793,7 @@ fn authorized(conn: &Connection, st: &State, id: &str, credential: &str) -> bool
     let Some(n) = st.nodes.get(id) else {
         return false;
     };
-    if n.revoked || credential.is_empty() {
+    if n.revoked || n.is_offline() || credential.is_empty() {
         return false;
     }
     let stored: Option<String> = conn
@@ -1701,6 +1806,75 @@ fn authorized(conn: &Connection, st: &State, id: &str, credential: &str) -> bool
         .ok()
         .flatten();
     stored.as_deref() == Some(&auth::hash(credential))
+}
+
+fn build_snapshot_from_state(st: &State, key: &[u8], id: &str) -> Result<Snapshot, StoreError> {
+    let mut current_node = st.nodes.get(id).cloned().ok_or(StoreError::Auth)?;
+    current_node.client_tunnel = None;
+    if current_node.role == "client" {
+        current_node.tunnel = LocalTLS::default();
+    }
+    let mut out = Snapshot {
+        revision: current_node.desired_revision,
+        node: current_node.clone(),
+        nodes: Vec::new(),
+        bindings: Vec::new(),
+        mappings: Vec::new(),
+    };
+    if current_node.disabled {
+        return Ok(out);
+    }
+    let mut peers = BTreeMap::new();
+    for (bid, b) in &st.bindings {
+        let Some(a) = st.nodes.get(&b.server_id) else {
+            continue;
+        };
+        let Some(c) = st.nodes.get(&b.client_id) else {
+            continue;
+        };
+        if a.revoked
+            || c.revoked
+            || a.disabled
+            || c.disabled
+            || (b.server_id != id && b.client_id != id)
+        {
+            continue;
+        }
+        if !valid_endpoint_selection(a, &b.connect_endpoint_id) {
+            return Err(StoreError::Invalid(String::new()));
+        }
+        let secret = st
+            .secrets
+            .get(bid)
+            .ok_or_else(|| StoreError::Invalid(String::new()))?;
+        let mut b_copy = b.clone();
+        b_copy.uuid = auth::open(key, secret)?;
+        out.bindings.push(b_copy.clone());
+        peers.insert(b.server_id.clone(), true);
+        for m in st.mappings.values() {
+            if m.binding_id == *bid {
+                if !mapping_matches_binding(m, &b_copy) {
+                    return Err(StoreError::Invalid(String::new()));
+                }
+                out.mappings.push(m.clone());
+            }
+        }
+    }
+    for peer_id in peers.keys() {
+        let mut peer_node = st
+            .nodes
+            .get(peer_id)
+            .cloned()
+            .ok_or_else(|| StoreError::Invalid(String::new()))?;
+        if id != peer_id {
+            peer_node.tunnel = public_tunnel(&peer_node)?;
+            peer_node.tunnel.listen_host.clear();
+            peer_node.tunnel.listen_port = 0;
+        }
+        peer_node.client_tunnel = None;
+        out.nodes.push(peer_node);
+    }
+    Ok(out)
 }
 
 fn notify_locked(
@@ -1731,8 +1905,10 @@ fn valid_software_label(s: &str) -> bool {
 
 fn node_runtime_config(mut n: Node) -> Node {
     n.name.clear();
+    n.mode.clear();
     n.desired_revision = 0;
     n.applied_revision = 0;
+    n.exported_revision = 0;
     n.last_seen = 0;
     n.error.clear();
     for ep in &mut n.connect_endpoints {
@@ -2376,5 +2552,186 @@ fn public_tunnel(server: &Node) -> Result<LocalTLS, StoreError> {
         (None, None) => Ok(LocalTLS::default()),
         (Some(v), Some(ct)) if &v == ct => Ok(ct.clone()),
         _ => Err(StoreError::Invalid(String::new())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_embedded_node_and_revoke_enroll_token_skip_noop_audit_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("veilink.db");
+        let key_path = dir.path().join("master.key");
+        let store = Store::open(db_path.to_str().unwrap(), key_path.to_str().unwrap()).unwrap();
+
+        let seed = Node {
+            name: "公网网关".to_string(),
+            role: "server".to_string(),
+            address: "127.0.0.1".to_string(),
+            port: 18443,
+            embedded: true,
+            ..Default::default()
+        };
+
+        // First boot creates the embedded node and records its real ID once.
+        let embedded = store.ensure_embedded_node(seed.clone()).unwrap();
+        assert!(!embedded.id.is_empty());
+        assert!(embedded.embedded);
+        let audits_initial = store.audit().unwrap();
+        assert_eq!(audits_initial.len(), 1);
+        assert_eq!(audits_initial[0].action, "node.save");
+        assert_eq!(audits_initial[0].object, embedded.id);
+
+        // Subsequent restarts return the existing embedded node without phantom node.save entries.
+        let embedded_again = store.ensure_embedded_node(seed).unwrap();
+        assert_eq!(embedded_again.id, embedded.id);
+        assert_eq!(embedded_again.desired_revision, embedded.desired_revision);
+        assert_eq!(store.audit().unwrap().len(), 1);
+
+        // Revoking when no enrollment token exists is a clean no-op with zero audit noise.
+        store.revoke_enroll_token(&embedded.id).unwrap();
+        assert_eq!(store.audit().unwrap().len(), 1);
+
+        // Issuing an enrollment token and revoking it records exactly one revoke entry;
+        // a duplicate revoke afterwards does not emit another audit row.
+        let _tok = store
+            .enroll_token(&embedded.id, Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(store.audit().unwrap().len(), 2);
+        store.revoke_enroll_token(&embedded.id).unwrap();
+        let audits_after = store.audit().unwrap();
+        assert_eq!(audits_after.len(), 3);
+        assert_eq!(audits_after[0].action, "node.enroll.revoke");
+        assert_eq!(audits_after[0].object, embedded.id);
+
+        store.revoke_enroll_token(&embedded.id).unwrap();
+        assert_eq!(store.audit().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn offline_node_mode_purges_control_credentials_and_tracks_exported_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("veilink.db");
+        let key_path = dir.path().join("master.key");
+        let store = Store::open(db_path.to_str().unwrap(), key_path.to_str().unwrap()).unwrap();
+
+        // Embedded node must reject offline mode
+        let bad_embedded = store.ensure_embedded_node(Node {
+            name: "Embedded".to_string(),
+            role: "server".to_string(),
+            mode: "offline".to_string(),
+            address: "127.0.0.1".to_string(),
+            port: 18443,
+            embedded: true,
+            ..Default::default()
+        });
+        assert!(bad_embedded.is_err());
+
+        let (priv_k, _) = tunnel::generate_x25519().unwrap();
+        let srv = store
+            .save_node(Node {
+                name: "Gateway".to_string(),
+                role: "server".to_string(),
+                address: "127.0.0.1".to_string(),
+                port: 24443,
+                tunnel: LocalTLS {
+                    protocol: "vless".to_string(),
+                    listen_host: "127.0.0.1".to_string(),
+                    listen_port: 24443,
+                    reality: crate::model::Reality {
+                        dest: "www.microsoft.com:443".to_string(),
+                        private_key: priv_k,
+                        short_ids: "01020304".to_string(),
+                        server_names: "www.microsoft.com".to_string(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .unwrap();
+        let srv_tok = store.enroll_token(&srv.id, Duration::from_secs(600)).unwrap();
+        let srv_cred = store.enroll(&srv.id, &srv_tok).unwrap();
+
+        let cli = store
+            .save_node(Node {
+                name: "Airgap-NAS".to_string(),
+                role: "client".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        let cli_tok = store.enroll_token(&cli.id, Duration::from_secs(600)).unwrap();
+        let cli_cred = store.enroll(&cli.id, &cli_tok).unwrap();
+        store
+            .heartbeat(&cli.id, &cli_cred, cli.desired_revision, false)
+            .unwrap();
+        assert!(store.control_connected(&cli.id));
+
+        let mapping = store
+            .save_mapping(Mapping {
+                name: "SSH".to_string(),
+                server_id: srv.id.clone(),
+                client_id: cli.id.clone(),
+                listen_host: "127.0.0.1".to_string(),
+                listen_port: 22222,
+                target_host: "127.0.0.1".to_string(),
+                target_port: 22,
+                network: "tcp".to_string(),
+                pool: 1,
+                enabled: true,
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Switch client to offline mode: control credentials, last_seen, and applied_revision are purged
+        let cli_offline = store
+            .save_node(Node {
+                id: cli.id.clone(),
+                name: "Airgap-NAS".to_string(),
+                role: "client".to_string(),
+                mode: "offline".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(cli_offline.is_offline());
+        assert_eq!(cli_offline.applied_revision, 0);
+        assert_eq!(cli_offline.last_seen, 0);
+        assert_eq!(cli_offline.exported_revision, 0);
+        assert!(!store.control_connected(&cli.id));
+        assert!(store.request_refresh(&cli.id).is_err());
+        assert!(store.enroll_token(&cli.id, Duration::from_secs(600)).is_err());
+        assert!(store.enroll(&cli.id, &cli_tok).is_err());
+        assert!(store.heartbeat(&cli.id, &cli_cred, 1, false).is_err());
+
+        // Before export, mapping status reports offline_export_pending
+        let st_before = store.mapping_statuses().unwrap();
+        assert_eq!(st_before[&mapping.id].client.reason, "offline_export_pending");
+        assert!(!st_before[&mapping.id].client.acknowledged);
+
+        // Export offline snapshot: exported_revision matches desired_revision, idempotent on repeat
+        let (snap, changed1) = store.export_offline_snapshot(&cli.id).unwrap();
+        assert!(changed1);
+        assert_eq!(snap.revision, cli_offline.desired_revision);
+        assert_eq!(snap.mappings.len(), 1);
+        assert_eq!(snap.nodes.len(), 1);
+        let audit_count = store.audit().unwrap().len();
+        let (_snap2, changed2) = store.export_offline_snapshot(&cli.id).unwrap();
+        assert!(!changed2, "repeated export at same revision must not duplicate audit rows");
+        assert_eq!(store.audit().unwrap().len(), audit_count);
+
+        // Online server reporting live binding link marks hybrid offline client endpoint as linked too
+        let srv_snap = store.snapshot(&srv.id, &srv_cred).unwrap();
+        let bid = srv_snap.bindings[0].id.clone();
+        store
+            .heartbeat(&srv.id, &srv_cred, srv_snap.revision, false)
+            .unwrap();
+        store.report_links(&srv.id, &srv_cred, &[bid]).unwrap();
+        let st_after = store.mapping_statuses().unwrap();
+        assert_eq!(st_after[&mapping.id].client.reason, "offline_exported");
+        assert!(st_after[&mapping.id].client.acknowledged);
+        assert!(st_after[&mapping.id].server.linked);
+        assert!(st_after[&mapping.id].client.linked);
     }
 }

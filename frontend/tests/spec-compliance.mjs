@@ -219,3 +219,144 @@ test('copyText falls back to synchronous mobile-compatible textarea selection wh
   await m2.exports.copyText('http-fallback-ok')
   assert.equal(execCopiedValue, 'http-fallback-ok')
 })
+
+test('Transport badges avoid neutral surface collision and offline nodes suppress heartbeat checks', () => {
+  const format = loadTs('../src/format.ts')
+  const tokens = read('../src/styles/tokens.css')
+  const css = read('../src/styles/app.css')
+  const onboarding = read('../src/components/NodeOnboardingModal.tsx')
+  const editor = read('../src/components/NodeEditorDrawer.tsx')
+
+  assert.match(tokens, /--info-soft:/)
+  assert.match(tokens, /--badge-neutral-bg:/)
+  assert.match(tokens, /--segmented-track:/)
+  assert.match(css, /\.badge-info\s*\{/)
+  assert.match(onboarding, /\/offline/)
+  assert.match(editor, /脱机独立/)
+
+  const chips = format.tunnelBadges({
+    id: 'srv-reality',
+    name: 'Edge',
+    role: 'server',
+    address: '1.2.3.4',
+    port: 443,
+    revoked: false,
+    desired_revision: 1,
+    applied_revision: 1,
+    last_seen: Math.floor(Date.now() / 1000),
+    error: '',
+    tunnel: {
+      protocol: 'vless',
+      flow: 'xtls-rprx-vision',
+      decryption: 'mlkem768x25519plus.native.600s.demo',
+      reality: { dest: 'www.microsoft.com:443', public_key: 'pk', short_id: '0102' },
+    },
+  })
+  const tcpBadge = chips.find((b) => b.text === 'TCP')
+  assert.ok(tcpBadge)
+  assert.equal(tcpBadge.tone, 'info', 'TCP transport badge must use distinct info tone instead of neutral background shade')
+
+  const offlinePending = {
+    id: 'cli-off',
+    name: 'Airgap-Client',
+    role: 'client',
+    mode: 'offline',
+    address: '',
+    port: 0,
+    revoked: false,
+    desired_revision: 3,
+    applied_revision: 0,
+    exported_revision: 0,
+    last_seen: 0,
+    error: 'stale-online-error',
+  }
+  assert.equal(format.isOfflineNode(offlinePending), true)
+  assert.equal(format.heartbeatOnline(offlinePending), false)
+  assert.deepEqual(JSON.parse(JSON.stringify(format.presence(offlinePending))), { text: '脱机独立', tone: 'info' })
+  assert.deepEqual(JSON.parse(JSON.stringify(format.revisionState(offlinePending))), { text: '待导出', tone: 'warn' })
+  assert.deepEqual(JSON.parse(JSON.stringify(format.attentionReasons(offlinePending))), ['配置待导出'])
+
+  const offlineExported = { ...offlinePending, exported_revision: 3 }
+  assert.equal(format.nodeOperational(offlineExported), true)
+  assert.deepEqual(JSON.parse(JSON.stringify(format.revisionState(offlineExported))), { text: '已导出', tone: 'good' })
+  assert.deepEqual(JSON.parse(JSON.stringify(format.attentionReasons(offlineExported))), [])
+})
+
+test('Modals and Drawers stay flicker-free under 2s clock ticks and SSE node updates', () => {
+  const onboarding = read('../src/components/NodeOnboardingModal.tsx')
+  const editor = read('../src/components/NodeEditorDrawer.tsx')
+  const overlays = read('../src/components/ui/Overlays.tsx')
+  const cmdk = read('../src/components/ui/CommandPalette.tsx')
+  const tour = read('../src/components/ui/Tour.tsx')
+
+  // NodeOnboardingModal must NOT depend on object `node` or callback `onExported` in effect/callback deps,
+  // and must keep .subpanel-card mounted unconditionally to prevent open/reload height flicker.
+  assert.doesNotMatch(onboarding, /\},\s*\[node\b/)
+  assert.doesNotMatch(onboarding, /\[onExported\]/)
+  assert.doesNotMatch(onboarding, /\{onlineResult\s*&&\s*\(/)
+  assert.doesNotMatch(onboarding, /\{offlineResult\s*&&\s*\(\s*<div className="subpanel-card"/)
+  assert.match(onboarding, /\[nodeId,\s*offlineMode,\s*nodeEmbedded,\s*generateOnline,\s*exportOffline\]/)
+
+  // NodeEditorDrawer must key draft reset on primitive sessionKey, never raw `node` or `defaultName`.
+  assert.doesNotMatch(editor, /\[open,\s*node,\s*defaultName/)
+  assert.match(editor, /\[sessionKey,\s*isServer\]/)
+
+  // Overlays must ref-wrap callbacks instead of re-binding global key listeners on parent clock ticks.
+  assert.doesNotMatch(overlays, /\[open,\s*busy,\s*onClose\]/)
+  assert.doesNotMatch(cmdk, /onClose\]/)
+  assert.doesNotMatch(tour, /\[open,\s*index,\s*steps\]/)
+})
+
+test('Server clock calibration eliminates false clock-ahead warnings and all edit dialogs use centered Modal', () => {
+  const editor = read('../src/components/NodeEditorDrawer.tsx')
+  const proxies = read('../src/views/ProxiesView.tsx')
+  const nodesView = read('../src/views/NodesView.tsx')
+
+  // Both NodeEditorDrawer and ProxiesView mapping editor must render centered <Modal isForm ...>, never side <Drawer
+  assert.doesNotMatch(editor, /<Drawer\b/)
+  assert.match(editor, /<Modal[\s\S]*isForm/)
+  assert.doesNotMatch(proxies, /<Drawer\b/)
+  assert.match(proxies, /<Modal[\s\S]*isForm/)
+
+  // NodesView inspector and rows must pass calibrated renderNow, never stale raw Date.now()
+  assert.doesNotMatch(nodesView, /Date\.now\(\)/)
+  assert.match(nodesView, /serverNowMs\(\)/)
+
+  // Simulate server clock 10 minutes ahead of local browser + 2s React tick lag
+  const host = {
+    __VEILINK_CLOCK_OFFSET_MS__: 600_000,
+    __VEILINK_SERVER_FLOOR_MS__: Date.now() + 600_000,
+  }
+  const js = ts.transpileModule(read('../src/format.ts'), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+  }).outputText
+  const m = { exports: {} }
+  vm.runInContext(js, vm.createContext({ exports: m.exports, module: m, TextEncoder, Date, globalThis: host }))
+  const format = m.exports
+
+  const serverSec = Math.floor((Date.now() + 600_000) / 1000)
+  const onlineNode = {
+    id: 'gw-1',
+    name: 'Edge-1',
+    role: 'server',
+    address: '1.2.3.4',
+    port: 443,
+    revoked: false,
+    desired_revision: 4,
+    applied_revision: 4,
+    last_seen: serverSec,
+    error: '',
+  }
+  // Even with a 3-second tick lag behind last_seen, node stays online with "0 秒前" and zero false warnings
+  const laggedNow = (serverSec - 3) * 1000
+  assert.equal(format.heartbeatOnline(onlineNode), true)
+  assert.equal(format.heartbeatOnline(onlineNode, laggedNow), true)
+  assert.deepEqual(JSON.parse(JSON.stringify(format.presence(onlineNode, laggedNow))), { text: '近期在线', tone: 'good' })
+  assert.deepEqual(JSON.parse(JSON.stringify(format.attentionReasons(onlineNode, laggedNow))), [])
+  assert.equal(format.seenText(serverSec, laggedNow, true), '0 秒前')
+
+  // Meanwhile a genuinely dead node (5 minutes old on server) is still accurately reported as timed out even when browser is 10m behind
+  const deadNode = { ...onlineNode, last_seen: serverSec - 300 }
+  assert.equal(format.heartbeatOnline(deadNode), false)
+  assert.deepEqual(JSON.parse(JSON.stringify(format.presence(deadNode))), { text: '心跳超时', tone: 'warn' })
+})

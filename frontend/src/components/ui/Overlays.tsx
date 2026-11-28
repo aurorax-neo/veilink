@@ -43,6 +43,8 @@ export function Modal({
   const [error, setError] = useState('')
   const composingRef = useRef(false)
   const compEndRef = useRef(0)
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
 
   useEffect(() => {
     if (!open) {
@@ -53,12 +55,12 @@ export function Modal({
     const onKey = (e: globalThis.KeyboardEvent) => {
       if (e.key === 'Escape' && !busy) {
         e.preventDefault()
-        onClose()
+        onCloseRef.current()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [open, busy, onClose])
+  }, [open, busy])
 
   if (!open) return null
 
@@ -109,7 +111,7 @@ export function Modal({
             compEndRef.current = Date.now()
           }}
           onKeyDown={handleKeyDown}
-          style={{ display: 'flex', flexDirection: 'column', minHeight: 0, maxHeight: 'inherit' }}
+          style={{ display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: 0, width: '100%', overflow: 'hidden' }}
         >
           <header className="overlay-head">
             <div>
@@ -122,7 +124,7 @@ export function Modal({
           </header>
 
           <div className="overlay-body">
-            <fieldset disabled={busy} style={{ border: 0, margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 14, minWidth: 0 }}>
+            <fieldset disabled={busy} style={{ border: 0, margin: 0, padding: 0, display: 'flex', flexDirection: 'column', flexShrink: 0, gap: 16, minWidth: 0 }}>
               {children}
             </fieldset>
             <InlineAlert message={error} />
@@ -193,6 +195,8 @@ export function Drawer({
   const dragStartRef = useRef(0)
   const composingRef = useRef(false)
   const compEndRef = useRef(0)
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
 
   useEffect(() => {
     if (!open) {
@@ -206,12 +210,12 @@ export function Drawer({
     const onKey = (e: globalThis.KeyboardEvent) => {
       if (e.key === 'Escape' && !busy) {
         e.preventDefault()
-        onClose()
+        onCloseRef.current()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [open, busy, onClose])
+  }, [open, busy])
 
   if (!open) return null
 

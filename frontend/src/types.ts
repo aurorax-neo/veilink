@@ -92,6 +92,7 @@ export interface Node {
   id: string
   name: string
   role: 'server' | 'client' | string
+  mode?: 'online' | 'offline' | ''
   address: string
   port: number
   connect_endpoints?: ConnectEndpoint[]
@@ -104,6 +105,7 @@ export interface Node {
   disabled?: boolean
   desired_revision: number
   applied_revision: number
+  exported_revision?: number
   last_seen: number
   error: string
 }
@@ -163,6 +165,7 @@ export interface Stats {
   online_servers?: number
   online_clients?: number
   online_nodes?: number
+  offline_nodes?: number
   total_nodes: number
   total_mappings?: number
   enabled_mappings?: number
@@ -204,6 +207,7 @@ export interface MasterServiceConfig {
 export interface JoinResult {
   prepare?: string
   command: string
+  binary_command?: string
   offline_command?: string
   offline_binary_command?: string
   bootstrap_state?: string
@@ -211,6 +215,23 @@ export interface JoinResult {
   expires_at: number
   token: string
   warning: string
+}
+
+export interface OfflineExportResult {
+  mode: 'offline'
+  node_id: string
+  role: string
+  revision: number
+  exported_revision: number
+  filename: string
+  config_path: string
+  prepare: string
+  command: string
+  file_command: string
+  binary_command: string
+  inline_binary_command: string
+  offline_state: string
+  state_json: string
 }
 
 export type PageId = 'dashboard' | 'servers' | 'clients' | 'proxies' | 'logs' | 'audit' | 'settings'

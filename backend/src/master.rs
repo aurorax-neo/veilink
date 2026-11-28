@@ -531,7 +531,8 @@ pub async fn run_embedded_attempt(
         }
     }
 
-    if cached.credential.is_empty() {
+    let issued_enroll_token = cached.credential.is_empty();
+    if issued_enroll_token {
         let token = s
             .enroll_token(&n.id, Duration::from_secs(60))
             .map_err(|e| {
@@ -569,7 +570,9 @@ pub async fn run_embedded_attempt(
     }
 
     let res = node::run_with_ring(cancel, srv_config, "server", ring).await;
-    let _ = s.revoke_enroll_token(&n.id);
+    if issued_enroll_token {
+        let _ = s.revoke_enroll_token(&n.id);
+    }
     res
 }
 

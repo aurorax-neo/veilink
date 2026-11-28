@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowUp, Pause, Play, RefreshCw, Search, Terminal } from 'lucide-react'
 import { api } from '../api'
 import { useConsole } from '../context/ConsoleContext'
-import { byNameAndId, formatTime, logLevelTone, nodeName } from '../format'
+import { byNameAndId, formatTime, isOfflineNode, logLevelTone, nodeName } from '../format'
 import { askNodes, nodeBaseline, nodeChanged, registerPageRefresh, waitForReports } from '../pageRefresh'
 import { stream } from '../stream'
 import type { LogEntry } from '../types'
@@ -113,7 +113,7 @@ export function LogsView() {
       await fetchLogs()
       if (!activeRef.current || source === 'master') return
       const targetNodes = (source === 'node' && nodeId ? nodesRef.current.filter((n) => n.id === nodeId) : nodesRef.current).filter(
-        (n) => !n.revoked,
+        (n) => !n.revoked && !isOfflineNode(n),
       )
       const baseline = new Map(targetNodes.map((n) => [n.id, nodeBaseline(n)]))
       const connected = await askNodes(targetNodes.map((n) => n.id))
@@ -262,29 +262,34 @@ export function LogsView() {
           <EmptyState icon={<Terminal size={20} />} title={dict.logs.emptyTitle} />
         ) : (
           <div ref={listRef} className="log-viewport" onScroll={handleScroll}>
-            {filteredLogs.map((entry, idx) => {
-              const sig = `${entry.at}|${entry.source}|${entry.node_id || ''}|${entry.level}|${entry.message}`
-              const animateNew = freshKeys.has(sig) && idx < 6
-              return (
-                <div
-                  key={`${entry.at}-${entry.source}-${idx}`}
-                  className={`log-row ${animateNew ? 'stream-reveal' : ''}`}
-                  style={animateNew ? ({ '--stagger-index': idx } as React.CSSProperties) : undefined}
-                >
-                  <time
-                    className="cell-sub tabular ltr-force"
-                    dateTime={entry.at ? new Date(entry.at * 1000).toISOString() : undefined}
+            {(() => {
+              const dupCounts = new Map<string, number>()
+              return filteredLogs.map((entry, idx) => {
+                const sig = `${entry.at}|${entry.source}|${entry.node_id || ''}|${entry.level}|${entry.message}`
+                const occ = (dupCounts.get(sig) || 0) + 1
+                dupCounts.set(sig, occ)
+                const animateNew = freshKeys.has(sig) && idx < 6
+                return (
+                  <div
+                    key={`${sig}#${occ}`}
+                    className={`log-row ${animateNew ? 'stream-reveal' : ''}`}
+                    style={animateNew ? ({ '--stagger-index': idx } as React.CSSProperties) : undefined}
                   >
-                    {entry.at ? formatTime(entry.at * 1000) : '时间未知'}
-                  </time>
-                  <div style={{ display: 'flex', gap: 5, alignItems: 'center', flexWrap: 'wrap' }}>
-                    <Badge text={entry.level || 'INFO'} tone={logLevelTone(entry.level)} />
-                    {entry.source && <Badge text={sourceLabel(entry)} />}
+                    <time
+                      className="cell-sub tabular ltr-force"
+                      dateTime={entry.at ? new Date(entry.at * 1000).toISOString() : undefined}
+                    >
+                      {entry.at ? formatTime(entry.at * 1000) : '时间未知'}
+                    </time>
+                    <div style={{ display: 'flex', gap: 5, alignItems: 'center', flexWrap: 'wrap' }}>
+                      <Badge text={entry.level || 'INFO'} tone={logLevelTone(entry.level)} />
+                      {entry.source && <Badge text={sourceLabel(entry)} />}
+                    </div>
+                    <span className="log-msg">{entry.message}</span>
                   </div>
-                  <span className="log-msg">{entry.message}</span>
-                </div>
-              )
-            })}
+                )
+              })
+            })()}
 
             {showJumpLatest && (
               <button type="button" className="btn btn-sm btn-primary jump-latest-fab" onClick={jumpLatest}>

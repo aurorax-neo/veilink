@@ -2,12 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowLeftRight, ArrowRight, Edit3, MoreHorizontal, Plus, Power, Search, Trash2 } from 'lucide-react'
 import { api } from '../api'
 import { useConsole } from '../context/ConsoleContext'
-import { byNameAndId, endpoint, formatBytes, formatTime, heartbeatOnline, nodeName, triggerHaptic, validateMapping, type Tone } from '../format'
+import { byNameAndId, endpoint, formatBytes, formatTime, heartbeatOnline, isOfflineNode, nodeName, serverNowMs, triggerHaptic, validateMapping, type Tone } from '../format'
 import { askNodes, nodeBaseline, nodeChanged, registerPageRefresh, waitForReports } from '../pageRefresh'
 import type { Mapping, TrafficRow } from '../types'
 import { Alert, Badge, EmptyState, InlineAlert } from '../components/ui/Badge'
 import { Dropdown, Segmented, Select, Switch } from '../components/ui/Controls'
-import { ActionSheet, AlertDialog, Drawer } from '../components/ui/Overlays'
+import { ActionSheet, AlertDialog, Modal } from '../components/ui/Overlays'
 
 type FilterState = 'all' | 'on' | 'off'
 
@@ -80,7 +80,7 @@ export function ProxiesView() {
     return 'all'
   })
   const [query, setQuery] = useState('')
-  const [now, setNow] = useState(() => Date.now())
+  const [now, setNow] = useState(() => serverNowMs())
 
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [hasSavedDraft, setHasSavedDraft] = useState(false)
@@ -115,11 +115,11 @@ export function ProxiesView() {
 
   useEffect(() => {
     activeRef.current = true
-    const clock = window.setInterval(() => setNow(Date.now()), 2000)
+    const clock = window.setInterval(() => setNow(serverNowMs()), 2000)
     const unregister = registerPageRefresh(async () => {
       const ids = [...new Set(mappingsRef.current.flatMap((m) => [m.server_id, m.client_id]))].filter((id) => {
         const n = nodesRef.current.find((x) => x.id === id)
-        return !!n && !n.revoked
+        return !!n && !n.revoked && !isOfflineNode(n)
       })
       const baseline = new Map(ids.map((id) => [id, nodeBaseline(nodesRef.current.find((x) => x.id === id)!)]))
       const connected = await askNodes(ids)
@@ -295,11 +295,37 @@ export function ProxiesView() {
     if (srv.disabled || cli.disabled) {
       return { text: srv.disabled && cli.disabled ? '两端已停用' : srv.disabled ? '服务端已停用' : '客户端已停用', tone: 'neutral' }
     }
-    const currentNow = Math.max(now, Date.now())
+    const currentNow = Math.max(now, serverNowMs())
+    const srvOffline = isOfflineNode(srv)
+    const cliOffline = isOfflineNode(cli)
+    const st = mappingStatuses[mapping.id]
+
+    if (srvOffline && cliOffline) {
+      const srvExported = srv.desired_revision > 0 && (srv.exported_revision || 0) >= srv.desired_revision
+      const cliExported = cli.desired_revision > 0 && (cli.exported_revision || 0) >= cli.desired_revision
+      return srvExported && cliExported
+        ? { text: '脱机就绪', tone: 'info' }
+        : { text: '待导出配置', tone: 'warn' }
+    }
+
+    if (srvOffline || cliOffline) {
+      const onlinePeer = srvOffline ? cli : srv
+      const offlinePeer = srvOffline ? srv : cli
+      if (!heartbeatOnline(onlinePeer, currentNow)) {
+        return { text: srvOffline ? '客户端离线' : '服务端离线', tone: 'warn' }
+      }
+      if (st?.server?.linked === true && st?.client?.linked === true) {
+        return { text: '隧道已连通', tone: 'good' }
+      }
+      if ((offlinePeer.exported_revision || 0) === 0) {
+        return { text: '待导出配置', tone: 'warn' }
+      }
+      return { text: '待建连', tone: 'warn' }
+    }
+
     const sOn = heartbeatOnline(srv, currentNow)
     const cOn = heartbeatOnline(cli, currentNow)
     if (!sOn || !cOn) return { text: !sOn && !cOn ? '两端离线' : !sOn ? '服务端离线' : '客户端离线', tone: 'warn' }
-    const st = mappingStatuses[mapping.id]
     const sDown = st?.server?.linked !== true
     const cDown = st?.client?.linked !== true
     if (!sDown && !cDown) return { text: '隧道已连通', tone: 'good' }
@@ -592,10 +618,12 @@ export function ProxiesView() {
         )}
       </div>
 
-      {/* Mapping Editor Drawer / Mobile BottomSheet */}
-      <Drawer
+      {/* Mapping Editor Centered Modal */}
+      <Modal
         open={drawerOpen}
         onClose={() => setDrawerOpen(false)}
+        isForm
+        size="lg"
         title={draft.id ? `编辑映射 · ${draft.name}` : '新建端口映射'}
         saveLabel={draft.id ? '保存' : '创建'}
         disabled={!servers.length || !clients.length}
@@ -741,7 +769,7 @@ export function ProxiesView() {
         </div>
 
         <Switch checked={draft.enabled} label="保存后立即启用此映射" onChange={(enabled) => setDraft((p) => ({ ...p, enabled }))} />
-      </Drawer>
+      </Modal>
 
       <ActionSheet
         open={!!mobileSheet}

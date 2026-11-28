@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { Search } from 'lucide-react'
 
@@ -24,6 +24,8 @@ export function CommandPalette({
 }) {
   const [query, setQuery] = useState('')
   const [activeIndex, setActiveIndex] = useState(0)
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
 
   useEffect(() => {
     if (!open) {
@@ -47,7 +49,7 @@ export function CommandPalette({
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.preventDefault()
-        onClose()
+        onCloseRef.current()
       } else if (e.key === 'ArrowDown') {
         e.preventDefault()
         setActiveIndex((i) => (filtered.length ? (i + 1) % filtered.length : 0))
@@ -57,12 +59,12 @@ export function CommandPalette({
       } else if (e.key === 'Enter' && filtered[activeIndex] && !e.isComposing) {
         e.preventDefault()
         filtered[activeIndex].onSelect()
-        onClose()
+        onCloseRef.current()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [open, filtered, activeIndex, onClose])
+  }, [open, filtered, activeIndex])
 
   if (!open) return null
 

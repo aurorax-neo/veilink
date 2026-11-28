@@ -38,14 +38,34 @@
   --accent-border: rgba(45, 212, 191, 0.30);
 
   --good: #34d399;
-  --good-soft: rgba(52, 211, 153, 0.12);
+  --good-soft: rgba(52, 211, 153, 0.14);
+  --good-border: rgba(52, 211, 153, 0.28);
   --warn: #fbbf24;
-  --warn-soft: rgba(251, 191, 36, 0.12);
+  --warn-soft: rgba(251, 191, 36, 0.14);
+  --warn-border: rgba(251, 191, 36, 0.28);
   --bad: #f87171;
   --bad-solid: #dc2626;
-  --bad-soft: rgba(248, 113, 113, 0.13);
+  --bad-soft: rgba(248, 113, 113, 0.14);
+  --bad-border: rgba(248, 113, 113, 0.28);
   --purple: #a78bfa;
-  --purple-soft: rgba(167, 139, 250, 0.13);
+  --purple-soft: rgba(167, 139, 250, 0.15);
+  --purple-border: rgba(167, 139, 250, 0.30);
+  --info: #38bdf8;
+  --info-soft: rgba(56, 189, 248, 0.14);
+  --info-border: rgba(56, 189, 248, 0.30);
+
+  /* High-separation neutral pill & recessed/elevated control surfaces (anti-collision on all surface-0..4) */
+  --badge-neutral-bg: rgba(255, 255, 255, 0.085);
+  --badge-neutral-border: rgba(255, 255, 255, 0.16);
+  --badge-neutral-fg: #d8d8d2;
+  --control-bg: rgba(255, 255, 255, 0.075);
+  --control-bg-hover: rgba(255, 255, 255, 0.125);
+  --segmented-track: rgba(0, 0, 0, 0.34);
+  --segmented-thumb: #2b2b28;
+  --segmented-thumb-border: rgba(255, 255, 255, 0.14);
+  --segmented-thumb-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+  --switch-off-bg: rgba(255, 255, 255, 0.14);
+  --surface-nested: rgba(255, 255, 255, 0.035);
 
   /* Input focus interlocking dual-layer shadow (Spec 6.2) */
   --focus-ring: rgba(45, 212, 191, 0.45);
@@ -115,13 +135,32 @@
 
   --good: #059669;
   --good-soft: rgba(5, 150, 105, 0.11);
+  --good-border: rgba(5, 150, 105, 0.25);
   --warn: #d97706;
   --warn-soft: rgba(217, 119, 6, 0.11);
+  --warn-border: rgba(217, 119, 6, 0.25);
   --bad: #dc2626;
   --bad-solid: #dc2626;
   --bad-soft: rgba(220, 38, 38, 0.10);
+  --bad-border: rgba(220, 38, 38, 0.24);
   --purple: #6d28d9;
   --purple-soft: rgba(109, 40, 217, 0.10);
+  --purple-border: rgba(109, 40, 217, 0.24);
+  --info: #0284c7;
+  --info-soft: rgba(2, 132, 199, 0.10);
+  --info-border: rgba(2, 132, 199, 0.25);
+
+  --badge-neutral-bg: rgba(24, 24, 22, 0.065);
+  --badge-neutral-border: rgba(24, 24, 22, 0.15);
+  --badge-neutral-fg: #3f3f3a;
+  --control-bg: #ffffff;
+  --control-bg-hover: #f2f2ed;
+  --segmented-track: rgba(24, 24, 22, 0.065);
+  --segmented-thumb: #ffffff;
+  --segmented-thumb-border: rgba(24, 24, 22, 0.12);
+  --segmented-thumb-shadow: 0 1px 3px rgba(24, 24, 22, 0.10);
+  --switch-off-bg: rgba(24, 24, 22, 0.15);
+  --surface-nested: rgba(24, 24, 22, 0.03);
 
   --focus-ring: rgba(13, 148, 136, 0.36);
   --focus-depth: rgba(24, 24, 22, 0.10);

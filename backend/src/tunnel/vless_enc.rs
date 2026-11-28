@@ -27,8 +27,8 @@ pub const MLKEM768_CT_LEN: usize = 1088;
 pub const TAG_LEN: usize = 16;
 
 const MAX_NONCE: [u8; 12] = [0xFF; 12];
-const WRITE_CHUNK: usize = 16384 - 5 - TAG_LEN;
-const MAX_WRITE_BATCH: usize = 4 * WRITE_CHUNK;
+const WRITE_CHUNK: usize = 8192;
+const MAX_WRITE_BATCH: usize = 8 * WRITE_CHUNK;
 
 fn derive_key(ctx: &[u8], key_material: &[u8]) -> [u8; 32] {
     use blake3::hazmat::HasherExt;
@@ -719,6 +719,7 @@ impl ServerInstance {
             }
             if let Some(gap) = padding_gaps.get(i) {
                 if !gap.is_zero() {
+                    stream.flush().await.map_err(|e| e.to_string())?;
                     tokio::time::sleep(*gap).await;
                 }
             }
@@ -928,16 +929,30 @@ impl ClientInstance {
         })))
     }
 
-    pub fn has_cached_ticket(&self) -> bool {
+    pub fn cached_ticket_pfs_key(&self) -> Option<Vec<u8>> {
         if self.seconds == 0 {
-            return false;
+            return None;
         }
         let cache = self.cache.lock();
-        matches!(cache.expire, Some(exp) if Instant::now() < exp)
+        match cache.expire {
+            Some(exp) if Instant::now() < exp => Some(cache.pfs_key.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn has_cached_ticket(&self) -> bool {
+        self.cached_ticket_pfs_key().is_some()
     }
 
     pub fn invalidate_ticket(&self) {
         self.cache.lock().expire = None;
+    }
+
+    pub fn invalidate_ticket_if_pfs(&self, expected_pfs: &[u8]) {
+        let mut cache = self.cache.lock();
+        if cache.pfs_key == expected_pfs {
+            cache.expire = None;
+        }
     }
 
     pub async fn handshake(&self, mut stream: BoxStream) -> Result<BoxStream, String> {
@@ -1032,7 +1047,7 @@ impl ClientInstance {
                         write_ctr,
                         read_ctr: None,
                         xor: self.xor_mode == 2,
-                        reset_cache: Some(Arc::clone(&self.cache)),
+                        reset_cache: Some((Arc::clone(&self.cache), pfs_key)),
                     },
                 ));
             }
@@ -1071,6 +1086,7 @@ impl ClientInstance {
             }
             if let Some(gap) = padding_gaps.get(i) {
                 if !gap.is_zero() {
+                    stream.flush().await.map_err(|e| e.to_string())?;
                     tokio::time::sleep(*gap).await;
                 }
             }
@@ -1171,7 +1187,7 @@ struct DataPhase {
     write_ctr: Option<Aes256Ctr>,
     read_ctr: Option<Aes256Ctr>,
     xor: bool,
-    reset_cache: Option<Arc<Mutex<TicketCache>>>,
+    reset_cache: Option<(Arc<Mutex<TicketCache>>, Vec<u8>)>,
 }
 
 pub struct TaskedDuplex {
@@ -1284,7 +1300,7 @@ struct VlessEncStream {
     write_ctr: Option<Aes256Ctr>,
     read_ctr: Option<Aes256Ctr>,
     xor: bool,
-    reset_cache: Option<Arc<Mutex<TicketCache>>>,
+    reset_cache: Option<(Arc<Mutex<TicketCache>>, Vec<u8>)>,
     first_record_ok: bool,
     pending_rec_hdr: Option<([u8; 5], usize)>,
     read_raw_buf: Vec<u8>,
@@ -1299,8 +1315,11 @@ struct VlessEncStream {
 
 impl VlessEncStream {
     fn invalidate_cache(&mut self) {
-        if let Some(ref cache) = self.reset_cache {
-            cache.lock().expire = None;
+        if let Some((ref cache, ref expected_pfs)) = self.reset_cache {
+            let mut guard = cache.lock();
+            if guard.pfs_key == *expected_pfs {
+                guard.expire = None;
+            }
         }
     }
 

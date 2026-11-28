@@ -1686,6 +1686,9 @@ impl Api {
                 if *method == Method::POST && p.len() == 3 && p[2] == "join" {
                     return self.serve_join(req, id).await;
                 }
+                if *method == Method::POST && p.len() == 3 && p[2] == "offline" {
+                    return self.serve_offline_export(req, id).await;
+                }
                 if *method == Method::DELETE && p.len() == 3 && p[2] == "enroll" {
                     return match self.store.revoke_enroll_token(id) {
                         Ok(()) => {
@@ -1820,12 +1823,23 @@ impl Api {
         let now = Utc::now().timestamp();
         let online = nodes
             .iter()
-            .filter(|n| n.last_seen > 0 && now >= n.last_seen && (now - n.last_seen) < 90 && !n.revoked)
+            .filter(|n| {
+                !n.revoked
+                    && !n.is_offline()
+                    && n.last_seen > 0
+                    && now + 10 >= n.last_seen
+                    && (now - n.last_seen) < 90
+            })
+            .count();
+        let offline_mode = nodes
+            .iter()
+            .filter(|n| !n.revoked && n.is_offline())
             .count();
         let enabled_mappings = mappings.iter().filter(|m| m.enabled).count();
         Ok(serde_json::json!({
             "total_nodes": nodes.len(),
             "online_nodes": online,
+            "offline_nodes": offline_mode,
             "total_mappings": mappings.len(),
             "enabled_mappings": enabled_mappings,
         }))
@@ -1913,7 +1927,7 @@ impl Api {
         };
         let mut node_role = String::new();
         for n in &nodes {
-            if n.id == id && !n.revoked && !n.embedded {
+            if n.id == id && !n.revoked && !n.embedded && !n.is_offline() {
                 node_role = n.role.clone();
                 break;
             }
@@ -1992,6 +2006,17 @@ impl Api {
             command.push_str(&format!(" -control-server-name {}", shell_quote(&server_name)));
         }
         let offline_command = format!("{} -bootstrap-state {}", command, shell_quote(&bootstrap_state));
+        let mut binary_command = format!(
+            "veilink {} -master-addr {} -node-id {} -enroll-token {} -state-dir '/var/lib/veilink'",
+            node_role,
+            shell_quote(&address),
+            shell_quote(id),
+            shell_quote(&token),
+        );
+        if !server_name.is_empty() {
+            binary_command
+                .push_str(&format!(" -control-server-name {}", shell_quote(&server_name)));
+        }
         let mut offline_binary_command = format!(
             "veilink {} -master-addr {} -node-id {} -enroll-token {} -state-dir '/data/state'",
             node_role,
@@ -2022,6 +2047,7 @@ impl Api {
             &serde_json::json!({
                 "prepare": prepare,
                 "command": command,
+                "binary_command": binary_command,
                 "offline_command": offline_command,
                 "offline_binary_command": offline_binary_command,
                 "bootstrap_state": bootstrap_state,
@@ -2029,6 +2055,116 @@ impl Api {
                 "token": token,
                 "expires_at": expires_at,
                 "warning": warning,
+            }),
+            true,
+        )
+    }
+
+    async fn serve_offline_export(&self, req: Request<Body>, id: &str) -> Response<Body> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct EmptyObj {}
+
+        let bytes = match axum::body::to_bytes(req.into_body(), 64 << 10).await {
+            Ok(b) => b,
+            Err(_) => return failure_response(StatusCode::BAD_REQUEST, true),
+        };
+        if !bytes.iter().all(|b| b.is_ascii_whitespace()) {
+            let mut de = serde_json::Deserializer::from_slice(&bytes);
+            if EmptyObj::deserialize(&mut de).is_err() || de.end().is_err() {
+                return failure_response(StatusCode::BAD_REQUEST, true);
+            }
+        }
+
+        let (snapshot, changed) = match self.store.export_offline_snapshot(id) {
+            Ok(v) => v,
+            Err(_) => return failure_response(StatusCode::BAD_REQUEST, true),
+        };
+        let node_role = snapshot.node.role.clone();
+        let disk_state = crate::node::DiskState {
+            node_id: id.to_string(),
+            master: "offline".to_string(),
+            credential: String::new(),
+            snapshot: Some(snapshot.clone()),
+        };
+        let state_bytes = match serde_json::to_vec(&disk_state) {
+            Ok(b) => b,
+            Err(_) => return failure_response(StatusCode::INTERNAL_SERVER_ERROR, true),
+        };
+        let state_json = serde_json::to_string_pretty(&disk_state).unwrap_or_default();
+        let offline_state = URL_SAFE_NO_PAD.encode(&state_bytes);
+
+        let mut hasher = Sha256::new();
+        hasher.update(id.as_bytes());
+        let digest = hasher.finalize();
+        let short_hex = hex::encode(&digest[..16]);
+        let app = format!("veilink-{}-{}", node_role, short_hex);
+        let root = format!("/opt/docker/{}", app);
+        let cfg_dir = format!("{}/config", root);
+        let data_dir = format!("{}/data", root);
+        let cfg_file = format!("{}/offline-state.json", cfg_dir);
+        let prepare = format!(
+            "mkdir -p {} {} && chown -R 65532:65532 {} {} && chmod 700 {} {}",
+            shell_quote(&cfg_dir),
+            shell_quote(&data_dir),
+            shell_quote(&cfg_dir),
+            shell_quote(&data_dir),
+            shell_quote(&cfg_dir),
+            shell_quote(&data_dir)
+        );
+        let mut docker_base = format!(
+            "docker run -itd --restart unless-stopped --name {}",
+            shell_quote(&app)
+        );
+        if node_role == "server" {
+            docker_base.push_str(" --net host");
+        }
+        docker_base.push_str(&format!(
+            " -v {} -v {} -e TZ=Asia/Shanghai ghcr.io/aurorax-neo/veilink:latest {} -master-addr 'offline' -node-id {} -state-dir '/data/state'",
+            shell_quote(&format!("{}:/config:ro", cfg_dir)),
+            shell_quote(&format!("{}:/data", data_dir)),
+            node_role,
+            shell_quote(id),
+        ));
+        let command = format!("{} -offline-state {}", docker_base, shell_quote(&offline_state));
+        let file_command = format!("{} -offline-state '/config/offline-state.json'", docker_base);
+        let binary_command = format!(
+            "veilink {} -master-addr 'offline' -node-id {} -state-dir '/var/lib/veilink' -offline-state '/etc/veilink/offline-state.json'",
+            node_role,
+            shell_quote(id),
+        );
+        let inline_binary_command = format!(
+            "veilink {} -master-addr 'offline' -node-id {} -state-dir '/var/lib/veilink' -offline-state {}",
+            node_role,
+            shell_quote(id),
+            shell_quote(&offline_state),
+        );
+        let filename = format!(
+            "veilink-{}-{}-r{}.json",
+            node_role,
+            &short_hex[..8],
+            snapshot.revision
+        );
+        if changed {
+            self.log_mgmt("nodes", "POST", id);
+        }
+        json_response(
+            StatusCode::OK,
+            &serde_json::json!({
+                "mode": "offline",
+                "node_id": id,
+                "role": node_role,
+                "revision": snapshot.revision,
+                "exported_revision": snapshot.revision,
+                "filename": filename,
+                "config_path": cfg_file,
+                "prepare": prepare,
+                "command": command,
+                "file_command": file_command,
+                "binary_command": binary_command,
+                "inline_binary_command": inline_binary_command,
+                "offline_state": offline_state,
+                "state_json": state_json,
             }),
             true,
         )
@@ -2496,6 +2632,9 @@ fn set_security_headers(headers: &mut axum::http::HeaderMap, no_store: bool) {
             header::HeaderValue::from_static("no-store"),
         );
     }
+    if let Ok(val) = header::HeaderValue::from_str(&Utc::now().timestamp_millis().to_string()) {
+        headers.insert("X-Server-Time-Ms", val);
+    }
 }
 
 fn json_response<T: Serialize>(
@@ -2898,5 +3037,144 @@ mod tests {
             .to_str()
             .unwrap()
             .contains("; Secure"));
+    }
+
+    #[tokio::test]
+    async fn offline_node_export_api_rejects_online_join_and_tracks_stats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("veilink.db").to_string_lossy().to_string();
+        let key_path = tmp.path().join("master.key").to_string_lossy().to_string();
+        let store = Arc::new(Store::open(&db_path, &key_path).unwrap());
+        let api = Api::new(
+            Arc::clone(&store),
+            true,
+            None,
+            WebPersistConfig {
+                db_path: db_path.clone(),
+                html_dir: String::new(),
+            },
+        );
+        // Trigger .install_secret creation via /api/v1/auth/status
+        let _ = api
+            .handle(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/auth/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        let secret = std::fs::read_to_string(tmp.path().join(".install_secret"))
+            .unwrap()
+            .trim()
+            .to_string();
+        let setup_resp = api
+            .handle(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/auth/setup")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "install_secret": secret,
+                            "email": "ops@veilink.io",
+                            "password": "Password123!"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await;
+        let setup_json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(setup_resp.into_body(), 4096).await.unwrap(),
+        )
+        .unwrap();
+        let auth_hdr = format!("Bearer {}", setup_json["token"].as_str().unwrap());
+
+        // Create an offline client via POST /api/v1/nodes
+        let create_resp = api
+            .handle(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/nodes")
+                    .header(header::AUTHORIZATION, &auth_hdr)
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "Airgap-Edge",
+                            "role": "client",
+                            "mode": "offline",
+                            "address": "",
+                            "port": 0
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(create_resp.status(), StatusCode::OK);
+        let created: Node = serde_json::from_slice(
+            &axum::body::to_bytes(create_resp.into_body(), 8192).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(created.mode, "offline");
+
+        // Online /join must be rejected for offline nodes
+        let join_resp = api
+            .handle(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/nodes/{}/join", created.id))
+                    .header(header::AUTHORIZATION, &auth_hdr)
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"master_url":"https://hub.veilink.io:8443"}"#))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(join_resp.status(), StatusCode::BAD_REQUEST);
+
+        // Offline /offline endpoint returns standalone commands without enroll-token and updates exported_revision
+        let off_resp = api
+            .handle(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/nodes/{}/offline", created.id))
+                    .header(header::AUTHORIZATION, &auth_hdr)
+                    .header("Content-Type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(off_resp.status(), StatusCode::OK);
+        let off_json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(off_resp.into_body(), 64 << 10).await.unwrap(),
+        )
+        .unwrap();
+        let cmd = off_json["command"].as_str().unwrap();
+        assert!(cmd.contains("-master-addr 'offline'"));
+        assert!(cmd.contains("-offline-state "));
+        assert!(!cmd.contains("-enroll-token"));
+        let state_disk: crate::node::DiskState =
+            serde_json::from_str(off_json["state_json"].as_str().unwrap()).unwrap();
+        assert_eq!(state_disk.master, "offline");
+        assert!(state_disk.credential.is_empty());
+        assert!(state_disk.snapshot.is_some());
+
+        let stats_resp = api
+            .handle(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/stats")
+                    .header(header::AUTHORIZATION, &auth_hdr)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        let stats_json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(stats_resp.into_body(), 4096).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stats_json["offline_nodes"], 1);
+        assert_eq!(stats_json["online_nodes"], 0);
     }
 }

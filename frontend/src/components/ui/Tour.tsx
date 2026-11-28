@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { ArrowLeft, ArrowRight, Check } from 'lucide-react'
 
@@ -19,6 +19,8 @@ export function Tour({
 }) {
   const [index, setIndex] = useState(0)
   const [rect, setRect] = useState<DOMRect | null>(null)
+  const stepsRef = useRef(steps)
+  stepsRef.current = steps
 
   useEffect(() => {
     if (!open) {
@@ -26,7 +28,7 @@ export function Tour({
       return
     }
     const update = () => {
-      const step = steps[index]
+      const step = stepsRef.current[index]
       if (!step) return
       const el = document.querySelector(step.selector)
       if (el) {
@@ -42,7 +44,7 @@ export function Tour({
       window.removeEventListener('resize', update)
       window.removeEventListener('scroll', update, true)
     }
-  }, [open, index, steps])
+  }, [open, index])
 
   if (!open || !steps[index]) return null
   const current = steps[index]

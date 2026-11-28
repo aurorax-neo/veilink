@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Activity, AlertTriangle, ArrowLeftRight, ArrowRight, Laptop, Network, Server, ShieldCheck } from 'lucide-react'
 import { useConsole } from '../context/ConsoleContext'
-import { actionLabel, actionTone, attentionReasons, byNameAndId, formatBytes, heartbeatOnline, presence, relativeAge, revisionState, tunnelBadges } from '../format'
+import { actionLabel, actionTone, attentionReasons, byNameAndId, formatBytes, heartbeatOnline, isOfflineNode, nodeOperational, presence, relativeAge, revisionState, serverNowMs, tunnelBadges } from '../format'
 import { askNodes, nodeBaseline, nodeChanged, registerPageRefresh, waitForReports } from '../pageRefresh'
 import { Badge, EmptyState } from '../components/ui/Badge'
 import { TopologyCanvas } from '../components/TopologyCanvas'
@@ -11,11 +11,13 @@ export function DashboardView() {
   const activeRef = useRef(true)
   const nodesRef = useRef(nodes)
   nodesRef.current = nodes
+  const [now, setNow] = useState(() => serverNowMs())
 
   useEffect(() => {
     activeRef.current = true
+    const clock = window.setInterval(() => setNow(serverNowMs()), 5000)
     const unregister = registerPageRefresh(async () => {
-      const eligible = nodesRef.current.filter((n) => !n.revoked)
+      const eligible = nodesRef.current.filter((n) => !n.revoked && !isOfflineNode(n))
       const baseline = new Map(eligible.map((n) => [n.id, nodeBaseline(n)]))
       const connected = await askNodes(eligible.map((n) => n.id))
       await waitForReports(
@@ -25,20 +27,26 @@ export function DashboardView() {
     })
     return () => {
       activeRef.current = false
+      window.clearInterval(clock)
       unregister()
     }
   }, [reload])
 
+  const renderNow = Math.max(now, serverNowMs())
   const servers = useMemo(() => nodes.filter((n) => n.role === 'server').sort(byNameAndId), [nodes])
   const clients = useMemo(() => nodes.filter((n) => n.role === 'client').sort(byNameAndId), [nodes])
-  const onlineServers = useMemo(() => servers.filter((n) => !n.disabled && heartbeatOnline(n)).length, [servers])
-  const onlineClients = useMemo(() => clients.filter((n) => !n.disabled && heartbeatOnline(n)).length, [clients])
+  const onlineServers = useMemo(() => servers.filter((n) => !n.disabled && heartbeatOnline(n, renderNow)).length, [servers, renderNow])
+  const onlineClients = useMemo(() => clients.filter((n) => !n.disabled && heartbeatOnline(n, renderNow)).length, [clients, renderNow])
+  const offlineServers = useMemo(() => servers.filter((n) => !n.disabled && !n.revoked && isOfflineNode(n)).length, [servers])
+  const offlineClients = useMemo(() => clients.filter((n) => !n.disabled && !n.revoked && isOfflineNode(n)).length, [clients])
+  const readyServers = useMemo(() => servers.filter((n) => nodeOperational(n, renderNow)).length, [servers, renderNow])
+  const readyClients = useMemo(() => clients.filter((n) => nodeOperational(n, renderNow)).length, [clients, renderNow])
   const enabledMappings = useMemo(() => mappings.filter((m) => m.enabled).length, [mappings])
   const linkedMappings = useMemo(
     () => mappings.filter((m) => m.enabled && mappingStatuses[m.id]?.server?.linked && mappingStatuses[m.id]?.client?.linked).length,
     [mappings, mappingStatuses],
   )
-  const attention = useMemo(() => nodes.filter((n) => attentionReasons(n).length > 0).sort(byNameAndId), [nodes])
+  const attention = useMemo(() => nodes.filter((n) => attentionReasons(n, renderNow).length > 0).sort(byNameAndId), [nodes, renderNow])
   const totalTraffic = useMemo(() => {
     let up = 0
     let down = 0
@@ -65,8 +73,8 @@ export function DashboardView() {
     )
   }
 
-  const serverRatio = servers.length ? Math.round((onlineServers / servers.length) * 100) : 0
-  const clientRatio = clients.length ? Math.round((onlineClients / clients.length) * 100) : 0
+  const serverRatio = servers.length ? Math.round((readyServers / servers.length) * 100) : 0
+  const clientRatio = clients.length ? Math.round((readyClients / clients.length) * 100) : 0
   const mappingRatio = mappings.length ? Math.round((linkedMappings / mappings.length) * 100) : 0
 
   return (
@@ -78,9 +86,12 @@ export function DashboardView() {
             <Server size={14} />
           </div>
           <div className="kpi-value tabular">
-            {onlineServers}
+            {readyServers}
             <span style={{ fontSize: 14, color: 'var(--text-muted)', fontWeight: 'var(--fw-regular)' }}> / {servers.length}</span>
           </div>
+          {offlineServers > 0 && (
+            <div className="kpi-sub tabular">在线 {onlineServers} · 脱机 {offlineServers}</div>
+          )}
           <div className="kpi-bar">
             <div className="kpi-bar-fill" style={{ width: `${serverRatio}%` }} />
           </div>
@@ -92,9 +103,12 @@ export function DashboardView() {
             <Laptop size={14} />
           </div>
           <div className="kpi-value tabular">
-            {onlineClients}
+            {readyClients}
             <span style={{ fontSize: 14, color: 'var(--text-muted)', fontWeight: 'var(--fw-regular)' }}> / {clients.length}</span>
           </div>
+          {offlineClients > 0 && (
+            <div className="kpi-sub tabular">在线 {onlineClients} · 脱机 {offlineClients}</div>
+          )}
           <div className="kpi-bar">
             <div className="kpi-bar-fill" style={{ width: `${clientRatio}%`, background: 'var(--good)' }} />
           </div>
@@ -161,7 +175,7 @@ export function DashboardView() {
           </div>
         </header>
         {servers.length > 0 || clients.length > 0 ? (
-          <TopologyCanvas nodes={nodes} mappings={mappings} statuses={mappingStatuses} onNavigate={navigate} />
+          <TopologyCanvas nodes={nodes} mappings={mappings} statuses={mappingStatuses} now={renderNow} onNavigate={navigate} />
         ) : (
           <EmptyState
             icon={<Network size={18} />}
@@ -199,7 +213,7 @@ export function DashboardView() {
                 </thead>
                 <tbody>
                   {servers.slice(0, 6).map((node) => {
-                    const st = presence(node)
+                    const st = presence(node, renderNow)
                     const rev = revisionState(node)
                     return (
                       <tr key={node.id} style={{ cursor: 'pointer' }} onClick={() => navigate('servers')}>
@@ -250,13 +264,13 @@ export function DashboardView() {
                 </thead>
                 <tbody>
                   {clients.slice(0, 6).map((node) => {
-                    const st = presence(node)
+                    const st = presence(node, renderNow)
                     const rev = revisionState(node)
                     return (
                       <tr key={node.id} style={{ cursor: 'pointer' }} onClick={() => navigate('clients')}>
                         <td>
                           <div style={{ fontWeight: 'var(--fw-medium)' }}>{node.name}</div>
-                          <div className="cell-sub tabular ltr-force">{node.software_version || '—'}</div>
+                          <div className="cell-sub tabular ltr-force">{isOfflineNode(node) ? '脱机独立' : node.software_version || '—'}</div>
                         </td>
                         <td><Badge text={st.text} tone={st.tone} dot pulse={st.tone === 'good'} /></td>
                         <td className="tabular">{mappings.filter((m) => m.client_id === node.id).length}</td>
@@ -285,7 +299,7 @@ export function DashboardView() {
           <ul className="audit-list">
             {audit.slice(0, 5).map((item, idx) => (
               <li key={`${item.at}-${item.action}-${idx}`} className="audit-item">
-                <span className="cell-sub tabular">{relativeAge(item.at)}</span>
+                <span className="cell-sub tabular">{relativeAge(item.at, renderNow)}</span>
                 <Badge text={actionLabel(item.action)} tone={actionTone(item.action)} />
                 <code className="cell-sub ltr-force" style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>
                   {item.object || '—'}

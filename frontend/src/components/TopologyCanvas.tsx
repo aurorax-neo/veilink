@@ -1,15 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { byNameAndId, endpoint, heartbeatOnline } from '../format'
+import { byNameAndId, endpoint, heartbeatOnline, isOfflineNode, nodeOperational, serverNowMs } from '../format'
 import type { Mapping, MappingStatus, Node, PageId } from '../types'
 
 interface Props {
   nodes: Node[]
   mappings: Mapping[]
   statuses: Record<string, MappingStatus>
+  now?: number
   onNavigate: (page: PageId) => void
 }
 
-export function TopologyCanvas({ nodes, mappings, statuses, onNavigate }: Props) {
+export function TopologyCanvas({ nodes, mappings, statuses, now, onNavigate }: Props) {
+  const refNow = Math.max(now ?? 0, serverNowMs())
   const wrapRef = useRef<HTMLDivElement>(null)
   const [hoverId, setHoverId] = useState<string>('')
   const [canvasWidth, setCanvasWidth] = useState<number>(820)
@@ -32,20 +34,27 @@ export function TopologyCanvas({ nodes, mappings, statuses, onNavigate }: Props)
   const clients = useMemo(() => nodes.filter((n) => n.role === 'client' && !n.revoked).sort(byNameAndId), [nodes])
 
   const pairMap = useMemo(() => {
-    const map = new Map<string, { serverId: string; clientId: string; count: number; linked: number; enabled: number }>()
+    const nodeMap = new Map(nodes.map((n) => [n.id, n]))
+    const map = new Map<string, { serverId: string; clientId: string; count: number; linked: number; offlineReady: number; enabled: number }>()
     for (const m of mappings) {
       const key = `${m.server_id}->${m.client_id}`
-      const cur = map.get(key) || { serverId: m.server_id, clientId: m.client_id, count: 0, linked: 0, enabled: 0 }
+      const cur = map.get(key) || { serverId: m.server_id, clientId: m.client_id, count: 0, linked: 0, offlineReady: 0, enabled: 0 }
       cur.count += 1
       if (m.enabled) {
         cur.enabled += 1
         const st = statuses[m.id]
-        if (st?.server?.linked && st?.client?.linked) cur.linked += 1
+        const srv = nodeMap.get(m.server_id)
+        const cli = nodeMap.get(m.client_id)
+        if (st?.server?.linked && st?.client?.linked) {
+          cur.linked += 1
+        } else if (srv && cli && isOfflineNode(srv) && isOfflineNode(cli) && nodeOperational(srv, refNow) && nodeOperational(cli, refNow)) {
+          cur.offlineReady += 1
+        }
       }
       map.set(key, cur)
     }
     return [...map.values()]
-  }, [mappings, statuses])
+  }, [mappings, nodes, statuses, refNow])
 
   // True 1:1 pixel geometry — never magnifies nodes or fonts on wide screens
   const nodeW = Math.min(188, Math.max(146, Math.round(canvasWidth * 0.23)))
@@ -99,6 +108,7 @@ export function TopologyCanvas({ nodes, mappings, statuses, onNavigate }: Props)
           const to = clientCoords.get(edge.clientId)
           if (!from || !to) return null
           const activeLink = edge.linked > 0
+          const offlineReady = !activeLink && edge.offlineReady > 0
           const muted = hoverId && hoverId !== edge.serverId && hoverId !== edge.clientId
           const midX = Math.round((from.x + to.x) / 2)
           const midY = Math.round((from.y + to.y) / 2)
@@ -108,14 +118,14 @@ export function TopologyCanvas({ nodes, mappings, statuses, onNavigate }: Props)
               <path
                 d={d}
                 fill="none"
-                stroke={activeLink ? 'url(#edgeLinked)' : edge.enabled > 0 ? 'url(#edgePending)' : 'var(--line-strong)'}
-                strokeWidth={activeLink ? 1.8 : 1.25}
+                stroke={activeLink ? 'url(#edgeLinked)' : offlineReady ? 'var(--info)' : edge.enabled > 0 ? 'url(#edgePending)' : 'var(--line-strong)'}
+                strokeWidth={activeLink || offlineReady ? 1.8 : 1.25}
                 strokeDasharray={activeLink ? undefined : '4 4'}
               />
               <g transform={`translate(${midX}, ${midY})`} style={{ cursor: 'pointer' }} onClick={() => onNavigate('proxies')}>
                 <rect x="-26" y="-9.5" width="52" height="19" rx="9.5" fill="var(--surface-3)" stroke="var(--line-subtle)" strokeWidth="1" />
-                <text x="0" y="3.5" textAnchor="middle" fill={activeLink ? 'var(--good)' : 'var(--text-secondary)'} fontSize="10.5" fontFamily="var(--font-mono)">
-                  {edge.linked}/{edge.count}
+                <text x="0" y="3.5" textAnchor="middle" fill={activeLink ? 'var(--good)' : offlineReady ? 'var(--info)' : 'var(--text-secondary)'} fontSize="10.5" fontFamily="var(--font-mono)">
+                  {edge.linked + edge.offlineReady}/{edge.count}
                 </text>
               </g>
             </g>
@@ -124,7 +134,17 @@ export function TopologyCanvas({ nodes, mappings, statuses, onNavigate }: Props)
 
         {servers.map((node) => {
           const pos = serverCoords.get(node.id)!
-          const online = !node.disabled && heartbeatOnline(node)
+          const offline = isOfflineNode(node)
+          const online = !node.disabled && heartbeatOnline(node, refNow)
+          const dotColor = node.disabled
+            ? 'var(--text-muted)'
+            : offline
+              ? nodeOperational(node, refNow)
+                ? 'var(--info)'
+                : 'var(--warn)'
+              : online
+                ? 'var(--good)'
+                : 'var(--warn)'
           const isHovered = hoverId === node.id
           const sub = node.address ? endpoint(node.address, node.port) : ''
           return (
@@ -144,7 +164,7 @@ export function TopologyCanvas({ nodes, mappings, statuses, onNavigate }: Props)
                 stroke={isHovered ? 'var(--accent-border)' : 'var(--line-subtle)'}
                 strokeWidth="1"
               />
-              <circle cx="12" cy={nodeH / 2} r="3.5" fill={online ? 'var(--good)' : node.disabled ? 'var(--text-muted)' : 'var(--warn)'} />
+              <circle cx="12" cy={nodeH / 2} r="3.5" fill={dotColor} />
               <text x="22" y={sub ? 15.5 : 23} fill="var(--text-primary)" fontSize="12" fontWeight="500">
                 {node.name.length > 16 ? `${node.name.slice(0, 15)}…` : node.name}
               </text>
@@ -160,7 +180,17 @@ export function TopologyCanvas({ nodes, mappings, statuses, onNavigate }: Props)
 
         {clients.map((node) => {
           const pos = clientCoords.get(node.id)!
-          const online = !node.disabled && heartbeatOnline(node)
+          const offline = isOfflineNode(node)
+          const online = !node.disabled && heartbeatOnline(node, refNow)
+          const dotColor = node.disabled
+            ? 'var(--text-muted)'
+            : offline
+              ? nodeOperational(node, refNow)
+                ? 'var(--info)'
+                : 'var(--warn)'
+              : online
+                ? 'var(--good)'
+                : 'var(--warn)'
           const isHovered = hoverId === node.id
           const routeCount = mappings.filter((m) => m.client_id === node.id).length
           return (
@@ -180,8 +210,8 @@ export function TopologyCanvas({ nodes, mappings, statuses, onNavigate }: Props)
                 stroke={isHovered ? 'var(--accent-border)' : 'var(--line-subtle)'}
                 strokeWidth="1"
               />
-              <circle cx="0" cy={nodeH / 2} r="3" fill={online ? 'var(--good)' : 'var(--text-muted)'} />
-              <circle cx="12" cy={nodeH / 2} r="3.5" fill={online ? 'var(--good)' : node.disabled ? 'var(--text-muted)' : 'var(--warn)'} />
+              <circle cx="0" cy={nodeH / 2} r="3" fill={online ? 'var(--good)' : offline && nodeOperational(node, refNow) ? 'var(--info)' : 'var(--text-muted)'} />
+              <circle cx="12" cy={nodeH / 2} r="3.5" fill={dotColor} />
               <text x="22" y="15.5" fill="var(--text-primary)" fontSize="12" fontWeight="500">
                 {node.name.length > 16 ? `${node.name.slice(0, 15)}…` : node.name}
               </text>

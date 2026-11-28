@@ -8,6 +8,29 @@ Release。
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-28
+
+### Features
+
+- **新增节点运行模式（在线受控 / 脱机独立）完整闭环**（`model.rs` / `store.rs` / `httpapi.rs` / `NodeEditorDrawer.tsx` / `NodeOnboardingModal.tsx`）：
+  - 公网网关与内网节点支持切换 `online`（在线受控）与 `offline`（脱机独立）两种运行模式（内置网关固定 `online`）。
+  - 切换至 `offline` 模式时，自动清除控制面凭证、接入令牌、`last_seen` 与历史运行错误，彻底停用心跳超时检查、健康告警与主动刷新，控制面与拓扑图独立统计 `offline_nodes` 与修订导出就绪状态（`待导出 / 需重导出 / 已导出`）。
+  - 新增 `POST /api/v1/nodes/{id}/offline` 导出接口，自动记录 `exported_revision` 并生成 Docker 一键运行、Docker 挂载文件、原生二进制启动命令及独立 `offline-state.json` 下载。
+- **原生对齐上游内核协议细节（`sing-mux` / `XUDP` / `REALITY` / `Vision` / `VLESS Encryption` / `XHTTP` / `Hysteria2`）**（`mux_proto.rs` / `reality.rs` / `vision.rs` / `vless_enc.rs` / `xhttp.rs` / `hysteria2.rs`）：
+  - 新增完整线级协议模块 `mux_proto.rs`：实现 `sing-mux` 握手头、`xtaci/smux` v2（小端帧头 + 增量窗口 `CMD_UPD`）、`hashicorp/yamux`（大端 12 字节帧头 + `256 KiB` 流控窗口）、`h2mux`（HTTP/2 `CONNECT` 复用流）以及 `Xray XUDP`（帧级 `NEW / KEEP / END` 会话复用与状态校验）。
+  - `REALITY` 实现主动向 `dest` 发起真实 TLS 1.3 探测以镜像目标站证书链长度与加密扩展，并在握手校验失败时双向原样透传（Fallback Splice）至真实目标站点，且内置网关默认启用可直接探测的目标域名。
+
+### Bug Fixes & Performance
+
+- **高吞吐 `smux` v2 流控唤醒与控制帧优先级优化**（`mux_proto.rs`）：修复 `SmuxSubStream::poll_write` 在高并发满载下栈上临时 `Notify` 丢失唤醒注册及数据通道满时丢弃 `CMD_UPD` 窗口更新帧的问题；重构为锁内持久化 `Waker` + 独立高优先级控制帧通道 + `2 MiB` 初始窗口，8 并发吞吐达 `4.78–5.69 Gbps`。
+- **修复 `h2mux` 与 `XHTTP` 半关闭提前中断下行流**（`mux_proto.rs` / `xhttp.rs`）：修复上行 `END_STREAM` 正常半关闭时提前中止写任务或过早移除会话导致的双向并发流截断问题。
+- **消除控制面空操作「撤销接入令牌」审计噪音**（`master.rs` / `store.rs`）：内置网关启动自检未发生实质配置变更时不再重写节点或触发令牌撤销；`revoke_enroll_token` 仅在确实存在未消费接入令牌时才写入 `node.enroll.revoke` 审计记录。
+- **服务端毫秒级时钟校准与消除「时钟超前」误报**（`httpapi.rs` / `store.rs` / `api.ts` / `format.ts`）：API 响应头统一下发 `X-Server-Time-Ms` 权威时间戳，前端新增 `serverNowMs()` 自动校准浏览器与服务端时钟偏差并保留真实历史 `last_seen`，叠加 `10s` 时钟抖动容差与实时渲染基准时间，彻底消除跨机时钟差及 2 秒定时器滞后引发的「时钟超前」与假离线告警。
+- **UI 交互与视觉体验优化**（`NodeEditorDrawer.tsx` / `NodeOnboardingModal.tsx` / `ProxiesView.tsx` / `Overlays.tsx` / `tokens.css` / `app.css`）：
+  - 公网网关、内网节点与端口映射的新建/编辑弹层统一由侧边抽屉改为与「快捷接入」一致的居中模态弹窗（`<Modal isForm>`），支持头部/底部固定与长表单独立滚动。
+  - 修复「快捷接入」弹窗受父级 2 秒时钟与 SSE 重绘影响重复请求导致的画面闪烁。
+  - 修复深浅双主题下 `TCP` 等传输层徽章、分段控制器与次级按钮和面板底色重色碰撞的问题。
+
 ## [0.5.1] - 2026-11-27
 
 ### Bug Fixes & UI Refinements

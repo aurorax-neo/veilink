@@ -8,6 +8,7 @@ export type XhttpMode = 'packet-up' | 'stream-up' | 'stream-one' | 'auto'
 export interface NodeDraft {
   id: string
   name: string
+  mode: 'online' | 'offline'
   address: string
   port: string
   listenPort: string
@@ -240,6 +241,7 @@ export function nodeToDraft(node: Node | undefined, defaultName = '1'): {
   const draft: NodeDraft = {
     id: node?.id || '',
     name: node?.name || defaultName,
+    mode: !node?.embedded && node?.mode === 'offline' ? 'offline' : 'online',
     address: node?.address || '',
     port: String(node?.port || 443),
     listenPort,
@@ -430,9 +432,13 @@ export function buildNodeSavePayload(
     role,
   })
   if (problem) throw new Error(problem)
+  if (draft.mode && draft.mode !== 'online' && draft.mode !== 'offline') {
+    throw new Error('节点模式仅支持 online 或 offline。')
+  }
+  const modeField = draft.mode === 'offline' ? { mode: 'offline' as const } : {}
 
   if (!isServer) {
-    return { name: draft.name.trim(), role, address: '', port: 0 }
+    return { name: draft.name.trim(), role, ...modeField, address: '', port: 0 }
   }
 
   if (!workingEndpoints.length || !workingEndpoints.some((ep) => ep.enabled)) {
@@ -723,6 +729,7 @@ export function buildNodeSavePayload(
   return {
     name: draft.name.trim(),
     role,
+    ...modeField,
     address: primary!.host.trim(),
     port: Number(primary!.port),
     connect_endpoints: workingEndpoints.map((ep) => ({

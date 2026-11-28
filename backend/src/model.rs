@@ -47,10 +47,14 @@ pub struct Node {
     pub revoked: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub disabled: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mode: String,
     #[serde(default)]
     pub desired_revision: i64,
     #[serde(default)]
     pub applied_revision: i64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub exported_revision: i64,
     #[serde(default)]
     pub last_seen: i64,
     #[serde(default)]
@@ -61,6 +65,20 @@ pub struct Node {
     pub client_tunnel: Option<LocalTLS>,
     #[serde(default)]
     pub embedded: bool,
+}
+
+impl Node {
+    pub fn is_offline(&self) -> bool {
+        !self.embedded && self.mode == "offline"
+    }
+
+    pub fn effective_mode(&self) -> &'static str {
+        if self.is_offline() {
+            "offline"
+        } else {
+            "online"
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

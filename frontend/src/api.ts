@@ -95,11 +95,41 @@ export async function api<T>(path: string, method = 'GET', data?: unknown): Prom
     throw new ApiError(hints[res.status] || `请求失败 (${res.status})`, res.status)
   }
 
+  const localNowMs = Date.now()
+  let serverTimeMs: number | null = null
+  const rawServerMs = res.headers?.get?.('x-server-time-ms')
+  if (rawServerMs) {
+    const parsedMs = Number(rawServerMs)
+    if (Number.isFinite(parsedMs) && parsedMs > 0) serverTimeMs = parsedMs
+  }
+  if (serverTimeMs === null) {
+    const rawDate = res.headers?.get?.('date')
+    if (rawDate) {
+      const parsedDate = Date.parse(rawDate)
+      if (Number.isFinite(parsedDate) && parsedDate > 0) {
+        // HTTP Date header has 1-second resolution; add 999ms so sub-second heartbeats never appear in the future.
+        serverTimeMs = parsedDate + 999
+      }
+    }
+  }
+  const clockHost = globalThis as {
+    __VEILINK_CLOCK_OFFSET_MS__?: number
+    __VEILINK_SERVER_FLOOR_MS__?: number
+  }
+  if (serverTimeMs !== null) {
+    clockHost.__VEILINK_CLOCK_OFFSET_MS__ = serverTimeMs - localNowMs
+    clockHost.__VEILINK_SERVER_FLOOR_MS__ = Math.max(clockHost.__VEILINK_SERVER_FLOOR_MS__ || 0, serverTimeMs)
+  }
+
   if (res.status === 204) return null as T
   const text = await res.text()
   if (!text) return null as T
   const parsed = JSON.parse(text)
-  const nowSec = Math.floor(Date.now() / 1000)
+  const effectiveNowMs =
+    serverTimeMs !== null
+      ? serverTimeMs
+      : Date.now() + (typeof clockHost.__VEILINK_CLOCK_OFFSET_MS__ === 'number' ? clockHost.__VEILINK_CLOCK_OFFSET_MS__ : 0)
+  const nowSec = Math.floor(effectiveNowMs / 1000)
   const clampLastSeen = (item: unknown) => {
     if (item && typeof item === 'object' && typeof (item as Record<string, unknown>).last_seen === 'number') {
       const rec = item as Record<string, number>

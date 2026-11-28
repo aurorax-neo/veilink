@@ -1,3 +1,5 @@
+use ml_kem::{DecapsulationKey, KeyExport, Kem, MlKem768};
+use p256::elliptic_curve::sec1::ToEncodedPoint;
 use rand::RngCore;
 
 const GREASE_VALUES: [u16; 16] = [
@@ -38,6 +40,7 @@ impl FingerprintProfile {
 pub struct BuiltClientHello {
     pub record: Vec<u8>,
     pub session_id_record_offset: usize,
+    pub mlkem_dk: Option<Box<DecapsulationKey<MlKem768>>>,
 }
 
 pub fn build_client_hello(
@@ -47,6 +50,26 @@ pub fn build_client_hello(
     session_id_placeholder: &[u8; 32],
     x25519_pub: &[u8; 32],
     alpn: &[&str],
+) -> BuiltClientHello {
+    build_client_hello_with_options(
+        profile,
+        sni,
+        client_random,
+        session_id_placeholder,
+        x25519_pub,
+        alpn,
+        true,
+    )
+}
+
+pub fn build_client_hello_with_options(
+    profile: FingerprintProfile,
+    sni: &str,
+    client_random: &[u8; 32],
+    session_id_placeholder: &[u8; 32],
+    x25519_pub: &[u8; 32],
+    alpn: &[&str],
+    enable_pq: bool,
 ) -> BuiltClientHello {
     let mut rng_bytes = [0u8; 8];
     rand::rng().fill_bytes(&mut rng_bytes);
@@ -59,7 +82,21 @@ pub fn build_client_hello(
     let g_group = pick_grease(rng_bytes[3]);
     let g_vers = pick_grease(rng_bytes[4]);
 
-    let mut body = Vec::with_capacity(512);
+    let pq_pair = if enable_pq
+        && matches!(
+            profile,
+            FingerprintProfile::Chrome | FingerprintProfile::Edge | FingerprintProfile::Firefox
+        ) {
+        let (dk, ek) = MlKem768::generate_keypair();
+        let mut share = Vec::with_capacity(1216);
+        share.extend_from_slice(ek.to_bytes().as_slice());
+        share.extend_from_slice(x25519_pub);
+        Some((Box::new(dk), share))
+    } else {
+        None
+    };
+
+    let mut body = Vec::with_capacity(if pq_pair.is_some() { 1792 } else { 512 });
     body.extend_from_slice(&[0x03, 0x03]);
     body.extend_from_slice(client_random);
     body.push(32);
@@ -86,13 +123,34 @@ pub fn build_client_hello(
     }
     body.extend_from_slice(&[0x01, 0x00]);
 
+    let pq_share_ref = pq_pair.as_ref().map(|(_, sh)| sh.as_slice());
     let exts = match profile {
-        FingerprintProfile::Chrome | FingerprintProfile::Edge => {
-            build_chrome_extensions(sni, x25519_pub, alpn, g_ext1, g_ext2, g_group, g_vers)
-        }
-        FingerprintProfile::Firefox => build_firefox_extensions(sni, x25519_pub, alpn),
-        FingerprintProfile::Safari | FingerprintProfile::Ios => {
+        FingerprintProfile::Chrome => build_chrome_extensions(
+            sni,
+            x25519_pub,
+            pq_share_ref,
+            alpn,
+            g_ext1,
+            g_ext2,
+            g_group,
+            g_vers,
+        ),
+        FingerprintProfile::Edge => build_edge_extensions(
+            sni,
+            x25519_pub,
+            pq_share_ref,
+            alpn,
+            g_ext1,
+            g_ext2,
+            g_group,
+            g_vers,
+        ),
+        FingerprintProfile::Firefox => build_firefox_extensions(sni, x25519_pub, pq_share_ref, alpn),
+        FingerprintProfile::Safari => {
             build_safari_extensions(sni, x25519_pub, alpn, g_ext1, g_ext2, g_group, g_vers)
+        }
+        FingerprintProfile::Ios => {
+            build_ios_extensions(sni, x25519_pub, alpn, g_ext1, g_ext2, g_group, g_vers)
         }
     };
     put_u16(&mut body, exts.len() as u16);
@@ -133,6 +191,7 @@ pub fn build_client_hello(
     BuiltClientHello {
         record,
         session_id_record_offset,
+        mlkem_dk: pq_pair.map(|(dk, _)| dk),
     }
 }
 
@@ -141,21 +200,27 @@ pub fn patch_session_id(hello: &mut BuiltClientHello, encrypted_sid: &[u8; 32]) 
     hello.record[off..off + 32].copy_from_slice(encrypted_sid);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_chrome_extensions(
     sni: &str,
     x25519_pub: &[u8; 32],
+    pq_share: Option<&[u8]>,
     alpn: &[&str],
     g_ext1: u16,
     g_ext2: u16,
     g_group: u16,
     g_vers: u16,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(320);
+    let mut out = Vec::with_capacity(if pq_share.is_some() { 1600 } else { 360 });
     write_ext(&mut out, g_ext1, &[]);
     write_ext_sni(&mut out, sni);
     write_ext(&mut out, 0x0017, &[]);
     write_ext(&mut out, 0xff01, &[0x00]);
-    write_ext_supported_groups(&mut out, &[g_group, 0x001d, 0x0017, 0x0018]);
+    if pq_share.is_some() {
+        write_ext_supported_groups(&mut out, &[g_group, 0x11ec, 0x001d, 0x0017, 0x0018]);
+    } else {
+        write_ext_supported_groups(&mut out, &[g_group, 0x001d, 0x0017, 0x0018]);
+    }
     write_ext(&mut out, 0x000b, &[0x01, 0x00]);
     write_ext(&mut out, 0x0023, &[]);
     write_ext_alpn(&mut out, alpn);
@@ -167,25 +232,97 @@ fn build_chrome_extensions(
         ],
     );
     write_ext(&mut out, 0x0012, &[]);
-    write_ext_key_share(&mut out, Some(g_group), x25519_pub);
+    write_ext_key_share(&mut out, Some(g_group), pq_share, x25519_pub, None);
     write_ext(&mut out, 0x002d, &[0x01, 0x01]);
     write_ext_supported_versions(&mut out, &[g_vers, 0x0304, 0x0303]);
-    write_ext(&mut out, 0027, &[0x02, 0x00, 0x02]);
+    write_ext(&mut out, 0x001b, &[0x02, 0x00, 0x02]); // compress_certificate: brotli
+    if alpn.contains(&"h2") {
+        write_ext(&mut out, 0x4469, &[0x00, 0x03, 0x02, b'h', b'2']); // application_settings (ALPS)
+    }
+    write_ext_grease_ech(&mut out);
     write_ext(&mut out, g_ext2, &[0x00]);
     out
 }
 
-fn build_firefox_extensions(sni: &str, x25519_pub: &[u8; 32], alpn: &[&str]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(280);
+#[allow(clippy::too_many_arguments)]
+fn build_edge_extensions(
+    sni: &str,
+    x25519_pub: &[u8; 32],
+    pq_share: Option<&[u8]>,
+    alpn: &[&str],
+    g_ext1: u16,
+    g_ext2: u16,
+    g_group: u16,
+    g_vers: u16,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(if pq_share.is_some() { 1550 } else { 340 });
+    write_ext(&mut out, g_ext1, &[]);
     write_ext_sni(&mut out, sni);
     write_ext(&mut out, 0x0017, &[]);
     write_ext(&mut out, 0xff01, &[0x00]);
-    write_ext_supported_groups(&mut out, &[0x001d, 0x0017, 0x0018, 0x0019]);
+    if pq_share.is_some() {
+        write_ext_supported_groups(&mut out, &[g_group, 0x11ec, 0x001d, 0x0017, 0x0018]);
+    } else {
+        write_ext_supported_groups(&mut out, &[g_group, 0x001d, 0x0017, 0x0018]);
+    }
     write_ext(&mut out, 0x000b, &[0x01, 0x00]);
     write_ext(&mut out, 0x0023, &[]);
     write_ext_alpn(&mut out, alpn);
     write_ext(&mut out, 0x0005, &[0x01, 0x00, 0x00, 0x00, 0x00]);
-    write_ext_key_share(&mut out, None, x25519_pub);
+    write_ext_sig_algs(
+        &mut out,
+        &[
+            0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601, 0x0807,
+        ],
+    );
+    write_ext(&mut out, 0x0012, &[]);
+    write_ext(&mut out, 0x001b, &[0x02, 0x00, 0x02]);
+    write_ext(&mut out, 0x002d, &[0x01, 0x01]);
+    write_ext_supported_versions(&mut out, &[g_vers, 0x0304, 0x0303]);
+    write_ext_key_share(&mut out, Some(g_group), pq_share, x25519_pub, None);
+    if alpn.contains(&"h2") {
+        write_ext(&mut out, 0x4469, &[0x00, 0x03, 0x02, b'h', b'2']);
+    }
+    write_ext(&mut out, g_ext2, &[0x00]);
+    out
+}
+
+fn build_firefox_extensions(
+    sni: &str,
+    x25519_pub: &[u8; 32],
+    pq_share: Option<&[u8]>,
+    alpn: &[&str],
+) -> Vec<u8> {
+    let mut p256_seed = [0u8; 32];
+    rand::rng().fill_bytes(&mut p256_seed);
+    let p256_pub = p256::SecretKey::from_slice(&p256_seed)
+        .ok()
+        .map(|sk| sk.public_key().to_encoded_point(false).as_bytes().to_vec());
+
+    let mut out = Vec::with_capacity(if pq_share.is_some() { 1650 } else { 380 });
+    write_ext_sni(&mut out, sni);
+    write_ext(&mut out, 0x0017, &[]);
+    write_ext(&mut out, 0xff01, &[0x00]);
+    if pq_share.is_some() {
+        write_ext_supported_groups(
+            &mut out,
+            &[0x11ec, 0x001d, 0x0017, 0x0018, 0x0019, 0x0100, 0x0101],
+        );
+    } else {
+        write_ext_supported_groups(&mut out, &[0x001d, 0x0017, 0x0018, 0x0019, 0x0100, 0x0101]);
+    }
+    write_ext(&mut out, 0x000b, &[0x01, 0x00]);
+    write_ext(&mut out, 0x0023, &[]);
+    write_ext_alpn(&mut out, alpn);
+    write_ext(&mut out, 0x0005, &[0x01, 0x00, 0x00, 0x00, 0x00]);
+    write_ext(&mut out, 0x0022, &[0x00, 0x08, 0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x02, 0x03]); // delegated_credentials
+    write_ext_key_share(
+        &mut out,
+        None,
+        pq_share,
+        x25519_pub,
+        p256_pub.as_deref(),
+    );
     write_ext_supported_versions(&mut out, &[0x0304, 0x0303]);
     write_ext_sig_algs(
         &mut out,
@@ -195,6 +332,8 @@ fn build_firefox_extensions(sni: &str, x25519_pub: &[u8; 32], alpn: &[&str]) -> 
     );
     write_ext(&mut out, 0x002d, &[0x01, 0x01]);
     write_ext(&mut out, 0x001c, &[0x40, 0x01]);
+    write_ext(&mut out, 0x001b, &[0x06, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03]); // zlib, brotli, zstd
+    write_ext_grease_ech(&mut out);
     out
 }
 
@@ -207,12 +346,44 @@ fn build_safari_extensions(
     g_group: u16,
     g_vers: u16,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(280);
+    let mut out = Vec::with_capacity(300);
     write_ext(&mut out, g_ext1, &[]);
     write_ext_sni(&mut out, sni);
     write_ext(&mut out, 0x0017, &[]);
     write_ext(&mut out, 0xff01, &[0x00]);
     write_ext_supported_groups(&mut out, &[g_group, 0x001d, 0x0017, 0x0018, 0x0019]);
+    write_ext(&mut out, 0x000b, &[0x01, 0x00]);
+    write_ext_alpn(&mut out, alpn);
+    write_ext(&mut out, 0x0005, &[0x01, 0x00, 0x00, 0x00, 0x00]);
+    write_ext(&mut out, 0x0012, &[]);
+    write_ext_sig_algs(
+        &mut out,
+        &[
+            0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601, 0x0807,
+        ],
+    );
+    write_ext_key_share(&mut out, Some(g_group), None, x25519_pub, None);
+    write_ext(&mut out, 0x002d, &[0x01, 0x01]);
+    write_ext_supported_versions(&mut out, &[g_vers, 0x0304, 0x0303, 0x0302, 0x0301]);
+    write_ext(&mut out, 0x001b, &[0x02, 0x00, 0x01]); // compress_certificate: zlib
+    write_ext(&mut out, g_ext2, &[0x00]);
+    out
+}
+
+fn build_ios_extensions(
+    sni: &str,
+    x25519_pub: &[u8; 32],
+    alpn: &[&str],
+    g_ext1: u16,
+    g_ext2: u16,
+    g_group: u16,
+    g_vers: u16,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(300);
+    write_ext(&mut out, g_ext1, &[]);
+    write_ext_sni(&mut out, sni);
+    write_ext(&mut out, 0x0017, &[]);
+    write_ext(&mut out, 0xff01, &[0x00]);
     write_ext(&mut out, 0x000b, &[0x01, 0x00]);
     write_ext_alpn(&mut out, alpn);
     write_ext(&mut out, 0x0005, &[0x01, 0x00, 0x00, 0x00, 0x00]);
@@ -222,12 +393,29 @@ fn build_safari_extensions(
             0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601, 0x0807,
         ],
     );
-    write_ext(&mut out, 0x0012, &[]);
-    write_ext_key_share(&mut out, Some(g_group), x25519_pub);
+    write_ext_supported_groups(&mut out, &[g_group, 0x001d, 0x0017, 0x0018, 0x0019]);
+    write_ext_key_share(&mut out, Some(g_group), None, x25519_pub, None);
+    write_ext(&mut out, 0x001b, &[0x02, 0x00, 0x01]);
     write_ext(&mut out, 0x002d, &[0x01, 0x01]);
     write_ext_supported_versions(&mut out, &[g_vers, 0x0304, 0x0303]);
     write_ext(&mut out, g_ext2, &[0x00]);
     out
+}
+
+fn write_ext_grease_ech(out: &mut Vec<u8>) {
+    let mut rnd = [0u8; 36];
+    rand::rng().fill_bytes(&mut rnd);
+    let mut payload = Vec::with_capacity(44);
+    payload.push(0x00); // outer ECHClientHello
+    payload.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // HKDF-SHA256 + AES-128-GCM
+    payload.push(rnd[0]); // config_id
+    payload.extend_from_slice(&[0x00, 0x20]); // enc len = 32
+    payload.extend_from_slice(&rnd[1..33]);
+    payload.extend_from_slice(&[0x00, 0x10]); // payload len = 16
+    let mut enc_payload = [0u8; 16];
+    rand::rng().fill_bytes(&mut enc_payload);
+    payload.extend_from_slice(&enc_payload);
+    write_ext(out, 0xfe0d, &payload);
 }
 
 fn write_ext(out: &mut Vec<u8>, ext_type: u16, payload: &[u8]) {
@@ -297,16 +485,32 @@ fn write_ext_supported_versions(out: &mut Vec<u8>, versions: &[u16]) {
     write_ext(out, 0x002b, &payload);
 }
 
-fn write_ext_key_share(out: &mut Vec<u8>, grease_group: Option<u16>, x25519_pub: &[u8; 32]) {
-    let mut entries = Vec::with_capacity(44);
+fn write_ext_key_share(
+    out: &mut Vec<u8>,
+    grease_group: Option<u16>,
+    pq_share: Option<&[u8]>,
+    x25519_pub: &[u8; 32],
+    p256_pub: Option<&[u8]>,
+) {
+    let mut entries = Vec::with_capacity(if pq_share.is_some() { 1340 } else { 120 });
     if let Some(gg) = grease_group {
         put_u16(&mut entries, gg);
         put_u16(&mut entries, 1);
         entries.push(0x00);
     }
+    if let Some(pq) = pq_share {
+        put_u16(&mut entries, 0x11ec);
+        put_u16(&mut entries, pq.len() as u16);
+        entries.extend_from_slice(pq);
+    }
     put_u16(&mut entries, 0x001d);
     put_u16(&mut entries, 32);
     entries.extend_from_slice(x25519_pub);
+    if let Some(p256_k) = p256_pub {
+        put_u16(&mut entries, 0x0017);
+        put_u16(&mut entries, p256_k.len() as u16);
+        entries.extend_from_slice(p256_k);
+    }
 
     let mut payload = Vec::with_capacity(2 + entries.len());
     put_u16(&mut payload, entries.len() as u16);

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Check, Copy, FileClock, RotateCcw, Search } from 'lucide-react'
 import { useConsole } from '../context/ConsoleContext'
-import { actionLabel, actionTone, copyText, formatTime, relativeAge, triggerHaptic } from '../format'
+import { actionLabel, actionTone, copyText, formatTime, relativeAge, serverNowMs, triggerHaptic } from '../format'
 import type { Audit, PageId } from '../types'
 import { Badge, EmptyState } from '../components/ui/Badge'
 import { Segmented } from '../components/ui/Controls'
@@ -20,13 +20,15 @@ export function AuditView() {
   })
   const [query, setQuery] = useState('')
   const [visibleLimit, setVisibleLimit] = useState(PAGE_STEP)
-  const [now, setNow] = useState(() => Date.now())
+  const [now, setNow] = useState(() => serverNowMs())
   const [copiedKey, setCopiedKey] = useState('')
 
   useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 10000)
+    const timer = window.setInterval(() => setNow(serverNowMs()), 10000)
     return () => window.clearInterval(timer)
   }, [])
+
+  const renderNow = Math.max(now, serverNowMs())
 
   const changeCategory = (next: AuditCategory) => {
     setCategory(next)
@@ -161,7 +163,7 @@ export function AuditView() {
                       <time className="tabular ltr-force" style={{ fontSize: 12.5, display: 'block' }}>
                         {formatTime(item.at * 1000)}
                       </time>
-                      <span className="cell-sub tabular">{relativeAge(item.at, now)}</span>
+                      <span className="cell-sub tabular">{relativeAge(item.at, renderNow)}</span>
                     </div>
 
                     <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>

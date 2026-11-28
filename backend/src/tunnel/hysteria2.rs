@@ -2,19 +2,20 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rand::RngCore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use std::sync::OnceLock;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
-use crate::model::{Binding, LocalTLS};
 use super::BoxStream;
+use crate::model::{Binding, LocalTLS};
 
 const H3_STREAM_TYPE_CONTROL: u64 = 0x00;
 const H3_FRAME_DATA: u64 = 0x00;
@@ -24,12 +25,49 @@ const H3_FRAME_SETTINGS: u64 = 0x04;
 const H3_FRAME_PUSH_PROMISE: u64 = 0x05;
 const H3_FRAME_GOAWAY: u64 = 0x07;
 const H3_FRAME_MAX_PUSH_ID: u64 = 0x0d;
+const H3_NO_ERROR: u32 = 0x100;
+
 const HY2_FRAME_TCP_REQUEST: u64 = 0x401;
-const HY2_PADDING_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+const HY2_MAX_PADDING_LEN: usize = 4096;
+const HY2_PADDING_CHARS: &[u8] =
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
 const QUIC_STREAM_RWND: u32 = 8 * 1024 * 1024;
 const QUIC_CONN_RWND: u32 = 20 * 1024 * 1024;
 const QUIC_SEND_WND: u64 = 16 * 1024 * 1024;
+const QUIC_DGRAM_BUF: usize = 4 * 1024 * 1024;
+
+pub fn format_hy2_addr(host: &str, port: u16) -> String {
+    let h = host.trim();
+    if h.contains(':') && !h.starts_with('[') {
+        format!("[{}]:{}", h, port)
+    } else {
+        format!("{}:{}", h, port)
+    }
+}
+
+pub fn parse_hy2_addr(addr: &str) -> Result<(String, u16), String> {
+    let trimmed = addr.trim();
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let (host, after) = rest
+            .split_once(']')
+            .ok_or_else(|| "invalid bracketed IPv6 address".to_string())?;
+        let port_str = after
+            .strip_prefix(':')
+            .ok_or_else(|| "missing port in bracketed IPv6 address".to_string())?;
+        let port = port_str
+            .parse::<u16>()
+            .map_err(|_| "invalid port in address".to_string())?;
+        return Ok((host.to_string(), port));
+    }
+    let (host, port_str) = trimmed
+        .rsplit_once(':')
+        .ok_or_else(|| "missing port in hysteria2 address".to_string())?;
+    let port = port_str
+        .parse::<u16>()
+        .map_err(|_| "invalid port in hysteria2 address".to_string())?;
+    Ok((host.to_string(), port))
+}
 
 pub struct QuicBidiStream {
     send: quinn::SendStream,
@@ -37,20 +75,39 @@ pub struct QuicBidiStream {
     conn: quinn::Connection,
     endpoint: Option<quinn::Endpoint>,
     uni_abort: Option<tokio::task::AbortHandle>,
+    keep: Option<Arc<dyn Send + Sync>>,
     owns_conn: bool,
 }
 
 impl Drop for QuicBidiStream {
     fn drop(&mut self) {
-        if let Some(ref abort) = self.uni_abort {
-            abort.abort();
-        }
+        let _ = self.send.finish();
         if self.owns_conn {
-            self.conn.close(0u32.into(), b"closed");
-            if let Some(ref ep) = self.endpoint {
-                ep.close(0u32.into(), b"closed");
+            let conn = self.conn.clone();
+            let ep = self.endpoint.take();
+            let uni = self.uni_abort.take();
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    if let Some(ab) = uni {
+                        ab.abort();
+                    }
+                    conn.close(H3_NO_ERROR.into(), b"closed");
+                    if let Some(e) = ep {
+                        e.close(H3_NO_ERROR.into(), b"closed");
+                    }
+                });
+            } else {
+                if let Some(ab) = uni {
+                    ab.abort();
+                }
+                conn.close(H3_NO_ERROR.into(), b"closed");
+                if let Some(e) = ep {
+                    e.close(H3_NO_ERROR.into(), b"closed");
+                }
             }
         }
+        let _ = self.keep.take();
     }
 }
 
@@ -82,6 +139,7 @@ impl AsyncWrite for QuicBidiStream {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let _ = self.send.finish();
         Pin::new(&mut self.send)
             .poll_shutdown(cx)
             .map_err(io::Error::from)
@@ -90,11 +148,14 @@ impl AsyncWrite for QuicBidiStream {
 
 fn build_quic_transport_config() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
+    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     transport.max_concurrent_bidi_streams(1024u32.into());
     transport.max_concurrent_uni_streams(256u32.into());
     transport.stream_receive_window(QUIC_STREAM_RWND.into());
     transport.receive_window(QUIC_CONN_RWND.into());
     transport.send_window(QUIC_SEND_WND);
+    transport.datagram_receive_buffer_size(Some(QUIC_DGRAM_BUF));
+    transport.datagram_send_buffer_size(QUIC_DGRAM_BUF);
     if let Ok(idle) = Duration::from_secs(30).try_into() {
         transport.max_idle_timeout(Some(idle));
     }
@@ -220,14 +281,74 @@ pub async fn init_h3_connection(
         })
 }
 
+struct PooledH3Entry {
+    conn: quinn::Connection,
+    endpoint: quinn::Endpoint,
+    uni_abort: tokio::task::AbortHandle,
+    created_at: Instant,
+    requests: AtomicU64,
+    active_streams: Arc<AtomicUsize>,
+}
+
+impl PooledH3Entry {
+    fn is_usable(&self, local: &LocalTLS) -> bool {
+        if self.conn.close_reason().is_some() {
+            return false;
+        }
+        let m = &local.xhttp.xmux;
+        if m.h_max_reusable_secs > 0
+            && self.created_at.elapsed() >= Duration::from_secs(m.h_max_reusable_secs as u64)
+        {
+            return false;
+        }
+        let max_reqs = if m.h_max_request_times > 0 {
+            m.h_max_request_times as u64
+        } else if m.c_max_reuse_times > 0 {
+            m.c_max_reuse_times as u64
+        } else {
+            0
+        };
+        if max_reqs > 0 && self.requests.load(Ordering::Relaxed) >= max_reqs {
+            return false;
+        }
+        if m.max_concurrency > 0
+            && self.active_streams.load(Ordering::Relaxed) >= m.max_concurrency as usize
+        {
+            return false;
+        }
+        true
+    }
+
+    fn shutdown(&self) {
+        self.uni_abort.abort();
+        self.conn.close(H3_NO_ERROR.into(), b"xmux rotate");
+        self.endpoint.close(H3_NO_ERROR.into(), b"xmux rotate");
+    }
+}
+
+pub struct ActiveStreamGuard(pub Arc<AtomicUsize>);
+
+impl Drop for ActiveStreamGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub async fn xhttp_h3_open_bi(
     remote_addr: SocketAddr,
     local: &LocalTLS,
     sni: &str,
-) -> Result<(quinn::SendStream, quinn::RecvStream, quinn::Connection), String> {
+) -> Result<
+    (
+        quinn::SendStream,
+        quinn::RecvStream,
+        quinn::Connection,
+        ActiveStreamGuard,
+    ),
+    String,
+> {
     type PoolKey = (SocketAddr, String, [u8; 32]);
-    type PoolVal = (quinn::Connection, quinn::Endpoint, tokio::task::AbortHandle);
-    type Slot = Arc<tokio::sync::Mutex<Option<PoolVal>>>;
+    type Slot = Arc<tokio::sync::Mutex<Vec<Arc<PooledH3Entry>>>>;
     static H3_POOL: OnceLock<parking_lot::Mutex<HashMap<PoolKey, Slot>>> = OnceLock::new();
 
     let ca_hash: [u8; 32] = *blake3::hash(local.ca_pem.trim().as_bytes()).as_bytes();
@@ -239,69 +360,91 @@ pub async fn xhttp_h3_open_bi(
         if g.len() >= 128 && !g.contains_key(&key) {
             g.retain(|_, sl| {
                 if let Ok(mut guard) = sl.try_lock() {
-                    if let Some((ref c, ref ep, ref ab)) = *guard {
-                        if c.close_reason().is_some() {
-                            ab.abort();
-                            ep.close(0u32.into(), b"closed");
-                            *guard = None;
-                            return false;
+                    guard.retain(|e| {
+                        if e.conn.close_reason().is_some() {
+                            e.shutdown();
+                            false
+                        } else {
+                            true
                         }
-                    } else {
-                        return false;
-                    }
+                    });
+                    !guard.is_empty()
+                } else {
+                    true
                 }
-                true
             });
         }
         g.entry(key)
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None)))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(Vec::new())))
             .clone()
     };
 
-    let mut slot_guard = slot.lock().await;
-    if let Some((ref conn, ref ep, ref ab)) = *slot_guard {
-        if conn.close_reason().is_none() {
+    let max_conns = if local.xhttp.xmux.max_connections > 0 {
+        (local.xhttp.xmux.max_connections as usize).clamp(1, 32)
+    } else {
+        4
+    };
+
+    let mut list = slot.lock().await;
+    let mut kept = Vec::with_capacity(list.len());
+    let mut opened = None;
+    for entry in list.drain(..) {
+        if opened.is_none() && entry.is_usable(local) {
             if let Ok(Ok((send, recv))) =
-                tokio::time::timeout(Duration::from_secs(5), conn.open_bi()).await
+                tokio::time::timeout(Duration::from_secs(5), entry.conn.open_bi()).await
             {
-                return Ok((send, recv, conn.clone()));
+                entry.requests.fetch_add(1, Ordering::Relaxed);
+                entry.active_streams.fetch_add(1, Ordering::Relaxed);
+                let guard = ActiveStreamGuard(entry.active_streams.clone());
+                let conn = entry.conn.clone();
+                kept.push(entry);
+                opened = Some((send, recv, conn, guard));
+                continue;
             }
+            entry.shutdown();
+        } else if entry.conn.close_reason().is_none() {
+            if entry.active_streams.load(Ordering::Relaxed) > 0 {
+                kept.push(entry);
+            } else {
+                entry.shutdown();
+            }
+        } else {
+            entry.shutdown();
         }
-        ab.abort();
-        conn.close(0u32.into(), b"stale");
-        ep.close(0u32.into(), b"stale");
-        *slot_guard = None;
+    }
+    *list = kept;
+    if let Some(res) = opened {
+        return Ok(res);
     }
 
     let quic_ep = create_quic_client_endpoint(remote_addr, local)?;
-    let connecting = quic_ep
-        .connect(remote_addr, sni)
-        .map_err(|e| {
-            quic_ep.close(0u32.into(), b"connect err");
-            e.to_string()
-        })?;
+    let connecting = quic_ep.connect(remote_addr, sni).map_err(|e| {
+        quic_ep.close(H3_NO_ERROR.into(), b"connect err");
+        e.to_string()
+    })?;
     let conn = match tokio::time::timeout(Duration::from_secs(8), connecting).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
-            quic_ep.close(0u32.into(), b"handshake err");
+            quic_ep.close(H3_NO_ERROR.into(), b"handshake err");
             return Err(format!("xhttp h3 connect: {}", e));
         }
         Err(_) => {
-            quic_ep.close(0u32.into(), b"timeout");
+            quic_ep.close(H3_NO_ERROR.into(), b"timeout");
             return Err("xhttp h3 connect timeout".to_string());
         }
     };
-    let uni_abort = match tokio::time::timeout(Duration::from_secs(5), init_h3_connection(&conn)).await
+    let uni_abort = match tokio::time::timeout(Duration::from_secs(5), init_h3_connection(&conn))
+        .await
     {
         Ok(Ok(ab)) => ab,
         Ok(Err(e)) => {
-            conn.close(0u32.into(), b"h3 control err");
-            quic_ep.close(0u32.into(), b"h3 control err");
+            conn.close(H3_NO_ERROR.into(), b"h3 control err");
+            quic_ep.close(H3_NO_ERROR.into(), b"h3 control err");
             return Err(format!("xhttp h3 control stream: {}", e));
         }
         Err(_) => {
-            conn.close(0u32.into(), b"h3 control timeout");
-            quic_ep.close(0u32.into(), b"h3 control timeout");
+            conn.close(H3_NO_ERROR.into(), b"h3 control timeout");
+            quic_ep.close(H3_NO_ERROR.into(), b"h3 control timeout");
             return Err("xhttp h3 control stream timeout".to_string());
         }
     };
@@ -309,27 +452,139 @@ pub async fn xhttp_h3_open_bi(
         Ok(Ok(pair)) => pair,
         Ok(Err(e)) => {
             uni_abort.abort();
-            conn.close(0u32.into(), b"open_bi err");
-            quic_ep.close(0u32.into(), b"open_bi err");
+            conn.close(H3_NO_ERROR.into(), b"open_bi err");
+            quic_ep.close(H3_NO_ERROR.into(), b"open_bi err");
             return Err(e.to_string());
         }
         Err(_) => {
             uni_abort.abort();
-            conn.close(0u32.into(), b"open_bi timeout");
-            quic_ep.close(0u32.into(), b"open_bi timeout");
+            conn.close(H3_NO_ERROR.into(), b"open_bi timeout");
+            quic_ep.close(H3_NO_ERROR.into(), b"open_bi timeout");
             return Err("xhttp h3 open_bi timeout".to_string());
         }
     };
-    *slot_guard = Some((conn.clone(), quic_ep, uni_abort));
-    Ok((send, recv, conn))
+    let active_streams = Arc::new(AtomicUsize::new(1));
+    let guard = ActiveStreamGuard(active_streams.clone());
+    let entry = Arc::new(PooledH3Entry {
+        conn: conn.clone(),
+        endpoint: quic_ep,
+        uni_abort,
+        created_at: Instant::now(),
+        requests: AtomicU64::new(1),
+        active_streams,
+    });
+    while list.len() >= max_conns {
+        let evicted = list.remove(0);
+        if evicted.active_streams.load(Ordering::Relaxed) == 0 {
+            evicted.shutdown();
+        }
+    }
+    list.push(entry);
+    Ok((send, recv, conn, guard))
 }
 
-pub async fn hy2_connect(
+/// Authenticated multi-stream + UDP-datagram Hysteria2 client QUIC session.
+pub struct Hy2ClientSession {
+    pub conn: quinn::Connection,
+    endpoint: quinn::Endpoint,
+    uni_abort: tokio::task::AbortHandle,
+    pub udp_supported: bool,
+}
+
+impl Drop for Hy2ClientSession {
+    fn drop(&mut self) {
+        self.uni_abort.abort();
+        self.conn.close(H3_NO_ERROR.into(), b"closed");
+        self.endpoint.close(H3_NO_ERROR.into(), b"closed");
+    }
+}
+
+impl Hy2ClientSession {
+    pub fn is_closed(&self) -> bool {
+        self.conn.close_reason().is_some()
+    }
+
+    pub fn max_datagram_size(&self) -> usize {
+        self.conn.max_datagram_size().unwrap_or(1200)
+    }
+
+    pub async fn open_tcp_stream(
+        self: &Arc<Self>,
+        host: &str,
+        port: u16,
+    ) -> Result<BoxStream, String> {
+        let (mut send, mut recv) = tokio::time::timeout(Duration::from_secs(8), self.conn.open_bi())
+            .await
+            .map_err(|_| "hy2 open_bi timeout".to_string())?
+            .map_err(|e| e.to_string())?;
+        let addr = format_hy2_addr(host, port);
+        let req_pad = random_padding(64, 512);
+        let mut req_buf = Vec::with_capacity(16 + addr.len() + req_pad.len());
+        append_varint(&mut req_buf, HY2_FRAME_TCP_REQUEST);
+        append_varint(&mut req_buf, addr.len() as u64);
+        req_buf.extend_from_slice(addr.as_bytes());
+        append_varint(&mut req_buf, req_pad.len() as u64);
+        req_buf.extend_from_slice(req_pad.as_bytes());
+        send.write_all(&req_buf)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let hs = tokio::time::timeout(Duration::from_secs(8), async {
+            let mut status_byte = [0u8; 1];
+            recv.read_exact(&mut status_byte)
+                .await
+                .map_err(|e| e.to_string())?;
+            let msg_len = read_varint(&mut recv).await? as usize;
+            if msg_len > 4096 {
+                return Err("hy2 response message too long".to_string());
+            }
+            let mut msg_buf = vec![0u8; msg_len];
+            if msg_len > 0 {
+                recv.read_exact(&mut msg_buf)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            let pad_len = read_varint(&mut recv).await? as usize;
+            if pad_len > HY2_MAX_PADDING_LEN {
+                return Err("hy2 response padding too long".to_string());
+            }
+            if pad_len > 0 {
+                let mut pad_buf = vec![0u8; pad_len];
+                recv.read_exact(&mut pad_buf)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            if status_byte[0] != 0x00 {
+                return Err(format!(
+                    "hy2 tcp request rejected: {}",
+                    String::from_utf8_lossy(&msg_buf)
+                ));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| "hy2 tcp response timeout".to_string())?;
+        hs?;
+
+        let keep: Arc<dyn Send + Sync> = Arc::clone(self) as Arc<dyn Send + Sync>;
+        Ok(Box::new(QuicBidiStream {
+            send,
+            recv,
+            conn: self.conn.clone(),
+            endpoint: None,
+            uni_abort: None,
+            keep: Some(keep),
+            owns_conn: false,
+        }))
+    }
+}
+
+pub async fn hy2_connect_session(
     remote_addr: SocketAddr,
     local: &LocalTLS,
     binding: &Binding,
     gw_addr: &str,
-) -> Result<BoxStream, String> {
+) -> Result<Arc<Hy2ClientSession>, String> {
     let quic_ep = create_quic_client_endpoint(remote_addr, local)?;
 
     let sni = if !gw_addr.trim().is_empty() {
@@ -341,17 +596,17 @@ pub async fn hy2_connect(
     };
 
     let connecting = quic_ep.connect(remote_addr, &sni).map_err(|e| {
-        quic_ep.close(0u32.into(), b"connect err");
+        quic_ep.close(H3_NO_ERROR.into(), b"connect err");
         e.to_string()
     })?;
     let conn = match tokio::time::timeout(Duration::from_secs(8), connecting).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
-            quic_ep.close(0u32.into(), b"handshake err");
+            quic_ep.close(H3_NO_ERROR.into(), b"handshake err");
             return Err(format!("hy2 connect: {}", e));
         }
         Err(_) => {
-            quic_ep.close(0u32.into(), b"timeout");
+            quic_ep.close(H3_NO_ERROR.into(), b"timeout");
             return Err("hy2 connect timeout".to_string());
         }
     };
@@ -359,10 +614,11 @@ pub async fn hy2_connect(
     let hs_res = tokio::time::timeout(Duration::from_secs(10), async {
         let uni_abort = start_h3_control_streams(&conn).await?;
 
-        // 1. Auth stream
-        let (mut auth_send, mut auth_recv) =
-            conn.open_bi().await.map_err(|e| (Some(uni_abort.clone()), e.to_string()))?;
-        let pad = random_padding(32, 96);
+        let (mut auth_send, mut auth_recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| (Some(uni_abort.clone()), e.to_string()))?;
+        let pad = random_padding(256, 2048);
         let req_headers = encode_qpack_field_section(&[
             (":method", "POST"),
             (":scheme", "https"),
@@ -396,100 +652,70 @@ pub async fn hy2_connect(
                 format!("hysteria2 auth rejected with status {:?}", status),
             ));
         }
-
-        // 2. TCP tunnel stream
-        let (mut send, mut recv) =
-            conn.open_bi().await.map_err(|e| (Some(uni_abort.clone()), e.to_string()))?;
-        let addr = format!("{}:0", binding.domain.trim());
-        let req_pad = random_padding(16, 64);
-        let mut req_buf = Vec::with_capacity(16 + addr.len() + req_pad.len());
-        append_varint(&mut req_buf, HY2_FRAME_TCP_REQUEST);
-        append_varint(&mut req_buf, addr.len() as u64);
-        req_buf.extend_from_slice(addr.as_bytes());
-        append_varint(&mut req_buf, req_pad.len() as u64);
-        req_buf.extend_from_slice(req_pad.as_bytes());
-        if let Err(e) = send.write_all(&req_buf).await {
-            return Err((Some(uni_abort), e.to_string()));
-        }
-
-        let mut status_byte = [0u8; 1];
-        if let Err(e) = recv.read_exact(&mut status_byte).await {
-            return Err((Some(uni_abort), e.to_string()));
-        }
-        let msg_len = match read_varint(&mut recv).await {
-            Ok(v) => v as usize,
-            Err(e) => return Err((Some(uni_abort), e)),
-        };
-        if msg_len > 4096 {
-            return Err((Some(uni_abort), "hy2 response message too long".to_string()));
-        }
-        let mut msg_buf = vec![0u8; msg_len];
-        if msg_len > 0 {
-            if let Err(e) = recv.read_exact(&mut msg_buf).await {
-                return Err((Some(uni_abort), e.to_string()));
-            }
-        }
-        let pad_len = match read_varint(&mut recv).await {
-            Ok(v) => v as usize,
-            Err(e) => return Err((Some(uni_abort), e)),
-        };
-        if pad_len > 65536 {
-            return Err((Some(uni_abort), "hy2 response padding too long".to_string()));
-        }
-        if pad_len > 0 {
-            let mut pad_buf = vec![0u8; pad_len];
-            if let Err(e) = recv.read_exact(&mut pad_buf).await {
-                return Err((Some(uni_abort), e.to_string()));
-            }
-        }
-        if status_byte[0] != 0x00 {
-            return Err((
-                Some(uni_abort),
-                format!(
-                    "hy2 tcp request rejected: {}",
-                    String::from_utf8_lossy(&msg_buf)
-                ),
-            ));
-        }
-        Ok((send, recv, uni_abort))
+        let udp_supported = resp_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("hysteria-udp"))
+            .map(|(_, v)| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        Ok((uni_abort, udp_supported))
     })
     .await;
 
     match hs_res {
-        Ok(Ok((send, recv, uni_abort))) => Ok(Box::new(QuicBidiStream {
-            send,
-            recv,
+        Ok(Ok((uni_abort, udp_supported))) => Ok(Arc::new(Hy2ClientSession {
             conn,
-            endpoint: Some(quic_ep),
-            uni_abort: Some(uni_abort),
-            owns_conn: true,
+            endpoint: quic_ep,
+            uni_abort,
+            udp_supported,
         })),
         Ok(Err((maybe_abort, err))) => {
             if let Some(ab) = maybe_abort {
                 ab.abort();
             }
-            conn.close(0u32.into(), b"handshake err");
-            quic_ep.close(0u32.into(), b"handshake err");
+            conn.close(H3_NO_ERROR.into(), b"handshake err");
+            quic_ep.close(H3_NO_ERROR.into(), b"handshake err");
             Err(err)
         }
         Err(_) => {
-            conn.close(0u32.into(), b"handshake timeout");
-            quic_ep.close(0u32.into(), b"handshake timeout");
+            conn.close(H3_NO_ERROR.into(), b"handshake timeout");
+            quic_ep.close(H3_NO_ERROR.into(), b"handshake timeout");
             Err("hy2 protocol handshake timeout".to_string())
         }
     }
 }
 
-pub async fn hy2_accept_connection(
+pub async fn hy2_connect(
+    remote_addr: SocketAddr,
+    local: &LocalTLS,
+    binding: &Binding,
+    gw_addr: &str,
+) -> Result<BoxStream, String> {
+    let sess = hy2_connect_session(remote_addr, local, binding, gw_addr).await?;
+    sess.open_tcp_stream(binding.domain.trim(), 0).await
+}
+
+/// Authenticated multi-stream + UDP-datagram Hysteria2 server QUIC session.
+pub struct Hy2ServerSession {
+    pub conn: quinn::Connection,
+    pub binding: Binding,
+    uni_abort: tokio::task::AbortHandle,
+}
+
+impl Drop for Hy2ServerSession {
+    fn drop(&mut self) {
+        self.uni_abort.abort();
+    }
+}
+
+pub async fn hy2_accept_authenticated(
     conn: quinn::Connection,
     _local: &LocalTLS,
     bindings: &[Binding],
-) -> Result<(BoxStream, Binding), String> {
+) -> Result<Arc<Hy2ServerSession>, String> {
     let conn_ref = conn.clone();
     let hs_res = tokio::time::timeout(Duration::from_secs(10), async move {
         let uni_abort = start_h3_control_streams(&conn_ref).await?;
 
-        // 1. Auth stream
         let (mut auth_send, mut auth_recv) = conn_ref
             .accept_bi()
             .await
@@ -518,7 +744,10 @@ pub async fn hy2_accept_connection(
             .map(|(_, v)| v.as_str())
             .unwrap_or("");
         if method != "POST" || path != "/auth" || auth_val.is_empty() {
-            return Err((Some(uni_abort), "invalid hysteria2 auth request".to_string()));
+            return Err((
+                Some(uni_abort),
+                "invalid hysteria2 auth request".to_string(),
+            ));
         }
 
         let mut matched_binding: Option<Binding> = None;
@@ -540,10 +769,10 @@ pub async fn hy2_accept_connection(
             }
         };
 
-        let resp_pad = random_padding(32, 96);
+        let resp_pad = random_padding(256, 2048);
         let resp_headers = encode_qpack_field_section(&[
             (":status", "233"),
-            ("hysteria-udp", "false"),
+            ("hysteria-udp", "true"),
             ("hysteria-cc-rx", "auto"),
             ("hysteria-padding", &resp_pad),
         ]);
@@ -551,94 +780,262 @@ pub async fn hy2_accept_connection(
             return Err((Some(uni_abort), e));
         }
         let _ = auth_send.finish();
-
-        // 2. TCP tunnel stream
-        let (mut send, mut recv) = conn_ref
-            .accept_bi()
-            .await
-            .map_err(|e| (Some(uni_abort.clone()), e.to_string()))?;
-        let req_type = match read_varint(&mut recv).await {
-            Ok(v) => v,
-            Err(e) => return Err((Some(uni_abort), e)),
-        };
-        if req_type != HY2_FRAME_TCP_REQUEST {
-            return Err((
-                Some(uni_abort),
-                format!("unexpected hy2 stream type 0x{:x}", req_type),
-            ));
-        }
-        let addr_len = match read_varint(&mut recv).await {
-            Ok(v) => v as usize,
-            Err(e) => return Err((Some(uni_abort), e)),
-        };
-        if addr_len == 0 || addr_len > 2048 {
-            return Err((Some(uni_abort), "invalid hy2 address length".to_string()));
-        }
-        let mut addr_buf = vec![0u8; addr_len];
-        if let Err(e) = recv.read_exact(&mut addr_buf).await {
-            return Err((Some(uni_abort), e.to_string()));
-        }
-        let pad_len = match read_varint(&mut recv).await {
-            Ok(v) => v as usize,
-            Err(e) => return Err((Some(uni_abort), e)),
-        };
-        if pad_len > 65536 {
-            return Err((Some(uni_abort), "hy2 request padding too long".to_string()));
-        }
-        if pad_len > 0 {
-            let mut pad_buf = vec![0u8; pad_len];
-            if let Err(e) = recv.read_exact(&mut pad_buf).await {
-                return Err((Some(uni_abort), e.to_string()));
-            }
-        }
-
-        let addr_str = String::from_utf8_lossy(&addr_buf);
-        let host = addr_str
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(&addr_str);
-        if !host.eq_ignore_ascii_case(binding.domain.trim()) {
-            let err_resp = [0x01u8, 0x00, 0x00];
-            let _ = send.write_all(&err_resp).await;
-            return Err((Some(uni_abort), format!("hy2 domain mismatch: got {}", host)));
-        }
-
-        let ok_pad = random_padding(16, 48);
-        let mut ok_resp = Vec::with_capacity(4 + ok_pad.len());
-        ok_resp.push(0x00); // status OK
-        append_varint(&mut ok_resp, 0); // empty message
-        append_varint(&mut ok_resp, ok_pad.len() as u64);
-        ok_resp.extend_from_slice(ok_pad.as_bytes());
-        if let Err(e) = send.write_all(&ok_resp).await {
-            return Err((Some(uni_abort), e.to_string()));
-        }
-        Ok((send, recv, binding, uni_abort))
+        Ok((binding, uni_abort))
     })
     .await;
 
     match hs_res {
-        Ok(Ok((send, recv, binding, uni_abort))) => Ok((
-            Box::new(QuicBidiStream {
-                send,
-                recv,
-                conn,
-                endpoint: None,
-                uni_abort: Some(uni_abort),
-                owns_conn: true,
-            }),
+        Ok(Ok((binding, uni_abort))) => Ok(Arc::new(Hy2ServerSession {
+            conn,
             binding,
-        )),
+            uni_abort,
+        })),
         Ok(Err((maybe_abort, err))) => {
             if let Some(ab) = maybe_abort {
                 ab.abort();
             }
-            conn.close(0u32.into(), b"reject");
+            conn.close(H3_NO_ERROR.into(), b"reject");
             Err(err)
         }
         Err(_) => {
-            conn.close(0u32.into(), b"timeout");
+            conn.close(H3_NO_ERROR.into(), b"timeout");
             Err("hy2 accept timeout".to_string())
         }
+    }
+}
+
+pub async fn hy2_accept_tcp_stream(
+    sess: &Arc<Hy2ServerSession>,
+) -> Result<(BoxStream, String, u16), String> {
+    let (mut send, mut recv) = sess.conn.accept_bi().await.map_err(|e| e.to_string())?;
+    let hs = tokio::time::timeout(Duration::from_secs(8), async {
+        let req_type = read_varint(&mut recv).await?;
+        if req_type != HY2_FRAME_TCP_REQUEST {
+            return Err(format!("unexpected hy2 stream type 0x{:x}", req_type));
+        }
+        let addr_len = read_varint(&mut recv).await? as usize;
+        if addr_len == 0 || addr_len > 2048 {
+            return Err("invalid hy2 address length".to_string());
+        }
+        let mut addr_buf = vec![0u8; addr_len];
+        recv.read_exact(&mut addr_buf)
+            .await
+            .map_err(|e| e.to_string())?;
+        let pad_len = read_varint(&mut recv).await? as usize;
+        if pad_len > HY2_MAX_PADDING_LEN {
+            return Err("hy2 request padding too long".to_string());
+        }
+        if pad_len > 0 {
+            let mut pad_buf = vec![0u8; pad_len];
+            recv.read_exact(&mut pad_buf)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        let addr_str = String::from_utf8_lossy(&addr_buf);
+        let (host, port) = parse_hy2_addr(&addr_str)?;
+        if !host.eq_ignore_ascii_case(sess.binding.domain.trim()) {
+            let err_resp = [0x01u8, 0x00, 0x00];
+            let _ = send.write_all(&err_resp).await;
+            return Err(format!("hy2 domain mismatch: got {}", host));
+        }
+
+        let ok_pad = random_padding(128, 1024);
+        let mut ok_resp = Vec::with_capacity(4 + ok_pad.len());
+        ok_resp.push(0x00);
+        append_varint(&mut ok_resp, 0);
+        append_varint(&mut ok_resp, ok_pad.len() as u64);
+        ok_resp.extend_from_slice(ok_pad.as_bytes());
+        send.write_all(&ok_resp).await.map_err(|e| e.to_string())?;
+        Ok((host, port))
+    })
+    .await
+    .map_err(|_| "hy2 tcp stream header timeout".to_string())?;
+    let (host, port) = hs?;
+
+    let keep: Arc<dyn Send + Sync> = Arc::clone(sess) as Arc<dyn Send + Sync>;
+    Ok((
+        Box::new(QuicBidiStream {
+            send,
+            recv,
+            conn: sess.conn.clone(),
+            endpoint: None,
+            uni_abort: None,
+            keep: Some(keep),
+            owns_conn: false,
+        }),
+        host,
+        port,
+    ))
+}
+
+pub async fn hy2_accept_connection(
+    conn: quinn::Connection,
+    local: &LocalTLS,
+    bindings: &[Binding],
+) -> Result<(BoxStream, Binding), String> {
+    let sess = hy2_accept_authenticated(conn, local, bindings).await?;
+    let binding = sess.binding.clone();
+    let (stream, _, _) = hy2_accept_tcp_stream(&sess).await?;
+    Ok((stream, binding))
+}
+
+// ============================================================================
+// Hysteria2 Native QUIC UDP Datagram Framing & Fragmentation (RFC 9221 + HY2)
+// Wire: [SessionID:4B BE][PacketID:2B BE][FragID:1B][FragCount:1B][AddrLen:varint][Addr][Data]
+// ============================================================================
+
+fn varint_encoded_len(v: u64) -> usize {
+    if v <= 63 {
+        1
+    } else if v <= 16383 {
+        2
+    } else if v <= 1073741823 {
+        4
+    } else {
+        8
+    }
+}
+
+fn read_varint_slice(buf: &[u8]) -> Option<(u64, usize)> {
+    let first = *buf.first()?;
+    let len = 1usize << (first >> 6);
+    if buf.len() < len {
+        return None;
+    }
+    let mut val = (first & 0x3f) as u64;
+    for &b in &buf[1..len] {
+        val = (val << 8) | (b as u64);
+    }
+    Some((val, len))
+}
+
+pub fn encode_hy2_udp_datagrams(
+    session_id: u32,
+    packet_id: u16,
+    addr: &str,
+    payload: &[u8],
+    max_dgram_size: usize,
+) -> Vec<Bytes> {
+    let addr_bytes = addr.as_bytes();
+    let hdr_len = 4 + 2 + 1 + 1 + varint_encoded_len(addr_bytes.len() as u64) + addr_bytes.len();
+    let max_chunk = max_dgram_size.saturating_sub(hdr_len).max(64);
+
+    if payload.is_empty() {
+        let mut out = Vec::with_capacity(hdr_len);
+        out.extend_from_slice(&session_id.to_be_bytes());
+        out.extend_from_slice(&packet_id.to_be_bytes());
+        out.push(0);
+        out.push(1);
+        append_varint(&mut out, addr_bytes.len() as u64);
+        out.extend_from_slice(addr_bytes);
+        return vec![Bytes::from(out)];
+    }
+
+    let frag_count = payload.len().div_ceil(max_chunk);
+    if frag_count > 255 {
+        return Vec::new();
+    }
+    let mut dgrams = Vec::with_capacity(frag_count);
+    for (frag_id, chunk) in payload.chunks(max_chunk).enumerate() {
+        let mut out = Vec::with_capacity(hdr_len + chunk.len());
+        out.extend_from_slice(&session_id.to_be_bytes());
+        out.extend_from_slice(&packet_id.to_be_bytes());
+        out.push(frag_id as u8);
+        out.push(frag_count as u8);
+        append_varint(&mut out, addr_bytes.len() as u64);
+        out.extend_from_slice(addr_bytes);
+        out.extend_from_slice(chunk);
+        dgrams.push(Bytes::from(out));
+    }
+    dgrams
+}
+
+struct PartialHy2Udp {
+    addr: String,
+    frag_count: u8,
+    received: usize,
+    total_bytes: usize,
+    frags: Vec<Option<Vec<u8>>>,
+    created_at: Instant,
+}
+
+#[derive(Default)]
+pub struct Hy2UdpDefragmenter {
+    pending: HashMap<(u32, u16), PartialHy2Udp>,
+}
+
+impl Hy2UdpDefragmenter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, dgram: &[u8]) -> Option<(u32, String, Vec<u8>)> {
+        if dgram.len() < 9 {
+            return None;
+        }
+        let session_id = u32::from_be_bytes([dgram[0], dgram[1], dgram[2], dgram[3]]);
+        let packet_id = u16::from_be_bytes([dgram[4], dgram[5]]);
+        let frag_id = dgram[6];
+        let frag_count = dgram[7];
+        if frag_count == 0 || frag_id >= frag_count {
+            return None;
+        }
+        let (addr_len_u64, vlen) = read_varint_slice(&dgram[8..])?;
+        let addr_len = addr_len_u64 as usize;
+        let addr_start = 8 + vlen;
+        if addr_len > 2048 || dgram.len() < addr_start + addr_len {
+            return None;
+        }
+        let addr = std::str::from_utf8(&dgram[addr_start..addr_start + addr_len])
+            .ok()?
+            .to_string();
+        let data = &dgram[addr_start + addr_len..];
+
+        if frag_count == 1 {
+            return Some((session_id, addr, data.to_vec()));
+        }
+
+        let now = Instant::now();
+        if self.pending.len() >= 128 {
+            self.pending
+                .retain(|_, p| now.saturating_duration_since(p.created_at) < Duration::from_secs(5));
+            if self.pending.len() >= 256 {
+                self.pending.clear();
+            }
+        }
+
+        let key = (session_id, packet_id);
+        let entry = self.pending.entry(key).or_insert_with(|| PartialHy2Udp {
+            addr: addr.clone(),
+            frag_count,
+            received: 0,
+            total_bytes: 0,
+            frags: vec![None; frag_count as usize],
+            created_at: now,
+        });
+        if entry.frag_count != frag_count {
+            self.pending.remove(&key);
+            return None;
+        }
+        let slot = &mut entry.frags[frag_id as usize];
+        if slot.is_none() {
+            if entry.total_bytes.saturating_add(data.len()) > 65535 {
+                self.pending.remove(&key);
+                return None;
+            }
+            entry.total_bytes += data.len();
+            entry.received += 1;
+            *slot = Some(data.to_vec());
+        }
+        if entry.received == frag_count as usize {
+            let done = self.pending.remove(&key)?;
+            let mut full = Vec::with_capacity(done.total_bytes);
+            for f in done.frags.into_iter().flatten() {
+                full.extend_from_slice(&f);
+            }
+            return Some((session_id, done.addr, full));
+        }
+        None
     }
 }
 
@@ -885,49 +1282,46 @@ impl AsyncRead for H3BodyStream {
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                         Poll::Pending => return Poll::Pending,
                     }
+                } else if buf.remaining() <= this.rem_payload {
+                    let before = buf.filled().len();
+                    match Pin::new(&mut this.recv).poll_read(cx, buf) {
+                        Poll::Ready(Ok(())) => {
+                            let n = buf.filled().len() - before;
+                            if n == 0 {
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::UnexpectedEof,
+                                    "EOF inside H3 DATA frame",
+                                )));
+                            }
+                            this.rem_payload -= n;
+                            return Poll::Ready(Ok(()));
+                        }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
+                    }
                 } else {
-                    if buf.remaining() <= this.rem_payload {
-                        let before = buf.filled().len();
-                        match Pin::new(&mut this.recv).poll_read(cx, buf) {
-                            Poll::Ready(Ok(())) => {
-                                let n = buf.filled().len() - before;
-                                if n == 0 {
-                                    return Poll::Ready(Err(io::Error::new(
-                                        io::ErrorKind::UnexpectedEof,
-                                        "EOF inside H3 DATA frame",
-                                    )));
-                                }
-                                this.rem_payload -= n;
-                                return Poll::Ready(Ok(()));
+                    let mut scratch = [0u8; 32768];
+                    let cap = this.rem_payload.min(scratch.len()).min(buf.remaining());
+                    let mut sub = ReadBuf::new(&mut scratch[..cap]);
+                    match Pin::new(&mut this.recv).poll_read(cx, &mut sub) {
+                        Poll::Ready(Ok(())) => {
+                            let filled = sub.filled();
+                            if filled.is_empty() {
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::UnexpectedEof,
+                                    "EOF inside H3 DATA frame",
+                                )));
                             }
-                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                            Poll::Pending => return Poll::Pending,
+                            this.rem_payload -= filled.len();
+                            buf.put_slice(filled);
+                            return Poll::Ready(Ok(()));
                         }
-                    } else {
-                        let mut scratch = [0u8; 32768];
-                        let cap = this.rem_payload.min(scratch.len()).min(buf.remaining());
-                        let mut sub = ReadBuf::new(&mut scratch[..cap]);
-                        match Pin::new(&mut this.recv).poll_read(cx, &mut sub) {
-                            Poll::Ready(Ok(())) => {
-                                let filled = sub.filled();
-                                if filled.is_empty() {
-                                    return Poll::Ready(Err(io::Error::new(
-                                        io::ErrorKind::UnexpectedEof,
-                                        "EOF inside H3 DATA frame",
-                                    )));
-                                }
-                                this.rem_payload -= filled.len();
-                                buf.put_slice(filled);
-                                return Poll::Ready(Ok(()));
-                            }
-                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                            Poll::Pending => return Poll::Pending,
-                        }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
                     }
                 }
             }
 
-            // Read varint frame_type + varint frame_length into hdr_buf
             let type_vlen = if this.hdr_len == 0 {
                 1
             } else {
@@ -1135,7 +1529,6 @@ async fn read_h3_frame(recv: &mut quinn::RecvStream) -> Result<(u64, Vec<u8>), S
     Ok((frame_type, payload))
 }
 
-// RFC 9204 Appendix A: QPACK Static Table (indices 0..=98).
 const QPACK_STATIC_TABLE: [(&str, &str); 99] = [
     (":authority", ""),
     (":path", "/"),
@@ -1238,7 +1631,6 @@ const QPACK_STATIC_TABLE: [(&str, &str); 99] = [
     ("x-frame-options", "sameorigin"),
 ];
 
-// RFC 7541 Appendix B: Static Huffman Code (shared by HPACK & QPACK).
 const HUFFMAN_CODES: [u32; 256] = [
     0x1ff8, 0x7fffd8, 0xfffffe2, 0xfffffe3, 0xfffffe4, 0xfffffe5, 0xfffffe6, 0xfffffe7, 0xfffffe8,
     0xffffea, 0x3ffffffc, 0xfffffe9, 0xfffffea, 0x3ffffffd, 0xfffffeb, 0xfffffec, 0xfffffed,
@@ -1380,15 +1772,13 @@ fn decode_qpack_string(
 }
 
 pub(crate) fn encode_qpack_field_section(headers: &[(&str, &str)]) -> Vec<u8> {
-    let mut out = vec![0x00, 0x00]; // Required Insert Count = 0, Delta Base = 0
+    let mut out = vec![0x00, 0x00];
     for (name, value) in headers {
         let nb = name.to_ascii_lowercase();
         let nb = nb.as_bytes();
         let vb = value.as_bytes();
-        // Literal Field Line With Literal Name (pattern 0010_0xxx, N=0, H=0, 3-bit prefix)
         encode_prefixed_int(&mut out, 0x20, 3, nb.len());
         out.extend_from_slice(nb);
-        // Value string (H=0, 7-bit prefix)
         encode_prefixed_int(&mut out, 0x00, 7, vb.len());
         out.extend_from_slice(vb);
     }
@@ -1403,7 +1793,9 @@ pub(crate) fn decode_qpack_field_section(data: &[u8]) -> Result<Vec<(String, Str
     let (ric, n1) = decode_prefixed_int(&data[pos..], 8)?;
     pos += n1;
     if ric != 0 {
-        return Err("QPACK dynamic table references not allowed (MAX_TABLE_CAPACITY=0)".to_string());
+        return Err(
+            "QPACK dynamic table references not allowed (MAX_TABLE_CAPACITY=0)".to_string(),
+        );
     }
     let (_, n2) = decode_prefixed_int(&data[pos..], 7)?;
     pos += n2;
@@ -1415,7 +1807,6 @@ pub(crate) fn decode_qpack_field_section(data: &[u8]) -> Result<Vec<(String, Str
         }
         let b = data[pos];
         if (b & 0x80) != 0 {
-            // Indexed Field Line: 1_T_xxxxxx
             if (b & 0x40) == 0 {
                 return Err("QPACK dynamic indexed field not allowed".to_string());
             }
@@ -1426,7 +1817,6 @@ pub(crate) fn decode_qpack_field_section(data: &[u8]) -> Result<Vec<(String, Str
                 .ok_or_else(|| format!("QPACK static index {} out of range", idx))?;
             out.push((k.to_string(), v.to_string()));
         } else if (b & 0xc0) == 0x40 {
-            // Literal Field Line With Name Reference: 01_N_T_xxxx
             if (b & 0x10) == 0 {
                 return Err("QPACK dynamic name reference not allowed".to_string());
             }
@@ -1438,7 +1828,6 @@ pub(crate) fn decode_qpack_field_section(data: &[u8]) -> Result<Vec<(String, Str
             let val = decode_qpack_string(data, &mut pos, 7, 0x80)?;
             out.push((k.to_string(), val));
         } else if (b & 0xe0) == 0x20 {
-            // Literal Field Line With Literal Name: 001_N_H_xxx
             let name = decode_qpack_string(data, &mut pos, 3, 0x08)?.to_ascii_lowercase();
             let val = decode_qpack_string(data, &mut pos, 7, 0x80)?;
             out.push((name, val));
@@ -1538,7 +1927,6 @@ mod tests {
 
     #[test]
     fn qpack_decodes_static_table_and_rfc7541_huffman() {
-        // RFC 7541 C.4.1 vector: Huffman("www.example.com") = f1e3 c2e5 f23a 6ba0 ab90 f4ff (12 bytes)
         let huff_example: [u8; 12] = [
             0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
         ];
@@ -1548,11 +1936,12 @@ mod tests {
         );
 
         let mut section = vec![
-            0x00, 0x00, // RIC = 0, Delta Base = 0
-            0xc0 | 20,  // Static index 20 -> (:method, POST)
-            0xc0 | 23,  // Static index 23 -> (:scheme, https)
-            0xc0 | 25,  // Static index 25 -> (:status, 200)
-            0x50 | 0,   // Static name index 0 (:authority) + Huffman value
+            0x00,
+            0x00,
+            0xc0 | 20,
+            0xc0 | 23,
+            0xc0 | 25,
+            0x50 | 0,
             0x80 | (huff_example.len() as u8),
         ];
         section.extend_from_slice(&huff_example);
@@ -1568,7 +1957,27 @@ mod tests {
             ]
         );
 
-        // Dynamic table RIC > 0 must be rejected since SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0
         assert!(decode_qpack_field_section(&[0x01, 0x00, 0x80]).is_err());
+    }
+
+    #[test]
+    fn hy2_udp_datagram_fragmentation_and_reassembly_roundtrip() {
+        let payload: Vec<u8> = (0..4096).map(|i| (i * 7 % 251) as u8).collect();
+        let dgrams = encode_hy2_udp_datagrams(0x1234_5678, 42, "[2001:db8::1]:5353", &payload, 1100);
+        assert!(dgrams.len() >= 4);
+
+        let mut defrag = Hy2UdpDefragmenter::new();
+        // Deliver out of order
+        for dg in dgrams.iter().skip(1) {
+            assert!(defrag.push(dg).is_none());
+        }
+        let (sid, addr, reassembled) = defrag.push(&dgrams[0]).expect("reassembled UDP packet");
+        assert_eq!(sid, 0x1234_5678);
+        assert_eq!(addr, "[2001:db8::1]:5353");
+        assert_eq!(reassembled, payload);
+        assert_eq!(
+            parse_hy2_addr(&addr).unwrap(),
+            ("2001:db8::1".to_string(), 5353)
+        );
     }
 }

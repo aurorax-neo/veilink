@@ -79,3 +79,30 @@ test('API stays strictly same-origin, sends credentials, and stores session toke
   assert.equal(calls[2].url, '/api/version')
   assert.equal(calls[2].options.credentials, 'same-origin')
 })
+
+test('API calibrates server clock offset from X-Server-Time-Ms without falsifying historical last_seen', async () => {
+  const host = {}
+  const serverAheadMs = Date.now() + 600_000 // Server clock 10 minutes ahead of client browser
+  const serverNowSec = Math.floor(serverAheadMs / 1000)
+  const mod = loadTs('../src/api.ts', {
+    globalThis: host,
+    sessionStorage: { getItem: () => 'tok', setItem: () => {}, removeItem: () => {} },
+    localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+    fetch: async () => ({
+      ok: true,
+      status: 200,
+      headers: {
+        get: (name) => (name.toLowerCase() === 'x-server-time-ms' ? String(serverAheadMs) : null),
+      },
+      text: async () =>
+        JSON.stringify([
+          { id: 'live', last_seen: serverNowSec - 2 },
+          { id: 'dead', last_seen: serverNowSec - 300 },
+        ]),
+    }),
+  })
+  const nodes = await mod.api('/nodes')
+  assert.ok(Math.abs(host.__VEILINK_CLOCK_OFFSET_MS__ - 600_000) < 2000)
+  assert.equal(nodes[0].last_seen, serverNowSec - 2)
+  assert.equal(nodes[1].last_seen, serverNowSec - 300)
+})

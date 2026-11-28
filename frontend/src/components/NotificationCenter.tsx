@@ -15,7 +15,7 @@ import {
   X,
 } from 'lucide-react'
 import { useConsole } from '../context/ConsoleContext'
-import { attentionReasons, byNameAndId, seenText } from '../format'
+import { attentionReasons, byNameAndId, isOfflineNode, nodeSeenSummary, serverNowMs } from '../format'
 import type { PageId } from '../types'
 import { Badge, Tooltip } from './ui/Badge'
 
@@ -55,8 +55,9 @@ export function NotificationCenter() {
   const allNotices = useMemo<NoticeEntry[]>(() => {
     const list: NoticeEntry[] = []
 
+    const refNow = serverNowMs()
     const attentionNodes = nodes
-      .filter((n) => attentionReasons(n).length > 0)
+      .filter((n) => attentionReasons(n, refNow).length > 0)
       .sort((a, b) => {
         const aErr = a.error ? 0 : 1
         const bErr = b.error ? 0 : 1
@@ -64,20 +65,21 @@ export function NotificationCenter() {
       })
 
     for (const node of attentionNodes) {
-      const reasons = attentionReasons(node)
-      const isBad = Boolean(node.error)
-      const subtitle = node.error
+      const reasons = attentionReasons(node, refNow)
+      const offline = isOfflineNode(node)
+      const isBad = !offline && Boolean(node.error)
+      const subtitle = !offline && node.error
         ? node.error
-        : `${node.role === 'server' ? '公网网关' : '内网节点'} · ${seenText(node.last_seen, Date.now(), true)}`
+        : `${node.role === 'server' ? '公网网关' : '内网节点'} · ${nodeSeenSummary(node, refNow, true)}`
       list.push({
-        key: `node:${node.id}:${reasons.join('|')}:${node.error || ''}`,
+        key: `node:${node.id}:${reasons.join('|')}:${offline ? node.exported_revision || 0 : node.error || ''}`,
         severity: isBad ? 'bad' : 'warn',
         category: node.role === 'server' ? 'server' : 'client',
         title: node.name,
         subtitle,
         reasons,
         targetPage: node.role === 'server' ? 'servers' : 'clients',
-        actionLabel: '排查',
+        actionLabel: offline ? '去导出' : '排查',
       })
     }
 

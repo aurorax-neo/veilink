@@ -40,6 +40,29 @@ const NAV_GROUPS: Array<{
   { key: 'system', items: ['settings'] },
 ]
 
+const TOUR_STEPS: TourStep[] = [
+  {
+    selector: '[data-tour="sidebar"]',
+    title: '分层导航工作台',
+    description: '按「概览 / 网络拓扑 / 可观测性 / 系统」分区组织，并支持折叠为图标栏释放更大视野。',
+  },
+  {
+    selector: '[data-tour="cmdk"]',
+    title: '全局快速跳转（⌘K / Ctrl+K）',
+    description: '随时呼出命令面板，跨页面检索任意网关、客户端、端口映射或快速切换主题与刷新。',
+  },
+  {
+    selector: '[data-tour="sse-pill"]',
+    title: 'SSE 实时遥测连接',
+    description: '控制平面通过 Server-Sent Events 毫秒级接收节点心跳、隧道状态与实时运行日志。',
+  },
+  {
+    selector: '[data-tour="page-refresh"]',
+    title: '主动唤醒节点上报',
+    description: '点击刷新不仅重新拉取状态，还会通过控制通道主动唤醒在线节点立即回传最新修订与应用结果。',
+  },
+]
+
 function navIcon(id: PageId) {
   switch (id) {
     case 'dashboard':
@@ -187,29 +210,6 @@ export function AppShell({ children }: { children: ReactNode }) {
     ]
     return [...navCmds, ...nodeCmds, ...actionCmds]
   }, [dict, navigate, nodes, setTourOpen, theme, toggleTheme, triggerPageRefresh])
-
-  const tourSteps: TourStep[] = [
-    {
-      selector: '[data-tour="sidebar"]',
-      title: '分层导航工作台',
-      description: '按「概览 / 网络拓扑 / 可观测性 / 系统」分区组织，并支持折叠为图标栏释放更大视野。',
-    },
-    {
-      selector: '[data-tour="cmdk"]',
-      title: '全局快速跳转（⌘K / Ctrl+K）',
-      description: '随时呼出命令面板，跨页面检索任意网关、客户端、端口映射或快速切换主题与刷新。',
-    },
-    {
-      selector: '[data-tour="sse-pill"]',
-      title: 'SSE 实时遥测连接',
-      description: '控制平面通过 Server-Sent Events 毫秒级接收节点心跳、隧道状态与实时运行日志。',
-    },
-    {
-      selector: '[data-tour="page-refresh"]',
-      title: '主动唤醒节点上报',
-      description: '点击刷新不仅重新拉取状态，还会通过控制通道主动唤醒在线节点立即回传最新修订与应用结果。',
-    },
-  ]
 
   const activeLocale = LOCALES.find((l) => l.code === locale)
 
@@ -507,7 +507,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       </nav>
 
       <CommandPalette open={cmdkOpen} onClose={() => setCmdkOpen(false)} commands={commands} />
-      <Tour open={tourOpen} steps={tourSteps} onClose={() => setTourOpen(false)} />
+      <Tour open={tourOpen} steps={TOUR_STEPS} onClose={() => setTourOpen(false)} />
     </>
   )
 }

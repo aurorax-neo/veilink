@@ -6,7 +6,7 @@ import { buildNodeSavePayload, effectiveXhttpMode, isFlowAllowed, nodeToDraft, p
 import type { ConnectEndpoint, Node, TunnelConfig } from '../types'
 import { Badge, InlineAlert } from './ui/Badge'
 import { Collapsible, SecretField, Segmented, Select, Switch } from './ui/Controls'
-import { Drawer } from './ui/Overlays'
+import { Modal } from './ui/Overlays'
 
 type PEMField = 'cert' | 'key' | 'ca'
 type GenerateKind = 'reality' | 'short_id' | 'mldsa65' | 'vless' | 'hysteria2' | 'certificate'
@@ -26,7 +26,7 @@ export function NodeEditorDrawer({
   node: Node | null
   defaultName: string
   onClose: () => void
-  onSaved: () => Promise<void>
+  onSaved: (saved: Node) => Promise<void>
 }) {
   const isServer = role === 'server'
   const init = useMemo(() => nodeToDraft(node || undefined, defaultName), [node, defaultName])
@@ -48,15 +48,21 @@ export function NodeEditorDrawer({
   })
   const endpointAutoPortRef = useRef(!node)
   const genRevRef = useRef(0)
+  const nodeRef = useRef(node)
+  nodeRef.current = node
+  const defaultNameRef = useRef(defaultName)
+  defaultNameRef.current = defaultName
+  const sessionKey = open ? `${isServer ? 'server' : 'client'}:${node?.id || '__new__'}` : ''
 
   useEffect(() => {
-    if (!open) return
-    const fresh = nodeToDraft(node || undefined, defaultName)
+    if (!sessionKey) return
+    const targetNode = nodeRef.current
+    const fresh = nodeToDraft(targetNode || undefined, defaultNameRef.current)
     setDraft(fresh.draft)
     setEndpoints(fresh.endpoints)
     setOptions(fresh.options)
     setOriginalTunnel(fresh.originalTunnel)
-    endpointAutoPortRef.current = !node
+    endpointAutoPortRef.current = !targetNode
     setGenBusy('')
     setGenStatus('')
     setGenError('')
@@ -66,7 +72,7 @@ export function NodeEditorDrawer({
       key: { busy: false, error: '', status: '', fileName: '' },
       ca: { busy: false, error: '', status: '', fileName: '' },
     })
-    if (!node && isServer) {
+    if (!targetNode && isServer) {
       try {
         setHasSavedDraft(!!globalThis.sessionStorage?.getItem(NODE_DRAFT_KEY))
       } catch {
@@ -75,7 +81,7 @@ export function NodeEditorDrawer({
     } else {
       setHasSavedDraft(false)
     }
-  }, [open, node, defaultName, isServer])
+  }, [sessionKey, isServer])
 
   // Spec 2.5: Auto-save draft for unsaved new Server nodes so accidental close preserves work
   useEffect(() => {
@@ -228,10 +234,10 @@ export function NodeEditorDrawer({
         throw e
       }
     }
-    const payload = buildNodeSavePayload(role, draft, endpoints, originalTunnel)
-    await api(draft.id ? `/nodes/${encodeURIComponent(draft.id)}` : '/nodes', draft.id ? 'PUT' : 'POST', payload)
+    const payload = buildNodeSavePayload(role, node?.embedded ? { ...draft, mode: 'online' } : draft, endpoints, originalTunnel)
+    const saved = await api<Node>(draft.id ? `/nodes/${encodeURIComponent(draft.id)}` : '/nodes', draft.id ? 'PUT' : 'POST', payload)
     if (!node && isServer) discardDraft()
-    await onSaved()
+    await onSaved(saved)
     return true
   }
 
@@ -239,10 +245,11 @@ export function NodeEditorDrawer({
   const sessionTableKind = ['', 'hex', 'base62'].includes(draft.xhttpSessionTable) ? draft.xhttpSessionTable : 'custom'
 
   return (
-    <Drawer
+    <Modal
       open={open}
       onClose={onClose}
-      wide={isServer}
+      isForm
+      size={isServer ? 'lg' : 'md'}
       title={`${draft.id ? '编辑' : '新建'}${isServer ? '公网网关' : '内网节点'}`}
       saveLabel={draft.id ? '保存' : '创建'}
       disabled={readingPem || !!uploadErr || !!genBusy}
@@ -258,7 +265,7 @@ export function NodeEditorDrawer({
         </div>
       )}
 
-      {/* Section 1: Basic Identity */}
+      {/* Section 1: Basic Identity & Node Operating Mode */}
       <div className="form-section">
         <div className="field">
           <label className="field-label" htmlFor="node-name">节点名称</label>
@@ -270,6 +277,37 @@ export function NodeEditorDrawer({
             value={draft.name}
             onChange={(e) => updateDraft('name', e.target.value)}
           />
+        </div>
+
+        <div className="field">
+          <div className="field-label">
+            <span>节点模式</span>
+            {node?.embedded && <Badge text="内置网关固定在线" tone="accent" />}
+          </div>
+          {node?.embedded ? (
+            <Segmented<'online'>
+              ariaLabel="节点模式"
+              value="online"
+              disabled
+              onChange={() => {}}
+              options={[{ value: 'online', label: '在线受控' }]}
+            />
+          ) : (
+            <Segmented<'online' | 'offline'>
+              ariaLabel="节点模式"
+              value={draft.mode}
+              onChange={(mode) => updateDraft('mode', mode)}
+              options={[
+                { value: 'online', label: '在线受控' },
+                { value: 'offline', label: '脱机独立' },
+              ]}
+            />
+          )}
+          <span className="field-help">
+            {draft.mode === 'offline' && !node?.embedded
+              ? '脱机独立：节点不连接 Hub 控制面、不轮询心跳；保存后导出脱机配置直接启动。'
+              : '在线受控：节点通过接入令牌连接 Hub，实时同步修订并上报心跳与链路状态。'}
+          </span>
         </div>
       </div>
 
@@ -337,10 +375,9 @@ export function NodeEditorDrawer({
               {endpoints.map((ep, idx) => (
                 <div
                   key={ep.id}
+                  className="subpanel-card"
                   style={{
                     padding: 12,
-                    borderRadius: 'var(--radius-md)',
-                    background: 'var(--surface-1)',
                     display: 'grid',
                     gap: 10,
                   }}
@@ -489,7 +526,7 @@ export function NodeEditorDrawer({
 
             {/* TLS / CA PEM Uploads */}
             {pemFields.length > 0 && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 14, borderRadius: 'var(--radius-md)', background: 'var(--surface-1)' }}>
+              <div className="subpanel-card" style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 14 }}>
                 {pemFields.includes('cert') && (
                   <div style={{ display: 'flex', alignItems: 'flex-end', gap: 10, flexWrap: 'wrap' }}>
                     <div className="field" style={{ flex: '0 1 160px' }}>
@@ -562,7 +599,7 @@ export function NodeEditorDrawer({
 
             {/* REALITY Parameters */}
             {draft.protocol === 'vless' && draft.security === 'reality' && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 14, borderRadius: 'var(--radius-md)', background: 'var(--surface-1)' }}>
+              <div className="subpanel-card" style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 14 }}>
                 <div className="form-grid-2">
                   <div className="field">
                     <label className="field-label" htmlFor="reality-dest">回落目标（Dest）</label>
@@ -727,7 +764,7 @@ export function NodeEditorDrawer({
 
             {/* XHTTP Full Configuration (Progressive Disclosure) */}
             {draft.protocol === 'vless' && draft.transport === 'xhttp' && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 14, borderRadius: 'var(--radius-md)', background: 'var(--surface-1)' }}>
+              <div className="subpanel-card" style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 14 }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
                   <span className="form-section-title">XHTTP 传输配置</span>
                   <Badge text={`有效模式: ${effXhttpMode}`} tone="accent" />
@@ -1065,6 +1102,6 @@ export function NodeEditorDrawer({
           </div>
         </>
       )}
-    </Drawer>
+    </Modal>
   )
 }

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Check,
   Copy,
+  Download,
   Edit3,
   FileCode2,
   Laptop,
@@ -24,10 +25,13 @@ import {
   copyText,
   endpoint,
   heartbeatOnline,
+  isOfflineNode,
   needsAttention,
+  nodeSeenSummary,
   presence,
   revisionState,
   seenText,
+  serverNowMs,
   triggerHaptic,
   tunnelBadges,
   tunnelSummaryText,
@@ -41,7 +45,7 @@ import { Alert, Badge, EmptyState, Tooltip } from '../components/ui/Badge'
 import { Dropdown, Segmented, SplitPane } from '../components/ui/Controls'
 import { ActionSheet, AlertDialog, Drawer, Modal, Popconfirm } from '../components/ui/Overlays'
 
-type NodeFilter = 'all' | 'online' | 'attention' | 'disabled'
+type NodeFilter = 'all' | 'online' | 'offline' | 'attention' | 'disabled'
 
 export function NodesView({ role }: { role: 'server' | 'client' }) {
   const { nodes, mappings, loaded, loading, error, reload, reloadNode, toast, showSnackbar, dict } = useConsole()
@@ -51,7 +55,7 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
   const [filter, setFilter] = useState<NodeFilter>('all')
   const [query, setQuery] = useState('')
   const [selectedId, setSelectedId] = useState('')
-  const [now, setNow] = useState(() => Date.now())
+  const [now, setNow] = useState(() => serverNowMs())
 
   const [editorOpen, setEditorOpen] = useState(false)
   const [editingNode, setEditingNode] = useState<Node | null>(null)
@@ -88,7 +92,7 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
 
   useEffect(() => {
     activeRef.current = true
-    const timer = window.setInterval(() => setNow(Date.now()), 2000)
+    const timer = window.setInterval(() => setNow(serverNowMs()), 2000)
     const off = stream.on('node', (data) => {
       const nid = (data as { node_id?: string } | null)?.node_id
       if (nid) {
@@ -110,7 +114,7 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
 
   const refreshSingleNode = useCallback(
     async (node: Node) => {
-      if (node.revoked) return
+      if (node.revoked || isOfflineNode(node)) return
       setRefreshingIds((prev) => new Set(prev).add(node.id))
       try {
         const res = await api<{ connected: boolean; reported?: boolean }>(`/nodes/${encodeURIComponent(node.id)}/refresh`, 'POST', {})
@@ -150,7 +154,7 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
 
   useEffect(() => {
     const unregister = registerPageRefresh(async () => {
-      const targets = nodesRef.current.filter((n) => n.role === role && !n.revoked)
+      const targets = nodesRef.current.filter((n) => n.role === role && !n.revoked && !isOfflineNode(n))
       await Promise.all(targets.map((n) => refreshSingleNode(n)))
     })
     return unregister
@@ -167,14 +171,15 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
 
   const rows = useMemo(() => {
     const q = query.trim().toLowerCase()
-    const currentNow = Math.max(now, Date.now())
+    const currentNow = Math.max(now, serverNowMs())
     return roleNodes
       .filter((n) => {
-        if (filter === 'online' && (n.disabled || !heartbeatOnline(n, currentNow))) return false
+        if (filter === 'online' && (n.disabled || isOfflineNode(n) || !heartbeatOnline(n, currentNow))) return false
+        if (filter === 'offline' && !isOfflineNode(n)) return false
         if (filter === 'attention' && !needsAttention(n, currentNow)) return false
         if (filter === 'disabled' && !n.disabled && !n.revoked) return false
         if (!q) return true
-        return [n.name, n.id, n.address, n.error, tunnelSummaryText(n)].join(' ').toLowerCase().includes(q)
+        return [n.name, n.id, n.address, n.error, isOfflineNode(n) ? 'offline 脱机' : 'online 在线', tunnelSummaryText(n)].join(' ').toLowerCase().includes(q)
       })
       .sort((a, b) => Number(needsAttention(b, currentNow)) - Number(needsAttention(a, currentNow)) || byNameAndId(a, b))
   }, [roleNodes, filter, query, now])
@@ -205,13 +210,17 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
         disabled: nextDisabled,
       })
       await reload()
-      const msg = !res?.connected
+      const msg = isOfflineNode(node)
         ? nextDisabled
-          ? `已标记停用「${node.name}」（重连后停止）`
-          : `已标记启用「${node.name}」（重连后恢复）`
-        : nextDisabled
-          ? `已停用${roleLabel}「${node.name}」`
-          : `已启用${roleLabel}「${node.name}」`
+          ? `已标记停用「${node.name}」（需重导出脱机配置）`
+          : `已标记启用「${node.name}」（需重导出脱机配置）`
+        : !res?.connected
+          ? nextDisabled
+            ? `已标记停用「${node.name}」（重连后停止）`
+            : `已标记启用「${node.name}」（重连后恢复）`
+          : nextDisabled
+            ? `已停用${roleLabel}「${node.name}」`
+            : `已启用${roleLabel}「${node.name}」`
       showSnackbar(
         msg,
         async () => {
@@ -252,6 +261,28 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
     await reload()
   }
 
+  const closeEditor = useCallback(() => setEditorOpen(false), [])
+  const handleEditorSaved = useCallback(
+    async (saved: Node) => {
+      await reload()
+      if (isOfflineNode(saved)) {
+        toast('脱机节点已保存，请导出最新脱机配置部署到节点。')
+        if (!editingNode) setOnboardingNode(saved)
+      } else {
+        toast('节点已保存，等待节点上报确认同步状态。')
+        if (!editingNode && !saved.embedded) setOnboardingNode(saved)
+      }
+    },
+    [editingNode, reload, toast],
+  )
+  const closeOnboarding = useCallback(() => setOnboardingNode(null), [])
+  const handleOnboardingExported = useCallback(
+    (nid: string) => {
+      void reloadNode(nid).catch(() => {})
+    },
+    [reloadNode],
+  )
+
   if (!loaded && loading) {
     return (
       <div className="panel">
@@ -267,6 +298,8 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
       </div>
     )
   }
+
+  const renderNow = Math.max(now, serverNowMs())
 
   const tablePane = (
     <div>
@@ -304,7 +337,8 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
               </thead>
               <tbody>
                 {rows.map((node) => {
-                  const st = presence(node, Math.max(now, Date.now()))
+                  const offline = isOfflineNode(node)
+                  const st = presence(node, renderNow)
                   const rev = revisionState(node)
                   const mCount = nodeMappings(node.id).length
                   const fb = feedbackMap[node.id]
@@ -322,9 +356,10 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
                           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                             <span className="node-name">{node.name}</span>
                             {node.embedded && <Badge text="内置" tone="accent" />}
+                            {offline && <Badge text="脱机模式" tone="info" />}
                           </span>
                           <span className="cell-sub mono ltr-force tabular">
-                            {node.software_version || '未上报版本'} · {node.id.slice(0, 12)}
+                            {offline ? '独立运行' : node.software_version || '未上报版本'} · {node.id.slice(0, 12)}
                           </span>
                         </button>
                       </td>
@@ -332,28 +367,30 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
                       <td>
                         <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
                           <Badge text={st.text} tone={st.tone} dot pulse={st.tone === 'good'} />
-                          <Popconfirm
-                            title={`主动向「${node.name}」发送状态上报指令？`}
-                            confirmLabel="立即刷新"
-                            onConfirm={() => refreshSingleNode(node)}
-                          >
-                            {(toggle) => (
-                              <Tooltip content="请求节点立即上报心跳与修订">
-                                <button
-                                  type="button"
-                                  className="icon-btn icon-btn-compact"
-                                  disabled={node.revoked || isBusyRefresh}
-                                  aria-label={`刷新节点 ${node.name}`}
-                                  onClick={toggle}
-                                >
-                                  <RefreshCw size={14} className={isBusyRefresh ? 'spin' : ''} />
-                                </button>
-                              </Tooltip>
-                            )}
-                          </Popconfirm>
+                          {!offline && (
+                            <Popconfirm
+                              title={`主动向「${node.name}」发送状态上报指令？`}
+                              confirmLabel="立即刷新"
+                              onConfirm={() => refreshSingleNode(node)}
+                            >
+                              {(toggle) => (
+                                <Tooltip content="请求节点立即上报心跳与修订">
+                                  <button
+                                    type="button"
+                                    className="icon-btn icon-btn-compact"
+                                    disabled={node.revoked || isBusyRefresh}
+                                    aria-label={`刷新节点 ${node.name}`}
+                                    onClick={toggle}
+                                  >
+                                    <RefreshCw size={14} className={isBusyRefresh ? 'spin' : ''} />
+                                  </button>
+                                </Tooltip>
+                              )}
+                            </Popconfirm>
+                          )}
                         </div>
                         <div className="cell-sub tabular" style={{ color: fb?.bad ? 'var(--bad)' : undefined }}>
-                          {fb?.text || seenText(node.last_seen, now, true)}
+                          {fb?.text || nodeSeenSummary(node, renderNow, true)}
                         </div>
                       </td>
 
@@ -373,7 +410,13 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
                       <td className="tabular">{mCount}</td>
 
                       <td>
-                        <Tooltip content={node.error || `目标修订 r${node.desired_revision} · 已应用 r${node.applied_revision}`}>
+                        <Tooltip
+                          content={
+                            offline
+                              ? `目标修订 r${node.desired_revision} · 已导出 r${node.exported_revision || 0}（脱机免心跳）`
+                              : node.error || `目标修订 r${node.desired_revision} · 已应用 r${node.applied_revision}`
+                          }
+                        >
                           <Badge text={rev.text} tone={rev.tone} />
                         </Tooltip>
                       </td>
@@ -387,8 +430,8 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
                               disabled={node.revoked}
                               onClick={() => setOnboardingNode(node)}
                             >
-                              <QrCode size={13} />
-                              <span>{dict.nodes.onboarding}</span>
+                              {offline ? <Download size={13} /> : <QrCode size={13} />}
+                              <span>{offline ? '脱机配置' : dict.nodes.onboarding}</span>
                             </button>
                           )}
                           <button
@@ -446,20 +489,25 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
                               },
                               ...(!node.embedded
                                 ? [
-                                    {
-                                      id: 'revoke',
-                                      label: '吊销节点凭据…',
-                                      icon: <ShieldOff size={14} />,
-                                      danger: true,
-                                      disabled: node.revoked,
-                                      separatorBefore: true,
-                                      onSelect: () => setDangerAction({ node, kind: 'revoke' }),
-                                    },
+                                    ...(!offline
+                                      ? [
+                                          {
+                                            id: 'revoke',
+                                            label: '吊销节点凭据…',
+                                            icon: <ShieldOff size={14} />,
+                                            danger: true,
+                                            disabled: node.revoked,
+                                            separatorBefore: true,
+                                            onSelect: () => setDangerAction({ node, kind: 'revoke' }),
+                                          },
+                                        ]
+                                      : []),
                                     {
                                       id: 'delete',
                                       label: '永久删除节点…',
                                       icon: <Trash2 size={14} />,
                                       danger: true,
+                                      separatorBefore: offline,
                                       onSelect: () => setDangerAction({ node, kind: 'delete' }),
                                     },
                                   ]
@@ -478,7 +526,8 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
           {/* Dedicated Touch-Friendly Mobile Cards (<= 640px) */}
           <div className="mobile-cards" role="list" aria-label={`${roleLabel}卡片列表`}>
             {rows.map((node) => {
-              const st = presence(node, Math.max(now, Date.now()))
+              const offline = isOfflineNode(node)
+              const st = presence(node, renderNow)
               const rev = revisionState(node)
               const mCount = nodeMappings(node.id).length
               const isSelected = selectedId === node.id
@@ -493,9 +542,10 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
                       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                         <span className="node-name" style={{ fontSize: 15 }}>{node.name}</span>
                         {node.embedded && <Badge text="内置" tone="accent" />}
+                        {offline && <Badge text="脱机模式" tone="info" />}
                       </span>
                       <span className="cell-sub mono ltr-force tabular">
-                        {node.software_version || '未上报'} · {seenText(node.last_seen, now, true)}
+                        {offline ? nodeSeenSummary(node, renderNow, true) : `${node.software_version || '未上报'} · ${seenText(node.last_seen, renderNow, true)}`}
                       </span>
                     </button>
                     <Badge text={st.text} tone={st.tone} dot pulse={st.tone === 'good'} />
@@ -528,8 +578,8 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
                         disabled={node.revoked}
                         onClick={() => setOnboardingNode(node)}
                       >
-                        <QrCode size={14} />
-                        <span>{dict.nodes.onboarding}</span>
+                        {offline ? <Download size={14} /> : <QrCode size={14} />}
+                        <span>{offline ? '脱机配置' : dict.nodes.onboarding}</span>
                       </button>
                     )}
                     <button
@@ -568,7 +618,7 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             <h2 style={{ fontSize: 17 }}>{selectedNode.name}</h2>
-            <Badge text={presence(selectedNode, now).text} tone={presence(selectedNode, now).tone} dot />
+            <Badge text={presence(selectedNode, renderNow).text} tone={presence(selectedNode, renderNow).tone} dot />
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBlockStart: 4 }}>
             <code className="cell-sub ltr-force">{selectedNode.id}</code>
@@ -588,30 +638,36 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
         </button>
       </div>
 
-      {selectedNode.error && <Alert tone="bad">{selectedNode.error}</Alert>}
-      {attentionReasons(selectedNode, now).length > 0 && !selectedNode.error && (
-        <Alert tone="warn">待排查项：{attentionReasons(selectedNode, now).join(' · ')}</Alert>
+      {selectedNode.error && !isOfflineNode(selectedNode) && <Alert tone="bad">{selectedNode.error}</Alert>}
+      {attentionReasons(selectedNode, renderNow).length > 0 && (!selectedNode.error || isOfflineNode(selectedNode)) && (
+        <Alert tone="warn">待排查项：{attentionReasons(selectedNode, renderNow).join(' · ')}</Alert>
       )}
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 10 }}>
-        <div style={{ padding: 12, borderRadius: 'var(--radius-md)', background: 'var(--surface-2)' }}>
-          <div className="cell-sub">软件版本（节点上报）</div>
+        <div className="inspector-card" style={{ padding: 12 }}>
+          <div className="cell-sub">{isOfflineNode(selectedNode) ? '运行模式' : '软件版本（节点上报）'}</div>
           <div className="mono tabular ltr-force" style={{ marginBlockStart: 4, fontWeight: 'var(--fw-medium)' }}>
-            {selectedNode.software_version || '未上报'}
+            {isOfflineNode(selectedNode) ? '脱机独立运行' : selectedNode.software_version || '未上报'}
           </div>
-          <div className="cell-sub mono ltr-force">{selectedNode.software_commit ? selectedNode.software_commit.slice(0, 10) : '—'}</div>
+          <div className="cell-sub mono ltr-force">
+            {isOfflineNode(selectedNode) ? '免控制面连接 · 免心跳' : selectedNode.software_commit ? selectedNode.software_commit.slice(0, 10) : '—'}
+          </div>
         </div>
-        <div style={{ padding: 12, borderRadius: 'var(--radius-md)', background: 'var(--surface-2)' }}>
-          <div className="cell-sub">配置修订同步</div>
+        <div className="inspector-card" style={{ padding: 12 }}>
+          <div className="cell-sub">{isOfflineNode(selectedNode) ? '脱机配置导出' : '配置修订同步'}</div>
           <div className="tabular" style={{ marginBlockStart: 4, fontWeight: 'var(--fw-medium)' }}>
-            r{selectedNode.applied_revision} / r{selectedNode.desired_revision}
+            {isOfflineNode(selectedNode)
+              ? `已导出 r${selectedNode.exported_revision || 0} / r${selectedNode.desired_revision}`
+              : `r${selectedNode.applied_revision} / r${selectedNode.desired_revision}`}
           </div>
-          <div className="cell-sub tabular">{seenText(selectedNode.last_seen, now, false)}</div>
+          <div className="cell-sub tabular">
+            {isOfflineNode(selectedNode) ? '导出文件或命令独立启动' : seenText(selectedNode.last_seen, renderNow, false)}
+          </div>
         </div>
       </div>
 
       {isServer ? (
-        <div style={{ padding: 14, borderRadius: 'var(--radius-md)', background: 'var(--surface-2)', display: 'grid', gap: 10 }}>
+        <div className="inspector-card" style={{ padding: 14, display: 'grid', gap: 10 }}>
           <span className="form-section-title">隧道与连接入口</span>
           <div style={{ fontSize: 13 }}>{tunnelSummaryText(selectedNode)}</div>
           <div className="cell-sub mono ltr-force">
@@ -625,7 +681,7 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
           ))}
         </div>
       ) : (
-        <div style={{ padding: 14, borderRadius: 'var(--radius-md)', background: 'var(--surface-2)', display: 'grid', gap: 8 }}>
+        <div className="inspector-card" style={{ padding: 14, display: 'grid', gap: 8 }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
             <span className="form-section-title">派生网关来源</span>
             <button
@@ -671,8 +727,8 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
             disabled={selectedNode.revoked}
             onClick={() => setOnboardingNode(selectedNode)}
           >
-            <QrCode size={14} />
-            <span>快捷接入</span>
+            {isOfflineNode(selectedNode) ? <Download size={14} /> : <QrCode size={14} />}
+            <span>{isOfflineNode(selectedNode) ? '导出脱机配置' : '快捷接入'}</span>
           </button>
         )}
         <button
@@ -684,7 +740,7 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
           <Power size={14} />
           <span>{selectedNode.disabled ? '启用' : '停用'}</span>
         </button>
-        {!selectedNode.embedded && (
+        {!selectedNode.embedded && !isOfflineNode(selectedNode) && (
           <button
             type="button"
             className="btn btn-sm btn-danger-ghost"
@@ -709,6 +765,7 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
           options={[
             { value: 'all', label: `${dict.common.all} (${roleNodes.length})` },
             { value: 'online', label: dict.common.online },
+            { value: 'offline', label: '脱机独立' },
             { value: 'attention', label: dict.common.attention },
             { value: 'disabled', label: dict.common.disabled },
           ]}
@@ -761,14 +818,15 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
         role={role}
         node={editingNode}
         defaultName={defaultName}
-        onClose={() => setEditorOpen(false)}
-        onSaved={async () => {
-          await reload()
-          toast('节点已保存，等待节点上报确认同步状态。')
-        }}
+        onClose={closeEditor}
+        onSaved={handleEditorSaved}
       />
 
-      <NodeOnboardingModal node={onboardingNode} onClose={() => setOnboardingNode(null)} />
+      <NodeOnboardingModal
+        node={onboardingNode}
+        onClose={closeOnboarding}
+        onExported={handleOnboardingExported}
+      />
 
       {/* Mobile ActionSheet (Spec 2.6) */}
       <ActionSheet
@@ -795,8 +853,8 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
                 ...(!mobileSheetNode.embedded
                   ? [
                       {
-                        label: '快捷接入命令',
-                        icon: <QrCode size={16} />,
+                        label: isOfflineNode(mobileSheetNode) ? '导出脱机配置' : '快捷接入命令',
+                        icon: isOfflineNode(mobileSheetNode) ? <Download size={16} /> : <QrCode size={16} />,
                         disabled: mobileSheetNode.revoked,
                         onSelect: () => setOnboardingNode(mobileSheetNode),
                       },
@@ -810,13 +868,17 @@ export function NodesView({ role }: { role: 'server' | 'client' }) {
                 },
                 ...(!mobileSheetNode.embedded
                   ? [
-                      {
-                        label: '吊销节点凭据',
-                        icon: <ShieldOff size={16} />,
-                        danger: true,
-                        disabled: mobileSheetNode.revoked,
-                        onSelect: () => setDangerAction({ node: mobileSheetNode, kind: 'revoke' }),
-                      },
+                      ...(!isOfflineNode(mobileSheetNode)
+                        ? [
+                            {
+                              label: '吊销节点凭据',
+                              icon: <ShieldOff size={16} />,
+                              danger: true,
+                              disabled: mobileSheetNode.revoked,
+                              onSelect: () => setDangerAction({ node: mobileSheetNode, kind: 'revoke' }),
+                            },
+                          ]
+                        : []),
                       {
                         label: '永久删除节点',
                         icon: <Trash2 size={16} />,

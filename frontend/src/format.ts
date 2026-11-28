@@ -1,13 +1,15 @@
 import type { Mapping, Node } from './types'
 
-export type Tone = 'neutral' | 'good' | 'warn' | 'bad' | 'accent' | 'purple'
+export type Tone = 'neutral' | 'info' | 'good' | 'warn' | 'bad' | 'accent' | 'purple'
 
 const actions: Record<string, string> = {
   'node.save': '保存节点',
+  'node.disable': '切换节点启停',
   'node.revoke': '吊销或删除节点',
   'node.enroll.token': '签发接入令牌',
   'node.enroll.revoke': '撤销接入令牌',
   'node.credential.reset': '重置节点凭证',
+  'node.offline.export': '导出脱机配置',
   'mapping.save': '保存映射',
   'mapping.delete': '删除映射',
   'auth.setup': '初始化注册管理员',
@@ -23,6 +25,7 @@ export function actionLabel(action: string): string {
 export function actionTone(action: string): Tone {
   if (action === 'node.revoke' || action === 'mapping.delete') return 'bad'
   if (action === 'node.enroll.revoke' || action === 'node.credential.reset' || action === 'auth.password.reset') return 'warn'
+  if (action === 'node.offline.export' || action === 'node.disable') return 'info'
   if (
     action === 'node.save' ||
     action === 'mapping.save' ||
@@ -114,21 +117,67 @@ export function byNameAndId<T extends { name: string; id: string }>(a: T, b: T):
   return (a.name || '').localeCompare(b.name || '', 'zh-CN') || a.id.localeCompare(b.id)
 }
 
-export function heartbeatOnline(node: Node, now = Date.now()): boolean {
-  return !node.revoked && node.last_seen > 0 && now / 1000 >= node.last_seen && now / 1000 - node.last_seen < 90
+export const CLOCK_SKEW_TOLERANCE_SEC = 10
+
+export function serverNowMs(localNow?: number): number {
+  const host = globalThis as {
+    __VEILINK_CLOCK_OFFSET_MS__?: number
+    __VEILINK_SERVER_FLOOR_MS__?: number
+  }
+  const offset =
+    typeof host.__VEILINK_CLOCK_OFFSET_MS__ === 'number' && Number.isFinite(host.__VEILINK_CLOCK_OFFSET_MS__)
+      ? host.__VEILINK_CLOCK_OFFSET_MS__
+      : 0
+  if (typeof localNow === 'number') {
+    return localNow + offset
+  }
+  const calibrated = Date.now() + offset
+  const floor =
+    typeof host.__VEILINK_SERVER_FLOOR_MS__ === 'number' && Number.isFinite(host.__VEILINK_SERVER_FLOOR_MS__)
+      ? host.__VEILINK_SERVER_FLOOR_MS__
+      : 0
+  return Math.max(calibrated, floor)
 }
 
-export function presence(node: Node, now = Date.now()): { text: string; tone: Tone } {
+export function isOfflineNode(node?: Pick<Node, 'mode' | 'embedded'> | null): boolean {
+  return Boolean(node && !node.embedded && node.mode === 'offline')
+}
+
+export function heartbeatOnline(node: Node, now = serverNowMs()): boolean {
+  if (isOfflineNode(node)) return false
+  if (node.revoked || node.last_seen <= 0) return false
+  const deltaSec = now / 1000 - node.last_seen
+  return deltaSec >= -CLOCK_SKEW_TOLERANCE_SEC && deltaSec < 90
+}
+
+export function nodeOperational(node: Node, now = serverNowMs()): boolean {
+  if (node.revoked || node.disabled) return false
+  if (isOfflineNode(node)) {
+    return node.desired_revision > 0 && (node.exported_revision || 0) >= node.desired_revision
+  }
+  return heartbeatOnline(node, now)
+}
+
+export function presence(node: Node, now = serverNowMs()): { text: string; tone: Tone } {
   if (node.revoked) return { text: '已吊销', tone: 'bad' }
   if (node.disabled) return { text: '已停用', tone: 'neutral' }
+  if (isOfflineNode(node)) return { text: '脱机独立', tone: 'info' }
   if (heartbeatOnline(node, now)) return { text: '近期在线', tone: 'good' }
   if (!node.last_seen) return { text: '尚未连接', tone: 'neutral' }
-  if (now / 1000 < node.last_seen) return { text: '时钟超前', tone: 'warn' }
+  if (now / 1000 - node.last_seen < -CLOCK_SKEW_TOLERANCE_SEC) return { text: '时钟偏移', tone: 'warn' }
   return { text: '心跳超时', tone: 'warn' }
 }
 
 export function revisionState(node: Node): { text: string; tone: Tone } {
   if (node.revoked) return { text: '不再同步', tone: 'neutral' }
+  if (node.disabled) return { text: '已停用', tone: 'neutral' }
+  if (isOfflineNode(node)) {
+    if (!node.desired_revision) return { text: '尚无配置', tone: 'neutral' }
+    const exported = node.exported_revision || 0
+    if (exported === 0) return { text: '待导出', tone: 'warn' }
+    if (exported < node.desired_revision) return { text: '需重导出', tone: 'warn' }
+    return { text: '已导出', tone: 'good' }
+  }
   if (node.error) return { text: '应用失败', tone: 'bad' }
   if (!node.desired_revision) return { text: '尚无配置', tone: 'neutral' }
   if (!node.applied_revision && !node.last_seen) return { text: '未上报', tone: 'warn' }
@@ -143,15 +192,15 @@ export function tunnelBadges(node: Node): Array<{ text: string; tone: Tone }> {
   if (protocol === 'hysteria2') {
     return [
       { text: 'Hysteria2', tone: 'purple' },
-      { text: 'QUIC + TLS', tone: 'neutral' },
+      { text: 'QUIC + TLS', tone: 'info' },
     ]
   }
   const chips: Array<{ text: string; tone: Tone }> = [{ text: 'VLESS', tone: 'accent' }]
   if (t.xhttp?.path) {
-    chips.push({ text: `XHTTP · ${t.xhttp.mode || 'packet-up'}`, tone: 'neutral' })
-    if (t.xhttp.http_version) chips.push({ text: `H${t.xhttp.http_version}`, tone: 'neutral' })
+    chips.push({ text: `XHTTP · ${t.xhttp.mode || 'packet-up'}`, tone: 'info' })
+    if (t.xhttp.http_version) chips.push({ text: `H${t.xhttp.http_version}`, tone: 'info' })
   } else {
-    chips.push({ text: 'TCP', tone: 'neutral' })
+    chips.push({ text: 'TCP', tone: 'info' })
   }
   if (t.reality && Object.values(t.reality).some(Boolean)) {
     chips.push({ text: 'REALITY', tone: 'good' })
@@ -182,25 +231,43 @@ export function tunnelSummaryText(node: Node): string {
   return '未配置安全模式'
 }
 
-export function attentionReasons(node: Node, now = Date.now()): string[] {
+export function attentionReasons(node: Node, now = serverNowMs()): string[] {
   if (node.revoked || node.disabled) return []
+  if (isOfflineNode(node)) {
+    const exported = node.exported_revision || 0
+    if (node.desired_revision > 0 && exported === 0) return ['配置待导出']
+    if (node.desired_revision > 0 && exported < node.desired_revision) return ['配置变更需重导出']
+    return []
+  }
   const reasons: string[] = []
   if (node.error) reasons.push('应用失败')
   if (node.applied_revision !== node.desired_revision) reasons.push('配置待应用')
-  if (!heartbeatOnline(node, now)) reasons.push(node.last_seen ? '心跳超过 90 秒' : '尚未上报心跳')
+  if (!heartbeatOnline(node, now)) {
+    if (!node.last_seen) reasons.push('尚未上报心跳')
+    else if (now / 1000 - node.last_seen < -CLOCK_SKEW_TOLERANCE_SEC) reasons.push('节点时间戳异常')
+    else reasons.push('心跳超过 90 秒')
+  }
   return reasons
 }
 
-export function needsAttention(node: Node, now = Date.now()): boolean {
+export function nodeSeenSummary(node: Node, now = serverNowMs(), relative = true): string {
+  if (isOfflineNode(node)) {
+    const exported = node.exported_revision || 0
+    return exported > 0 ? `脱机免心跳 · 已导出 r${exported}` : '脱机免心跳 · 待导出'
+  }
+  return seenText(node.last_seen, now, relative)
+}
+
+export function needsAttention(node: Node, now = serverNowMs()): boolean {
   return attentionReasons(node, now).length > 0
 }
 
-export function seenText(unix: number, now = Date.now(), relative = true): string {
+export function seenText(unix: number, now = serverNowMs(), relative = true): string {
   if (!unix) return '尚未上报'
   const abs = formatTime(unix * 1000)
   if (!relative) return abs
   const delta = Math.round(now / 1000 - unix)
-  if (delta < -5) return `${abs}（比本机时钟晚 ${-delta} 秒）`
+  if (delta < -CLOCK_SKEW_TOLERANCE_SEC) return `${abs}（时间戳超前 ${-delta} 秒）`
   if (delta < 90) return `${Math.max(delta, 0)} 秒前`
   const minutes = Math.floor(delta / 60)
   if (minutes < 120) return `${minutes} 分钟前`
@@ -209,7 +276,7 @@ export function seenText(unix: number, now = Date.now(), relative = true): strin
   return abs
 }
 
-export function relativeAge(unix: number, now = Date.now()): string {
+export function relativeAge(unix: number, now = serverNowMs()): string {
   if (!unix) return '—'
   const delta = Math.max(0, Math.round(now / 1000 - unix))
   if (delta < 60) return `${delta} 秒前`

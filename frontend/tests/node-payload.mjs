@@ -126,6 +126,17 @@ test('Hysteria2 enforces QUIC + TLS + password and client payload stays stripped
 
   const clientOut = JSON.parse(JSON.stringify(payload.buildNodeSavePayload('client', draft, endpoints, originalTunnel)))
   assert.deepEqual(clientOut, { name: 'HY2 Gateway', role: 'client', address: '', port: 0 })
+
+  draft.mode = 'offline'
+  const offlineServer = payload.buildNodeSavePayload('server', draft, endpoints, originalTunnel)
+  assert.equal(offlineServer.mode, 'offline')
+  const offlineClient = JSON.parse(JSON.stringify(payload.buildNodeSavePayload('client', draft, endpoints, originalTunnel)))
+  assert.deepEqual(offlineClient, { name: 'HY2 Gateway', role: 'client', mode: 'offline', address: '', port: 0 })
+
+  const roundTrip = payload.nodeToDraft({ id: 'c-off', name: 'Airgap', role: 'client', mode: 'offline', address: '', port: 0, revoked: false, desired_revision: 2, applied_revision: 0, exported_revision: 2, last_seen: 0, error: '' })
+  assert.equal(roundTrip.draft.mode, 'offline')
+  const embeddedLocked = payload.nodeToDraft({ id: 'gw-emb', name: 'Builtin', role: 'server', mode: 'offline', embedded: true, address: '127.0.0.1', port: 443, revoked: false, desired_revision: 1, applied_revision: 1, last_seen: 100, error: '' })
+  assert.equal(embeddedLocked.draft.mode, 'online')
 })
 
 test('Mapping validation detects tunnel port conflict and enabled overlap', () => {

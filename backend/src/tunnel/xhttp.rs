@@ -2,11 +2,13 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use rand::RngCore;
@@ -23,6 +25,8 @@ const MAX_XHTTP_BODY_BYTES: usize = 4 * 1024 * 1024;
 const H2_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
 const H2_CONN_WINDOW: u32 = 16 * 1024 * 1024;
 pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 Electron/35.1.2";
+
+const BASE62_CHARS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 pub fn xhttp_effective_http_version(x: &XHTTP, reality_enabled: bool) -> &'static str {
     match x.http_version.as_str() {
@@ -56,30 +60,211 @@ fn effective_request_timeout(local: &LocalTLS) -> Duration {
     }
 }
 
-fn downlink_content_type(local: &LocalTLS) -> &'static str {
+fn downlink_content_type(local: &LocalTLS) -> Option<&'static str> {
     if local.xhttp.no_sse_header {
-        "application/octet-stream"
+        None
     } else {
-        "text/event-stream"
+        Some("text/event-stream")
     }
 }
 
-fn stream_uplink_content_type(local: &LocalTLS) -> &'static str {
+fn stream_uplink_content_type(local: &LocalTLS) -> Option<&'static str> {
     if local.xhttp.no_grpc_header {
-        "application/octet-stream"
+        None
     } else {
-        "application/grpc"
+        Some("application/grpc")
     }
 }
 
-fn sample_post_size(local: &LocalTLS) -> usize {
-    let min_b = if local.xhttp.max_each_post_bytes > 0 {
-        (local.xhttp.max_each_post_bytes as usize).clamp(1024, 32768)
+fn effective_padding_bounds(x: &XHTTP) -> (usize, usize) {
+    let min_l = if x.padding_bytes > 0 {
+        x.padding_bytes as usize
+    } else {
+        100
+    };
+    let max_l = if x.padding_max_bytes > 0 && (x.padding_max_bytes as usize) >= min_l {
+        x.padding_max_bytes as usize
+    } else if x.padding_bytes > 0 {
+        min_l
+    } else {
+        1000
+    };
+    (min_l, max_l)
+}
+
+fn generate_xhttp_padding(x: &XHTTP) -> String {
+    let (min_l, max_l) = effective_padding_bounds(x);
+    let n = if max_l <= min_l {
+        min_l
+    } else {
+        let mut b = [0u8; 4];
+        rand::rng().fill_bytes(&mut b);
+        min_l + (u32::from_be_bytes(b) as usize % (max_l - min_l + 1))
+    };
+    if x.padding_obfs_mode && x.padding_method == "tokenish" {
+        let mut raw = vec![0u8; n];
+        rand::rng().fill_bytes(&mut raw);
+        raw.into_iter()
+            .map(|v| BASE62_CHARS[(v as usize) % BASE62_CHARS.len()] as char)
+            .collect()
+    } else {
+        "X".repeat(n)
+    }
+}
+
+fn xhttp_meta_placement(value: &str) -> &str {
+    if value.is_empty() {
+        "path"
+    } else {
+        value
+    }
+}
+
+fn xhttp_session_key(x: &XHTTP) -> &str {
+    if !x.session_id_key.is_empty() {
+        &x.session_id_key
+    } else if xhttp_meta_placement(&x.session_id_placement) == "header" {
+        "X-Veilink-Session"
+    } else {
+        "x_session"
+    }
+}
+
+fn xhttp_seq_key(x: &XHTTP) -> &str {
+    if !x.seq_key.is_empty() {
+        &x.seq_key
+    } else if xhttp_meta_placement(&x.seq_placement) == "header" {
+        "X-Veilink-Seq"
+    } else {
+        "x_seq"
+    }
+}
+
+fn xhttp_padding_placement(x: &XHTTP) -> &str {
+    if x.padding_placement.is_empty() {
+        "query_in_header"
+    } else {
+        &x.padding_placement
+    }
+}
+
+fn xhttp_padding_key(x: &XHTTP) -> &str {
+    if x.padding_key.is_empty() {
+        "x_padding"
+    } else {
+        &x.padding_key
+    }
+}
+
+fn xhttp_padding_header(x: &XHTTP) -> &str {
+    if !x.padding_header.is_empty() {
+        &x.padding_header
+    } else if xhttp_padding_placement(x) == "query_in_header" {
+        "Referer"
+    } else {
+        "X-Padding"
+    }
+}
+
+fn xhttp_data_placement(x: &XHTTP) -> &str {
+    if x.uplink_data_placement.is_empty() {
+        "body"
+    } else {
+        &x.uplink_data_placement
+    }
+}
+
+fn xhttp_data_key(x: &XHTTP) -> &str {
+    if !x.uplink_data_key.is_empty() {
+        &x.uplink_data_key
+    } else if xhttp_data_placement(x) == "header" {
+        "X-Veilink-Data"
+    } else {
+        "x_data"
+    }
+}
+
+fn xhttp_data_chunk_size(x: &XHTTP) -> usize {
+    if x.uplink_chunk_size > 0 {
+        x.uplink_chunk_size as usize
+    } else if xhttp_data_placement(x) == "header" {
+        4096
+    } else if xhttp_data_placement(x) == "cookie" {
+        3072
+    } else {
+        32768
+    }
+}
+
+fn generate_session_id(x: &XHTTP) -> String {
+    if x.session_id_table.is_empty() && x.session_id_length == 0 {
+        return uuid::Uuid::new_v4().to_string();
+    }
+    let table: &[u8] = match x.session_id_table.as_str() {
+        "base62" => BASE62_CHARS,
+        "hex" => b"0123456789abcdef",
+        other => other.as_bytes(),
+    };
+    let len = (x.session_id_length as usize).clamp(24, 64);
+    let mut rnd = vec![0u8; len];
+    rand::rng().fill_bytes(&mut rnd);
+    rnd.into_iter()
+        .map(|b| table[(b as usize) % table.len()] as char)
+        .collect()
+}
+
+fn effective_upload_cap(local: &LocalTLS) -> usize {
+    if xhttp_data_placement(&local.xhttp) == "body" {
+        return 32768;
+    }
+    let hdr_limit = if local.xhttp.server_max_header_bytes > 0 {
+        local.xhttp.server_max_header_bytes as isize
+    } else {
+        8192
+    };
+    let (_, max_pad) = effective_padding_bounds(&local.xhttp);
+    let mut budget = hdr_limit - 2048 - max_pad as isize;
+    if let Ok(entries) = local.xhttp.headers.entries() {
+        for (k, v) in entries {
+            budget -= (k.len() + v.len() + 36) as isize;
+        }
+    }
+    let csize = xhttp_data_chunk_size(&local.xhttp);
+    if csize == 0 || budget <= 0 {
+        return 1024;
+    }
+    let dkey_len = xhttp_data_key(&local.xhttp).len();
+    let max_p = if local.xhttp.post_bytes_max > 0 {
+        local.xhttp.post_bytes_max as usize
+    } else if local.xhttp.max_each_post_bytes > 0 {
+        local.xhttp.max_each_post_bytes as usize
     } else {
         32768
     };
+    let (mut low, mut high) = (0usize, max_p);
+    while low < high {
+        let n = low + (high - low + 1) / 2;
+        let encoded = (n * 4).div_ceil(3);
+        let chunks = encoded.div_ceil(csize);
+        let cost = encoded + chunks * (dkey_len + 40);
+        if chunks <= 32 && (cost as isize) <= budget {
+            low = n;
+        } else {
+            high = n - 1;
+        }
+    }
+    low.max(256)
+}
+
+fn sample_post_size(local: &LocalTLS) -> usize {
+    let cap = effective_upload_cap(local);
+    let min_b = if local.xhttp.max_each_post_bytes > 0 {
+        (local.xhttp.max_each_post_bytes as usize).clamp(256, cap)
+    } else {
+        cap
+    };
     let max_b = if local.xhttp.post_bytes_max > 0 {
-        (local.xhttp.post_bytes_max as usize).clamp(min_b, 32768)
+        (local.xhttp.post_bytes_max as usize).clamp(min_b, cap)
     } else {
         min_b
     };
@@ -109,24 +294,39 @@ fn sample_post_interval_ms(local: &LocalTLS) -> u64 {
     min_ms + (u32::from_be_bytes(b) as u64 % (max_ms - min_ms + 1))
 }
 
-fn format_xhttp_headers(local: &LocalTLS) -> String {
-    let mut out = String::new();
-    let mut has_ua = false;
-    if let Ok(entries) = local.xhttp.headers.entries() {
-        for (k, v) in entries {
-            if k.eq_ignore_ascii_case("user-agent") {
-                has_ua = true;
-            }
-            out.push_str(&k);
-            out.push_str(": ");
-            out.push_str(&v);
-            out.push_str("\r\n");
-        }
+fn sample_stream_up_keepalive(x: &XHTTP) -> Option<Duration> {
+    if x.stream_up_server_secs <= 0 {
+        return None;
     }
-    if !has_ua {
-        out.insert_str(0, &format!("User-Agent: {}\r\n", DEFAULT_USER_AGENT));
+    let min_s = x.stream_up_server_secs as u64;
+    let max_s = if x.stream_up_server_max_secs >= x.stream_up_server_secs {
+        x.stream_up_server_max_secs as u64
+    } else {
+        min_s
+    };
+    if max_s <= min_s {
+        return Some(Duration::from_secs(min_s));
     }
-    out
+    let mut b = [0u8; 4];
+    rand::rng().fill_bytes(&mut b);
+    Some(Duration::from_secs(
+        min_s + (u32::from_be_bytes(b) as u64 % (max_s - min_s + 1)),
+    ))
+}
+
+fn is_reserved_custom_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "host"
+            | "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "transfer-encoding"
+            | "upgrade"
+            | "content-length"
+            | "te"
+            | "trailer"
+    )
 }
 
 fn collect_xhttp_header_pairs(local: &LocalTLS) -> Vec<(String, String)> {
@@ -134,6 +334,9 @@ fn collect_xhttp_header_pairs(local: &LocalTLS) -> Vec<(String, String)> {
     let mut has_ua = false;
     if let Ok(entries) = local.xhttp.headers.entries() {
         for (k, v) in entries {
+            if is_reserved_custom_header(&k) {
+                continue;
+            }
             if k.eq_ignore_ascii_case("user-agent") {
                 has_ua = true;
             }
@@ -144,6 +347,291 @@ fn collect_xhttp_header_pairs(local: &LocalTLS) -> Vec<(String, String)> {
         pairs.insert(0, ("User-Agent".to_string(), DEFAULT_USER_AGENT.to_string()));
     }
     pairs
+}
+
+#[cfg(test)]
+fn format_xhttp_headers(local: &LocalTLS) -> String {
+    let mut out = String::new();
+    for (k, v) in collect_xhttp_header_pairs(local) {
+        out.push_str(&k);
+        out.push_str(": ");
+        out.push_str(&v);
+        out.push_str("\r\n");
+    }
+    out
+}
+
+pub fn normalize_xhttp_path(raw: &str) -> String {
+    let t = raw.trim();
+    if t.is_empty() {
+        return "/".to_string();
+    }
+    if t.starts_with('/') {
+        t.to_string()
+    } else {
+        format!("/{}", t)
+    }
+}
+
+fn join_xhttp_subpath(base: &str, segments: &[String]) -> String {
+    if segments.is_empty() {
+        return base.to_string();
+    }
+    let joined = segments.join("/");
+    if base == "/" {
+        format!("/{}", joined)
+    } else if base.ends_with('/') {
+        format!("{}{}", base, joined)
+    } else {
+        format!("{}/{}", base, joined)
+    }
+}
+
+fn extract_xhttp_subpath<'a>(path_only: &'a str, base_path: &str) -> Option<&'a str> {
+    let base_trimmed = base_path.trim_end_matches('/');
+    if base_trimmed.is_empty() {
+        return Some(path_only.trim_start_matches('/').trim_end_matches('/'));
+    }
+    let rest = path_only.strip_prefix(base_trimmed)?;
+    if rest.is_empty() || rest == "/" {
+        return Some("");
+    }
+    let after = rest.strip_prefix('/')?;
+    Some(after.trim_end_matches('/'))
+}
+
+struct BuiltClientReqParts {
+    uri_path_and_query: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_client_req_parts(
+    scheme: &str,
+    host: &str,
+    base_path: &str,
+    local: &LocalTLS,
+    sid: Option<&str>,
+    seq: Option<u64>,
+    uplink_payload: Option<&[u8]>,
+    is_eof: bool,
+    explicit_content_type: Option<&str>,
+) -> BuiltClientReqParts {
+    let x = &local.xhttp;
+    let mut path_segs: Vec<String> = Vec::new();
+    let mut query_pairs: Vec<(String, String)> = Vec::new();
+    let mut headers = collect_xhttp_header_pairs(local);
+    let mut cookies: Vec<(String, String)> = Vec::new();
+
+    if let Some(s) = sid {
+        match xhttp_meta_placement(&x.session_id_placement) {
+            "query" => query_pairs.push((xhttp_session_key(x).to_string(), s.to_string())),
+            "header" => headers.push((xhttp_session_key(x).to_string(), s.to_string())),
+            "cookie" => cookies.push((xhttp_session_key(x).to_string(), s.to_string())),
+            _ => path_segs.push(s.to_string()),
+        }
+    }
+
+    if let Some(q) = seq {
+        let qs = q.to_string();
+        match xhttp_meta_placement(&x.seq_placement) {
+            "query" => query_pairs.push((xhttp_seq_key(x).to_string(), qs)),
+            "header" => headers.push((xhttp_seq_key(x).to_string(), qs)),
+            "cookie" => cookies.push((xhttp_seq_key(x).to_string(), qs)),
+            _ => path_segs.push(qs),
+        }
+    }
+
+    if is_eof {
+        headers.push(("X-Veilink-EOF".to_string(), "1".to_string()));
+    }
+
+    let mut body = Vec::new();
+    let mut final_ct = explicit_content_type.map(|s| s.to_string());
+    if let Some(data) = uplink_payload {
+        match xhttp_data_placement(x) {
+            "header" => {
+                if !data.is_empty() {
+                    let encoded = URL_SAFE_NO_PAD.encode(data);
+                    let csize = xhttp_data_chunk_size(x);
+                    let key_prefix = xhttp_data_key(x);
+                    for (idx, chunk) in encoded.as_bytes().chunks(csize).enumerate() {
+                        headers.push((
+                            format!("{}-{}", key_prefix, idx),
+                            String::from_utf8_lossy(chunk).into_owned(),
+                        ));
+                    }
+                }
+                final_ct = None;
+            }
+            "cookie" => {
+                if !data.is_empty() {
+                    let encoded = URL_SAFE_NO_PAD.encode(data);
+                    let csize = xhttp_data_chunk_size(x);
+                    let key_prefix = xhttp_data_key(x);
+                    for (idx, chunk) in encoded.as_bytes().chunks(csize).enumerate() {
+                        cookies.push((
+                            format!("{}_{}", key_prefix, idx),
+                            String::from_utf8_lossy(chunk).into_owned(),
+                        ));
+                    }
+                }
+                final_ct = None;
+            }
+            _ => {
+                body.extend_from_slice(data);
+            }
+        }
+    }
+
+    let pad = generate_xhttp_padding(x);
+    if x.padding_obfs_mode {
+        match xhttp_padding_placement(x) {
+            "query" => query_pairs.push((xhttp_padding_key(x).to_string(), pad.clone())),
+            "header" => headers.push((xhttp_padding_header(x).to_string(), pad.clone())),
+            "cookie" => cookies.push((xhttp_padding_key(x).to_string(), pad.clone())),
+            _ => {}
+        }
+    }
+
+    let path_str = join_xhttp_subpath(base_path, &path_segs);
+    let uri_path_and_query = if query_pairs.is_empty() {
+        path_str
+    } else {
+        let qs: Vec<String> = query_pairs
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+        format!("{}?{}", path_str, qs.join("&"))
+    };
+
+    // Default Xray non-obfs mode AND `query_in_header` obfs mode place `?x_padding=...` in `Referer`
+    if !x.padding_obfs_mode || xhttp_padding_placement(x) == "query_in_header" {
+        let hdr_name = if x.padding_obfs_mode {
+            xhttp_padding_header(x)
+        } else {
+            "Referer"
+        };
+        let pkey = if x.padding_obfs_mode {
+            xhttp_padding_key(x)
+        } else {
+            "x_padding"
+        };
+        let sep = if uri_path_and_query.contains('?') {
+            '&'
+        } else {
+            '?'
+        };
+        let val = if hdr_name.eq_ignore_ascii_case("referer") {
+            format!(
+                "{}://{}{}{}{}={}",
+                scheme, host, uri_path_and_query, sep, pkey, pad
+            )
+        } else {
+            format!("?{}={}", pkey, pad)
+        };
+        headers.push((hdr_name.to_string(), val));
+    }
+
+    if let Some(ct) = final_ct {
+        headers.push(("Content-Type".to_string(), ct));
+    }
+
+    if !cookies.is_empty() {
+        let joined: Vec<String> = cookies
+            .into_iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+        headers.push(("Cookie".to_string(), joined.join("; ")));
+    }
+
+    BuiltClientReqParts {
+        uri_path_and_query,
+        headers,
+        body,
+    }
+}
+
+fn parse_query_map(query: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = pair.split_once('=') {
+            map.insert(k.to_string(), v.to_string());
+        }
+    }
+    map
+}
+
+fn parse_cookie_map(headers: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    if let Some(raw) = headers.get("cookie") {
+        for part in raw.split(';') {
+            let trimmed = part.trim();
+            if let Some((k, v)) = trimmed.split_once('=') {
+                out.insert(k.trim().to_string(), v.trim().to_string());
+            }
+        }
+    }
+    out
+}
+
+fn server_response_padding_header(local: &LocalTLS) -> (String, String) {
+    let x = &local.xhttp;
+    let pad = generate_xhttp_padding(x);
+    if x.padding_obfs_mode && xhttp_padding_placement(x) == "cookie" {
+        (
+            "set-cookie".to_string(),
+            format!("{}={}; Path=/; HttpOnly", xhttp_padding_key(x), pad),
+        )
+    } else if x.padding_obfs_mode && xhttp_padding_placement(x) == "header" {
+        (xhttp_padding_header(x).to_ascii_lowercase(), pad)
+    } else {
+        ("x-padding".to_string(), pad)
+    }
+}
+
+fn validate_incoming_padding(
+    x: &XHTTP,
+    query_map: &HashMap<String, String>,
+    cookies: &HashMap<String, String>,
+    headers: &HashMap<String, String>,
+) -> bool {
+    let (min_l, max_l) = effective_padding_bounds(x);
+    let check_len = |s: &str| s.len() >= min_l && s.len() <= max_l;
+
+    let extract_query_in_hdr = |hdr_name: &str, pkey: &str| -> Option<String> {
+        let hv = headers.get(&hdr_name.to_ascii_lowercase())?;
+        let q = hv.split_once('?').map(|(_, q)| q).unwrap_or(hv.as_str());
+        parse_query_map(q).remove(pkey)
+    };
+
+    if x.padding_obfs_mode {
+        let pkey = xhttp_padding_key(x);
+        match xhttp_padding_placement(x) {
+            "query" => query_map.get(pkey).is_some_and(|v| check_len(v)),
+            "cookie" => cookies.get(pkey).is_some_and(|v| check_len(v)),
+            "header" => headers
+                .get(&xhttp_padding_header(x).to_ascii_lowercase())
+                .is_some_and(|v| check_len(v)),
+            _ => extract_query_in_hdr(xhttp_padding_header(x), pkey)
+                .is_some_and(|v| check_len(&v)),
+        }
+    } else {
+        if let Some(v) = extract_query_in_hdr("referer", "x_padding") {
+            return check_len(&v);
+        }
+        if let Some(v) = query_map.get("x_padding") {
+            return check_len(v);
+        }
+        if let Some(v) = headers.get("x-padding") {
+            return check_len(v);
+        }
+        false
+    }
 }
 
 fn validate_request_host_and_headers(
@@ -165,6 +653,148 @@ fn validate_request_host_and_headers(
     true
 }
 
+enum ParsedXhttpRoute {
+    StreamOne,
+    DownlinkGet { sid: String },
+    StreamUp { sid: String },
+    PacketUp {
+        sid: String,
+        seq: u64,
+        header_or_cookie_data: Option<Vec<u8>>,
+        explicit_eof: bool,
+    },
+}
+
+fn parse_xhttp_route(
+    method: &str,
+    raw_uri: &str,
+    headers: &HashMap<String, String>,
+    local: &LocalTLS,
+) -> Result<ParsedXhttpRoute, u16> {
+    let x = &local.xhttp;
+    let (path_only, query_str) = raw_uri
+        .split_once('?')
+        .map(|(p, q)| (p, q))
+        .unwrap_or((raw_uri, ""));
+    let base_path = normalize_xhttp_path(&x.path);
+    let Some(sub) = extract_xhttp_subpath(path_only, &base_path) else {
+        return Err(404);
+    };
+
+    let query_map = parse_query_map(query_str);
+    let cookies = parse_cookie_map(headers);
+    if !validate_incoming_padding(x, &query_map, &cookies, headers) {
+        return Err(400);
+    }
+
+    let mut path_parts: VecDeque<&str> = if sub.is_empty() {
+        VecDeque::new()
+    } else {
+        sub.split('/').collect()
+    };
+
+    let eff_mode = xhttp_effective_mode(x, local.reality.enabled());
+    let expected_method = effective_uplink_method(local);
+
+    if eff_mode == "stream-one" && method == expected_method && path_parts.is_empty() {
+        return Ok(ParsedXhttpRoute::StreamOne);
+    }
+
+    let sid_opt: Option<String> = match xhttp_meta_placement(&x.session_id_placement) {
+        "query" => query_map.get(xhttp_session_key(x)).cloned(),
+        "header" => headers
+            .get(&xhttp_session_key(x).to_ascii_lowercase())
+            .cloned(),
+        "cookie" => cookies.get(xhttp_session_key(x)).cloned(),
+        _ => path_parts.pop_front().map(|s| s.to_string()),
+    };
+
+    if method == "GET" {
+        let sid = sid_opt.ok_or(400u16)?;
+        if !path_parts.is_empty() || !is_valid_xhttp_sid(&sid) {
+            return Err(400);
+        }
+        return Ok(ParsedXhttpRoute::DownlinkGet { sid });
+    }
+
+    if method != expected_method {
+        return Err(400);
+    }
+
+    if sid_opt.is_none() && path_parts.is_empty() {
+        return Ok(ParsedXhttpRoute::StreamOne);
+    }
+    let sid = sid_opt.ok_or(400u16)?;
+    if !is_valid_xhttp_sid(&sid) {
+        return Err(400);
+    }
+
+    let seq_raw_opt: Option<String> = match xhttp_meta_placement(&x.seq_placement) {
+        "query" => query_map.get(xhttp_seq_key(x)).cloned(),
+        "header" => headers.get(&xhttp_seq_key(x).to_ascii_lowercase()).cloned(),
+        "cookie" => cookies.get(xhttp_seq_key(x)).cloned(),
+        _ => path_parts.pop_front().map(|s| s.to_string()),
+    };
+
+    if !path_parts.is_empty() {
+        return Err(400);
+    }
+
+    if let Some(seq_str) = seq_raw_opt {
+        let seq = seq_str.parse::<u64>().map_err(|_| 400u16)?;
+        let explicit_eof = headers
+            .get("x-veilink-eof")
+            .is_some_and(|v| v.trim() == "1");
+        let header_or_cookie_data = match xhttp_data_placement(x) {
+            "header" => {
+                let prefix = xhttp_data_key(x).to_ascii_lowercase();
+                let mut b64 = String::new();
+                for idx in 0..32 {
+                    let key = format!("{}-{}", prefix, idx);
+                    if let Some(chunk) = headers.get(&key) {
+                        b64.push_str(chunk.trim());
+                    } else {
+                        break;
+                    }
+                }
+                let decoded = if b64.is_empty() {
+                    Vec::new()
+                } else {
+                    URL_SAFE_NO_PAD.decode(b64.as_bytes()).map_err(|_| 400u16)?
+                };
+                Some(decoded)
+            }
+            "cookie" => {
+                let prefix = xhttp_data_key(x);
+                let mut b64 = String::new();
+                for idx in 0..32 {
+                    let key = format!("{}_{}", prefix, idx);
+                    if let Some(chunk) = cookies.get(&key) {
+                        b64.push_str(chunk.trim());
+                    } else {
+                        break;
+                    }
+                }
+                let decoded = if b64.is_empty() {
+                    Vec::new()
+                } else {
+                    URL_SAFE_NO_PAD.decode(b64.as_bytes()).map_err(|_| 400u16)?
+                };
+                Some(decoded)
+            }
+            _ => None,
+        };
+        Ok(ParsedXhttpRoute::PacketUp {
+            sid,
+            seq,
+            header_or_cookie_data,
+            explicit_eof,
+        })
+    } else {
+        Ok(ParsedXhttpRoute::StreamUp { sid })
+    }
+}
+
 pub fn is_valid_xhttp_sid(sid: &str) -> bool {
     !sid.is_empty()
         && sid.len() <= 128
@@ -182,13 +812,16 @@ struct XhttpSession {
     up_tx: mpsc::Sender<SessionPacket>,
     dn_rx: tokio::sync::Mutex<Option<tokio::io::ReadHalf<DuplexStream>>>,
     dn_taken: AtomicBool,
+    up_done: AtomicBool,
+    dn_done: AtomicBool,
     last_active_ms: AtomicU64,
 }
 
 enum SessionPacket {
     SeqData(u64, Vec<u8>),
+    SeqEof(u64),
     StreamData(Vec<u8>),
-    Eof,
+    StreamEof,
 }
 
 impl XhttpSession {
@@ -264,6 +897,8 @@ impl XhttpServerState {
             up_tx,
             dn_rx: tokio::sync::Mutex::new(Some(dn_read)),
             dn_taken: AtomicBool::new(false),
+            up_done: AtomicBool::new(false),
+            dn_done: AtomicBool::new(false),
             last_active_ms: AtomicU64::new(now_ms),
         });
         let sess_weak = Arc::downgrade(&sess);
@@ -271,6 +906,7 @@ impl XhttpServerState {
         tokio::spawn(async move {
             let mut next_seq = 0u64;
             let mut pending: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+            let mut eof_seq: Option<u64> = None;
             let mut abort_session = false;
             loop {
                 let pkt = match tokio::time::timeout(Duration::from_secs(15), up_rx.recv()).await {
@@ -325,21 +961,31 @@ impl XhttpServerState {
                         if abort_session {
                             break;
                         }
+                        if eof_seq == Some(next_seq) {
+                            let _ = up_write.shutdown().await;
+                            break;
+                        }
                     }
-                    SessionPacket::Eof => {
+                    SessionPacket::SeqEof(at_seq) => {
+                        eof_seq = Some(at_seq);
+                        if eof_seq == Some(next_seq) {
+                            let _ = up_write.shutdown().await;
+                            break;
+                        }
+                    }
+                    SessionPacket::StreamEof => {
                         let _ = up_write.shutdown().await;
                         break;
                     }
                 }
             }
             let _ = up_write.shutdown().await;
-            let dn_taken = sess_weak
-                .upgrade()
-                .map(|s| s.dn_taken.load(Ordering::Relaxed))
-                .unwrap_or(false);
-            if abort_session || !dn_taken {
-                if let Some(st) = state_weak.upgrade() {
-                    st.remove_session(&sid_owned);
+            if let (Some(st), Some(s)) = (state_weak.upgrade(), sess_weak.upgrade()) {
+                s.up_done.store(true, Ordering::SeqCst);
+                let dn_taken = s.dn_taken.load(Ordering::SeqCst);
+                let dn_done = s.dn_done.load(Ordering::SeqCst);
+                if abort_session || !dn_taken || dn_done {
+                    st.remove_session_arc(&sid_owned, &s);
                 }
             }
         });
@@ -355,44 +1001,24 @@ impl XhttpServerState {
         self.sessions.lock().remove(sid);
     }
 
+    fn remove_session_arc(&self, sid: &str, sess: &Arc<XhttpSession>) {
+        let mut map = self.sessions.lock();
+        if map.get(sid).is_some_and(|cur| Arc::ptr_eq(cur, sess)) {
+            map.remove(sid);
+        }
+    }
+
+    fn finish_downlink(&self, sid: &str, sess: &Arc<XhttpSession>, force_abort: bool) {
+        sess.dn_done.store(true, Ordering::SeqCst);
+        if force_abort || sess.up_done.load(Ordering::SeqCst) {
+            self.remove_session_arc(sid, sess);
+        }
+    }
+
     #[cfg(test)]
     pub fn session_count(&self) -> usize {
         self.sessions.lock().len()
     }
-}
-
-pub fn normalize_xhttp_path(raw: &str) -> String {
-    let t = raw.trim();
-    if t.is_empty() {
-        return "/".to_string();
-    }
-    let with_slash = if t.starts_with('/') {
-        t.to_string()
-    } else {
-        format!("/{}", t)
-    };
-    if with_slash.len() > 1 {
-        with_slash.trim_end_matches('/').to_string()
-    } else {
-        with_slash
-    }
-}
-
-fn random_xhttp_padding(min_len: i64, max_len: i64) -> String {
-    let min_l = if min_len > 0 { min_len as usize } else { 100 };
-    let max_l = if max_len > 0 && (max_len as usize) >= min_l {
-        max_len as usize
-    } else {
-        min_l
-    };
-    if max_l <= min_l {
-        return "X".repeat(min_l);
-    }
-    let span = max_l - min_l + 1;
-    let mut b = [0u8; 2];
-    rand::rng().fill_bytes(&mut b);
-    let n = min_l + (u16::from_be_bytes(b) as usize % span);
-    "X".repeat(n)
 }
 
 struct PrefixedStream {
@@ -518,8 +1144,6 @@ pub async fn handle_xhttp_server_conn<F>(
         return;
     }
 
-    let base_path = normalize_xhttp_path(&local.xhttp.path);
-    let expected_method = effective_uplink_method(&local);
     let reorder_win = if local.xhttp.max_buffered_posts > 0 {
         local.xhttp.max_buffered_posts as usize
     } else {
@@ -550,6 +1174,12 @@ pub async fn handle_xhttp_server_conn<F>(
             break;
         }
 
+        let cors_origin = req
+            .headers
+            .get("origin")
+            .map(|s| s.as_str())
+            .unwrap_or("*");
+
         if req.method == "OPTIONS" && req.headers.contains_key("access-control-request-method") {
             let acrm = req
                 .headers
@@ -561,14 +1191,9 @@ pub async fn handle_xhttp_server_conn<F>(
                 .get("access-control-request-headers")
                 .map(|s| s.as_str())
                 .unwrap_or("*");
-            let origin = req
-                .headers
-                .get("origin")
-                .map(|s| s.as_str())
-                .unwrap_or("*");
             let preflight = format!(
-                "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: {}\r\nAccess-Control-Allow-Methods: {}\r\nAccess-Control-Allow-Headers: {}\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
-                origin, acrm, acrh
+                "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: {}\r\nAccess-Control-Allow-Methods: {}\r\nAccess-Control-Allow-Headers: {}\r\nCache-Control: no-store\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
+                cors_origin, acrm, acrh
             );
             if wr.write_all(preflight.as_bytes()).await.is_err() || wr.flush().await.is_err() {
                 break;
@@ -576,11 +1201,9 @@ pub async fn handle_xhttp_server_conn<F>(
             continue;
         }
 
-        let path_only = req.path.split('?').next().unwrap_or(&req.path);
-        let sub = if base_path == "/" {
-            path_only.trim_start_matches('/')
-        } else if let Some(rest) = path_only.strip_prefix(&base_path) {
-            if !rest.is_empty() && !rest.starts_with('/') {
+        let route = match parse_xhttp_route(&req.method, &req.path, &req.headers, &local) {
+            Ok(r) => r,
+            Err(404) => {
                 let _ = wr
                     .write_all(
                         b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -588,37 +1211,7 @@ pub async fn handle_xhttp_server_conn<F>(
                     .await;
                 break;
             }
-            rest.trim_start_matches('/')
-        } else {
-            let _ = wr
-                .write_all(
-                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .await;
-            break;
-        };
-        let sub = sub.trim_end_matches('/');
-        let pad = random_xhttp_padding(local.xhttp.padding_bytes, local.xhttp.padding_max_bytes);
-
-        if req.method == expected_method && sub.is_empty() {
-            // stream-one: full-duplex chunked request & response
-            let resp_hdr = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nX-Accel-Buffering: no\r\nX-Padding: {}\r\n\r\n",
-                dn_ctype, pad
-            );
-            if wr.write_all(resp_hdr.as_bytes()).await.is_err() {
-                break;
-            }
-            if wr.flush().await.is_err() {
-                break;
-            }
-            let stream = wrap_chunked_duplex(rd, wr, read_buf);
-            on_tunnel_stream(stream);
-            return;
-        } else if req.method == "GET" && !sub.is_empty() && !sub.contains('/') {
-            // stream-up or packet-up downlink GET
-            let sid = sub.to_string();
-            if !is_valid_xhttp_sid(&sid) {
+            Err(_) => {
                 let _ = wr
                     .write_all(
                         b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -626,187 +1219,224 @@ pub async fn handle_xhttp_server_conn<F>(
                     .await;
                 break;
             }
-            let cb = on_tunnel_stream.clone();
-            let Some(sess) = state.get_or_create_session(&sid, reorder_win, move |s| cb(s)) else {
-                let _ = wr
-                    .write_all(
-                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    )
-                    .await;
-                break;
-            };
-            let mut dn_guard = sess.dn_rx.lock().await;
-            let mut dn_reader = match dn_guard.take() {
-                Some(r) => r,
-                None => {
+        };
+
+        let (pad_hdr_k, pad_hdr_v) = server_response_padding_header(&local);
+        let ct_line = dn_ctype
+            .map(|ct| format!("Content-Type: {}\r\n", ct))
+            .unwrap_or_default();
+
+        match route {
+            ParsedXhttpRoute::StreamOne => {
+                let resp_hdr = format!(
+                    "HTTP/1.1 200 OK\r\n{}Transfer-Encoding: chunked\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: {}\r\nX-Accel-Buffering: no\r\n{}: {}\r\n\r\n",
+                    ct_line, cors_origin, pad_hdr_k, pad_hdr_v
+                );
+                if wr.write_all(resp_hdr.as_bytes()).await.is_err() || wr.flush().await.is_err() {
+                    break;
+                }
+                let stream = wrap_chunked_duplex(rd, wr, read_buf);
+                on_tunnel_stream(stream);
+                return;
+            }
+            ParsedXhttpRoute::DownlinkGet { sid } => {
+                let cb = on_tunnel_stream.clone();
+                let Some(sess) = state.get_or_create_session(&sid, reorder_win, move |s| cb(s))
+                else {
+                    let _ = wr
+                        .write_all(
+                            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    break;
+                };
+                let mut dn_guard = sess.dn_rx.lock().await;
+                let Some(mut dn_reader) = dn_guard.take() else {
                     let _ = wr
                         .write_all(b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\n\r\n")
                         .await;
                     break;
-                }
-            };
-            sess.dn_taken.store(true, Ordering::Relaxed);
-            drop(dn_guard);
+                };
+                sess.dn_taken.store(true, Ordering::SeqCst);
+                drop(dn_guard);
 
-            let resp_hdr = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nX-Accel-Buffering: no\r\nX-Padding: {}\r\n\r\n",
-                dn_ctype, pad
-            );
-            if wr.write_all(resp_hdr.as_bytes()).await.is_err() {
-                state.remove_session(&sid);
-                break;
+                let resp_hdr = format!(
+                    "HTTP/1.1 200 OK\r\n{}Transfer-Encoding: chunked\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: {}\r\nX-Accel-Buffering: no\r\n{}: {}\r\n\r\n",
+                    ct_line, cors_origin, pad_hdr_k, pad_hdr_v
+                );
+                if wr.write_all(resp_hdr.as_bytes()).await.is_err() || wr.flush().await.is_err() {
+                    state.finish_downlink(&sid, &sess, true);
+                    break;
+                }
+                let mut chunk_buf = vec![0u8; 65520];
+                let mut scratch = Vec::with_capacity(65536);
+                let mut dn_errored = false;
+                loop {
+                    match dn_reader.read(&mut chunk_buf).await {
+                        Ok(0) => {
+                            if wr.write_all(b"0\r\n\r\n").await.is_err() || wr.flush().await.is_err()
+                            {
+                                dn_errored = true;
+                            }
+                            break;
+                        }
+                        Ok(n) => {
+                            sess.touch(&state.epoch);
+                            if write_http_chunk(&mut wr, &chunk_buf[..n], &mut scratch)
+                                .await
+                                .is_err()
+                            {
+                                dn_errored = true;
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            dn_errored = true;
+                            break;
+                        }
+                    }
+                }
+                state.finish_downlink(&sid, &sess, dn_errored);
+                return;
             }
-            if wr.flush().await.is_err() {
-                state.remove_session(&sid);
-                break;
+            ParsedXhttpRoute::StreamUp { sid } => {
+                let cb = on_tunnel_stream.clone();
+                let Some(sess) = state.get_or_create_session(&sid, reorder_win, move |s| cb(s))
+                else {
+                    let _ = wr
+                        .write_all(
+                            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    break;
+                };
+                // Send 200 OK immediately so HTTP/1.1 proxies and clients never stall waiting for headers.
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: {}\r\n{}: {}\r\n\r\n",
+                    cors_origin, pad_hdr_k, pad_hdr_v
+                );
+                if wr.write_all(resp.as_bytes()).await.is_err() || wr.flush().await.is_err() {
+                    break;
+                }
+
+                let mut scratch = Vec::with_capacity(2048);
+                if req.chunked {
+                    loop {
+                        let ka_opt = sample_stream_up_keepalive(&local.xhttp);
+                        tokio::select! {
+                            chunk_res = read_http_chunk(&mut rd, &mut read_buf) => {
+                                match chunk_res {
+                                    Ok(Some(chunk)) => {
+                                        sess.touch(&state.epoch);
+                                        if sess.up_tx.send(SessionPacket::StreamData(chunk)).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            _ = async {
+                                match ka_opt {
+                                    Some(d) => tokio::time::sleep(d).await,
+                                    None => std::future::pending::<()>().await,
+                                }
+                            } => {
+                                let ka_pad = generate_xhttp_padding(&local.xhttp);
+                                if write_http_chunk(&mut wr, ka_pad.as_bytes(), &mut scratch).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } else if req.content_length > 0 {
+                    if let Ok(body) =
+                        read_exact_with_buf(&mut rd, &mut read_buf, req.content_length).await
+                    {
+                        sess.touch(&state.epoch);
+                        let _ = sess.up_tx.send(SessionPacket::StreamData(body)).await;
+                    }
+                }
+                let _ = sess.up_tx.send(SessionPacket::StreamEof).await;
+                let _ = wr.write_all(b"0\r\n\r\n").await;
+                let _ = wr.flush().await;
+                return;
             }
-            let mut chunk_buf = vec![0u8; 65520];
-            let mut scratch = Vec::with_capacity(65536);
-            loop {
-                match dn_reader.read(&mut chunk_buf).await {
-                    Ok(0) => {
-                        let _ = wr.write_all(b"0\r\n\r\n").await;
-                        let _ = wr.flush().await;
+            ParsedXhttpRoute::PacketUp {
+                sid,
+                seq,
+                header_or_cookie_data,
+                explicit_eof,
+            } => {
+                let cb = on_tunnel_stream.clone();
+                let Some(sess) = state.get_or_create_session(&sid, reorder_win, move |s| cb(s))
+                else {
+                    let _ = wr
+                        .write_all(
+                            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    break;
+                };
+                let body = if req.chunked {
+                    let mut all = Vec::new();
+                    let mut over_limit = false;
+                    while let Ok(Some(c)) = read_http_chunk(&mut rd, &mut read_buf).await {
+                        if all.len().saturating_add(c.len()) > MAX_XHTTP_BODY_BYTES {
+                            over_limit = true;
+                            break;
+                        }
+                        all.extend_from_slice(&c);
+                    }
+                    if over_limit {
+                        state.remove_session(&sid);
                         break;
                     }
-                    Ok(n) => {
+                    all
+                } else if req.content_length > 0 {
+                    match read_exact_with_buf(&mut rd, &mut read_buf, req.content_length).await {
+                        Ok(b) => b,
+                        Err(_) => break,
+                    }
+                } else {
+                    Vec::new()
+                };
+
+                let payload = header_or_cookie_data.unwrap_or(body);
+                if explicit_eof || payload.is_empty() {
+                    if !payload.is_empty() {
                         sess.touch(&state.epoch);
-                        if write_http_chunk(&mut wr, &chunk_buf[..n], &mut scratch)
+                        if sess
+                            .up_tx
+                            .send(SessionPacket::SeqData(seq, payload))
                             .await
                             .is_err()
                         {
                             break;
                         }
+                        let _ = sess.up_tx.send(SessionPacket::SeqEof(seq + 1)).await;
+                    } else {
+                        let _ = sess.up_tx.send(SessionPacket::SeqEof(seq)).await;
                     }
-                    Err(_) => break,
-                }
-            }
-            state.remove_session(&sid);
-            return;
-        } else if req.method == expected_method && !sub.is_empty() && !sub.contains('/') {
-            // stream-up uplink POST/PUT/OPTIONS (chunked or content-length stream)
-            let sid = sub.to_string();
-            if !is_valid_xhttp_sid(&sid) {
-                let _ = wr
-                    .write_all(
-                        b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    )
-                    .await;
-                break;
-            }
-            let cb = on_tunnel_stream.clone();
-            let Some(sess) = state.get_or_create_session(&sid, reorder_win, move |s| cb(s)) else {
-                let _ = wr
-                    .write_all(
-                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    )
-                    .await;
-                break;
-            };
-            if req.chunked {
-                while let Ok(Some(chunk)) = read_http_chunk(&mut rd, &mut read_buf).await {
+                } else {
                     sess.touch(&state.epoch);
-                    if sess.up_tx.send(SessionPacket::StreamData(chunk)).await.is_err() {
+                    if sess
+                        .up_tx
+                        .send(SessionPacket::SeqData(seq, payload))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
-            } else if req.content_length > 0 {
-                if let Ok(body) =
-                    read_exact_with_buf(&mut rd, &mut read_buf, req.content_length).await
-                {
-                    sess.touch(&state.epoch);
-                    let _ = sess.up_tx.send(SessionPacket::StreamData(body)).await;
-                }
-            }
-            let _ = sess.up_tx.send(SessionPacket::Eof).await;
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Padding: {}\r\n\r\n",
-                pad
-            );
-            let _ = wr.write_all(resp.as_bytes()).await;
-            let _ = wr.flush().await;
-            return;
-        } else if req.method == expected_method && sub.contains('/') {
-            // packet-up POST/PUT/OPTIONS /<base>/<sid>/<seq>
-            let mut parts = sub.splitn(2, '/');
-            let sid = parts.next().unwrap_or("");
-            let seq_str = parts.next().unwrap_or("");
-            if !is_valid_xhttp_sid(sid) {
-                let _ = wr
-                    .write_all(
-                        b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    )
-                    .await;
-                break;
-            }
-            let seq: u64 = match seq_str.parse() {
-                Ok(s) => s,
-                Err(_) => {
-                    let _ = wr
-                        .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
-                        .await;
-                    break;
-                }
-            };
-            let cb = on_tunnel_stream.clone();
-            let Some(sess) = state.get_or_create_session(sid, reorder_win, move |s| cb(s)) else {
-                let _ = wr
-                    .write_all(
-                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    )
-                    .await;
-                break;
-            };
-            let body = if req.chunked {
-                let mut all = Vec::new();
-                let mut over_limit = false;
-                while let Ok(Some(c)) = read_http_chunk(&mut rd, &mut read_buf).await {
-                    if all.len().saturating_add(c.len()) > MAX_XHTTP_BODY_BYTES {
-                        over_limit = true;
-                        break;
-                    }
-                    all.extend_from_slice(&c);
-                }
-                if over_limit {
-                    state.remove_session(sid);
-                    break;
-                }
-                all
-            } else if req.content_length > 0 {
-                match read_exact_with_buf(&mut rd, &mut read_buf, req.content_length).await {
-                    Ok(b) => b,
-                    Err(_) => break,
-                }
-            } else {
-                Vec::new()
-            };
 
-            if body.is_empty() {
-                let _ = sess.up_tx.send(SessionPacket::Eof).await;
-            } else {
-                sess.touch(&state.epoch);
-                if sess.up_tx.send(SessionPacket::SeqData(seq, body)).await.is_err() {
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: {}\r\nContent-Length: 0\r\nConnection: keep-alive\r\n{}: {}\r\n\r\n",
+                    cors_origin, pad_hdr_k, pad_hdr_v
+                );
+                if wr.write_all(resp.as_bytes()).await.is_err() || wr.flush().await.is_err() {
                     break;
                 }
             }
-
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\nX-Padding: {}\r\n\r\n",
-                pad
-            );
-            if wr.write_all(resp.as_bytes()).await.is_err() {
-                break;
-            }
-            if wr.flush().await.is_err() {
-                break;
-            }
-        } else {
-            let _ = wr
-                .write_all(
-                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .await;
-            break;
         }
     }
 }
@@ -826,10 +1456,18 @@ async fn handle_xhttp_h2_stream<F>(
         }
     };
 
-    let mut hdr_map = HashMap::new();
+    let mut hdr_map: HashMap<String, String> = HashMap::new();
     for (k, v) in req.headers() {
         if let Ok(s) = v.to_str() {
-            hdr_map.insert(k.as_str().to_ascii_lowercase(), s.to_string());
+            let key = k.as_str().to_ascii_lowercase();
+            if key == "cookie" {
+                if let Some(prev) = hdr_map.get_mut(&key) {
+                    prev.push_str("; ");
+                    prev.push_str(s);
+                    continue;
+                }
+            }
+            hdr_map.insert(key, s.to_string());
         }
     }
     let req_host = req
@@ -843,6 +1481,10 @@ async fn handle_xhttp_h2_stream<F>(
         return;
     }
 
+    let cors_origin = hdr_map
+        .get("origin")
+        .cloned()
+        .unwrap_or_else(|| "*".to_string());
     let method = req.method().as_str().to_ascii_uppercase();
     if method == "OPTIONS" && hdr_map.contains_key("access-control-request-method") {
         let acrm = hdr_map
@@ -853,15 +1495,12 @@ async fn handle_xhttp_h2_stream<F>(
             .get("access-control-request-headers")
             .cloned()
             .unwrap_or_else(|| "*".to_string());
-        let origin = hdr_map
-            .get("origin")
-            .cloned()
-            .unwrap_or_else(|| "*".to_string());
         if let Ok(resp) = http::Response::builder()
             .status(200)
-            .header("access-control-allow-origin", origin)
+            .header("access-control-allow-origin", cors_origin)
             .header("access-control-allow-methods", acrm)
             .header("access-control-allow-headers", acrh)
+            .header("cache-control", "no-store")
             .body(())
         {
             let _ = respond.send_response(resp, true);
@@ -869,190 +1508,226 @@ async fn handle_xhttp_h2_stream<F>(
         return;
     }
 
-    let base_path = normalize_xhttp_path(&local.xhttp.path);
-    let expected_method = effective_uplink_method(&local);
+    let raw_uri = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+
+    let route = match parse_xhttp_route(&method, &raw_uri, &hdr_map, &local) {
+        Ok(r) => r,
+        Err(status) => {
+            send_empty_status(&mut respond, status);
+            return;
+        }
+    };
+
     let reorder_win = if local.xhttp.max_buffered_posts > 0 {
         local.xhttp.max_buffered_posts as usize
     } else {
         MAX_XHTTP_REORDER_WINDOW
     };
     let dn_ctype = downlink_content_type(&local);
-    let path_only = req.uri().path();
-    let sub = if base_path == "/" {
-        path_only.trim_start_matches('/')
-    } else if let Some(rest) = path_only.strip_prefix(&base_path) {
-        if !rest.is_empty() && !rest.starts_with('/') {
-            send_empty_status(&mut respond, 404);
-            return;
-        }
-        rest.trim_start_matches('/')
-    } else {
-        send_empty_status(&mut respond, 404);
-        return;
-    };
-    let sub = sub.trim_end_matches('/').to_string();
-    let pad = random_xhttp_padding(local.xhttp.padding_bytes, local.xhttp.padding_max_bytes);
+    let (pad_hdr_k, pad_hdr_v) = server_response_padding_header(&local);
     let mut recv_body = req.into_body();
 
-    if method == expected_method && sub.is_empty() {
-        // stream-one over HTTP/2
-        let Ok(resp) = http::Response::builder()
-            .status(200)
-            .header("content-type", dn_ctype)
-            .header("cache-control", "no-store")
-            .header("x-accel-buffering", "no")
-            .header("x-padding", pad)
-            .body(())
-        else {
-            return;
-        };
-        let Ok(send_body) = respond.send_response(resp, false) else {
-            return;
-        };
-        let stream = wrap_h2_duplex(recv_body, send_body);
-        on_tunnel_stream(stream);
-    } else if method == "GET" && !sub.is_empty() && !sub.contains('/') {
-        // downlink GET over HTTP/2
-        if !is_valid_xhttp_sid(&sub) {
-            send_empty_status(&mut respond, 400);
-            return;
+    match route {
+        ParsedXhttpRoute::StreamOne => {
+            let mut b = http::Response::builder()
+                .status(200)
+                .header("cache-control", "no-store")
+                .header("access-control-allow-origin", cors_origin)
+                .header("x-accel-buffering", "no")
+                .header(pad_hdr_k.as_str(), pad_hdr_v.as_str());
+            if let Some(ct) = dn_ctype {
+                b = b.header("content-type", ct);
+            }
+            let Ok(resp) = b.body(()) else { return };
+            let Ok(send_body) = respond.send_response(resp, false) else {
+                return;
+            };
+            on_tunnel_stream(wrap_h2_duplex(recv_body, send_body));
         }
-        let cb = on_tunnel_stream.clone();
-        let Some(sess) = state.get_or_create_session(&sub, reorder_win, move |s| cb(s)) else {
-            send_empty_status(&mut respond, 503);
-            return;
-        };
-        let mut dn_guard = sess.dn_rx.lock().await;
-        let Some(mut dn_reader) = dn_guard.take() else {
-            send_empty_status(&mut respond, 409);
-            return;
-        };
-        sess.dn_taken.store(true, Ordering::Relaxed);
-        drop(dn_guard);
+        ParsedXhttpRoute::DownlinkGet { sid } => {
+            let cb = on_tunnel_stream.clone();
+            let Some(sess) = state.get_or_create_session(&sid, reorder_win, move |s| cb(s)) else {
+                send_empty_status(&mut respond, 503);
+                return;
+            };
+            let mut dn_guard = sess.dn_rx.lock().await;
+            let Some(mut dn_reader) = dn_guard.take() else {
+                send_empty_status(&mut respond, 409);
+                return;
+            };
+            sess.dn_taken.store(true, Ordering::SeqCst);
+            drop(dn_guard);
 
-        let Ok(resp) = http::Response::builder()
-            .status(200)
-            .header("content-type", dn_ctype)
-            .header("cache-control", "no-store")
-            .header("x-accel-buffering", "no")
-            .header("x-padding", pad)
-            .body(())
-        else {
-            state.remove_session(&sub);
-            return;
-        };
-        let Ok(mut send_body) = respond.send_response(resp, false) else {
-            state.remove_session(&sub);
-            return;
-        };
-        let mut chunk_buf = vec![0u8; 65536];
-        loop {
-            match dn_reader.read(&mut chunk_buf).await {
-                Ok(0) => {
-                    let _ = send_body.send_data(Bytes::new(), true);
-                    break;
-                }
-                Ok(n) => {
-                    sess.touch(&state.epoch);
-                    if h2_send_chunk(&mut send_body, &chunk_buf[..n]).await.is_err() {
+            let mut b = http::Response::builder()
+                .status(200)
+                .header("cache-control", "no-store")
+                .header("access-control-allow-origin", cors_origin)
+                .header("x-accel-buffering", "no")
+                .header(pad_hdr_k.as_str(), pad_hdr_v.as_str());
+            if let Some(ct) = dn_ctype {
+                b = b.header("content-type", ct);
+            }
+            let Ok(resp) = b.body(()) else {
+                state.finish_downlink(&sid, &sess, true);
+                return;
+            };
+            let Ok(mut send_body) = respond.send_response(resp, false) else {
+                state.finish_downlink(&sid, &sess, true);
+                return;
+            };
+            let mut chunk_buf = vec![0u8; 65536];
+            let mut dn_errored = false;
+            loop {
+                match dn_reader.read(&mut chunk_buf).await {
+                    Ok(0) => {
+                        if send_body.send_data(Bytes::new(), true).is_err() {
+                            dn_errored = true;
+                        }
+                        break;
+                    }
+                    Ok(n) => {
+                        sess.touch(&state.epoch);
+                        if h2_send_chunk(&mut send_body, &chunk_buf[..n]).await.is_err() {
+                            dn_errored = true;
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        dn_errored = true;
                         break;
                     }
                 }
-                Err(_) => break,
+            }
+            state.finish_downlink(&sid, &sess, dn_errored);
+        }
+        ParsedXhttpRoute::StreamUp { sid } => {
+            let cb = on_tunnel_stream.clone();
+            let Some(sess) = state.get_or_create_session(&sid, reorder_win, move |s| cb(s)) else {
+                send_empty_status(&mut respond, 503);
+                return;
+            };
+            let mut maybe_send_body = http::Response::builder()
+                .status(200)
+                .header("cache-control", "no-store")
+                .header("access-control-allow-origin", cors_origin)
+                .header(pad_hdr_k.as_str(), pad_hdr_v.as_str())
+                .body(())
+                .ok()
+                .and_then(|r| respond.send_response(r, false).ok());
+
+            loop {
+                let ka_opt = sample_stream_up_keepalive(&local.xhttp);
+                tokio::select! {
+                    chunk_opt = recv_body.data() => {
+                        match chunk_opt {
+                            Some(Ok(chunk)) => {
+                                let _ = recv_body.flow_control().release_capacity(chunk.len());
+                                if !chunk.is_empty() {
+                                    sess.touch(&state.epoch);
+                                    if sess
+                                        .up_tx
+                                        .send(SessionPacket::StreamData(chunk.to_vec()))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                    _ = async {
+                        match ka_opt {
+                            Some(d) => tokio::time::sleep(d).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {
+                        if let Some(ref mut sb) = maybe_send_body {
+                            let ka = generate_xhttp_padding(&local.xhttp);
+                            if h2_send_chunk(sb, ka.as_bytes()).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = sess.up_tx.send(SessionPacket::StreamEof).await;
+            if let Some(mut sb) = maybe_send_body {
+                let _ = sb.send_data(Bytes::new(), true);
             }
         }
-        state.remove_session(&sub);
-    } else if method == expected_method && !sub.is_empty() && !sub.contains('/') {
-        // stream-up uplink over HTTP/2
-        if !is_valid_xhttp_sid(&sub) {
-            send_empty_status(&mut respond, 400);
-            return;
-        }
-        let cb = on_tunnel_stream.clone();
-        let Some(sess) = state.get_or_create_session(&sub, reorder_win, move |s| cb(s)) else {
-            send_empty_status(&mut respond, 503);
-            return;
-        };
-        // Immediately send 200 OK headers so reverse proxies & client stream cleanly
-        let maybe_send_body = http::Response::builder()
-            .status(200)
-            .header("cache-control", "no-store")
-            .header("x-padding", pad)
-            .body(())
-            .ok()
-            .and_then(|r| respond.send_response(r, false).ok());
-
-        while let Some(Ok(chunk)) = recv_body.data().await {
-            let _ = recv_body.flow_control().release_capacity(chunk.len());
-            if !chunk.is_empty() {
+        ParsedXhttpRoute::PacketUp {
+            sid,
+            seq,
+            header_or_cookie_data,
+            explicit_eof,
+        } => {
+            let cb = on_tunnel_stream.clone();
+            let Some(sess) = state.get_or_create_session(&sid, reorder_win, move |s| cb(s)) else {
+                send_empty_status(&mut respond, 503);
+                return;
+            };
+            let mut all = Vec::new();
+            while let Some(Ok(chunk)) = recv_body.data().await {
+                let _ = recv_body.flow_control().release_capacity(chunk.len());
+                if all.len().saturating_add(chunk.len()) > MAX_XHTTP_BODY_BYTES {
+                    state.remove_session(&sid);
+                    send_empty_status(&mut respond, 413);
+                    return;
+                }
+                all.extend_from_slice(&chunk);
+            }
+            let payload = header_or_cookie_data.unwrap_or(all);
+            if explicit_eof || payload.is_empty() {
+                if !payload.is_empty() {
+                    sess.touch(&state.epoch);
+                    if sess
+                        .up_tx
+                        .send(SessionPacket::SeqData(seq, payload))
+                        .await
+                        .is_err()
+                    {
+                        send_empty_status(&mut respond, 500);
+                        return;
+                    }
+                    let _ = sess.up_tx.send(SessionPacket::SeqEof(seq + 1)).await;
+                } else {
+                    let _ = sess.up_tx.send(SessionPacket::SeqEof(seq)).await;
+                }
+            } else {
                 sess.touch(&state.epoch);
                 if sess
                     .up_tx
-                    .send(SessionPacket::StreamData(chunk.to_vec()))
+                    .send(SessionPacket::SeqData(seq, payload))
                     .await
                     .is_err()
                 {
-                    break;
+                    send_empty_status(&mut respond, 500);
+                    return;
                 }
             }
-        }
-        let _ = sess.up_tx.send(SessionPacket::Eof).await;
-        if let Some(mut sb) = maybe_send_body {
-            let _ = sb.send_data(Bytes::new(), true);
-        }
-    } else if method == expected_method && sub.contains('/') {
-        // packet-up over HTTP/2
-        let mut parts = sub.splitn(2, '/');
-        let sid = parts.next().unwrap_or("");
-        let seq_str = parts.next().unwrap_or("");
-        if !is_valid_xhttp_sid(sid) {
-            send_empty_status(&mut respond, 400);
-            return;
-        }
-        let Ok(seq) = seq_str.parse::<u64>() else {
-            send_empty_status(&mut respond, 400);
-            return;
-        };
-        let cb = on_tunnel_stream.clone();
-        let Some(sess) = state.get_or_create_session(sid, reorder_win, move |s| cb(s)) else {
-            send_empty_status(&mut respond, 503);
-            return;
-        };
-        let mut all = Vec::new();
-        while let Some(Ok(chunk)) = recv_body.data().await {
-            let _ = recv_body.flow_control().release_capacity(chunk.len());
-            if all.len().saturating_add(chunk.len()) > MAX_XHTTP_BODY_BYTES {
-                state.remove_session(sid);
-                send_empty_status(&mut respond, 413);
-                return;
-            }
-            all.extend_from_slice(&chunk);
-        }
-        if all.is_empty() {
-            let _ = sess.up_tx.send(SessionPacket::Eof).await;
-        } else {
-            sess.touch(&state.epoch);
-            if sess.up_tx.send(SessionPacket::SeqData(seq, all)).await.is_err() {
-                send_empty_status(&mut respond, 500);
-                return;
+            if let Ok(resp) = http::Response::builder()
+                .status(200)
+                .header("cache-control", "no-store")
+                .header("access-control-allow-origin", cors_origin)
+                .header(pad_hdr_k.as_str(), pad_hdr_v.as_str())
+                .body(())
+            {
+                let _ = respond.send_response(resp, true);
             }
         }
-        if let Ok(resp) = http::Response::builder()
-            .status(200)
-            .header("x-padding", pad)
-            .body(())
-        {
-            let _ = respond.send_response(resp, true);
-        }
-    } else {
-        send_empty_status(&mut respond, 400);
     }
 }
 
 async fn dial_h2_client(
     conn: BoxStream,
     timeout_dur: Duration,
-) -> Result<h2::client::SendRequest<Bytes>, String> {
+) -> Result<(h2::client::SendRequest<Bytes>, Arc<AtomicBool>), String> {
     let mut builder = h2::client::Builder::new();
     builder
         .initial_window_size(H2_STREAM_WINDOW)
@@ -1061,54 +1736,144 @@ async fn dial_h2_client(
         .await
         .map_err(|_| "xhttp h2 handshake timeout".to_string())?
         .map_err(|e| format!("xhttp h2 handshake: {}", e))?;
+    let dead = Arc::new(AtomicBool::new(false));
+    let dead_c = dead.clone();
     tokio::spawn(async move {
         let _ = h2_conn.await;
+        dead_c.store(true, Ordering::Relaxed);
     });
-    Ok(sender)
+    Ok((sender, dead))
 }
 
-fn build_h2_request(
+struct PooledH2Conn {
+    sender: h2::client::SendRequest<Bytes>,
+    dead: Arc<AtomicBool>,
+    created_at: Instant,
+    requests: AtomicU64,
+    active_streams: Arc<AtomicUsize>,
+}
+
+impl PooledH2Conn {
+    fn is_usable(&self, local: &LocalTLS) -> bool {
+        if self.dead.load(Ordering::Relaxed) {
+            return false;
+        }
+        let m = &local.xhttp.xmux;
+        if m.h_max_reusable_secs > 0
+            && self.created_at.elapsed() >= Duration::from_secs(m.h_max_reusable_secs as u64)
+        {
+            return false;
+        }
+        let max_reqs = if m.h_max_request_times > 0 {
+            m.h_max_request_times as u64
+        } else if m.c_max_reuse_times > 0 {
+            m.c_max_reuse_times as u64
+        } else {
+            0
+        };
+        if max_reqs > 0 && self.requests.load(Ordering::Relaxed) >= max_reqs {
+            return false;
+        }
+        if m.max_concurrency > 0
+            && self.active_streams.load(Ordering::Relaxed) >= m.max_concurrency as usize
+        {
+            return false;
+        }
+        true
+    }
+}
+
+struct H2XmuxPool {
+    conns: tokio::sync::Mutex<Vec<Arc<PooledH2Conn>>>,
+}
+
+impl H2XmuxPool {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            conns: tokio::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    async fn acquire<F, Fut>(
+        &self,
+        addr: SocketAddr,
+        local: &LocalTLS,
+        binding: &Binding,
+        timeout_dur: Duration,
+        connect_transport: &F,
+    ) -> Result<(h2::client::SendRequest<Bytes>, super::hysteria2::ActiveStreamGuard), String>
+    where
+        F: Fn(SocketAddr, LocalTLS, Binding) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<BoxStream, String>> + Send + 'static,
+    {
+        let max_conns = if local.xhttp.xmux.max_connections > 0 {
+            (local.xhttp.xmux.max_connections as usize).clamp(1, 32)
+        } else {
+            4
+        };
+        let mut guard = self.conns.lock().await;
+        guard.retain(|c| !c.dead.load(Ordering::Relaxed));
+        for entry in guard.iter() {
+            if entry.is_usable(local) {
+                if let Ok(ready) = entry.sender.clone().ready().await {
+                    entry.requests.fetch_add(1, Ordering::Relaxed);
+                    entry.active_streams.fetch_add(1, Ordering::Relaxed);
+                    return Ok((
+                        ready,
+                        super::hysteria2::ActiveStreamGuard(entry.active_streams.clone()),
+                    ));
+                }
+                entry.dead.store(true, Ordering::Relaxed);
+            }
+        }
+        guard.retain(|c| !c.dead.load(Ordering::Relaxed));
+
+        let raw = connect_transport(addr, local.clone(), binding.clone()).await?;
+        let (mut sender, dead) = dial_h2_client(raw, timeout_dur).await?;
+        sender = sender.ready().await.map_err(|e| e.to_string())?;
+        let active_streams = Arc::new(AtomicUsize::new(1));
+        let active_guard = super::hysteria2::ActiveStreamGuard(active_streams.clone());
+        let entry = Arc::new(PooledH2Conn {
+            sender: sender.clone(),
+            dead,
+            created_at: Instant::now(),
+            requests: AtomicU64::new(1),
+            active_streams,
+        });
+        while guard.len() >= max_conns {
+            guard.remove(0);
+        }
+        guard.push(entry);
+        Ok((sender, active_guard))
+    }
+}
+
+fn build_h2_request_from_parts(
     method: &str,
     scheme: &str,
     authority: &str,
-    path: &str,
-    local: &LocalTLS,
-    content_type: Option<&str>,
+    parts: &BuiltClientReqParts,
 ) -> Result<http::Request<()>, String> {
-    let uri = format!("{}://{}{}", scheme, authority, path);
-    let pad = random_xhttp_padding(local.xhttp.padding_bytes, local.xhttp.padding_max_bytes);
-    let mut b = http::Request::builder()
-        .method(method)
-        .uri(&uri)
-        .header("x-padding", pad);
-    if let Some(ct) = content_type {
-        b = b.header("content-type", ct);
-    }
-    for (k, v) in collect_xhttp_header_pairs(local) {
+    let uri = format!("{}://{}{}", scheme, authority, parts.uri_path_and_query);
+    let mut b = http::Request::builder().method(method).uri(&uri);
+    for (k, v) in &parts.headers {
         b = b.header(k.as_str(), v.as_str());
     }
     b.body(()).map_err(|e| e.to_string())
 }
 
-fn build_h3_request_headers(
+fn build_h3_headers_from_parts(
     method: &str,
     authority: &str,
-    path: &str,
-    local: &LocalTLS,
-    content_type: Option<&str>,
+    parts: &BuiltClientReqParts,
 ) -> Vec<(String, String)> {
-    let pad = random_xhttp_padding(local.xhttp.padding_bytes, local.xhttp.padding_max_bytes);
-    let mut hdrs = Vec::with_capacity(8);
+    let mut hdrs = Vec::with_capacity(4 + parts.headers.len());
     hdrs.push((":method".to_string(), method.to_string()));
     hdrs.push((":scheme".to_string(), "https".to_string()));
     hdrs.push((":authority".to_string(), authority.to_string()));
-    hdrs.push((":path".to_string(), path.to_string()));
-    hdrs.push(("x-padding".to_string(), pad));
-    if let Some(ct) = content_type {
-        hdrs.push(("content-type".to_string(), ct.to_string()));
-    }
-    for (k, v) in collect_xhttp_header_pairs(local) {
-        hdrs.push((k.to_ascii_lowercase(), v));
+    hdrs.push((":path".to_string(), parts.uri_path_and_query.clone()));
+    for (k, v) in &parts.headers {
+        hdrs.push((k.to_ascii_lowercase(), v.clone()));
     }
     hdrs
 }
@@ -1148,13 +1913,20 @@ pub async fn handle_xhttp_h3_stream<F>(
     let mut method = String::new();
     let mut raw_path = String::from("/");
     let mut authority = String::new();
-    let mut hdr_map = HashMap::new();
+    let mut hdr_map: HashMap<String, String> = HashMap::new();
     for (k, v) in raw_hdrs {
         match k.as_str() {
             ":method" => method = v.to_ascii_uppercase(),
             ":path" => raw_path = v,
             ":authority" => authority = v,
             _ => {
+                if k == "cookie" {
+                    if let Some(prev) = hdr_map.get_mut("cookie") {
+                        prev.push_str("; ");
+                        prev.push_str(&v);
+                        continue;
+                    }
+                }
                 hdr_map.insert(k, v);
             }
         }
@@ -1170,6 +1942,12 @@ pub async fn handle_xhttp_h3_stream<F>(
         return;
     }
 
+    let cors_origin = hdr_map
+        .get("origin")
+        .map(|s| s.as_str())
+        .unwrap_or("*")
+        .to_string();
+
     if method == "OPTIONS" && hdr_map.contains_key("access-control-request-method") {
         let acrm = hdr_map
             .get("access-control-request-method")
@@ -1179,14 +1957,14 @@ pub async fn handle_xhttp_h3_stream<F>(
             .get("access-control-request-headers")
             .map(|s| s.as_str())
             .unwrap_or("*");
-        let origin = hdr_map.get("origin").map(|s| s.as_str()).unwrap_or("*");
         let _ = super::hysteria2::write_h3_headers_frame(
             &mut send,
             &[
                 (":status", "200"),
-                ("access-control-allow-origin", origin),
+                ("access-control-allow-origin", &cors_origin),
                 ("access-control-allow-methods", acrm),
                 ("access-control-allow-headers", acrh),
+                ("cache-control", "no-store"),
             ],
         )
         .await;
@@ -1194,183 +1972,229 @@ pub async fn handle_xhttp_h3_stream<F>(
         return;
     }
 
-    let base_path = normalize_xhttp_path(&local.xhttp.path);
-    let expected_method = effective_uplink_method(&local);
+    let route = match parse_xhttp_route(&method, &raw_path, &hdr_map, &local) {
+        Ok(r) => r,
+        Err(status) => {
+            send_h3_empty_status(&mut send, &status.to_string()).await;
+            return;
+        }
+    };
+
     let reorder_win = if local.xhttp.max_buffered_posts > 0 {
         local.xhttp.max_buffered_posts as usize
     } else {
         MAX_XHTTP_REORDER_WINDOW
     };
     let dn_ctype = downlink_content_type(&local);
-    let path_only = raw_path.split('?').next().unwrap_or(&raw_path);
-    let sub = if base_path == "/" {
-        path_only.trim_start_matches('/')
-    } else if let Some(rest) = path_only.strip_prefix(&base_path) {
-        if !rest.is_empty() && !rest.starts_with('/') {
-            send_h3_empty_status(&mut send, "404").await;
-            return;
-        }
-        rest.trim_start_matches('/')
-    } else {
-        send_h3_empty_status(&mut send, "404").await;
-        return;
-    };
-    let sub = sub.trim_end_matches('/').to_string();
-    let pad = random_xhttp_padding(local.xhttp.padding_bytes, local.xhttp.padding_max_bytes);
+    let (pad_hdr_k, pad_hdr_v) = server_response_padding_header(&local);
     let on_tunnel_stream = Arc::new(on_tunnel_stream);
 
-    if method == expected_method && sub.is_empty() {
-        if super::hysteria2::write_h3_headers_frame(
-            &mut send,
-            &[
-                (":status", "200"),
-                ("content-type", dn_ctype),
-                ("cache-control", "no-store"),
-                ("x-accel-buffering", "no"),
-                ("x-padding", &pad),
-            ],
-        )
-        .await
-        .is_err()
-        {
-            return;
+    let build_dn_resp_hdrs = || -> Vec<(String, String)> {
+        let mut h = vec![
+            (":status".to_string(), "200".to_string()),
+            ("cache-control".to_string(), "no-store".to_string()),
+            ("access-control-allow-origin".to_string(), cors_origin.clone()),
+            ("x-accel-buffering".to_string(), "no".to_string()),
+            (pad_hdr_k.clone(), pad_hdr_v.clone()),
+        ];
+        if let Some(ct) = dn_ctype {
+            h.insert(1, ("content-type".to_string(), ct.to_string()));
         }
-        on_tunnel_stream(Box::new(super::hysteria2::H3BodyStream::new(
-            Some(send),
-            recv,
-            conn,
-            None,
-        )));
-    } else if method == "GET" && !sub.is_empty() && !sub.contains('/') {
-        if !is_valid_xhttp_sid(&sub) {
-            send_h3_empty_status(&mut send, "400").await;
-            return;
-        }
-        let cb = on_tunnel_stream.clone();
-        let Some(sess) = state.get_or_create_session(&sub, reorder_win, move |s| cb(s)) else {
-            send_h3_empty_status(&mut send, "503").await;
-            return;
-        };
-        let mut dn_guard = sess.dn_rx.lock().await;
-        let Some(mut dn_reader) = dn_guard.take() else {
-            send_h3_empty_status(&mut send, "409").await;
-            return;
-        };
-        sess.dn_taken.store(true, Ordering::Relaxed);
-        drop(dn_guard);
+        h
+    };
 
-        if super::hysteria2::write_h3_headers_frame(
-            &mut send,
-            &[
-                (":status", "200"),
-                ("content-type", dn_ctype),
-                ("cache-control", "no-store"),
-                ("x-accel-buffering", "no"),
-                ("x-padding", &pad),
-            ],
-        )
-        .await
-        .is_err()
-        {
-            state.remove_session(&sub);
-            return;
+    match route {
+        ParsedXhttpRoute::StreamOne => {
+            let hdrs = build_dn_resp_hdrs();
+            if write_h3_hdr_pairs(&mut send, &hdrs).await.is_err() {
+                return;
+            }
+            on_tunnel_stream(Box::new(super::hysteria2::H3BodyStream::new(
+                Some(send),
+                recv,
+                conn,
+                None,
+            )));
         }
-        let mut chunk_buf = vec![0u8; 65520];
-        loop {
-            match dn_reader.read(&mut chunk_buf).await {
-                Ok(0) => {
-                    let _ = send.finish();
-                    break;
-                }
-                Ok(n) => {
-                    sess.touch(&state.epoch);
-                    if super::hysteria2::write_h3_data_frame(&mut send, &chunk_buf[..n])
-                        .await
-                        .is_err()
-                    {
+        ParsedXhttpRoute::DownlinkGet { sid } => {
+            let cb = on_tunnel_stream.clone();
+            let Some(sess) = state.get_or_create_session(&sid, reorder_win, move |s| cb(s)) else {
+                send_h3_empty_status(&mut send, "503").await;
+                return;
+            };
+            let mut dn_guard = sess.dn_rx.lock().await;
+            let Some(mut dn_reader) = dn_guard.take() else {
+                send_h3_empty_status(&mut send, "409").await;
+                return;
+            };
+            sess.dn_taken.store(true, Ordering::SeqCst);
+            drop(dn_guard);
+
+            let hdrs = build_dn_resp_hdrs();
+            if write_h3_hdr_pairs(&mut send, &hdrs).await.is_err() {
+                state.finish_downlink(&sid, &sess, true);
+                return;
+            }
+            let mut chunk_buf = vec![0u8; 65520];
+            let mut dn_errored = false;
+            loop {
+                match dn_reader.read(&mut chunk_buf).await {
+                    Ok(0) => {
+                        if send.finish().is_err() {
+                            dn_errored = true;
+                        }
+                        break;
+                    }
+                    Ok(n) => {
+                        sess.touch(&state.epoch);
+                        if super::hysteria2::write_h3_data_frame(&mut send, &chunk_buf[..n])
+                            .await
+                            .is_err()
+                        {
+                            dn_errored = true;
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        dn_errored = true;
                         break;
                     }
                 }
-                Err(_) => break,
             }
+            state.finish_downlink(&sid, &sess, dn_errored);
         }
-        state.remove_session(&sub);
-    } else if method == expected_method && !sub.is_empty() && !sub.contains('/') {
-        if !is_valid_xhttp_sid(&sub) {
-            send_h3_empty_status(&mut send, "400").await;
-            return;
-        }
-        let cb = on_tunnel_stream.clone();
-        let Some(sess) = state.get_or_create_session(&sub, reorder_win, move |s| cb(s)) else {
-            send_h3_empty_status(&mut send, "503").await;
-            return;
-        };
-        let _ = super::hysteria2::write_h3_headers_frame(
-            &mut send,
-            &[
-                (":status", "200"),
-                ("cache-control", "no-store"),
-                ("x-padding", &pad),
-            ],
-        )
-        .await;
-        while let Ok(Some(chunk)) = super::hysteria2::read_h3_data_frame(&mut recv).await {
-            sess.touch(&state.epoch);
-            if sess
-                .up_tx
-                .send(SessionPacket::StreamData(chunk))
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-        let _ = sess.up_tx.send(SessionPacket::Eof).await;
-        let _ = send.finish();
-    } else if method == expected_method && sub.contains('/') {
-        let mut parts = sub.splitn(2, '/');
-        let sid = parts.next().unwrap_or("");
-        let seq_str = parts.next().unwrap_or("");
-        if !is_valid_xhttp_sid(sid) {
-            send_h3_empty_status(&mut send, "400").await;
-            return;
-        }
-        let Ok(seq) = seq_str.parse::<u64>() else {
-            send_h3_empty_status(&mut send, "400").await;
-            return;
-        };
-        let cb = on_tunnel_stream.clone();
-        let Some(sess) = state.get_or_create_session(sid, reorder_win, move |s| cb(s)) else {
-            send_h3_empty_status(&mut send, "503").await;
-            return;
-        };
-        let mut all = Vec::new();
-        while let Ok(Some(chunk)) = super::hysteria2::read_h3_data_frame(&mut recv).await {
-            if all.len().saturating_add(chunk.len()) > MAX_XHTTP_BODY_BYTES {
-                state.remove_session(sid);
-                send_h3_empty_status(&mut send, "413").await;
+        ParsedXhttpRoute::StreamUp { sid } => {
+            let cb = on_tunnel_stream.clone();
+            let Some(sess) = state.get_or_create_session(&sid, reorder_win, move |s| cb(s)) else {
+                send_h3_empty_status(&mut send, "503").await;
                 return;
+            };
+            let _ = super::hysteria2::write_h3_headers_frame(
+                &mut send,
+                &[
+                    (":status", "200"),
+                    ("cache-control", "no-store"),
+                    ("access-control-allow-origin", &cors_origin),
+                    (&pad_hdr_k, &pad_hdr_v),
+                ],
+            )
+            .await;
+            loop {
+                let ka_opt = sample_stream_up_keepalive(&local.xhttp);
+                tokio::select! {
+                    chunk_res = super::hysteria2::read_h3_data_frame(&mut recv) => {
+                        match chunk_res {
+                            Ok(Some(chunk)) => {
+                                sess.touch(&state.epoch);
+                                if sess
+                                    .up_tx
+                                    .send(SessionPacket::StreamData(chunk))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                    _ = async {
+                        match ka_opt {
+                            Some(d) => tokio::time::sleep(d).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {
+                        let ka = generate_xhttp_padding(&local.xhttp);
+                        if super::hysteria2::write_h3_data_frame(&mut send, ka.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                }
             }
-            all.extend_from_slice(&chunk);
+            let _ = sess.up_tx.send(SessionPacket::StreamEof).await;
+            let _ = send.finish();
         }
-        if all.is_empty() {
-            let _ = sess.up_tx.send(SessionPacket::Eof).await;
-        } else {
-            sess.touch(&state.epoch);
-            if sess.up_tx.send(SessionPacket::SeqData(seq, all)).await.is_err() {
-                send_h3_empty_status(&mut send, "500").await;
+        ParsedXhttpRoute::PacketUp {
+            sid,
+            seq,
+            header_or_cookie_data,
+            explicit_eof,
+        } => {
+            let cb = on_tunnel_stream.clone();
+            let Some(sess) = state.get_or_create_session(&sid, reorder_win, move |s| cb(s)) else {
+                send_h3_empty_status(&mut send, "503").await;
                 return;
+            };
+            let mut all = Vec::new();
+            while let Ok(Some(chunk)) = super::hysteria2::read_h3_data_frame(&mut recv).await {
+                if all.len().saturating_add(chunk.len()) > MAX_XHTTP_BODY_BYTES {
+                    state.remove_session(&sid);
+                    send_h3_empty_status(&mut send, "413").await;
+                    return;
+                }
+                all.extend_from_slice(&chunk);
             }
+            let payload = header_or_cookie_data.unwrap_or(all);
+            if explicit_eof || payload.is_empty() {
+                if !payload.is_empty() {
+                    sess.touch(&state.epoch);
+                    if sess
+                        .up_tx
+                        .send(SessionPacket::SeqData(seq, payload))
+                        .await
+                        .is_err()
+                    {
+                        send_h3_empty_status(&mut send, "500").await;
+                        return;
+                    }
+                    let _ = sess.up_tx.send(SessionPacket::SeqEof(seq + 1)).await;
+                } else {
+                    let _ = sess.up_tx.send(SessionPacket::SeqEof(seq)).await;
+                }
+            } else {
+                sess.touch(&state.epoch);
+                if sess
+                    .up_tx
+                    .send(SessionPacket::SeqData(seq, payload))
+                    .await
+                    .is_err()
+                {
+                    send_h3_empty_status(&mut send, "500").await;
+                    return;
+                }
+            }
+            let _ = super::hysteria2::write_h3_headers_frame(
+                &mut send,
+                &[
+                    (":status", "200"),
+                    ("cache-control", "no-store"),
+                    ("access-control-allow-origin", &cors_origin),
+                    (&pad_hdr_k, &pad_hdr_v),
+                ],
+            )
+            .await;
+            let _ = send.finish();
         }
-        let _ = super::hysteria2::write_h3_headers_frame(
-            &mut send,
-            &[(":status", "200"), ("x-padding", &pad)],
-        )
-        .await;
-        let _ = send.finish();
-    } else {
-        send_h3_empty_status(&mut send, "400").await;
     }
+}
+
+fn format_h1_request_head(method: &str, host: &str, parts: &BuiltClientReqParts, extra_lines: &str) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut out = Vec::with_capacity(512 + parts.body.len());
+    let _ = write!(
+        out,
+        "{} {} HTTP/1.1\r\nHost: {}\r\n",
+        method, parts.uri_path_and_query, host
+    );
+    for (k, v) in &parts.headers {
+        let _ = write!(out, "{}: {}\r\n", k, v);
+    }
+    out.extend_from_slice(extra_lines.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    if !parts.body.is_empty() {
+        out.extend_from_slice(&parts.body);
+    }
+    out
 }
 
 pub async fn xhttp_client_connect<F, Fut>(
@@ -1430,34 +2254,54 @@ where
         .await;
     }
 
-    let pad = random_xhttp_padding(local.xhttp.padding_bytes, local.xhttp.padding_max_bytes);
-    let up_headers = format_xhttp_headers(local);
+    let scheme = if local.xhttp.tls || local.reality.enabled() {
+        "https"
+    } else {
+        "http"
+    };
     let stream_ct = stream_uplink_content_type(local);
 
     if eff_mode == "stream-one" {
         let conn = connect_transport(up_addr, local.clone(), binding.clone()).await?;
         let (mut rd, mut wr) = tokio::io::split(conn);
-        let req = format!(
-            "{} {} HTTP/1.1\r\nHost: {}\r\n{}Content-Type: {}\r\nTransfer-Encoding: chunked\r\nX-Padding: {}\r\n\r\n",
-            up_method, up_base, up_host, up_headers, stream_ct, pad
+        let parts = build_client_req_parts(
+            scheme,
+            &up_host,
+            &up_base,
+            local,
+            None,
+            None,
+            None,
+            false,
+            stream_ct,
         );
-        wr.write_all(req.as_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
+        let req_bytes = format_h1_request_head(
+            up_method,
+            &up_host,
+            &parts,
+            "Transfer-Encoding: chunked\r\n",
+        );
+        wr.write_all(&req_bytes).await.map_err(|e| e.to_string())?;
         wr.flush().await.map_err(|e| e.to_string())?;
 
         let mut read_buf = Vec::with_capacity(4096);
-        let status = tokio::time::timeout(req_timeout, read_http_response_head(&mut rd, &mut read_buf))
-            .await
-            .map_err(|_| "xhttp stream-one response timeout".to_string())??;
+        let status =
+            tokio::time::timeout(req_timeout, read_http_response_head(&mut rd, &mut read_buf))
+                .await
+                .map_err(|_| "xhttp stream-one response timeout".to_string())??;
         if status != 200 {
             return Err(format!("xhttp stream-one unexpected status {}", status));
         }
         return Ok(wrap_chunked_duplex(rd, wr, read_buf));
     }
 
-    let sid = uuid::Uuid::new_v4().to_string();
+    let sid = generate_session_id(&local.xhttp);
     let (dn_addr, dn_ep) = dn_target.unwrap_or_else(|| (up_addr, local.clone()));
+    let dn_scheme = if dn_ep.xhttp.tls || dn_ep.reality.enabled() {
+        "https"
+    } else {
+        "http"
+    };
     let dn_base = normalize_xhttp_path(&dn_ep.xhttp.path);
     let dn_host = if !dn_ep.xhttp.host.trim().is_empty() {
         dn_ep.xhttp.host.trim().to_string()
@@ -1468,19 +2312,21 @@ where
     };
 
     let dn_conn = connect_transport(dn_addr, dn_ep.clone(), binding.clone()).await?;
-    let dn_headers = format_xhttp_headers(&dn_ep);
     let (mut dn_rd, mut dn_wr) = tokio::io::split(dn_conn);
-    let get_path = if dn_base == "/" {
-        format!("/{}", sid)
-    } else {
-        format!("{}/{}", dn_base, sid)
-    };
-    let get_req = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\n{}X-Padding: {}\r\n\r\n",
-        get_path, dn_host, dn_headers, pad
+    let get_parts = build_client_req_parts(
+        dn_scheme,
+        &dn_host,
+        &dn_base,
+        &dn_ep,
+        Some(&sid),
+        None,
+        None,
+        false,
+        None,
     );
+    let get_bytes = format_h1_request_head("GET", &dn_host, &get_parts, "");
     dn_wr
-        .write_all(get_req.as_bytes())
+        .write_all(&get_bytes)
         .await
         .map_err(|e| e.to_string())?;
     dn_wr.flush().await.map_err(|e| e.to_string())?;
@@ -1488,22 +2334,29 @@ where
     if eff_mode == "stream-up" {
         let up_conn = connect_transport(up_addr, local.clone(), binding.clone()).await?;
         let (mut up_rd, mut up_wr) = tokio::io::split(up_conn);
-        let post_path = if up_base == "/" {
-            format!("/{}", sid)
-        } else {
-            format!("{}/{}", up_base, sid)
-        };
-        let post_req = format!(
-            "{} {} HTTP/1.1\r\nHost: {}\r\n{}Content-Type: {}\r\nTransfer-Encoding: chunked\r\nX-Padding: {}\r\n\r\n",
-            up_method, post_path, up_host, up_headers, stream_ct, pad
+        let post_parts = build_client_req_parts(
+            scheme,
+            &up_host,
+            &up_base,
+            local,
+            Some(&sid),
+            None,
+            None,
+            false,
+            stream_ct,
+        );
+        let post_bytes = format_h1_request_head(
+            up_method,
+            &up_host,
+            &post_parts,
+            "Transfer-Encoding: chunked\r\n",
         );
         up_wr
-            .write_all(post_req.as_bytes())
+            .write_all(&post_bytes)
             .await
             .map_err(|e| e.to_string())?;
         up_wr.flush().await.map_err(|e| e.to_string())?;
 
-        // Drain any TLS post-handshake records / server uplink response padding
         tokio::spawn(async move {
             let mut discard = [0u8; 4096];
             while let Ok(n) = up_rd.read(&mut discard).await {
@@ -1514,22 +2367,26 @@ where
         });
 
         let mut dn_buf = Vec::with_capacity(4096);
-        let status = tokio::time::timeout(req_timeout, read_http_response_head(&mut dn_rd, &mut dn_buf))
-            .await
-            .map_err(|_| "xhttp stream-up GET response timeout".to_string())??;
+        let status =
+            tokio::time::timeout(req_timeout, read_http_response_head(&mut dn_rd, &mut dn_buf))
+                .await
+                .map_err(|_| "xhttp stream-up GET response timeout".to_string())??;
         if status != 200 {
             return Err(format!("xhttp stream-up GET unexpected status {}", status));
         }
         return Ok(wrap_chunked_duplex_keep(dn_rd, up_wr, dn_buf, dn_wr));
     }
 
-    // packet-up mode (HTTP/1.1 or HTTP/3 stream)
     let mut dn_buf = Vec::with_capacity(4096);
-    let dn_status = tokio::time::timeout(req_timeout, read_http_response_head(&mut dn_rd, &mut dn_buf))
-        .await
-        .map_err(|_| "xhttp packet-up GET response timeout".to_string())??;
+    let dn_status =
+        tokio::time::timeout(req_timeout, read_http_response_head(&mut dn_rd, &mut dn_buf))
+            .await
+            .map_err(|_| "xhttp packet-up GET response timeout".to_string())??;
     if dn_status != 200 {
-        return Err(format!("xhttp packet-up GET unexpected status {}", dn_status));
+        return Err(format!(
+            "xhttp packet-up GET unexpected status {}",
+            dn_status
+        ));
     }
 
     let connect_transport = Arc::new(connect_transport);
@@ -1539,13 +2396,7 @@ where
     let (local_stream, peer_stream) = tokio::io::duplex(256 * 1024);
     let (mut peer_rd, mut peer_wr) = tokio::io::split(peer_stream);
 
-    let max_buf_cap = if local.xhttp.post_bytes_max > 0 {
-        (local.xhttp.post_bytes_max as usize).clamp(1024, 32768)
-    } else if local.xhttp.max_each_post_bytes > 0 {
-        (local.xhttp.max_each_post_bytes as usize).clamp(1024, 32768)
-    } else {
-        32768
-    };
+    let max_buf_cap = effective_upload_cap(local).clamp(256, 32768);
     let max_in_flight = if local.xhttp.max_concurrent_posts > 0 {
         (local.xhttp.max_concurrent_posts as usize).clamp(1, 8)
     } else {
@@ -1557,37 +2408,34 @@ where
     let (write_failed_tx, mut write_failed_rx) = tokio::sync::watch::channel(false);
 
     let write_task = tokio::spawn(async move {
-        use std::io::Write as _;
         let mut seq = 0u64;
         let mut buf = vec![0u8; max_buf_cap];
-        let mut post_buf = Vec::with_capacity(max_buf_cap + 1024);
         let mut up_resp_buf = Vec::with_capacity(4096);
-        let mut unacked: VecDeque<(u64, Vec<u8>)> = VecDeque::with_capacity(max_in_flight);
+        let mut unacked: VecDeque<(u64, Vec<u8>, bool)> = VecDeque::with_capacity(max_in_flight);
         let mut peer_eof = false;
 
-        let format_post = |post_buf: &mut Vec<u8>, pkt_seq: u64, data: &[u8]| {
-            let post_path = if up_base == "/" {
-                format!("/{}/{}", sid, pkt_seq)
+        let build_h1_post = |pkt_seq: u64, data: &[u8], is_eof_pkt: bool| -> Vec<u8> {
+            let ct = if !data.is_empty() && xhttp_data_placement(&ep_clone.xhttp) == "body" {
+                Some("application/octet-stream")
             } else {
-                format!("{}/{}/{}", up_base, sid, pkt_seq)
+                None
             };
-            let pad_s =
-                random_xhttp_padding(ep_clone.xhttp.padding_bytes, ep_clone.xhttp.padding_max_bytes);
-            post_buf.clear();
-            if data.is_empty() {
-                let _ = write!(
-                    post_buf,
-                    "{} {} HTTP/1.1\r\nHost: {}\r\n{}Content-Length: 0\r\nConnection: keep-alive\r\nX-Padding: {}\r\n\r\n",
-                    up_method, post_path, up_host, up_headers, pad_s
-                );
-            } else {
-                let _ = write!(
-                    post_buf,
-                    "{} {} HTTP/1.1\r\nHost: {}\r\n{}Content-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\nX-Padding: {}\r\n\r\n",
-                    up_method, post_path, up_host, up_headers, data.len(), pad_s
-                );
-                post_buf.extend_from_slice(data);
-            }
+            let parts = build_client_req_parts(
+                scheme,
+                &up_host,
+                &up_base,
+                &ep_clone,
+                Some(&sid),
+                Some(pkt_seq),
+                Some(data),
+                is_eof_pkt,
+                ct,
+            );
+            let extra = format!(
+                "Content-Length: {}\r\nConnection: keep-alive\r\n",
+                parts.body.len()
+            );
+            format_h1_request_head(up_method, &up_host, &parts, &extra)
         };
 
         loop {
@@ -1603,10 +2451,10 @@ where
                             peer_eof = true;
                             let pkt_seq = seq;
                             seq += 1;
-                            unacked.push_back((pkt_seq, Vec::new()));
-                            format_post(&mut post_buf, pkt_seq, &[]);
+                            let wire = build_h1_post(pkt_seq, &[], true);
+                            unacked.push_back((pkt_seq, Vec::new(), true));
                             if tokio::time::timeout(req_timeout, async {
-                                up_wr.write_all(&post_buf).await?;
+                                up_wr.write_all(&wire).await?;
                                 up_wr.flush().await
                             })
                             .await
@@ -1619,10 +2467,10 @@ where
                             let pkt_seq = seq;
                             seq += 1;
                             let payload = buf[..n].to_vec();
-                            format_post(&mut post_buf, pkt_seq, &payload);
-                            unacked.push_back((pkt_seq, payload));
+                            let wire = build_h1_post(pkt_seq, &payload, false);
+                            unacked.push_back((pkt_seq, payload, false));
                             if tokio::time::timeout(req_timeout, async {
-                                up_wr.write_all(&post_buf).await?;
+                                up_wr.write_all(&wire).await?;
                                 up_wr.flush().await
                             })
                             .await
@@ -1652,7 +2500,7 @@ where
             }
 
             if need_reconnect {
-                if peer_eof && unacked.iter().all(|(_, p)| p.is_empty()) {
+                if peer_eof && unacked.iter().all(|(_, _, eof)| *eof) {
                     break;
                 }
                 let mut reconnected = false;
@@ -1662,10 +2510,10 @@ where
                     {
                         let (new_rd, mut new_wr) = tokio::io::split(new_conn);
                         let mut replay_ok = true;
-                        for (pkt_seq, payload) in &unacked {
-                            format_post(&mut post_buf, *pkt_seq, payload);
+                        for (pkt_seq, payload, is_eof_pkt) in &unacked {
+                            let wire = build_h1_post(*pkt_seq, payload, *is_eof_pkt);
                             if tokio::time::timeout(req_timeout, async {
-                                new_wr.write_all(&post_buf).await?;
+                                new_wr.write_all(&wire).await?;
                                 new_wr.flush().await
                             })
                             .await
@@ -1699,10 +2547,12 @@ where
     let write_abort = write_task.abort_handle();
     let read_task = tokio::spawn(async move {
         let _keep_dn_wr = dn_wr;
+        let mut read_errored = false;
         loop {
             tokio::select! {
                 _ = write_failed_rx.changed() => {
                     if *write_failed_rx.borrow() {
+                        read_errored = true;
                         break;
                     }
                 }
@@ -1713,12 +2563,18 @@ where
                                 break;
                             }
                         }
-                        _ => break,
+                        Ok(None) => break,
+                        Err(_) => {
+                            read_errored = true;
+                            break;
+                        }
                     }
                 }
             }
         }
-        write_abort.abort();
+        if read_errored {
+            write_abort.abort();
+        }
         let _ = peer_wr.shutdown().await;
     });
 
@@ -1751,10 +2607,20 @@ async fn xhttp_client_connect_h3(
     let stream_ct = stream_uplink_content_type(local);
 
     if eff_mode == "stream-one" {
-        let (mut send, mut recv, conn) =
+        let (mut send, mut recv, conn, guard) =
             super::hysteria2::xhttp_h3_open_bi(up_addr, local, &sni).await?;
-        let req_hdrs =
-            build_h3_request_headers(up_method, up_host, up_base, local, Some(stream_ct));
+        let parts = build_client_req_parts(
+            "https",
+            up_host,
+            up_base,
+            local,
+            None,
+            None,
+            None,
+            false,
+            stream_ct,
+        );
+        let req_hdrs = build_h3_headers_from_parts(up_method, up_host, &parts);
         write_h3_hdr_pairs(&mut send, &req_hdrs).await?;
         let resp_hdrs = tokio::time::timeout(
             req_timeout,
@@ -1774,11 +2640,11 @@ async fn xhttp_client_connect_h3(
             Some(send),
             recv,
             conn,
-            None,
+            Some(Box::new(guard)),
         )));
     }
 
-    let sid = uuid::Uuid::new_v4().to_string();
+    let sid = generate_session_id(&local.xhttp);
     let (dn_addr, dn_ep) = dn_target.unwrap_or_else(|| (up_addr, local.clone()));
     let dn_base = normalize_xhttp_path(&dn_ep.xhttp.path);
     let dn_host = if !dn_ep.xhttp.host.trim().is_empty() {
@@ -1788,28 +2654,39 @@ async fn xhttp_client_connect_h3(
     } else {
         "localhost".to_string()
     };
-    let get_path = if dn_base == "/" {
-        format!("/{}", sid)
-    } else {
-        format!("{}/{}", dn_base, sid)
-    };
 
-    let (mut dn_send, mut dn_recv, dn_conn) =
+    let (mut dn_send, mut dn_recv, dn_conn, dn_guard) =
         super::hysteria2::xhttp_h3_open_bi(dn_addr, &dn_ep, &sni).await?;
-    let get_hdrs = build_h3_request_headers("GET", &dn_host, &get_path, &dn_ep, None);
+    let get_parts = build_client_req_parts(
+        "https",
+        &dn_host,
+        &dn_base,
+        &dn_ep,
+        Some(&sid),
+        None,
+        None,
+        false,
+        None,
+    );
+    let get_hdrs = build_h3_headers_from_parts("GET", &dn_host, &get_parts);
     write_h3_hdr_pairs(&mut dn_send, &get_hdrs).await?;
     let _ = dn_send.finish();
 
     if eff_mode == "stream-up" {
-        let post_path = if up_base == "/" {
-            format!("/{}", sid)
-        } else {
-            format!("{}/{}", up_base, sid)
-        };
-        let (mut up_send, mut up_recv, up_conn) =
+        let (mut up_send, mut up_recv, up_conn, up_guard) =
             super::hysteria2::xhttp_h3_open_bi(up_addr, local, &sni).await?;
-        let post_hdrs =
-            build_h3_request_headers(up_method, up_host, &post_path, local, Some(stream_ct));
+        let post_parts = build_client_req_parts(
+            "https",
+            up_host,
+            up_base,
+            local,
+            Some(&sid),
+            None,
+            None,
+            false,
+            stream_ct,
+        );
+        let post_hdrs = build_h3_headers_from_parts(up_method, up_host, &post_parts);
         write_h3_hdr_pairs(&mut up_send, &post_hdrs).await?;
         tokio::spawn(async move {
             let _ = super::hysteria2::read_h3_headers_decoded(&mut up_recv).await;
@@ -1837,11 +2714,10 @@ async fn xhttp_client_connect_h3(
             Some(up_send),
             dn_recv,
             dn_conn,
-            Some(Box::new(up_conn)),
+            Some(Box::new((up_conn, dn_guard, up_guard))),
         )));
     }
 
-    // packet-up over RFC 9114 HTTP/3
     let dn_resp_hdrs = tokio::time::timeout(
         req_timeout,
         super::hysteria2::read_h3_headers_decoded(&mut dn_recv),
@@ -1862,12 +2738,11 @@ async fn xhttp_client_connect_h3(
 
     let (local_stream, peer_stream) = tokio::io::duplex(256 * 1024);
     let (mut peer_rd, mut peer_wr) = tokio::io::split(peer_stream);
-    let max_buf_cap = if local.xhttp.post_bytes_max > 0 {
-        (local.xhttp.post_bytes_max as usize).clamp(1024, 32768)
-    } else if local.xhttp.max_each_post_bytes > 0 {
-        (local.xhttp.max_each_post_bytes as usize).clamp(1024, 32768)
+    let max_buf_cap = effective_upload_cap(local).clamp(256, 32768);
+    let max_conc = if local.xhttp.max_concurrent_posts > 0 {
+        (local.xhttp.max_concurrent_posts as usize).clamp(1, 8)
     } else {
-        32768
+        4
     };
     let ep_clone = local.clone();
     let up_base_owned = up_base.to_string();
@@ -1877,79 +2752,92 @@ async fn xhttp_client_connect_h3(
     let write_task = tokio::spawn(async move {
         let mut seq = 0u64;
         let mut buf = vec![0u8; max_buf_cap];
-        let mut peer_eof = false;
+        let sem = Arc::new(tokio::sync::Semaphore::new(max_conc));
+        let mut in_flight = tokio::task::JoinSet::new();
 
         loop {
             let chunk_target = sample_post_size(&ep_clone).min(buf.len());
-            let payload = match peer_rd.read(&mut buf[..chunk_target]).await {
-                Ok(0) => {
-                    peer_eof = true;
-                    Vec::new()
-                }
-                Ok(n) => buf[..n].to_vec(),
+            let (payload, is_eof_pkt) = match peer_rd.read(&mut buf[..chunk_target]).await {
+                Ok(0) => (Vec::new(), true),
+                Ok(n) => (buf[..n].to_vec(), false),
                 Err(_) => break,
             };
             let pkt_seq = seq;
             seq += 1;
-            let post_path = if up_base_owned == "/" {
-                format!("/{}/{}", sid, pkt_seq)
-            } else {
-                format!("{}/{}/{}", up_base_owned, sid, pkt_seq)
-            };
-            let ct = if payload.is_empty() {
-                None
-            } else {
-                Some("application/octet-stream")
-            };
 
-            let mut delivered = false;
-            for attempt in 0..3 {
-                if attempt > 0 {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                let Ok((mut send, mut recv, _c)) =
-                    super::hysteria2::xhttp_h3_open_bi(up_addr, &ep_clone, &sni).await
-                else {
-                    continue;
+            let Ok(permit) = sem.clone().acquire_owned().await else {
+                break;
+            };
+            let ep_p = ep_clone.clone();
+            let base_p = up_base_owned.clone();
+            let host_p = up_host_owned.clone();
+            let sid_p = sid.clone();
+            let sni_p = sni.clone();
+            let wf_tx = write_failed_tx.clone();
+
+            in_flight.spawn(async move {
+                let _permit = permit;
+                let ct = if !payload.is_empty() && xhttp_data_placement(&ep_p.xhttp) == "body" {
+                    Some("application/octet-stream")
+                } else {
+                    None
                 };
-                let hdrs = build_h3_request_headers(
-                    up_method,
-                    &up_host_owned,
-                    &post_path,
-                    &ep_clone,
-                    ct,
-                );
-                if write_h3_hdr_pairs(&mut send, &hdrs).await.is_err() {
-                    continue;
-                }
-                if !payload.is_empty()
-                    && super::hysteria2::write_h3_data_frame(&mut send, &payload)
-                        .await
-                        .is_err()
-                {
-                    continue;
-                }
-                let _ = send.finish();
-                if let Ok(Ok(rh)) = tokio::time::timeout(
-                    req_timeout,
-                    super::hysteria2::read_h3_headers_decoded(&mut recv),
-                )
-                .await
-                {
-                    if rh.iter().any(|(k, v)| k == ":status" && v == "200") {
-                        delivered = true;
-                        break;
+                let mut delivered = false;
+                for attempt in 0..3 {
+                    if attempt > 0 {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    let Ok((mut send, mut recv, _c, _g)) =
+                        super::hysteria2::xhttp_h3_open_bi(up_addr, &ep_p, &sni_p).await
+                    else {
+                        continue;
+                    };
+                    let parts = build_client_req_parts(
+                        "https",
+                        &host_p,
+                        &base_p,
+                        &ep_p,
+                        Some(&sid_p),
+                        Some(pkt_seq),
+                        Some(&payload),
+                        is_eof_pkt,
+                        ct,
+                    );
+                    let hdrs = build_h3_headers_from_parts(up_method, &host_p, &parts);
+                    if write_h3_hdr_pairs(&mut send, &hdrs).await.is_err() {
+                        continue;
+                    }
+                    if !parts.body.is_empty()
+                        && super::hysteria2::write_h3_data_frame(&mut send, &parts.body)
+                            .await
+                            .is_err()
+                    {
+                        continue;
+                    }
+                    let _ = send.finish();
+                    if let Ok(Ok(rh)) = tokio::time::timeout(
+                        req_timeout,
+                        super::hysteria2::read_h3_headers_decoded(&mut recv),
+                    )
+                    .await
+                    {
+                        if rh.iter().any(|(k, v)| k == ":status" && v == "200") {
+                            delivered = true;
+                            break;
+                        }
                     }
                 }
-            }
-
-            if !delivered {
-                if !peer_eof {
-                    let _ = write_failed_tx.send(true);
+                if !delivered && !is_eof_pkt {
+                    let _ = wf_tx.send(true);
                 }
+                delivered
+            });
+
+            if is_eof_pkt {
+                while in_flight.join_next().await.is_some() {}
                 break;
             }
-            if peer_eof {
+            if *write_failed_tx.borrow() {
                 break;
             }
             let interval_ms = sample_post_interval_ms(&ep_clone);
@@ -1961,11 +2849,13 @@ async fn xhttp_client_connect_h3(
 
     let write_abort = write_task.abort_handle();
     let read_task = tokio::spawn(async move {
-        let _keep_dn_conn = dn_conn;
+        let _keep_dn = (dn_conn, dn_guard);
+        let mut read_errored = false;
         loop {
             tokio::select! {
                 _ = write_failed_rx.changed() => {
                     if *write_failed_rx.borrow() {
+                        read_errored = true;
                         break;
                     }
                 }
@@ -1976,12 +2866,18 @@ async fn xhttp_client_connect_h3(
                                 break;
                             }
                         }
-                        _ => break,
+                        Ok(None) => break,
+                        Err(_) => {
+                            read_errored = true;
+                            break;
+                        }
                     }
                 }
             }
         }
-        write_abort.abort();
+        if read_errored {
+            write_abort.abort();
+        }
         let _ = peer_wr.shutdown().await;
     });
 
@@ -2014,12 +2910,25 @@ where
         "http"
     };
     let stream_ct = stream_uplink_content_type(local);
+    let connect_transport = Arc::new(connect_transport);
+    let up_pool = H2XmuxPool::new();
 
     if eff_mode == "stream-one" {
-        let conn = connect_transport(up_addr, local.clone(), binding.clone()).await?;
-        let mut h2_sender = dial_h2_client(conn, req_timeout).await?;
-        h2_sender = h2_sender.ready().await.map_err(|e| e.to_string())?;
-        let req = build_h2_request(up_method, scheme, up_host, up_base, local, Some(stream_ct))?;
+        let (mut h2_sender, guard) = up_pool
+            .acquire(up_addr, local, binding, req_timeout, &*connect_transport)
+            .await?;
+        let parts = build_client_req_parts(
+            scheme,
+            up_host,
+            up_base,
+            local,
+            None,
+            None,
+            None,
+            false,
+            stream_ct,
+        );
+        let req = build_h2_request_from_parts(up_method, scheme, up_host, &parts)?;
         let (resp_fut, send_body) = h2_sender
             .send_request(req, false)
             .map_err(|e| e.to_string())?;
@@ -2033,10 +2942,10 @@ where
                 resp.status()
             ));
         }
-        return Ok(wrap_h2_duplex(resp.into_body(), send_body));
+        return Ok(wrap_h2_duplex_keep(resp.into_body(), send_body, guard));
     }
 
-    let sid = uuid::Uuid::new_v4().to_string();
+    let sid = generate_session_id(&local.xhttp);
     let shared_ep = dn_target.is_none();
     let (dn_addr, dn_ep) = dn_target.unwrap_or_else(|| (up_addr, local.clone()));
     let dn_scheme = if dn_ep.xhttp.tls || dn_ep.reality.enabled() {
@@ -2053,41 +2962,47 @@ where
         "localhost".to_string()
     };
 
-    let dn_raw_conn = connect_transport(dn_addr, dn_ep.clone(), binding.clone()).await?;
-    let mut dn_sender = dial_h2_client(dn_raw_conn, req_timeout).await?;
-    dn_sender = dn_sender.ready().await.map_err(|e| e.to_string())?;
-    let get_path = if dn_base == "/" {
-        format!("/{}", sid)
+    let dn_pool = if shared_ep {
+        up_pool.clone()
     } else {
-        format!("{}/{}", dn_base, sid)
+        H2XmuxPool::new()
     };
-    let get_req = build_h2_request("GET", dn_scheme, &dn_host, &get_path, &dn_ep, None)?;
+
+    let (mut dn_sender, dn_guard) = dn_pool
+        .acquire(dn_addr, &dn_ep, binding, req_timeout, &*connect_transport)
+        .await?;
+    let get_parts = build_client_req_parts(
+        dn_scheme,
+        &dn_host,
+        &dn_base,
+        &dn_ep,
+        Some(&sid),
+        None,
+        None,
+        false,
+        None,
+    );
+    let get_req = build_h2_request_from_parts("GET", dn_scheme, &dn_host, &get_parts)?;
     let (get_resp_fut, _get_send) = dn_sender
         .send_request(get_req, true)
         .map_err(|e| e.to_string())?;
 
-    let mut up_sender = if shared_ep {
-        dn_sender.clone()
-    } else {
-        let up_raw = connect_transport(up_addr, local.clone(), binding.clone()).await?;
-        dial_h2_client(up_raw, req_timeout).await?
-    };
-
     if eff_mode == "stream-up" {
-        up_sender = up_sender.ready().await.map_err(|e| e.to_string())?;
-        let post_path = if up_base == "/" {
-            format!("/{}", sid)
-        } else {
-            format!("{}/{}", up_base, sid)
-        };
-        let post_req = build_h2_request(
-            up_method,
+        let (mut up_sender, up_guard) = up_pool
+            .acquire(up_addr, local, binding, req_timeout, &*connect_transport)
+            .await?;
+        let post_parts = build_client_req_parts(
             scheme,
             up_host,
-            &post_path,
+            up_base,
             local,
-            Some(stream_ct),
-        )?;
+            Some(&sid),
+            None,
+            None,
+            false,
+            stream_ct,
+        );
+        let post_req = build_h2_request_from_parts(up_method, scheme, up_host, &post_parts)?;
         let (up_resp_fut, up_send_body) = up_sender
             .send_request(post_req, false)
             .map_err(|e| e.to_string())?;
@@ -2110,10 +3025,13 @@ where
                 get_resp.status()
             ));
         }
-        return Ok(wrap_h2_duplex(get_resp.into_body(), up_send_body));
+        return Ok(wrap_h2_duplex_keep(
+            get_resp.into_body(),
+            up_send_body,
+            (dn_guard, up_guard, dn_pool, up_pool),
+        ));
     }
 
-    // packet-up over HTTP/2 (including h2c prior-knowledge)
     let get_resp = tokio::time::timeout(req_timeout, get_resp_fut)
         .await
         .map_err(|_| "xhttp h2 packet-up GET response timeout".to_string())?
@@ -2128,106 +3046,114 @@ where
 
     let (local_stream, peer_stream) = tokio::io::duplex(256 * 1024);
     let (mut peer_rd, mut peer_wr) = tokio::io::split(peer_stream);
-    let max_buf_cap = if local.xhttp.post_bytes_max > 0 {
-        (local.xhttp.post_bytes_max as usize).clamp(1024, 32768)
-    } else if local.xhttp.max_each_post_bytes > 0 {
-        (local.xhttp.max_each_post_bytes as usize).clamp(1024, 32768)
+    let max_buf_cap = effective_upload_cap(local).clamp(256, 32768);
+    let max_conc = if local.xhttp.max_concurrent_posts > 0 {
+        (local.xhttp.max_concurrent_posts as usize).clamp(1, 8)
     } else {
-        32768
+        4
     };
     let ep_clone = local.clone();
     let binding_clone = binding.clone();
-    let connect_up = Arc::new(connect_transport);
+    let connect_up = Arc::clone(&connect_transport);
     let up_base_owned = up_base.to_string();
     let up_host_owned = up_host.to_string();
+    let up_pool_writer = up_pool.clone();
     let (write_failed_tx, mut write_failed_rx) = tokio::sync::watch::channel(false);
 
     let write_task = tokio::spawn(async move {
         let mut seq = 0u64;
         let mut buf = vec![0u8; max_buf_cap];
-        let mut peer_eof = false;
+        let sem = Arc::new(tokio::sync::Semaphore::new(max_conc));
+        let mut in_flight = tokio::task::JoinSet::new();
 
         loop {
             let chunk_target = sample_post_size(&ep_clone).min(buf.len());
-            let payload = match peer_rd.read(&mut buf[..chunk_target]).await {
-                Ok(0) => {
-                    peer_eof = true;
-                    Vec::new()
-                }
-                Ok(n) => buf[..n].to_vec(),
+            let (payload, is_eof_pkt) = match peer_rd.read(&mut buf[..chunk_target]).await {
+                Ok(0) => (Vec::new(), true),
+                Ok(n) => (buf[..n].to_vec(), false),
                 Err(_) => break,
             };
             let pkt_seq = seq;
             seq += 1;
-            let post_path = if up_base_owned == "/" {
-                format!("/{}/{}", sid, pkt_seq)
-            } else {
-                format!("{}/{}/{}", up_base_owned, sid, pkt_seq)
-            };
 
-            let mut delivered = false;
-            for attempt in 0..3 {
-                if attempt > 0 {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    let Ok(new_raw) =
-                        connect_up(up_addr, ep_clone.clone(), binding_clone.clone()).await
+            let Ok(permit) = sem.clone().acquire_owned().await else {
+                break;
+            };
+            let ep_p = ep_clone.clone();
+            let bind_p = binding_clone.clone();
+            let base_p = up_base_owned.clone();
+            let host_p = up_host_owned.clone();
+            let sid_p = sid.clone();
+            let pool_p = up_pool_writer.clone();
+            let conn_fn = connect_up.clone();
+            let wf_tx = write_failed_tx.clone();
+
+            in_flight.spawn(async move {
+                let _permit = permit;
+                let ct = if !payload.is_empty() && xhttp_data_placement(&ep_p.xhttp) == "body" {
+                    Some("application/octet-stream")
+                } else {
+                    None
+                };
+                let mut delivered = false;
+                for attempt in 0..3 {
+                    if attempt > 0 {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    let Ok((mut sender, _g)) = pool_p
+                        .acquire(up_addr, &ep_p, &bind_p, req_timeout, &*conn_fn)
+                        .await
                     else {
                         continue;
                     };
-                    let Ok(new_s) = dial_h2_client(new_raw, req_timeout).await else {
-                        continue;
+                    let parts = build_client_req_parts(
+                        scheme,
+                        &host_p,
+                        &base_p,
+                        &ep_p,
+                        Some(&sid_p),
+                        Some(pkt_seq),
+                        Some(&payload),
+                        is_eof_pkt,
+                        ct,
+                    );
+                    let Ok(req) = build_h2_request_from_parts(up_method, scheme, &host_p, &parts)
+                    else {
+                        break;
                     };
-                    up_sender = new_s;
-                }
-                let Ok(ready_s) = up_sender.clone().ready().await else {
-                    continue;
-                };
-                up_sender = ready_s;
-                let ct = if payload.is_empty() {
-                    None
-                } else {
-                    Some("application/octet-stream")
-                };
-                let Ok(req) = build_h2_request(
-                    up_method,
-                    scheme,
-                    &up_host_owned,
-                    &post_path,
-                    &ep_clone,
-                    ct,
-                ) else {
-                    break;
-                };
-                if payload.is_empty() {
-                    if let Ok((rf, _)) = up_sender.send_request(req, true) {
-                        if let Ok(Ok(r)) = tokio::time::timeout(req_timeout, rf).await {
-                            if r.status().as_u16() == 200 {
-                                delivered = true;
-                                break;
+                    if parts.body.is_empty() {
+                        if let Ok((rf, _)) = sender.send_request(req, true) {
+                            if let Ok(Ok(r)) = tokio::time::timeout(req_timeout, rf).await {
+                                if r.status().as_u16() == 200 {
+                                    delivered = true;
+                                    break;
+                                }
                             }
                         }
-                    }
-                } else if let Ok((rf, mut sb)) = up_sender.send_request(req, false) {
-                    if h2_send_chunk(&mut sb, &payload).await.is_ok()
-                        && sb.send_data(Bytes::new(), true).is_ok()
-                    {
-                        if let Ok(Ok(r)) = tokio::time::timeout(req_timeout, rf).await {
-                            if r.status().as_u16() == 200 {
-                                delivered = true;
-                                break;
+                    } else if let Ok((rf, mut sb)) = sender.send_request(req, false) {
+                        if h2_send_chunk(&mut sb, &parts.body).await.is_ok()
+                            && sb.send_data(Bytes::new(), true).is_ok()
+                        {
+                            if let Ok(Ok(r)) = tokio::time::timeout(req_timeout, rf).await {
+                                if r.status().as_u16() == 200 {
+                                    delivered = true;
+                                    break;
+                                }
                             }
                         }
                     }
                 }
-            }
+                if !delivered && !is_eof_pkt {
+                    let _ = wf_tx.send(true);
+                }
+                delivered
+            });
 
-            if !delivered {
-                if !peer_eof {
-                    let _ = write_failed_tx.send(true);
-                }
+            if is_eof_pkt {
+                while in_flight.join_next().await.is_some() {}
                 break;
             }
-            if peer_eof {
+            if *write_failed_tx.borrow() {
                 break;
             }
             let interval_ms = sample_post_interval_ms(&ep_clone);
@@ -2239,11 +3165,13 @@ where
 
     let write_abort = write_task.abort_handle();
     let read_task = tokio::spawn(async move {
-        let _keep_dn_sender = dn_sender;
+        let _keep_dn = (dn_sender, dn_guard, dn_pool);
+        let mut read_errored = false;
         loop {
             tokio::select! {
                 _ = write_failed_rx.changed() => {
                     if *write_failed_rx.borrow() {
+                        read_errored = true;
                         break;
                     }
                 }
@@ -2255,12 +3183,18 @@ where
                                 break;
                             }
                         }
-                        _ => break,
+                        Some(Err(_)) => {
+                            read_errored = true;
+                            break;
+                        }
+                        None => break,
                     }
                 }
             }
         }
-        write_abort.abort();
+        if read_errored {
+            write_abort.abort();
+        }
         let _ = peer_wr.shutdown().await;
     });
 
@@ -2270,12 +3204,26 @@ where
     )))
 }
 
-fn wrap_h2_duplex(mut recv_body: h2::RecvStream, mut send_body: h2::SendStream<Bytes>) -> BoxStream {
+fn wrap_h2_duplex(recv_body: h2::RecvStream, send_body: h2::SendStream<Bytes>) -> BoxStream {
+    wrap_h2_duplex_keep(recv_body, send_body, ())
+}
+
+fn wrap_h2_duplex_keep<K>(
+    mut recv_body: h2::RecvStream,
+    mut send_body: h2::SendStream<Bytes>,
+    keep: K,
+) -> BoxStream
+where
+    K: Send + 'static,
+{
+    let keep = Arc::new(Mutex::new(keep));
+    let keep_w = keep.clone();
     let (local_stream, peer_stream) = tokio::io::duplex(256 * 1024);
     let (mut peer_rd, mut peer_wr) = tokio::io::split(peer_stream);
     let (write_failed_tx, mut write_failed_rx) = tokio::sync::watch::channel(false);
 
     let write_task = tokio::spawn(async move {
+        let _keep = keep_w;
         let mut buf = vec![0u8; 65536];
         let mut clean_eof = false;
         loop {
@@ -2301,10 +3249,13 @@ fn wrap_h2_duplex(mut recv_body: h2::RecvStream, mut send_body: h2::SendStream<B
 
     let write_abort = write_task.abort_handle();
     let read_task = tokio::spawn(async move {
+        let _keep = keep;
+        let mut read_errored = false;
         loop {
             tokio::select! {
                 _ = write_failed_rx.changed() => {
                     if *write_failed_rx.borrow() {
+                        read_errored = true;
                         break;
                     }
                 }
@@ -2316,12 +3267,18 @@ fn wrap_h2_duplex(mut recv_body: h2::RecvStream, mut send_body: h2::SendStream<B
                                 break;
                             }
                         }
-                        _ => break,
+                        Some(Err(_)) => {
+                            read_errored = true;
+                            break;
+                        }
+                        None => break,
                     }
                 }
             }
         }
-        write_abort.abort();
+        if read_errored {
+            write_abort.abort();
+        }
         let _ = peer_wr.shutdown().await;
     });
 
@@ -2336,17 +3293,25 @@ where
     wrap_chunked_duplex_keep(rd, wr, read_buf, ())
 }
 
-fn wrap_chunked_duplex_keep<R, W, K>(mut rd: R, mut wr: W, mut read_buf: Vec<u8>, keep: K) -> BoxStream
+fn wrap_chunked_duplex_keep<R, W, K>(
+    mut rd: R,
+    mut wr: W,
+    mut read_buf: Vec<u8>,
+    keep: K,
+) -> BoxStream
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
     K: Send + 'static,
 {
+    let keep = Arc::new(Mutex::new(keep));
+    let keep_w = keep.clone();
     let (local_stream, peer_stream) = tokio::io::duplex(256 * 1024);
     let (mut peer_rd, mut peer_wr) = tokio::io::split(peer_stream);
     let (write_failed_tx, mut write_failed_rx) = tokio::sync::watch::channel(false);
 
     let write_task = tokio::spawn(async move {
+        let _keep = keep_w;
         let mut buf = vec![0u8; 65520];
         let mut scratch = Vec::with_capacity(65536);
         let mut clean_eof = false;
@@ -2381,10 +3346,12 @@ where
     let write_abort = write_task.abort_handle();
     let read_task = tokio::spawn(async move {
         let _keep = keep;
+        let mut read_errored = false;
         loop {
             tokio::select! {
                 _ = write_failed_rx.changed() => {
                     if *write_failed_rx.borrow() {
+                        read_errored = true;
                         break;
                     }
                 }
@@ -2395,12 +3362,18 @@ where
                                 break;
                             }
                         }
-                        _ => break,
+                        Ok(None) => break,
+                        Err(_) => {
+                            read_errored = true;
+                            break;
+                        }
                     }
                 }
             }
         }
-        write_abort.abort();
+        if read_errored {
+            write_abort.abort();
+        }
         let _ = peer_wr.shutdown().await;
     });
 
@@ -2467,7 +3440,7 @@ async fn read_http_request_head<R: AsyncRead + Unpin>(
     let mut content_length = 0usize;
     let mut chunked = false;
     let mut host = String::new();
-    let mut headers = HashMap::new();
+    let mut headers: HashMap<String, String> = HashMap::new();
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
             let k = k.trim().to_ascii_lowercase();
@@ -2487,6 +3460,13 @@ async fn read_http_request_head<R: AsyncRead + Unpin>(
                 content_length = parsed;
             } else if k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked") {
                 chunked = true;
+            }
+            if k == "cookie" {
+                if let Some(prev) = headers.get_mut("cookie") {
+                    prev.push_str("; ");
+                    prev.push_str(v);
+                    continue;
+                }
             }
             headers.insert(k, v.to_string());
         }
@@ -2672,5 +3652,89 @@ mod tests {
             custom_hdrs,
             "User-Agent: CustomClient/2.0\r\nX-Custom-Route: east\r\n"
         );
+    }
+
+    #[test]
+    fn xhttp_referer_padding_and_obfs_placements_roundtrip() {
+        // 1. Default non-obfs mode places x_padding in Referer query and preserves trailing `/`
+        let mut local = LocalTLS::default();
+        local.xhttp.path = "/veilink/".to_string();
+        local.xhttp.mode = "stream-one".to_string();
+        let parts = build_client_req_parts(
+            "https",
+            "cdn.example.com",
+            &normalize_xhttp_path(&local.xhttp.path),
+            &local,
+            None,
+            None,
+            None,
+            false,
+            Some("application/grpc"),
+        );
+        assert_eq!(parts.uri_path_and_query, "/veilink/");
+        let mut hmap = HashMap::new();
+        for (k, v) in &parts.headers {
+            hmap.insert(k.to_ascii_lowercase(), v.clone());
+        }
+        let referer = hmap.get("referer").expect("Referer header must carry x_padding");
+        assert!(referer.starts_with("https://cdn.example.com/veilink/?x_padding=X"));
+        assert!(!hmap.contains_key("x-padding"));
+        assert!(matches!(
+            parse_xhttp_route("POST", &parts.uri_path_and_query, &hmap, &local),
+            Ok(ParsedXhttpRoute::StreamOne)
+        ));
+
+        // 2. Obfs mode with cookie session_id, header seq, tokenish query padding, and cookie uplink data
+        local.xhttp.mode = "packet-up".to_string();
+        local.xhttp.session_id_placement = "cookie".to_string();
+        local.xhttp.session_id_key = "x_sid".to_string();
+        local.xhttp.session_id_table = "base62".to_string();
+        local.xhttp.session_id_length = 32;
+        local.xhttp.seq_placement = "header".to_string();
+        local.xhttp.seq_key = "X-Veilink-Seq".to_string();
+        local.xhttp.uplink_data_placement = "cookie".to_string();
+        local.xhttp.uplink_data_key = "x_payload".to_string();
+        local.xhttp.uplink_chunk_size = 64;
+        local.xhttp.padding_obfs_mode = true;
+        local.xhttp.padding_placement = "query".to_string();
+        local.xhttp.padding_key = "p_tok".to_string();
+        local.xhttp.padding_method = "tokenish".to_string();
+        local.xhttp.padding_bytes = 120;
+        local.xhttp.padding_max_bytes = 180;
+
+        let sid = generate_session_id(&local.xhttp);
+        assert_eq!(sid.len(), 32);
+        let raw_payload = b"hello xhttp cookie chunked uplink payload 0123456789abcdef!";
+        let obfs_parts = build_client_req_parts(
+            "https",
+            "cdn.example.com",
+            &normalize_xhttp_path(&local.xhttp.path),
+            &local,
+            Some(&sid),
+            Some(7),
+            Some(raw_payload),
+            false,
+            None,
+        );
+        assert!(obfs_parts.body.is_empty());
+        assert!(obfs_parts.uri_path_and_query.starts_with("/veilink/?p_tok="));
+        let mut obfs_hmap = HashMap::new();
+        for (k, v) in &obfs_parts.headers {
+            obfs_hmap.insert(k.to_ascii_lowercase(), v.clone());
+        }
+        match parse_xhttp_route("POST", &obfs_parts.uri_path_and_query, &obfs_hmap, &local) {
+            Ok(ParsedXhttpRoute::PacketUp {
+                sid: got_sid,
+                seq: got_seq,
+                header_or_cookie_data: Some(got_data),
+                explicit_eof,
+            }) => {
+                assert_eq!(got_sid, sid);
+                assert_eq!(got_seq, 7);
+                assert_eq!(got_data, raw_payload);
+                assert!(!explicit_eof);
+            }
+            other => panic!("unexpected route parse result: {:?}", other.err()),
+        }
     }
 }
