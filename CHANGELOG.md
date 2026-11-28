@@ -8,6 +8,22 @@ Release。
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-28
+
+### Bug Fixes & Runtime Stability
+
+- **单条隧道热更新完全隔离**（`tunnel/mod.rs` / `store.rs`）：将服务端与客户端运行时重构为按 `mapping.id` 增量调和的 `ServerRuntime` / `ClientRuntime`，新增、编辑、启停或删除单条端口映射时仅操作目标映射，不再中断同一网关或客户端上其它活跃隧道连接与状态；移除 `mapping_policy` 跨映射依赖，消除无关映射状态闪断。
+- **修复双向带宽限速与热生效缺陷**（`tunnel/mod.rs`）：服务端在 TCP（直连与 `smux` / `yamux` / `h2mux`）、`XUDP` 及 `Hysteria2 UDP` 全路径按精确 `mapping.id` 双向实时限速（`LiveLimiter`），修复多条映射共享同一内网目标时下行限速被不限速映射绕过的问题，并支持在线修改带宽上限对已建立连接实时生效。
+- **修复 `Hysteria2` 多连接池（`pool > 1`）UDP 丢包竞态**（`tunnel/mod.rs`）：为所有支持 UDP 的 `Hysteria2` 客户端连接池 worker 均挂载 UDP 响应协程，消除非首 worker 先完成 QUIC 握手时服务端发出的 UDP 数据报无人接收导致超时的问题。
+- **彻底消除内置 `default` 网关「撤销接入令牌」审计噪音**（`master.rs` / `store.rs`）：新增 `Store::ensure_embedded_credential` 在同进程内直接签发并复用嵌入式网关凭据，容器重建或丢失 `embedded-server/state.json` 后不再走临时 `enroll_token` 与 `revoke_enroll_token` 往返，实现零 `node.enroll.token` / `node.enroll.revoke` 审计噪音。
+- **脱机节点有效配置指纹去误报**（`store.rs`）：持久化脱机节点导出时的规范化有效运行快照指纹（`exported_fingerprints`，并兼容历史库自动惰性回填），停用后再启用、映射停用后再启用、编辑后改回原值或新增未启用映射等未实质改变有效配置的操作不再误报「待导出 / 需重导出」。
+
+### Console UX & Topology Polish
+
+- **节点详情全面改用居中弹窗并清理残余侧栏**（`NodesView.tsx`）：公网网关与内网节点详情由侧边分栏/抽屉统一升级为居中模态框（`<Modal size="md">`），进入编辑或快捷接入前自动关闭详情框避免弹窗堆叠。
+- **精简导航与消除入口冗余**（`AppShell.tsx` / `SettingsView.tsx` / `AccountView.tsx` / `i18n.ts`）：移除侧边栏左下角重复版本号（仅保留顶栏版本信息），将原「系统与账户」拆分为职责独立的「系统设置（`#/settings`）」与「账户与安全（`#/account`）」，并将「注销登录」收拢至左下角账户二级菜单内。
+- **拓扑图防重叠排布与视觉优化**（`TopologyCanvas.tsx` / `app.css`）：沿贝塞尔曲线采样并结合胶囊防重叠与跨线避让评分彻底消除连线计数标签重叠；拆分曲线、标签、节点与端口连接点图层，多连线接入时端口均匀扇形展开，拓宽节点卡片消除名称截断并支持直接悬停连线高亮路径。
+
 ## [0.6.0] - 2026-11-28
 
 ### Features
